@@ -112,6 +112,7 @@ impl From<ServiceError> for ApiError {
             ServiceError::AgentNotFound => (S::NOT_FOUND, "agent_not_found"),
             ServiceError::AgentClosed => (S::CONFLICT, "agent_closed"),
             ServiceError::TurnInProgress => (S::CONFLICT, "turn_in_progress"),
+            ServiceError::Git(GitError::PathNotFound(_)) => (S::BAD_REQUEST, "path_not_found"),
             ServiceError::Git(GitError::NotAGitRepo) => (S::BAD_REQUEST, "not_a_git_repo"),
             ServiceError::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
             ServiceError::Git(GitError::NoDefaultBranch) => (S::BAD_REQUEST, "no_default_branch"),

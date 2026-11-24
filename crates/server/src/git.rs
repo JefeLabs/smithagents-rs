@@ -17,6 +17,9 @@ pub struct RepoInfo {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
+    /// Nothing exists at the path, or it is not a directory.
+    #[error("no directory at {}", .0.display())]
+    PathNotFound(PathBuf),
     #[error("not a git repository")]
     NotAGitRepo,
     #[error("bare repositories are not supported")]
@@ -78,11 +81,27 @@ async fn git_ok(cwd: &Path, args: &[&str]) -> Result<bool, GitError> {
     Ok(git_raw(cwd, args).await?.status.success())
 }
 
-/// Resolves `path` to its repository root and default branch.
+/// Resolves `path` to its repository root and default branch. A path that is
+/// not an existing directory is [`GitError::PathNotFound`].
 ///
 /// The default branch is the one named by `origin/HEAD`, else the checked-out
 /// branch, else (detached HEAD) a local `main` or `master`.
 pub async fn validate_repo(path: &Path) -> Result<RepoInfo, GitError> {
+    // git runs in `path`, so without this a missing directory would surface
+    // as an I/O error from starting git rather than as a bad path.
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(GitError::PathNotFound(path.to_owned())),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Err(GitError::PathNotFound(path.to_owned()));
+        }
+        Err(e) => return Err(e.into()),
+    }
     if git(path, &["rev-parse", "--is-bare-repository"]).await? == "true" {
         return Err(GitError::BareRepo);
     }
@@ -258,6 +277,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = validate_repo(tmp.path()).await.unwrap_err();
         assert!(matches!(err, GitError::NotAGitRepo), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn validate_repo_rejects_a_path_that_is_not_a_directory() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("nope");
+        let err = validate_repo(&missing).await.unwrap_err();
+        assert!(
+            matches!(&err, GitError::PathNotFound(p) if *p == missing),
+            "{err:?}"
+        );
+        let file = tmp.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let err = validate_repo(&file).await.unwrap_err();
+        assert!(
+            matches!(&err, GitError::PathNotFound(p) if *p == file),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

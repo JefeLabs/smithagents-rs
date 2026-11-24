@@ -255,6 +255,21 @@ async fn add_repo_rejects_non_git_dir() {
 }
 
 #[tokio::test]
+async fn add_repo_rejects_missing_path() {
+    let fx = default_fx().await;
+    let dir = fx.tmp.path().join("does-not-exist");
+    let (status, body) = fx
+        .call(Method::POST, "/v1/repos", Some(json!({ "path": dir })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_error(&body, "path_not_found");
+    assert!(
+        body["message"].as_str().unwrap().contains("does-not-exist"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn add_repo_rejects_bare_repo() {
     let fx = default_fx().await;
     let dir = fx.tmp.path().join("bare.git");
