@@ -180,7 +180,9 @@ async fn wait_for_clients(state: &AppState, want: usize) {
 }
 
 fn closed_event(bus: &EventBus) -> Event {
-    bus.publish(EventKind::AgentClosed(AgentId::new()))
+    bus.publish(EventKind::AgentClosed {
+        agent_id: AgentId::new(),
+    })
 }
 
 #[tokio::test]

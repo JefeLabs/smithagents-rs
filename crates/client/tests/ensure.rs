@@ -879,7 +879,9 @@ fn sample_event(seq: u64) -> Event {
     Event {
         seq,
         at: Utc::now(),
-        kind: EventKind::AgentClosed(AgentId::new()),
+        kind: EventKind::AgentClosed {
+            agent_id: AgentId::new(),
+        },
     }
 }
 
@@ -931,6 +933,44 @@ async fn malformed_event_ends_the_event_stream() {
         ])
         .await;
         let mut stream = within("events", Client::new(&info).events(Some(5)))
+            .await
+            .unwrap();
+        assert_eq!(next_event(&mut stream).await, None);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn event_of_an_unknown_type_is_skipped() {
+    // A newer daemon may send kinds this client does not know yet.
+    bounded(async {
+        let later = sample_event(6);
+        let info = ws_stub(vec![
+            Message::text(
+                r#"{"seq":5,"at":"2026-11-24T10:00:00Z","kind":{"type":"agent_renamed","data":{"agent_id":"x","name":"Pluto"}}}"#,
+            ),
+            Message::text(serde_json::to_string(&later).unwrap()),
+        ])
+        .await;
+        let mut stream = within("events", Client::new(&info).events(None))
+            .await
+            .unwrap();
+        assert_eq!(next_event(&mut stream).await, Some(later));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn event_of_a_known_type_with_bad_data_ends_the_event_stream() {
+    bounded(async {
+        let info = ws_stub(vec![
+            Message::text(
+                r#"{"seq":5,"at":"2026-11-24T10:00:00Z","kind":{"type":"agent_closed","data":{"oops":1}}}"#,
+            ),
+            Message::text(serde_json::to_string(&sample_event(6)).unwrap()),
+        ])
+        .await;
+        let mut stream = within("events", Client::new(&info).events(None))
             .await
             .unwrap();
         assert_eq!(next_event(&mut stream).await, None);

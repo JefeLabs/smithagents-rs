@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smithagents_core::agent::{Agent, ChatMessage, Repo};
 use smithagents_core::daemon::DaemonInfo;
-use smithagents_core::event::Event;
+use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, RepoId};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
@@ -194,8 +194,10 @@ impl Client {
     ///
     /// The stream ends when the connection does. In particular the daemon
     /// closes it (reason `lagged`) when this subscriber falls too far behind;
-    /// callers resubscribe with the last seq they saw. An event that cannot be
-    /// decoded also ends the stream, with a warning logged through `tracing`.
+    /// callers resubscribe with the last seq they saw. An event whose
+    /// `kind.type` this version does not know (one a newer daemon added) is
+    /// skipped, logged at debug level; any other event that cannot be decoded
+    /// ends the stream, with a warning logged through `tracing`.
     pub async fn events(
         &self,
         since: Option<u64>,
@@ -280,6 +282,16 @@ fn api_error(status: u16, body: &str) -> ClientError {
     }
 }
 
+/// The `kind.type` of an undecodable event when it is one this version does
+/// not know (a newer daemon's), so the event can be skipped; `None` when the
+/// text is not JSON, has no such type, or has a known type (then it is
+/// malformed).
+fn unknown_kind(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let kind = value.get("kind")?.get("type")?.as_str()?;
+    (!EventKind::TYPES.contains(&kind)).then(|| kind.to_owned())
+}
+
 /// What one WebSocket read means for the event stream.
 enum Step {
     Event(Event),
@@ -291,10 +303,16 @@ fn read_step(read: Result<Message, tungstenite::Error>) -> Step {
     match read {
         Ok(Message::Text(text)) => match serde_json::from_str(&text) {
             Ok(event) => Step::Event(event),
-            Err(e) => {
-                tracing::warn!("ending the event stream: undecodable event: {e}");
-                Step::End
-            }
+            Err(e) => match unknown_kind(&text) {
+                Some(kind) => {
+                    tracing::debug!("skipping an event of unknown type {kind:?}");
+                    Step::Skip
+                }
+                None => {
+                    tracing::warn!("ending the event stream: undecodable event: {e}");
+                    Step::End
+                }
+            },
         },
         Ok(Message::Close(frame)) => {
             match frame {

@@ -240,7 +240,9 @@ impl AgentService {
         let _reservation = self.reserve(id, Slot::Closing)?;
         self.open_agent(id).await?;
         self.inner.store.close_agent(id, Utc::now()).await?;
-        self.inner.bus.publish(EventKind::AgentClosed(id));
+        self.inner
+            .bus
+            .publish(EventKind::AgentClosed { agent_id: id });
         Ok(())
     }
 
@@ -695,7 +697,7 @@ mod tests {
         match kind {
             EventKind::AgentCreated(a) => format!("created {}", a.name),
             EventKind::AgentUpdated(a) => format!("state {:?}", a.state),
-            EventKind::AgentClosed(_) => "closed".into(),
+            EventKind::AgentClosed { .. } => "closed".into(),
             EventKind::MessageAppended(m) => format!("{:?}: {}", m.role, m.text),
             EventKind::TurnDelta { text, .. } => format!("delta {text}"),
         }
@@ -767,7 +769,9 @@ mod tests {
         fx.svc.close_agent(mercury.id).await.unwrap();
         assert_eq!(
             rx.recv().await.unwrap().kind,
-            EventKind::AgentClosed(mercury.id)
+            EventKind::AgentClosed {
+                agent_id: mercury.id
+            }
         );
         assert!(fx.agent(mercury.id).await.closed_at.is_some());
         // The worktree is kept.
