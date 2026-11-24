@@ -294,7 +294,21 @@ mod tests {
         assert!(matches!(err, LockError::AlreadyRunning), "{err:?}");
 
         drop(first);
-        acquire_instance_lock(&paths).expect("lock is free once the holder drops it");
+        // Other tests in this process spawn child processes. A child forked
+        // while `first` was open holds a copy of the lock's file descriptor
+        // until its exec closes it (the descriptor is close-on-exec), and a
+        // flock is released only when every copy is closed. So the lock can
+        // stay held for a few milliseconds after the drop. Poll briefly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match acquire_instance_lock(&paths) {
+                Ok(_) => break,
+                Err(LockError::AlreadyRunning) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("lock is free once the holder drops it: {e:?}"),
+            }
+        }
     }
 
     #[test]
