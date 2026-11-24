@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "tools/*"]
 resolver = "2"
 
 [workspace.package]
@@ -35,3 +35,5 @@ futures = "0.3.34"
 tokio-stream = "0.1.19"
 tower = "0.5.3"
 http-body-util = "0.1.5"
+regex = "1.13.2"
+ignore = "0.4.35"

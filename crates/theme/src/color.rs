@@ -85,7 +85,8 @@ impl Oklch {
     }
 }
 
-fn fmt_num(x: f64) -> String {
+/// Number formatting shared with `css()`: at most 4 decimals, trailing zeros trimmed.
+pub fn fmt_num(x: f64) -> String {
     let s = format!("{x:.4}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     if s == "-0" || s.is_empty() {

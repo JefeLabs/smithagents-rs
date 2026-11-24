@@ -1,0 +1,2 @@
+[alias]
+themegen = "run -p themegen --"
