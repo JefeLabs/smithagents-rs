@@ -234,6 +234,104 @@ async fn dropping_stream_kills_process() {
     }
 }
 
+/// Collects a turn's events, failing instead of hanging past `limit`.
+async fn collect_within(env: &Env, r: TurnRequest, limit: Duration) -> Vec<HarnessEvent> {
+    tokio::time::timeout(limit, collect(env, r))
+        .await
+        .unwrap_or_else(|_| panic!("the turn's stream did not end within {limit:?}"))
+}
+
+/// Bounds a turn whose process lingers in some way; a hang fails the test.
+const LINGER_LIMIT: Duration = Duration::from_secs(15);
+/// How soon such a turn must end once claude itself has exited.
+const ENDS_WITHIN: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn grandchild_holding_stdout_does_not_hide_a_failed_exit() {
+    // claude exits 2 without a result line; a process it started keeps stdout open.
+    let env = setup(&[
+        ("FAKE_CLAUDE_EXIT", "2"),
+        ("FAKE_CLAUDE_STDERR", "boom: mcp server crashed"),
+        ("FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS", "8"),
+    ]);
+    let start = Instant::now();
+    let events = collect_within(&env, req(env.dir.path(), None), LINGER_LIMIT).await;
+    let elapsed = start.elapsed();
+    match events.as_slice() {
+        [HarnessEvent::Failed { message }] => {
+            assert!(message.contains("exit status: 2"), "{message}");
+            assert!(message.contains("boom: mcp server crashed"), "{message}");
+        }
+        other => panic!("expected only Failed, got {other:?}"),
+    }
+    assert!(elapsed < ENDS_WITHIN, "took {elapsed:?}");
+}
+
+#[tokio::test]
+async fn grandchild_holding_stdout_keeps_the_final_result_line() {
+    // A clean turn whose stdout stays open after claude exits: every line it
+    // printed, the result last, still arrives, and the stream then ends.
+    let env = setup(&[
+        ("FAKE_CLAUDE_FIXTURE", FIXTURE),
+        ("FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS", "8"),
+    ]);
+    let start = Instant::now();
+    let events = collect_within(&env, req(env.dir.path(), None), LINGER_LIMIT).await;
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(
+            events.last(),
+            Some(HarnessEvent::TurnCompleted {
+                is_error: false,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, HarnessEvent::Failed { .. })));
+    assert!(elapsed < ENDS_WITHIN, "took {elapsed:?}");
+}
+
+#[tokio::test]
+async fn clean_exit_with_stdout_held_open_just_ends() {
+    let env = setup(&[("FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS", "8")]);
+    let start = Instant::now();
+    let events = collect_within(&env, req(env.dir.path(), None), LINGER_LIMIT).await;
+    assert!(events.is_empty(), "{events:?}");
+    assert!(start.elapsed() < ENDS_WITHIN, "took {:?}", start.elapsed());
+}
+
+#[tokio::test]
+async fn stdout_read_error_kills_claude_and_fails() {
+    // Output that is not UTF-8 cannot be read as lines; claude, still running,
+    // is stopped instead of waited on.
+    let dir = tempfile::tempdir().unwrap();
+    let garbled = dir.path().join("garbled.jsonl");
+    let mut bytes = b"{\"type\":\"bad\xff\xfe\"}\n".to_vec();
+    bytes.extend(std::fs::read(FIXTURE).unwrap());
+    std::fs::write(&garbled, bytes).unwrap();
+    let pid_file = dir.path().join("pid");
+    let env = setup(&[
+        ("FAKE_CLAUDE_FIXTURE", garbled.to_str().unwrap()),
+        ("FAKE_CLAUDE_SLEEP", "8"),
+        ("FAKE_CLAUDE_PID_FILE", pid_file.to_str().unwrap()),
+    ]);
+    let start = Instant::now();
+    let events = collect_within(&env, req(env.dir.path(), None), LINGER_LIMIT).await;
+    let elapsed = start.elapsed();
+    match events.last() {
+        Some(HarnessEvent::Failed { message }) => {
+            assert!(message.contains("output"), "{message}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(elapsed < ENDS_WITHIN, "took {elapsed:?}");
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(!pid_alive(pid.trim()), "claude was left running");
+}
+
 #[tokio::test]
 async fn lingering_grandchild_holding_stderr_does_not_delay_failed() {
     let env = setup(&[
