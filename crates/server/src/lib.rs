@@ -2,6 +2,7 @@ pub mod api;
 pub mod events;
 pub mod git;
 pub mod harness;
+pub mod intents;
 pub mod lifecycle;
 pub mod paths;
 pub mod polish;

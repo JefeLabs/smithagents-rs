@@ -46,3 +46,8 @@ tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
+
+[[test]]
+name = "intents"
+path = "tests/intents.rs"
+required-features = ["test-util"]
