@@ -144,8 +144,24 @@ pub fn stop_daemon(home: &Path) {
     let _ = kill_process(pid, Signal::KILL);
 }
 
-/// Runs git with a fixed identity and C locale, panicking on failure.
-pub fn git(cwd: &Path, args: &[&str]) {
+/// Whether a process with this pid exists, via `kill(pid, 0)` as the client
+/// crate checks it. A child of this process that exited but was not reaped yet
+/// (tokio reaps the daemons `ensure_daemon` started while the runtime runs)
+/// still counts as alive.
+pub fn pid_alive(pid: u32) -> bool {
+    use rustix::io::Errno;
+    use rustix::process::{test_kill_process, Pid};
+
+    let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return false;
+    };
+    // EPERM means it exists but belongs to someone else.
+    !matches!(test_kill_process(pid), Err(Errno::SRCH))
+}
+
+/// Runs git with a fixed identity and C locale, panicking on failure; returns
+/// its trimmed stdout.
+pub fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args([
             "-c",
@@ -168,6 +184,7 @@ pub fn git(cwd: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
 /// Creates a git repo on `main` with one empty commit.

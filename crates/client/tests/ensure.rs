@@ -36,7 +36,10 @@ const TEST_DEADLINE: Duration = Duration::from_secs(60);
 const DEAD_PID: u32 = i32::MAX as u32;
 
 /// Bounds a whole test body, on top of the finer `within` bounds inside it.
+/// The daemon binary is resolved first, so a cold build of it never counts
+/// against (and is never reported as) a test running out of time.
 async fn bounded<T>(test: impl Future<Output = T>) -> T {
+    daemon_bin();
     tokio::time::timeout(TEST_DEADLINE, test)
         .await
         .unwrap_or_else(|_| panic!("the test did not finish within {TEST_DEADLINE:?}"))
