@@ -73,11 +73,28 @@ fn lint_repo_walks_and_skips() {
         write(root, skipped, bad);
     }
     write(root, "src/readme.md", bad);
-    write(root, "src/bin.rs", &[0xff, 0xfe, 0x00, 0x23, 0x66]);
+    write(root, "src/bin.rs", b"\xff\xfe\ncolor: #ff0000;\n");
     write(root, ".gitignore", b"ignored.css\n");
 
     let findings = lint_repo(root).unwrap();
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].path, root.join("src/App.tsx"));
     assert_eq!(findings[0].line, 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_repo_reports_unreadable_file_with_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "src/locked.rs", b"fn main() {}\n");
+    let p = root.join("src/locked.rs");
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&p).is_ok() {
+        // Running as root: permissions are not enforced.
+        return;
+    }
+    let err = lint_repo(root).expect_err("unreadable file must error");
+    assert!(err.to_string().contains("locked.rs"), "{err}");
 }

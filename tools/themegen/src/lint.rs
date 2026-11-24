@@ -96,8 +96,11 @@ pub fn lint_repo(root: &Path) -> io::Result<Vec<Finding>> {
         if !scanned {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            // Invalid UTF-8: not a text source file, skip silently.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
         };
         for (line, text) in lint_text(&text) {
             findings.push(Finding {

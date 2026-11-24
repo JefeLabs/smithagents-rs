@@ -24,13 +24,13 @@ pub fn render_css(set: &ThemeSet) -> String {
     for (name, rem) in &base.text_sizes_rem {
         let _ = writeln!(out, "  --text-{name}: {}rem;", fmt_num(*rem));
     }
-    out.push_str("  --font-sans: var(--font-sans);\n");
-    out.push_str("  --font-mono: var(--font-mono);\n");
+    out.push_str("  --font-sans: var(--smith-font-sans);\n");
+    out.push_str("  --font-mono: var(--smith-font-mono);\n");
     out.push_str("}\n");
 
     for theme in &set.themes {
         let selector = if theme.id == base.system_pair.dark {
-            format!(":root, [data-theme=\"{}\"]", theme.id)
+            format!(":where(:root), [data-theme=\"{}\"]", theme.id)
         } else {
             format!("[data-theme=\"{}\"]", theme.id)
         };
@@ -50,11 +50,18 @@ pub fn render_css(set: &ThemeSet) -> String {
         out.push_str("}\n");
     }
 
-    for font in &base.fonts {
+    for (i, font) in base.fonts.iter().enumerate() {
+        // The first font doubles as a zero-specificity fallback for pages
+        // without a `data-font` attribute.
+        let selector = if i == 0 {
+            format!(":where(:root), [data-font=\"{}\"]", font.id)
+        } else {
+            format!("[data-font=\"{}\"]", font.id)
+        };
         let _ = write!(
             out,
-            "\n[data-font=\"{}\"] {{\n  --font-sans: {};\n  --font-mono: {};\n}}\n",
-            font.id, font.sans, font.mono
+            "\n{selector} {{\n  --smith-font-sans: {};\n  --smith-font-mono: {};\n}}\n",
+            font.sans, font.mono
         );
     }
 

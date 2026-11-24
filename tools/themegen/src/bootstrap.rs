@@ -45,7 +45,7 @@ const TEMPLATE: &str = r#"(function () {
     var font = DATA.fonts.length > 0 ? DATA.fonts[0] : "";
     if (typeof s.font === "string" && DATA.fonts.indexOf(s.font) !== -1) font = s.font;
 
-    var raw = s.text_scale !== undefined ? s.text_scale : s.textScale;
+    var raw = s.text_scale;
     var scale = DATA.scale.default;
     if (typeof raw === "number" && isFinite(raw)) {
       scale = Math.min(Math.max(raw, DATA.scale.min), DATA.scale.max);

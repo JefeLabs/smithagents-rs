@@ -31,10 +31,18 @@ fn renders_embedded_themes() {
     assert!(css.contains("--radius-md: calc(var(--radius) - 2px);"));
     assert!(css.contains("--spacing: 0.25rem;"));
     assert!(css.contains("--text-xs: 0.75rem;"));
-    assert!(css.contains("--font-sans: var(--font-sans);"));
+    assert!(css.contains("--font-sans: var(--smith-font-sans);"));
+    assert!(css.contains("--font-mono: var(--smith-font-mono);"));
+    assert!(!css.contains("--font-sans: var(--font-sans);"));
     assert!(css.contains("[data-font=\"mono\"] {"));
+    let first = &ThemeSet::embedded().base.fonts[0].id;
+    assert!(css.contains(&format!(
+        ":where(:root), [data-font=\"{first}\"] {{\n  --smith-font-sans:"
+    )));
+    assert!(css.contains("  --smith-font-mono:"));
     assert!(css.contains("html { font-size: calc(16px * var(--text-scale, 1)); }"));
-    assert!(css.contains(":root, [data-theme=\"smith-dark\"] {"));
+    assert!(css.contains(":where(:root), [data-theme=\"smith-dark\"] {"));
+    assert!(!css.contains(":root, [data-theme"));
 }
 
 #[test]
@@ -84,4 +92,33 @@ fn third_theme_needs_no_code_change() {
     let css = render_css(&set);
     assert_eq!(css.matches("[data-theme=").count(), 3);
     assert!(css.contains("[data-theme=\"smith-third\"] {"));
+}
+
+#[test]
+fn dark_fallback_cannot_outrank_earlier_sorting_theme() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../design/tokens");
+    std::fs::create_dir(dir.path().join("themes")).unwrap();
+    for f in ["base.json", "agent-palette.json"] {
+        std::fs::copy(src.join(f), dir.path().join(f)).unwrap();
+    }
+    for f in ["smith-dark.json", "smith-light.json"] {
+        std::fs::copy(
+            src.join("themes").join(f),
+            dir.path().join("themes").join(f),
+        )
+        .unwrap();
+    }
+    let light = std::fs::read_to_string(src.join("themes/smith-light.json")).unwrap();
+    let third = light
+        .replace("\"smith-light\"", "\"aurora\"")
+        .replace("Smith Light", "Aurora");
+    std::fs::write(dir.path().join("themes/aurora.json"), third).unwrap();
+    let css = render_css(&ThemeSet::load_dir(dir.path()).unwrap());
+    let aurora = css.find("[data-theme=\"aurora\"] {").unwrap();
+    let dark = css.find("[data-theme=\"smith-dark\"] {").unwrap();
+    assert!(aurora < dark, "aurora block must come first");
+    // The :root fallback has zero specificity, so [data-theme] always wins.
+    assert!(css.contains(":where(:root), [data-theme=\"smith-dark\"] {"));
+    assert!(!css.contains(":root, [data-theme"));
 }

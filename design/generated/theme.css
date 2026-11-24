@@ -35,11 +35,11 @@
   --text-sm: 0.875rem;
   --text-xl: 1.25rem;
   --text-xs: 0.75rem;
-  --font-sans: var(--font-sans);
-  --font-mono: var(--font-mono);
+  --font-sans: var(--smith-font-sans);
+  --font-mono: var(--smith-font-mono);
 }
 
-:root, [data-theme="smith-dark"] {
+:where(:root), [data-theme="smith-dark"] {
   color-scheme: dark;
   --background: oklch(0.18 0.01 260);
   --foreground: oklch(0.96 0.005 260);
@@ -99,14 +99,14 @@
   --radius: 8px;
 }
 
-[data-font="system"] {
-  --font-sans: ui-sans-serif, system-ui, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+:where(:root), [data-font="system"] {
+  --smith-font-sans: ui-sans-serif, system-ui, sans-serif;
+  --smith-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 [data-font="mono"] {
-  --font-sans: ui-monospace, SFMono-Regular, Menlo, monospace;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --smith-font-sans: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --smith-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 html { font-size: calc(16px * var(--text-scale, 1)); }
