@@ -4,8 +4,10 @@ pub mod claude;
 pub mod claude_parser;
 #[cfg(feature = "test-util")]
 pub mod fake;
+pub mod structured;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -50,6 +52,30 @@ pub enum HarnessEvent {
 pub enum HarnessError {
     #[error("failed to spawn harness process: {0}")]
     Spawn(#[from] std::io::Error),
+    #[error("harness run timed out")]
+    Timeout,
+    #[error("harness run failed: {0}")]
+    Failed(String),
+    #[error("invalid harness output: {0}")]
+    InvalidOutput(String),
+}
+
+/// A single non-streaming run whose answer must match a JSON schema.
+#[derive(Debug, Clone)]
+pub struct StructuredRequest {
+    pub prompt: String,
+    pub cwd: PathBuf,
+    pub schema: serde_json::Value,
+    pub model: Option<String>,
+    pub system_prompt_append: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructuredResult {
+    pub value: serde_json::Value,
+    pub cost_usd: Option<f64>,
 }
 
 #[async_trait]
@@ -58,4 +84,9 @@ pub trait Harness: Send + Sync {
         &self,
         req: TurnRequest,
     ) -> Result<BoxStream<'static, HarnessEvent>, HarnessError>;
+
+    async fn run_structured(
+        &self,
+        req: StructuredRequest,
+    ) -> Result<StructuredResult, HarnessError>;
 }

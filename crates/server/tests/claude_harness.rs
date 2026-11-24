@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use smithagents_server::harness::claude::ClaudeCodeHarness;
-use smithagents_server::harness::{Harness, HarnessEvent, TurnRequest};
+use smithagents_server::harness::{
+    Harness, HarnessError, HarnessEvent, StructuredRequest, TurnRequest,
+};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -415,4 +417,122 @@ async fn lingering_grandchild_holding_stderr_does_not_delay_failed() {
         "took {:?}",
         start.elapsed()
     );
+}
+
+// ---- run_structured ----
+
+fn sreq(cwd: &Path, prompt: &str, timeout: Duration) -> StructuredRequest {
+    StructuredRequest {
+        prompt: prompt.into(),
+        cwd: cwd.to_path_buf(),
+        schema: serde_json::json!({"type":"object"}),
+        model: None,
+        system_prompt_append: None,
+        allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+        timeout,
+    }
+}
+
+fn structured_env(extra: &[(&str, &str)]) -> (Env, PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.json");
+    std::fs::write(&out, r#"{"title":"probe","count":2}"#).unwrap();
+    let stdin_file = dir.path().join("stdin");
+    let mut vars = vec![
+        (
+            "FAKE_CLAUDE_STRUCTURED_FILE",
+            out.to_str().unwrap().to_owned(),
+        ),
+        (
+            "FAKE_CLAUDE_STDIN_FILE",
+            stdin_file.to_str().unwrap().to_owned(),
+        ),
+    ];
+    vars.extend(extra.iter().map(|(k, v)| (*k, (*v).to_owned())));
+    let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    (setup(&vars), stdin_file, dir)
+}
+
+#[tokio::test]
+async fn structured_run_passes_flags_and_prompt_on_stdin() {
+    let (env, stdin_file, _files) = structured_env(&[]);
+    let mut r = sreq(env.dir.path(), "- not an option", Duration::from_secs(10));
+    r.model = Some("haiku".into());
+    r.system_prompt_append = Some("terse".into());
+    let res = env.harness.run_structured(r).await.unwrap();
+    assert_eq!(res.value, serde_json::json!({"title":"probe","count":2}));
+    assert_eq!(res.cost_usd, Some(0.007));
+    let args = std::fs::read_to_string(env.args_file()).unwrap();
+    for needle in [
+        "-p",
+        "--output-format\njson",
+        "--json-schema",
+        "--tools\nRead,Grep,Glob",
+        "--no-session-persistence",
+        "--dangerously-skip-permissions",
+        "--model\nhaiku",
+        "--append-system-prompt\nterse",
+    ] {
+        assert!(args.contains(needle), "missing {needle:?} in {args:?}");
+    }
+    assert!(!args.contains("not an option"), "{args:?}");
+    assert_eq!(
+        std::fs::read_to_string(stdin_file).unwrap(),
+        "- not an option"
+    );
+}
+
+#[tokio::test]
+async fn structured_timeout_kills_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let (env, _s, _files) = structured_env(&[
+        ("FAKE_CLAUDE_SLEEP", "30"),
+        ("FAKE_CLAUDE_PID_FILE", pid_file.to_str().unwrap()),
+    ]);
+    let start = Instant::now();
+    let err = env
+        .harness
+        .run_structured(sreq(env.dir.path(), "x", Duration::from_secs(2)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::Timeout), "{err:?}");
+    assert!(start.elapsed() < Duration::from_secs(5));
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let start = Instant::now();
+    while pid_alive(pid.trim()) {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "child still alive"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn structured_nonzero_exit_without_output_is_failed() {
+    let env = setup(&[
+        ("FAKE_CLAUDE_EXIT", "3"),
+        ("FAKE_CLAUDE_STDERR", "bad things"),
+    ]);
+    let err = env
+        .harness
+        .run_structured(sreq(env.dir.path(), "x", Duration::from_secs(10)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, HarnessError::Failed(m) if m.contains("bad things")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn structured_clean_exit_without_output_is_invalid() {
+    let env = setup(&[]);
+    let err = env
+        .harness
+        .run_structured(sreq(env.dir.path(), "x", Duration::from_secs(10)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarnessError::InvalidOutput(_)), "{err:?}");
 }

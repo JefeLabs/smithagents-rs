@@ -25,6 +25,7 @@ axum.workspace = true
 subtle.workspace = true
 fs2.workspace = true
 rand.workspace = true
+rustix = { workspace = true, features = ["process"] }
 tracing-subscriber.workspace = true
 
 [features]

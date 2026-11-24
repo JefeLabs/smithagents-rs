@@ -570,7 +570,9 @@ mod tests {
 
     use super::*;
     use crate::harness::fake::FakeHarness;
-    use crate::harness::{HarnessError, HarnessEvent, TurnRequest};
+    use crate::harness::{
+        HarnessError, HarnessEvent, StructuredRequest, StructuredResult, TurnRequest,
+    };
 
     /// A `quiet_after` long enough that no test without a delay ever goes quiet.
     const NEVER_QUIET: Duration = Duration::from_secs(60);
@@ -701,6 +703,7 @@ mod tests {
             EventKind::AgentClosed { .. } => "closed".into(),
             EventKind::MessageAppended(m) => format!("{:?}: {}", m.role, m.text),
             EventKind::TurnDelta { text, .. } => format!("delta {text}"),
+            other => format!("{other:?}"),
         }
     }
 
@@ -1353,6 +1356,13 @@ mod tests {
             _req: TurnRequest,
         ) -> Result<BoxStream<'static, HarnessEvent>, HarnessError> {
             Ok(stream::once(async { panic!("harness stream exploded") }).boxed())
+        }
+
+        async fn run_structured(
+            &self,
+            _req: StructuredRequest,
+        ) -> Result<StructuredResult, HarnessError> {
+            Err(HarnessError::Failed("not used".into()))
         }
     }
 

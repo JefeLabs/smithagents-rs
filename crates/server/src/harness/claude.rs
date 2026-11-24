@@ -16,7 +16,10 @@ use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::claude_parser::parse_events;
-use super::{Harness, HarnessError, HarnessEvent, TurnRequest};
+use super::structured::parse_cli_result;
+use super::{
+    Harness, HarnessError, HarnessEvent, StructuredRequest, StructuredResult, TurnRequest,
+};
 
 const STDERR_MAX_LINES: usize = 20;
 const STDERR_MAX_BYTES: usize = 4096;
@@ -93,6 +96,66 @@ fn lock_tail(tail: &StderrTail) -> std::sync::MutexGuard<'_, VecDeque<String>> {
     tail.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Writes the prompt to claude's stdin from its own task: a prompt larger than
+/// the pipe buffer must not hold up reading claude's output. Dropping `stdin`
+/// at the end closes it, which ends the prompt.
+fn spawn_prompt_writer(mut stdin: tokio::process::ChildStdin, prompt: String) -> AbortOnDrop<()> {
+    AbortOnDrop(tokio::spawn(async move {
+        if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+            // claude exited (or closed stdin) before reading all of it;
+            // how the run ended is reported from its exit and output.
+            tracing::debug!("could not write the whole prompt to claude: {e}");
+        }
+    }))
+}
+
+/// Drains stderr concurrently so a full pipe can never block the child,
+/// keeping its tail.
+fn spawn_stderr_tail(mut stderr: tokio::process::ChildStderr) -> (AbortOnDrop<()>, StderrTail) {
+    let tail: StderrTail = Arc::default();
+    let task = AbortOnDrop(tokio::spawn({
+        let tail = Arc::clone(&tail);
+        async move {
+            let mut lines = BufReader::new(&mut stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut tail = lock_tail(&tail);
+                if tail.len() == STDERR_MAX_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            // Ensure the pipe is fully drained even after a read error.
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        }
+    }));
+    (task, tail)
+}
+
+/// The command line of a structured run (prompt on stdin, as for turns).
+fn build_structured_args(req: &StructuredRequest) -> Vec<String> {
+    let mut args: Vec<String> = ["-p", "--output-format", "json", "--json-schema"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    args.push(req.schema.to_string());
+    args.extend(
+        [
+            "--dangerously-skip-permissions",
+            "--no-session-persistence",
+            "--tools",
+        ]
+        .map(str::to_owned),
+    );
+    args.push(req.allowed_tools.join(","));
+    if let Some(m) = &req.model {
+        args.extend(["--model".into(), m.clone()]);
+    }
+    if let Some(s) = &req.system_prompt_append {
+        args.extend(["--append-system-prompt".into(), s.clone()]);
+    }
+    args
+}
+
 #[async_trait]
 impl Harness for ClaudeCodeHarness {
     async fn run_turn(
@@ -107,39 +170,12 @@ impl Harness for ClaudeCodeHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
-        let mut stdin = child.stdin.take().expect("stdin piped");
+        let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
-        let mut stderr = child.stderr.take().expect("stderr piped");
+        let stderr = child.stderr.take().expect("stderr piped");
 
-        // Written from its own task: a prompt larger than the pipe buffer must
-        // not hold up reading claude's output. Dropping `stdin` at the end
-        // closes it, which ends the prompt.
-        let prompt = req.prompt;
-        let stdin_task = AbortOnDrop(tokio::spawn(async move {
-            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-                // claude exited (or closed stdin) before reading all of it;
-                // how the turn ended is reported from its exit and output.
-                tracing::debug!("could not write the whole prompt to claude: {e}");
-            }
-        }));
-
-        // Drain stderr concurrently so a full pipe can never block the child.
-        let tail: StderrTail = Arc::default();
-        let stderr_task = AbortOnDrop(tokio::spawn({
-            let tail = Arc::clone(&tail);
-            async move {
-                let mut lines = BufReader::new(&mut stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let mut tail = lock_tail(&tail);
-                    if tail.len() == STDERR_MAX_LINES {
-                        tail.pop_front();
-                    }
-                    tail.push_back(line);
-                }
-                // Ensure the pipe is fully drained even after a read error.
-                let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
-            }
-        }));
+        let stdin_task = spawn_prompt_writer(stdin, req.prompt);
+        let (stderr_task, tail) = spawn_stderr_tail(stderr);
 
         let (tx, rx) = mpsc::channel::<HarnessEvent>(64);
         tokio::spawn(async move {
@@ -238,5 +274,81 @@ impl Harness for ClaudeCodeHarness {
         });
 
         Ok(ReceiverStream::new(rx).boxed())
+    }
+
+    async fn run_structured(
+        &self,
+        req: StructuredRequest,
+    ) -> Result<StructuredResult, HarnessError> {
+        // Own process group, so a timeout can take down whatever claude started.
+        let mut child = Command::new(&self.bin)
+            .args(build_structured_args(&req))
+            .current_dir(&req.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()?;
+        let pgid = child
+            .id()
+            .and_then(|p| rustix::process::Pid::from_raw(p as i32));
+        let stdin = child.stdin.take().expect("stdin piped");
+        let mut stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let _stdin_task = spawn_prompt_writer(stdin, req.prompt.clone());
+        let (mut stderr_task, tail) = spawn_stderr_tail(stderr);
+
+        // Output is collected as it arrives so what was printed before claude
+        // exited is kept even if a process it left behind holds the pipe open.
+        let out: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let mut stdout_task = AbortOnDrop(tokio::spawn({
+            let out = Arc::clone(&out);
+            async move {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = tokio::io::AsyncReadExt::read(&mut stdout, &mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    out.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&buf[..n]);
+                }
+            }
+        }));
+
+        let waited = tokio::time::timeout(req.timeout, child.wait()).await;
+        let status = match waited {
+            Err(_) => {
+                if let Some(pid) = pgid {
+                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+                }
+                let _ = child.kill().await;
+                return Err(HarnessError::Timeout);
+            }
+            Ok(status) => status?,
+        };
+        // Everything claude printed was in the pipe when it exited.
+        let _ = tokio::time::timeout(DRAIN_AFTER_EXIT, &mut stdout_task.0).await;
+        drop(stdout_task);
+        let stdout_text =
+            String::from_utf8_lossy(&out.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+
+        let result = parse_cli_result(&stdout_text);
+        if status.success() || result.is_ok() {
+            return result;
+        }
+        if let Err(HarnessError::Failed(_)) = &result {
+            return result;
+        }
+        // Non-zero exit and nothing usable on stdout.
+        let _ =
+            tokio::time::timeout_at(Instant::now() + DRAIN_AFTER_EXIT, &mut stderr_task.0).await;
+        let mut message = format!("claude exited with {status}");
+        let tail = tail_of(&lock_tail(&tail));
+        if !tail.is_empty() {
+            message.push_str(&format!("; stderr: {tail}"));
+        }
+        Err(HarnessError::Failed(message))
     }
 }
