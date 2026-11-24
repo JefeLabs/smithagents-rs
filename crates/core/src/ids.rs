@@ -54,6 +54,18 @@ id_type!(
     /// Identifies a chat message.
     MessageId
 );
+id_type!(
+    /// Identifies an intent.
+    IntentId
+);
+id_type!(
+    /// Identifies a question inside an intent.
+    QuestionId
+);
+id_type!(
+    /// Identifies a precondition, criterion, story or dependency item.
+    ItemId
+);
 
 #[cfg(test)]
 mod tests {

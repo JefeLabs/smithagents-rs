@@ -237,7 +237,7 @@ impl Client {
             .take_while(|step| ready(!matches!(step, Step::End)))
             .filter_map(|step| {
                 ready(match step {
-                    Step::Event(event) => Some(event),
+                    Step::Event(event) => Some(*event),
                     Step::Skip | Step::End => None,
                 })
             }))
@@ -294,7 +294,7 @@ fn unknown_kind(text: &str) -> Option<String> {
 
 /// What one WebSocket read means for the event stream.
 enum Step {
-    Event(Event),
+    Event(Box<Event>),
     Skip,
     End,
 }
@@ -302,7 +302,7 @@ enum Step {
 fn read_step(read: Result<Message, tungstenite::Error>) -> Step {
     match read {
         Ok(Message::Text(text)) => match serde_json::from_str(&text) {
-            Ok(event) => Step::Event(event),
+            Ok(event) => Step::Event(Box::new(event)),
             Err(e) => match unknown_kind(&text) {
                 Some(kind) => {
                     tracing::debug!("skipping an event of unknown type {kind:?}");

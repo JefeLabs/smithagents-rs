@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, MessageId, RepoId};
+use crate::ids::{AgentId, IntentId, MessageId, RepoId};
 pub use crate::palette::next_color;
 use crate::palette::AgentColor;
 
@@ -47,6 +47,9 @@ pub struct Agent {
     pub state: AgentState,
     pub created_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
+    /// The intent this agent was started for, if any.
+    #[serde(default)]
+    pub intent_id: Option<IntentId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,10 +132,18 @@ mod tests {
             state: AgentState::Working,
             created_at: chrono::Utc::now(),
             closed_at: None,
+            intent_id: None,
         };
         let json = serde_json::to_string(&agent).unwrap();
         assert!(json.contains("\"working\""));
         let back: Agent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, agent);
+    }
+
+    #[test]
+    fn agent_without_intent_id_still_deserializes() {
+        let json = r#"{"id":"6f1d3a52-8c4e-4b7a-9e21-0d5c7f3b9a10","name":"Mercury","color":{"l":0.5,"c":0.25,"h":180.0},"repo_id":"2b7e9c41-5d3a-4f68-8a1c-7e4b0d9f2c35","worktree_path":"/tmp/wt","branch":"b","harness_session_id":null,"state":"idle","created_at":"2026-11-24T09:00:00Z","closed_at":null}"#;
+        let agent: Agent = serde_json::from_str(json).unwrap();
+        assert_eq!(agent.intent_id, None);
     }
 }

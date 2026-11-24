@@ -221,6 +221,7 @@ impl AgentService {
             state: AgentState::Idle,
             created_at: Utc::now(),
             closed_at: None,
+            intent_id: None,
         };
         if let Err(e) = store.insert_agent(&agent).await {
             if let Err(cleanup) = git::remove_worktree(&repo.path, &agent.worktree_path).await {

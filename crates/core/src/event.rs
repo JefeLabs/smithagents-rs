@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, ChatMessage};
 use crate::ids::AgentId;
+use crate::intent::Intent;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -22,18 +23,22 @@ pub enum EventKind {
     AgentClosed { agent_id: AgentId },
     MessageAppended(ChatMessage),
     TurnDelta { agent_id: AgentId, text: String },
+    IntentCreated(Intent),
+    IntentUpdated(Intent),
 }
 
 impl EventKind {
     /// The `type` of every kind this version knows. A client meeting another
     /// one (sent by a newer daemon) can skip that event. Tests check that it
     /// matches [`EventKind::type_name`] of every kind.
-    pub const TYPES: [&'static str; 5] = [
+    pub const TYPES: [&'static str; 7] = [
         "agent_created",
         "agent_updated",
         "agent_closed",
         "message_appended",
         "turn_delta",
+        "intent_created",
+        "intent_updated",
     ];
 
     /// The `type` this kind is sent with.
@@ -44,6 +49,8 @@ impl EventKind {
             EventKind::AgentClosed { .. } => "agent_closed",
             EventKind::MessageAppended(_) => "message_appended",
             EventKind::TurnDelta { .. } => "turn_delta",
+            EventKind::IntentCreated(_) => "intent_created",
+            EventKind::IntentUpdated(_) => "intent_updated",
         }
     }
 }
@@ -57,6 +64,7 @@ mod tests {
     use super::*;
     use crate::agent::{AgentState, Role};
     use crate::ids::{MessageId, RepoId};
+    use crate::intent::{Content, IntentKind, IntentState, Phase, Seed, SeedSource};
     use crate::palette::AgentColor;
 
     const AGENT_ID: &str = "6f1d3a52-8c4e-4b7a-9e21-0d5c7f3b9a10";
@@ -83,10 +91,46 @@ mod tests {
             state: AgentState::Working,
             created_at: time("2026-11-24T09:00:00Z"),
             closed_at: None,
+            intent_id: None,
         }
     }
 
-    const AGENT_JSON: &str = r#"{"id":"6f1d3a52-8c4e-4b7a-9e21-0d5c7f3b9a10","name":"Mercury","color":{"l":0.5,"c":0.25,"h":180.0},"repo_id":"2b7e9c41-5d3a-4f68-8a1c-7e4b0d9f2c35","worktree_path":"/tmp/wt/agent-mercury","branch":"agent/mercury-6f1d3a52","harness_session_id":"s1","state":"working","created_at":"2026-11-24T09:00:00Z","closed_at":null}"#;
+    const AGENT_JSON: &str = r#"{"id":"6f1d3a52-8c4e-4b7a-9e21-0d5c7f3b9a10","name":"Mercury","color":{"l":0.5,"c":0.25,"h":180.0},"repo_id":"2b7e9c41-5d3a-4f68-8a1c-7e4b0d9f2c35","worktree_path":"/tmp/wt/agent-mercury","branch":"agent/mercury-6f1d3a52","harness_session_id":"s1","state":"working","created_at":"2026-11-24T09:00:00Z","closed_at":null,"intent_id":null}"#;
+
+    const INTENT_ID: &str = "4a8d2f60-1b3c-4e57-b9d4-6c0e8a2f7d13";
+
+    fn intent() -> Intent {
+        Intent {
+            id: INTENT_ID.parse().unwrap(),
+            repo_id: REPO_ID.parse().unwrap(),
+            slug: "t".into(),
+            state: IntentState::Draft,
+            phase: Phase::Questions,
+            seed: Seed {
+                source: SeedSource::Text,
+                text: "s".into(),
+            },
+            content: Content {
+                title: "T".into(),
+                kind: IntentKind::Task,
+                current_behavior: String::new(),
+                questions: vec![],
+                preconditions: vec![],
+                criteria: vec![],
+                stories: vec![],
+                depends_on: vec![],
+            },
+            agent_id: None,
+            created_at: time("2026-11-24T09:00:00Z"),
+            updated_at: time("2026-11-24T09:00:00Z"),
+            queued_at: None,
+            sent_at: None,
+            resolved_at: None,
+            last_start_error: None,
+        }
+    }
+
+    const INTENT_JSON: &str = r#"{"id":"4a8d2f60-1b3c-4e57-b9d4-6c0e8a2f7d13","repo_id":"2b7e9c41-5d3a-4f68-8a1c-7e4b0d9f2c35","slug":"t","state":"draft","phase":{"kind":"questions"},"seed":{"source":"text","text":"s"},"content":{"title":"T","kind":"task","current_behavior":"","questions":[],"preconditions":[],"criteria":[],"stories":[],"depends_on":[]},"agent_id":null,"created_at":"2026-11-24T09:00:00Z","updated_at":"2026-11-24T09:00:00Z","queued_at":null,"sent_at":null,"resolved_at":null,"last_start_error":null}"#;
 
     /// One event of every kind, with the exact JSON the daemon sends for it.
     fn every_kind() -> Vec<(EventKind, String)> {
@@ -127,6 +171,14 @@ mod tests {
                 format!(
                     r#"{{"type":"turn_delta","data":{{"agent_id":"{AGENT_ID}","text":"Hel"}}}}"#
                 ),
+            ),
+            (
+                EventKind::IntentCreated(intent()),
+                format!(r#"{{"type":"intent_created","data":{INTENT_JSON}}}"#),
+            ),
+            (
+                EventKind::IntentUpdated(intent()),
+                format!(r#"{{"type":"intent_updated","data":{INTENT_JSON}}}"#),
             ),
         ]
     }

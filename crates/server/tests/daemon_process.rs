@@ -361,6 +361,7 @@ async fn agents_left_running_by_a_previous_daemon_start_dead() {
         state: AgentState::Working,
         created_at: Utc::now(),
         closed_at: None,
+        intent_id: None,
     };
     {
         let store = Store::open(&paths.db_path()).await.unwrap();

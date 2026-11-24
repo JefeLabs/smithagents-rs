@@ -110,6 +110,8 @@ fn agent_from_row(r: &SqliteRow) -> Result<Agent, StoreError> {
             .as_deref()
             .map(parse_ts)
             .transpose()?,
+        // Not persisted until the intents storage lands.
+        intent_id: None,
     })
 }
 
@@ -382,6 +384,7 @@ mod tests {
             state: AgentState::Working,
             created_at: Utc::now(),
             closed_at: None,
+            intent_id: None,
         }
     }
 
