@@ -1,4 +1,4 @@
-//! SQLite persistence for repos, agents and chat messages.
+//! SQLite persistence for repos, agents, chat messages, intents and settings.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo, Role};
-use smithagents_core::ids::{AgentId, MessageId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, MessageId, RepoId};
+use smithagents_core::intent::{Intent, IntentFilter, IntentVersion};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
@@ -18,6 +19,8 @@ pub enum StoreError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("a repo with this path already exists")]
     DuplicateRepoPath,
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
     #[error("database file: {0}")]
@@ -110,9 +113,65 @@ fn agent_from_row(r: &SqliteRow) -> Result<Agent, StoreError> {
             .as_deref()
             .map(parse_ts)
             .transpose()?,
-        // Not persisted until the intents storage lands.
-        intent_id: None,
+        intent_id: r
+            .try_get::<Option<String>, _>("intent_id")?
+            .as_deref()
+            .map(parse_id)
+            .transpose()?,
     })
+}
+
+fn opt_ts(r: &SqliteRow, col: &str) -> Result<Option<DateTime<Utc>>, StoreError> {
+    r.try_get::<Option<String>, _>(col)?
+        .as_deref()
+        .map(parse_ts)
+        .transpose()
+}
+
+fn intent_from_row(r: &SqliteRow) -> Result<Intent, StoreError> {
+    Ok(Intent {
+        id: parse_id(r.try_get("id")?)?,
+        repo_id: parse_id(r.try_get("repo_id")?)?,
+        slug: r.try_get("slug")?,
+        state: enum_from_str(r.try_get("state")?)?,
+        phase: serde_json::from_str(r.try_get("phase_json")?).map_err(corrupt)?,
+        seed: serde_json::from_str(r.try_get("seed_json")?).map_err(corrupt)?,
+        content: serde_json::from_str(r.try_get("content_json")?).map_err(corrupt)?,
+        agent_id: r
+            .try_get::<Option<String>, _>("agent_id")?
+            .as_deref()
+            .map(parse_id)
+            .transpose()?,
+        created_at: parse_ts(r.try_get("created_at")?)?,
+        updated_at: parse_ts(r.try_get("updated_at")?)?,
+        queued_at: opt_ts(r, "queued_at")?,
+        sent_at: opt_ts(r, "sent_at")?,
+        resolved_at: opt_ts(r, "resolved_at")?,
+        last_start_error: r.try_get("last_start_error")?,
+    })
+}
+
+fn version_from_row(r: &SqliteRow) -> Result<IntentVersion, StoreError> {
+    Ok(IntentVersion {
+        intent_id: parse_id(r.try_get("intent_id")?)?,
+        version: u32::try_from(r.try_get::<i64, _>("version")?).map_err(corrupt)?,
+        author: enum_from_str(r.try_get("author")?)?,
+        content: serde_json::from_str(r.try_get("content_json")?).map_err(corrupt)?,
+        at: parse_ts(r.try_get("at")?)?,
+    })
+}
+
+fn map_intent_conflict(e: sqlx::Error) -> StoreError {
+    match e {
+        sqlx::Error::Database(d)
+            if d.is_unique_violation()
+                && d.message().contains("intents.repo_id")
+                && d.message().contains("intents.slug") =>
+        {
+            StoreError::Conflict("an intent with this slug already exists in the repo".into())
+        }
+        e => e.into(),
+    }
 }
 
 fn message_from_row(r: &SqliteRow) -> Result<ChatMessage, StoreError> {
@@ -124,6 +183,25 @@ fn message_from_row(r: &SqliteRow) -> Result<ChatMessage, StoreError> {
         text: r.try_get("text")?,
         created_at: parse_ts(r.try_get("created_at")?)?,
     })
+}
+
+async fn insert_version(
+    tx: &mut sqlx::SqliteConnection,
+    v: &IntentVersion,
+    number: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO intent_versions (intent_id, version, author, content_json, at) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(v.intent_id.to_string())
+    .bind(number)
+    .bind(enum_to_str(&v.author)?)
+    .bind(serde_json::to_string(&v.content).map_err(corrupt)?)
+    .bind(ts(v.at))
+    .execute(tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -218,8 +296,8 @@ impl Store {
     pub async fn insert_agent(&self, agent: &Agent) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO agents (id, name, color_json, repo_id, worktree_path, branch, \
-             harness_session_id, state, created_at, closed_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             harness_session_id, state, created_at, closed_at, intent_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(agent.id.to_string())
         .bind(&agent.name)
@@ -231,6 +309,7 @@ impl Store {
         .bind(enum_to_str(&agent.state)?)
         .bind(ts(agent.created_at))
         .bind(agent.closed_at.map(ts))
+        .bind(agent.intent_id.map(|i| i.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -337,6 +416,198 @@ impl Store {
             text: text.to_owned(),
             created_at,
         })
+    }
+
+    pub async fn set_agent_system_prompt_append(
+        &self,
+        id: AgentId,
+        text: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE agents SET system_prompt_append = ? WHERE id = ?")
+            .bind(text)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn agent_system_prompt_append(
+        &self,
+        id: AgentId,
+    ) -> Result<Option<String>, StoreError> {
+        let v: Option<Option<String>> =
+            sqlx::query_scalar("SELECT system_prompt_append FROM agents WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(v.flatten())
+    }
+
+    /// Inserts the intent and its first version in one transaction. A
+    /// duplicate `(repo_id, slug)` is a `StoreError::Conflict`.
+    pub async fn insert_intent(
+        &self,
+        intent: &Intent,
+        first_version: &IntentVersion,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "INSERT INTO intents (id, repo_id, slug, state, phase_json, seed_json, \
+             content_json, agent_id, created_at, updated_at, queued_at, sent_at, \
+             resolved_at, last_start_error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(intent.id.to_string())
+        .bind(intent.repo_id.to_string())
+        .bind(&intent.slug)
+        .bind(enum_to_str(&intent.state)?)
+        .bind(serde_json::to_string(&intent.phase).map_err(corrupt)?)
+        .bind(serde_json::to_string(&intent.seed).map_err(corrupt)?)
+        .bind(serde_json::to_string(&intent.content).map_err(corrupt)?)
+        .bind(intent.agent_id.map(|a| a.to_string()))
+        .bind(ts(intent.created_at))
+        .bind(ts(intent.updated_at))
+        .bind(intent.queued_at.map(ts))
+        .bind(intent.sent_at.map(ts))
+        .bind(intent.resolved_at.map(ts))
+        .bind(intent.last_start_error.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(map_intent_conflict)?;
+        insert_version(&mut tx, first_version, i64::from(first_version.version)).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_intent(&self, id: IntentId) -> Result<Option<Intent>, StoreError> {
+        let row = sqlx::query("SELECT * FROM intents WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(intent_from_row).transpose()
+    }
+
+    /// Newest `updated_at` first.
+    pub async fn list_intents(&self, filter: IntentFilter) -> Result<Vec<Intent>, StoreError> {
+        let state = filter.state.as_ref().map(enum_to_str).transpose()?;
+        let rows = sqlx::query(
+            "SELECT * FROM intents WHERE (?1 IS NULL OR state = ?1) \
+             AND (?2 IS NULL OR repo_id = ?2) ORDER BY updated_at DESC, id",
+        )
+        .bind(state)
+        .bind(filter.repo_id.map(|r| r.to_string()))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(intent_from_row).collect()
+    }
+
+    /// Full row update; touches no timestamp itself.
+    pub async fn save_intent(&self, intent: &Intent) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE intents SET repo_id = ?, slug = ?, state = ?, phase_json = ?, \
+             seed_json = ?, content_json = ?, agent_id = ?, created_at = ?, updated_at = ?, \
+             queued_at = ?, sent_at = ?, resolved_at = ?, last_start_error = ? WHERE id = ?",
+        )
+        .bind(intent.repo_id.to_string())
+        .bind(&intent.slug)
+        .bind(enum_to_str(&intent.state)?)
+        .bind(serde_json::to_string(&intent.phase).map_err(corrupt)?)
+        .bind(serde_json::to_string(&intent.seed).map_err(corrupt)?)
+        .bind(serde_json::to_string(&intent.content).map_err(corrupt)?)
+        .bind(intent.agent_id.map(|a| a.to_string()))
+        .bind(ts(intent.created_at))
+        .bind(ts(intent.updated_at))
+        .bind(intent.queued_at.map(ts))
+        .bind(intent.sent_at.map(ts))
+        .bind(intent.resolved_at.map(ts))
+        .bind(intent.last_start_error.as_deref())
+        .bind(intent.id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(map_intent_conflict)?;
+        Ok(())
+    }
+
+    /// Stores `v` under the next version number (max + 1, computed inside a
+    /// `BEGIN IMMEDIATE` transaction so concurrent callers serialize) and
+    /// returns that number. `v.version` is ignored.
+    pub async fn append_version(&self, v: &IntentVersion) -> Result<u32, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM intent_versions WHERE intent_id = ?",
+        )
+        .bind(v.intent_id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        insert_version(&mut tx, v, next).await?;
+        tx.commit().await?;
+        u32::try_from(next).map_err(corrupt)
+    }
+
+    pub async fn list_versions(&self, id: IntentId) -> Result<Vec<IntentVersion>, StoreError> {
+        let rows =
+            sqlx::query("SELECT * FROM intent_versions WHERE intent_id = ? ORDER BY version")
+                .bind(id.to_string())
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(version_from_row).collect()
+    }
+
+    pub async fn slug_exists(&self, repo_id: RepoId, slug: &str) -> Result<bool, StoreError> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM intents WHERE repo_id = ? AND slug = ?")
+                .bind(repo_id.to_string())
+                .bind(slug)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n > 0)
+    }
+
+    pub async fn intents_in_phase_polishing(&self) -> Result<Vec<Intent>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM intents WHERE json_extract(phase_json, '$.kind') = 'polishing' \
+             ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(intent_from_row).collect()
+    }
+
+    /// Queued intents, oldest `queued_at` first.
+    pub async fn queued_intents(&self) -> Result<Vec<Intent>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM intents WHERE state = ? ORDER BY queued_at, id")
+            .bind(enum_to_str(&smithagents_core::intent::IntentState::Queued)?)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(intent_from_row).collect()
+    }
+
+    pub async fn get_setting<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let v: Option<String> = sqlx::query_scalar("SELECT value_json FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        v.map(|s| serde_json::from_str(&s).map_err(corrupt))
+            .transpose()
+    }
+
+    pub async fn set_setting<T: serde::Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO settings (key, value_json) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        )
+        .bind(key)
+        .bind(serde_json::to_string(value).map_err(corrupt)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn list_messages(
@@ -603,5 +874,333 @@ mod tests {
         store.insert_repo(&repo("/repos/a")).await.unwrap();
         let err = store.insert_repo(&repo("/repos/a")).await.unwrap_err();
         assert!(matches!(err, StoreError::DuplicateRepoPath), "got {err:?}");
+    }
+
+    // ---- intents ----
+
+    use smithagents_core::ids::{IntentId, ItemId, QuestionId};
+    use smithagents_core::intent::{
+        Answer, Content, Intent, IntentFilter, IntentKind, IntentState, IntentVersion, Item,
+        ItemStatus, Phase, Question, QuestionOption, Seed, SeedSource, VersionAuthor,
+    };
+
+    fn content(title: &str) -> Content {
+        Content {
+            title: title.into(),
+            kind: IntentKind::Bug,
+            current_behavior: "broken".into(),
+            questions: vec![Question {
+                id: QuestionId::new(),
+                text: "which?".into(),
+                options: vec![QuestionOption {
+                    id: "a".into(),
+                    label: "A".into(),
+                }],
+                answer: Answer::Option {
+                    option_id: "a".into(),
+                },
+            }],
+            preconditions: vec![],
+            criteria: vec![Item {
+                id: ItemId::new(),
+                text: "works".into(),
+                status: ItemStatus::Accepted,
+                edited: true,
+                intent_ref: None,
+            }],
+            stories: vec![],
+            depends_on: vec![],
+        }
+    }
+
+    fn intent(repo_id: RepoId, slug: &str) -> Intent {
+        let now = Utc::now();
+        Intent {
+            id: IntentId::new(),
+            repo_id,
+            slug: slug.into(),
+            state: IntentState::Draft,
+            phase: Phase::Polishing { pass: 1 },
+            seed: Seed {
+                source: SeedSource::Text,
+                text: "seed".into(),
+            },
+            content: content(slug),
+            agent_id: None,
+            created_at: now,
+            updated_at: now,
+            queued_at: None,
+            sent_at: None,
+            resolved_at: None,
+            last_start_error: Some("boom".into()),
+        }
+    }
+
+    fn version(i: &Intent, v: u32) -> IntentVersion {
+        IntentVersion {
+            intent_id: i.id,
+            version: v,
+            author: VersionAuthor::Seed,
+            content: i.content.clone(),
+            at: Utc::now(),
+        }
+    }
+
+    async fn store_with_repo() -> (Store, Repo) {
+        let store = Store::open_in_memory().await.unwrap();
+        let r = repo("/repos/i");
+        store.insert_repo(&r).await.unwrap();
+        (store, r)
+    }
+
+    #[tokio::test]
+    async fn intent_round_trips_with_first_version() {
+        let (store, r) = store_with_repo().await;
+        let i = intent(r.id, "one");
+        store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+        assert_eq!(store.get_intent(i.id).await.unwrap(), Some(i.clone()));
+        assert!(store.get_intent(IntentId::new()).await.unwrap().is_none());
+        let vs = store.list_versions(i.id).await.unwrap();
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].version, 1);
+        assert_eq!(vs[0].content, i.content);
+
+        let mut j = i.clone();
+        j.state = IntentState::Sent;
+        j.phase = Phase::Review;
+        j.last_start_error = None;
+        j.sent_at = Some(Utc::now());
+        store.save_intent(&j).await.unwrap();
+        assert_eq!(store.get_intent(i.id).await.unwrap(), Some(j));
+    }
+
+    #[tokio::test]
+    async fn duplicate_slug_is_conflict_and_rolls_back() {
+        let (store, r) = store_with_repo().await;
+        let i = intent(r.id, "same");
+        store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+        let dup = intent(r.id, "same");
+        let err = store
+            .insert_intent(&dup, &version(&dup, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+        assert!(store.get_intent(dup.id).await.unwrap().is_none());
+        assert!(store.slug_exists(r.id, "same").await.unwrap());
+        assert!(!store.slug_exists(r.id, "other").await.unwrap());
+        // Same slug in another repo is fine.
+        let r2 = repo("/repos/j");
+        store.insert_repo(&r2).await.unwrap();
+        let ok = intent(r2.id, "same");
+        store.insert_intent(&ok, &version(&ok, 1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_append_version_has_no_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("sa.db")).await.unwrap();
+        let r = repo("/repos/i");
+        store.insert_repo(&r).await.unwrap();
+        let i = intent(r.id, "one");
+        store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let s = store.clone();
+                let v = version(&i, 0);
+                tokio::spawn(async move { s.append_version(&v).await })
+            })
+            .collect();
+        let mut got = Vec::new();
+        for h in handles {
+            got.push(h.await.unwrap().unwrap());
+        }
+        got.sort_unstable();
+        assert_eq!(got, (2..=11).collect::<Vec<u32>>());
+        let vs = store.list_versions(i.id).await.unwrap();
+        assert_eq!(
+            vs.iter().map(|v| v.version).collect::<Vec<_>>(),
+            (1..=11).collect::<Vec<u32>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn append_version_numbers_sequentially() {
+        let (store, r) = store_with_repo().await;
+        let i = intent(r.id, "one");
+        store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+        assert_eq!(store.append_version(&version(&i, 0)).await.unwrap(), 2);
+        assert_eq!(store.append_version(&version(&i, 0)).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_intents_filters_and_orders_by_update() {
+        let (store, r) = store_with_repo().await;
+        let r2 = repo("/repos/j");
+        store.insert_repo(&r2).await.unwrap();
+        let base = Utc::now();
+        let mut made = Vec::new();
+        for (n, (repo_id, state)) in [
+            (r.id, IntentState::Draft),
+            (r.id, IntentState::Queued),
+            (r2.id, IntentState::Draft),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut i = intent(repo_id, &format!("s{n}"));
+            i.state = state;
+            i.updated_at = base + chrono::Duration::seconds(n as i64);
+            store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+            made.push(i);
+        }
+        let all = store.list_intents(IntentFilter::default()).await.unwrap();
+        let ids: Vec<_> = all.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![made[2].id, made[1].id, made[0].id]);
+        let drafts = store
+            .list_intents(IntentFilter {
+                state: Some(IntentState::Draft),
+                repo_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(drafts.len(), 2);
+        let both = store
+            .list_intents(IntentFilter {
+                state: Some(IntentState::Draft),
+                repo_id: Some(r.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            both.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![made[0].id]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_and_polishing_queries() {
+        let (store, r) = store_with_repo().await;
+        let base = Utc::now();
+        let mut ids = Vec::new();
+        for (n, offset) in [30i64, 10, 20].into_iter().enumerate() {
+            let mut i = intent(r.id, &format!("q{n}"));
+            i.state = IntentState::Queued;
+            i.phase = Phase::Review;
+            i.queued_at = Some(base + chrono::Duration::seconds(offset));
+            store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+            ids.push(i.id);
+        }
+        let polishing = intent(r.id, "p");
+        store
+            .insert_intent(&polishing, &version(&polishing, 1))
+            .await
+            .unwrap();
+        let q = store.queued_intents().await.unwrap();
+        assert_eq!(
+            q.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![ids[1], ids[2], ids[0]]
+        );
+        let p = store.intents_in_phase_polishing().await.unwrap();
+        assert_eq!(
+            p.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![polishing.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip() {
+        let store = Store::open_in_memory().await.unwrap();
+        assert_eq!(store.get_setting::<u32>("limit").await.unwrap(), None);
+        store.set_setting("limit", &3u32).await.unwrap();
+        assert_eq!(store.get_setting::<u32>("limit").await.unwrap(), Some(3));
+        store.set_setting("limit", &5u32).await.unwrap();
+        assert_eq!(store.get_setting::<u32>("limit").await.unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn agent_intent_id_and_prompt_append_round_trip() {
+        let (store, r) = store_with_repo().await;
+        let i = intent(r.id, "one");
+        store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+        let mut a = agent(r.id, "Earth");
+        a.intent_id = Some(i.id);
+        store.insert_agent(&a).await.unwrap();
+        assert_eq!(store.get_agent(a.id).await.unwrap(), Some(a.clone()));
+        assert_eq!(
+            store.list_agents(true).await.unwrap()[0].intent_id,
+            Some(i.id)
+        );
+        assert_eq!(store.agent_system_prompt_append(a.id).await.unwrap(), None);
+        store
+            .set_agent_system_prompt_append(a.id, "be nice")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_system_prompt_append(a.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("be nice")
+        );
+    }
+
+    #[tokio::test]
+    async fn database_from_0001_migrates_without_touching_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        let r = repo("/repos/old");
+        let a = agent(r.id, "Old");
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&db)
+                .create_if_missing(true)
+                .foreign_keys(true);
+            let pool = SqlitePool::connect_with(opts).await.unwrap();
+            let mut m = sqlx::migrate!("./migrations");
+            m.migrations = m
+                .migrations
+                .iter()
+                .filter(|x| x.version == 1)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
+            m.run(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO repos (id, path, default_branch, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(r.id.to_string())
+            .bind("/repos/old")
+            .bind("main")
+            .bind(ts(r.created_at))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO agents (id, name, color_json, repo_id, worktree_path, branch, \
+                 harness_session_id, state, created_at, closed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(a.id.to_string())
+            .bind(&a.name)
+            .bind(serde_json::to_string(&a.color).unwrap())
+            .bind(r.id.to_string())
+            .bind(a.worktree_path.to_string_lossy().into_owned())
+            .bind(&a.branch)
+            .bind(a.harness_session_id.as_deref())
+            .bind(enum_to_str(&a.state).unwrap())
+            .bind(ts(a.created_at))
+            .bind(None::<String>)
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let store = Store::open(&db).await.unwrap();
+        let got = store.get_agent(a.id).await.unwrap().unwrap();
+        assert_eq!(got, a);
+        assert_eq!(got.intent_id, None);
+        assert_eq!(store.agent_system_prompt_append(a.id).await.unwrap(), None);
+        assert_eq!(store.get_repo(r.id).await.unwrap(), Some(r));
     }
 }
