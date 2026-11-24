@@ -1,0 +1,40 @@
+#!/bin/sh
+# Test double for the `claude` CLI. Behavior is driven by environment:
+#   FAKE_CLAUDE_FIXTURE      file to print on stdout
+#   FAKE_CLAUDE_ARGS_FILE    overwritten each run with argv, one entry per line
+#   FAKE_CLAUDE_EXIT         exit code (default 0)
+#   FAKE_CLAUDE_SLEEP        seconds to sleep before exiting
+#   FAKE_CLAUDE_PID_FILE     receives this process's pid
+#   FAKE_CLAUDE_STDERR       text written to stderr
+#   FAKE_CLAUDE_CONTROL_DIR  if it holds `exit` / `sleep` files, their trimmed
+#                            content overrides the values above (re-read per run)
+if [ -n "$FAKE_CLAUDE_PID_FILE" ]; then
+  echo "$$" > "$FAKE_CLAUDE_PID_FILE"
+fi
+if [ -n "$FAKE_CLAUDE_ARGS_FILE" ]; then
+  : > "$FAKE_CLAUDE_ARGS_FILE"
+  for a in "$@"; do
+    printf '%s\n' "$a" >> "$FAKE_CLAUDE_ARGS_FILE"
+  done
+fi
+exit_code="${FAKE_CLAUDE_EXIT:-0}"
+sleep_secs="${FAKE_CLAUDE_SLEEP:-}"
+if [ -n "$FAKE_CLAUDE_CONTROL_DIR" ]; then
+  if [ -f "$FAKE_CLAUDE_CONTROL_DIR/exit" ]; then
+    exit_code=$(tr -d '[:space:]' < "$FAKE_CLAUDE_CONTROL_DIR/exit")
+  fi
+  if [ -f "$FAKE_CLAUDE_CONTROL_DIR/sleep" ]; then
+    sleep_secs=$(tr -d '[:space:]' < "$FAKE_CLAUDE_CONTROL_DIR/sleep")
+  fi
+fi
+if [ -n "$FAKE_CLAUDE_FIXTURE" ]; then
+  cat "$FAKE_CLAUDE_FIXTURE"
+fi
+if [ -n "$FAKE_CLAUDE_STDERR" ]; then
+  printf '%s\n' "$FAKE_CLAUDE_STDERR" >&2
+fi
+if [ -n "$sleep_secs" ]; then
+  # detach fds so an orphaned sleep cannot hold the daemon's pipes open
+  sleep "$sleep_secs" >/dev/null 2>&1 </dev/null
+fi
+exit "$exit_code"

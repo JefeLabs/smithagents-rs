@@ -1,5 +1,6 @@
 //! Agent harness abstraction: runs one conversational turn and streams events.
 
+pub mod claude;
 pub mod claude_parser;
 #[cfg(feature = "test-util")]
 pub mod fake;
