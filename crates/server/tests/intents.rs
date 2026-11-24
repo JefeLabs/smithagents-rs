@@ -13,7 +13,8 @@ use smithagents_core::event::EventKind;
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     Answer, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentKind, IntentState, Item,
-    ItemStatus, Patch, Phase, Question, QuestionOption, SeedInput, SeedSource, VersionAuthor,
+    ItemStatus, Patch, Phase, Question, QuestionOption, ReviewAction, SeedInput, SeedSource,
+    VersionAuthor,
 };
 use smithagents_server::events::{EventBus, Subscription};
 use smithagents_server::harness::fake::FakeHarness;
@@ -1714,4 +1715,363 @@ async fn dropped_create_and_retry_calls_never_strand_polishing() {
         };
         assert_eq!(starts(i.id, 2), expected, "{} is {:?}", i.id, now.phase);
     }
+}
+
+// ------------------------------------------------------------------ review
+
+fn item(text: &str, status: ItemStatus) -> Item {
+    Item {
+        id: ItemId::new(),
+        text: text.into(),
+        status,
+        edited: false,
+        intent_ref: None,
+    }
+}
+
+impl Fx {
+    /// A text intent in the review phase with three pending items
+    /// (precondition, criterion, story); returns their ids.
+    async fn review_intent(&self, repo: &Repo) -> (Intent, [ItemId; 3]) {
+        let i = self.text_intent(repo).await;
+        let mut s = self.store.get_intent(i.id).await.unwrap().unwrap();
+        s.phase = Phase::Review;
+        s.state = IntentState::Draft;
+        let items = [
+            item("pre", ItemStatus::Pending),
+            item("crit", ItemStatus::Pending),
+            item("story", ItemStatus::Pending),
+        ];
+        s.content.preconditions = vec![items[0].clone()];
+        s.content.criteria = vec![items[1].clone()];
+        s.content.stories = vec![items[2].clone()];
+        self.store.save_intent(&s).await.unwrap();
+        (s, [items[0].id, items[1].id, items[2].id])
+    }
+
+    async fn add_dep(&self, id: IntentId, target: IntentId, status: ItemStatus) -> ItemId {
+        let mut s = self.store.get_intent(id).await.unwrap().unwrap();
+        let mut d = item("dep", status);
+        d.intent_ref = Some(target);
+        let did = d.id;
+        s.content.depends_on.push(d);
+        self.store.save_intent(&s).await.unwrap();
+        did
+    }
+}
+
+#[tokio::test]
+async fn review_accept_edit_drop_and_counters() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (i, [a, b, c]) = f.review_intent(&repo).await;
+    let mut sub = f.bus.subscribe(None).unwrap();
+    let r = f.svc.review(i.id, a, ReviewAction::Accept).await.unwrap();
+    assert_eq!(r.content.preconditions[0].status, ItemStatus::Accepted);
+    assert!(!r.content.preconditions[0].edited);
+    assert_eq!(r.content.pending_count(), 2);
+    assert_eq!(r.state, IntentState::Draft);
+    let ev = tokio::time::timeout(Duration::from_secs(1), sub.live.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(ev.kind, EventKind::IntentUpdated(x) if x.id == i.id));
+
+    let r = f
+        .svc
+        .review(i.id, b, ReviewAction::Edit("  better ".into()))
+        .await
+        .unwrap();
+    let crit = &r.content.criteria[0];
+    assert_eq!(
+        (crit.text.as_str(), crit.edited, crit.status),
+        ("better", true, ItemStatus::Accepted)
+    );
+    let r = f.svc.review(i.id, c, ReviewAction::Drop).await.unwrap();
+    assert_eq!(r.content.stories[0].status, ItemStatus::Dropped);
+    assert_eq!(f.svc.get(i.id).await.unwrap(), r);
+    // No new version.
+    assert_eq!(f.versions_of(i.id).await, [VersionAuthor::Seed]);
+}
+
+#[tokio::test]
+async fn counters_read_one_of_three_accepted() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (i, [a, ..]) = f.review_intent(&repo).await;
+    let r = f.svc.review(i.id, a, ReviewAction::Accept).await.unwrap();
+    let all = r
+        .content
+        .preconditions
+        .iter()
+        .chain(&r.content.criteria)
+        .chain(&r.content.stories)
+        .chain(&r.content.depends_on);
+    let (accepted, total) = all.fold((0, 0), |(a, t), x| {
+        (a + (x.status == ItemStatus::Accepted) as u32, t + 1)
+    });
+    assert_eq!((accepted, total), (1, 3));
+}
+
+#[tokio::test]
+async fn last_decision_completes_and_reopening_recomputes() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (i, [a, b, c]) = f.review_intent(&repo).await;
+    f.svc.review(i.id, a, ReviewAction::Accept).await.unwrap();
+    f.svc.review(i.id, b, ReviewAction::Drop).await.unwrap();
+    let r = f.svc.review(i.id, c, ReviewAction::Accept).await.unwrap();
+    assert_eq!(r.state, IntentState::Complete);
+    // Changing a decision keeps it complete.
+    let r = f.svc.review(i.id, a, ReviewAction::Drop).await.unwrap();
+    assert_eq!(r.state, IntentState::Complete);
+    assert_eq!(r.content.preconditions[0].status, ItemStatus::Dropped);
+}
+
+#[tokio::test]
+async fn dropping_every_item_completes() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (i, ids) = f.review_intent(&repo).await;
+    let mut last = None;
+    for id in ids {
+        last = Some(f.svc.review(i.id, id, ReviewAction::Drop).await.unwrap());
+    }
+    assert_eq!(last.unwrap().state, IntentState::Complete);
+}
+
+#[tokio::test]
+async fn pending_open_question_keeps_it_draft_and_edit_validation() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (i, [a, ..]) = f.review_intent(&repo).await;
+    for bad in ["   ".to_string(), "x".repeat(2001)] {
+        let err = f
+            .svc
+            .review(i.id, a, ReviewAction::Edit(bad))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntentError::Invalid(_)), "{err:?}");
+    }
+    let err = f
+        .svc
+        .review(i.id, ItemId::new(), ReviewAction::Accept)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IntentError::Invalid(_)), "{err:?}");
+    let ok = f
+        .svc
+        .review(i.id, a, ReviewAction::Edit("x".repeat(2000)))
+        .await;
+    assert!(ok.is_ok());
+    let unchanged = f.svc.get(i.id).await.unwrap();
+    assert_eq!(unchanged.content.criteria[0].status, ItemStatus::Pending);
+}
+
+#[tokio::test]
+async fn review_in_wrong_phase_or_state_is_invalid_state() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (i, [a, ..]) = f.review_intent(&repo).await;
+    for phase in [
+        Phase::Polishing { pass: 1 },
+        Phase::Polishing { pass: 2 },
+        Phase::Questions,
+        Phase::Failed {
+            pass: 1,
+            message: "m".into(),
+        },
+    ] {
+        let mut s = f.store.get_intent(i.id).await.unwrap().unwrap();
+        s.phase = phase;
+        f.store.save_intent(&s).await.unwrap();
+        let err = f
+            .svc
+            .review(i.id, a, ReviewAction::Accept)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntentError::InvalidState { .. }), "{err:?}");
+    }
+    for state in [
+        IntentState::Queued,
+        IntentState::Sent,
+        IntentState::Resolved,
+    ] {
+        let mut s = f.store.get_intent(i.id).await.unwrap().unwrap();
+        s.phase = Phase::Review;
+        s.state = state;
+        f.store.save_intent(&s).await.unwrap();
+        let err = f
+            .svc
+            .review(i.id, a, ReviewAction::Accept)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IntentError::InvalidState { actual, .. } if actual == state),
+            "{err:?}"
+        );
+    }
+    let err = f
+        .svc
+        .review(IntentId::new(), a, ReviewAction::Accept)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IntentError::NotFound), "{err:?}");
+}
+
+#[tokio::test]
+async fn accepting_a_dependency_that_closes_a_cycle_fails() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (a, _) = f.review_intent(&repo).await;
+    let (b, _) = f.review_intent(&repo).await;
+    // A depends on B (confirmed); now B proposes A.
+    f.add_dep(a.id, b.id, ItemStatus::Accepted).await;
+    let dep = f.add_dep(b.id, a.id, ItemStatus::Pending).await;
+    let err = f
+        .svc
+        .review(b.id, dep, ReviewAction::Accept)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IntentError::DependencyCycle), "{err:?}");
+    let s = f.svc.get(b.id).await.unwrap();
+    assert_eq!(s.content.depends_on[0].status, ItemStatus::Pending);
+    // Dropping is still fine.
+    f.svc.review(b.id, dep, ReviewAction::Drop).await.unwrap();
+}
+
+#[tokio::test]
+async fn accepting_a_dependency_checks_existence_and_repository() {
+    let f = fx().await;
+    let r1 = f.repo("r1").await;
+    let r2 = f.repo("r2").await;
+    let (a, _) = f.review_intent(&r1).await;
+    let other = f.review_intent(&r2).await.0;
+    let stale = f.add_dep(a.id, other.id, ItemStatus::Pending).await;
+    let err = f
+        .svc
+        .review(a.id, stale, ReviewAction::Accept)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IntentError::DependencyCrossRepo), "{err:?}");
+    assert_eq!(err.code(), "dependency_cross_repo");
+    let missing = f.add_dep(a.id, IntentId::new(), ItemStatus::Pending).await;
+    let err = f
+        .svc
+        .review(a.id, missing, ReviewAction::Accept)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IntentError::Invalid(_)), "{err:?}");
+    assert_eq!(
+        f.svc.get(a.id).await.unwrap().content.depends_on[0].status,
+        ItemStatus::Pending
+    );
+
+    // A valid one is accepted; editing keeps the reference.
+    let (b, _) = f.review_intent(&r1).await;
+    let ok = f.add_dep(a.id, b.id, ItemStatus::Pending).await;
+    let r = f
+        .svc
+        .review(a.id, ok, ReviewAction::Edit("needs b first".into()))
+        .await
+        .unwrap();
+    let d = r.content.depends_on.iter().find(|d| d.id == ok).unwrap();
+    assert_eq!(d.intent_ref, Some(b.id));
+    assert_eq!(d.text, "needs b first");
+    assert_eq!(d.status, ItemStatus::Accepted);
+}
+
+#[tokio::test]
+async fn changing_repo_of_a_complete_intent_recomputes_state() {
+    let f = fx().await;
+    let r1 = f.repo("r1").await;
+    let r2 = f.repo("r2").await;
+    let (i, [a, b, c]) = f.review_intent(&r1).await;
+    f.svc.review(i.id, a, ReviewAction::Accept).await.unwrap();
+    f.svc.review(i.id, b, ReviewAction::Accept).await.unwrap();
+    f.add_dep(i.id, IntentId::new(), ItemStatus::Accepted).await;
+    let r = f.svc.review(i.id, c, ReviewAction::Accept).await.unwrap();
+    assert_eq!(r.state, IntentState::Complete);
+    let moved = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                repo_id: Some(r2.id),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(moved.content.depends_on.is_empty());
+    assert_eq!(moved.state, IntentState::Complete);
+
+    // A pending item reopens a complete intent when it is not removed.
+    let (j, _) = f.review_intent(&r1).await;
+    let mut s = f.store.get_intent(j.id).await.unwrap().unwrap();
+    s.state = IntentState::Complete;
+    f.store.save_intent(&s).await.unwrap();
+    let u = f
+        .svc
+        .update(
+            j.id,
+            Patch {
+                title: Some("t".into()),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(u.state, IntentState::Draft);
+}
+
+#[tokio::test]
+async fn repo_change_keeps_a_free_slug_and_suffixes_a_taken_one() {
+    let f = fx().await;
+    let r1 = f.repo("r1").await;
+    let r2 = f.repo("r2").await;
+    let (i, _) = f.review_intent(&r1).await;
+    let before = f.svc.get(i.id).await.unwrap().slug;
+    let moved = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                repo_id: Some(r2.id),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved.slug, before);
+
+    // Another intent in r1 owns that slug; moving there needs a suffix.
+    let (j, _) = f.review_intent(&r1).await;
+    let mut s = f.store.get_intent(j.id).await.unwrap().unwrap();
+    s.slug = before.clone();
+    f.store.save_intent(&s).await.unwrap();
+    let back = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                repo_id: Some(r1.id),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(back.slug, format!("{before}-2"));
+}
+
+#[tokio::test]
+async fn empty_patch_changes_nothing_and_publishes_nothing() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let (i, _) = f.review_intent(&repo).await;
+    let mut sub = f.bus.subscribe(None).unwrap();
+    let r = f.svc.update(i.id, Patch::default()).await.unwrap();
+    assert_eq!(r.updated_at, i.updated_at);
+    let none = tokio::time::timeout(Duration::from_millis(100), sub.live.recv()).await;
+    assert!(none.is_err(), "unexpected event");
 }

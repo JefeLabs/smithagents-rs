@@ -30,11 +30,11 @@ use std::time::Duration;
 use chrono::{TimeDelta, Utc};
 use futures::FutureExt;
 use smithagents_core::event::EventKind;
-use smithagents_core::ids::{AgentId, IntentId, QuestionId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     slugify, Answer, AnswerInput, Content, CreateIntentRequest, Intent, IntentFilter, IntentKind,
-    IntentState, IntentVersion, ItemStatus, Patch, Phase, Seed, SeedInput, SeedSource,
-    VersionAuthor,
+    IntentState, IntentVersion, ItemStatus, Patch, Phase, ReviewAction, Seed, SeedInput,
+    SeedSource, VersionAuthor,
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -42,13 +42,14 @@ use crate::events::EventBus;
 use crate::harness::{Harness, HarnessError};
 use crate::paths::Paths;
 use crate::polish::{
-    apply_pass1, apply_pass2, pass1_request, pass2_request, seed_from_transcript, Candidate,
-    DepContext, PolishError, SeedError, MAX_SEED_BYTES,
+    apply_pass1, apply_pass2, pass1_request, pass2_request, seed_from_transcript,
+    would_create_cycle, Candidate, DepContext, PolishError, SeedError, MAX_SEED_BYTES,
 };
 use crate::service::{AgentService, ServiceError};
 use crate::store::{Store, StoreError};
 
 const TITLE_MAX: usize = 120;
+const ITEM_MAX: usize = 2000;
 const DEFAULT_TITLE: &str = "Untitled intent";
 /// The length limit `slugify` applies; numbered slugs keep to it too.
 const SLUG_MAX: usize = 48;
@@ -401,12 +402,23 @@ impl IntentService {
             }
             None => None,
         };
-        if let Some(repo_id) = patch.repo_id.filter(|r| *r != intent.repo_id) {
+        let new_repo = patch.repo_id.filter(|r| *r != intent.repo_id);
+        if title.is_none()
+            && new_repo.is_none()
+            && patch.kind.is_none()
+            && patch.current_behavior.is_none()
+        {
+            return Ok(intent);
+        }
+        if let Some(repo_id) = new_repo {
             store
                 .get_repo(repo_id)
                 .await?
                 .ok_or(IntentError::RepoNotFound)?;
-            intent.slug = self.provisional_slug(repo_id, id).await?;
+            // Keep the slug unless the new repository already uses it.
+            if store.slug_exists(repo_id, &intent.slug).await? {
+                intent.slug = self.free_slug(repo_id, &intent.slug, "").await?;
+            }
             intent.repo_id = repo_id;
             // Dependencies must live in the same repository.
             intent.content.depends_on.clear();
@@ -420,10 +432,133 @@ impl IntentService {
         if let Some(b) = patch.current_behavior {
             intent.content.current_behavior = b;
         }
+        recompute_state(&mut intent);
         touch(&mut intent);
         store.save_intent(&intent).await?;
         self.publish_updated(&intent);
         Ok(intent)
+    }
+
+    /// Accepts, edits or drops one item. Valid in a draft's review phase and
+    /// in a complete intent (a changed decision reopens or keeps it).
+    pub async fn review(
+        &self,
+        id: IntentId,
+        item_id: ItemId,
+        action: ReviewAction,
+    ) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.review_now(id, item_id, action).await }).await
+    }
+
+    /// Body of [`Self::review`], run detached from the caller.
+    async fn review_now(
+        &self,
+        id: IntentId,
+        item_id: ItemId,
+        action: ReviewAction,
+    ) -> Result<Intent, IntentError> {
+        let _reservation = self.reserve(id).await;
+        let mut intent = self.get(id).await?;
+        let open = match intent.state {
+            IntentState::Draft => intent.phase == Phase::Review,
+            IntentState::Complete => true,
+            _ => false,
+        };
+        if !open {
+            return Err(wrong_state_or_phase(&intent, "the review phase"));
+        }
+        let text = match &action {
+            ReviewAction::Edit(t) => {
+                let t = t.trim();
+                if t.is_empty() || t.chars().count() > ITEM_MAX {
+                    return Err(IntentError::Invalid(format!(
+                        "text must be 1 to {ITEM_MAX} characters"
+                    )));
+                }
+                Some(t.to_string())
+            }
+            _ => None,
+        };
+        let is_dep = intent.content.depends_on.iter().any(|d| d.id == item_id);
+        if is_dep && !matches!(action, ReviewAction::Drop) {
+            let target = intent
+                .content
+                .depends_on
+                .iter()
+                .find(|d| d.id == item_id)
+                .and_then(|d| d.intent_ref);
+            self.check_dependency(&intent, target).await?;
+        }
+        let c = &mut intent.content;
+        let item = c
+            .preconditions
+            .iter_mut()
+            .chain(c.criteria.iter_mut())
+            .chain(c.stories.iter_mut())
+            .chain(c.depends_on.iter_mut())
+            .find(|i| i.id == item_id)
+            .ok_or_else(|| IntentError::Invalid("unknown item".into()))?;
+        match (action, text) {
+            (ReviewAction::Accept, _) => item.status = ItemStatus::Accepted,
+            (ReviewAction::Drop, _) => item.status = ItemStatus::Dropped,
+            (ReviewAction::Edit(_), t) => {
+                item.text = t.unwrap_or_default();
+                item.edited = true;
+                item.status = ItemStatus::Accepted;
+            }
+        }
+        recompute_state(&mut intent);
+        touch(&mut intent);
+        self.inner.store.save_intent(&intent).await?;
+        self.publish_updated(&intent);
+        Ok(intent)
+    }
+
+    /// A dependency about to be confirmed: the target must still exist, be in
+    /// the intent's repository, and not close a cycle with the confirmed edges.
+    async fn check_dependency(
+        &self,
+        intent: &Intent,
+        target: Option<IntentId>,
+    ) -> Result<(), IntentError> {
+        let target =
+            target.ok_or_else(|| IntentError::Invalid("dependency has no target".into()))?;
+        let other = self
+            .inner
+            .store
+            .get_intent(target)
+            .await?
+            .ok_or_else(|| IntentError::Invalid("the dependency no longer exists".into()))?;
+        if other.repo_id != intent.repo_id {
+            return Err(IntentError::DependencyCrossRepo);
+        }
+        let same_repo = self
+            .inner
+            .store
+            .list_intents(IntentFilter {
+                state: None,
+                repo_id: Some(intent.repo_id),
+            })
+            .await?;
+        let edges: HashMap<IntentId, Vec<IntentId>> = same_repo
+            .into_iter()
+            .filter(|o| o.id != intent.id)
+            .filter_map(|o| {
+                let confirmed: Vec<IntentId> = o
+                    .content
+                    .depends_on
+                    .iter()
+                    .filter(|d| d.status == ItemStatus::Accepted)
+                    .filter_map(|d| d.intent_ref)
+                    .collect();
+                (!confirmed.is_empty()).then_some((o.id, confirmed))
+            })
+            .collect();
+        if would_create_cycle(&edges, intent.id, target) {
+            return Err(IntentError::DependencyCycle);
+        }
+        Ok(())
     }
 
     /// Records the answer to one steering question; only in the questions
@@ -855,6 +990,17 @@ fn state_text(actual: &IntentState, phase: &Option<Phase>) -> String {
         Some(Phase::Questions) => "in the questions phase".into(),
         Some(Phase::Review) => "in the review phase".into(),
         Some(Phase::Failed { pass, .. }) => format!("in the failed phase (pass {pass})"),
+    }
+}
+
+/// `Complete` iff everything is decided, else `Draft`; other states stay.
+fn recompute_state(intent: &mut Intent) {
+    if matches!(intent.state, IntentState::Draft | IntentState::Complete) {
+        intent.state = if intent.is_complete_content() {
+            IntentState::Complete
+        } else {
+            IntentState::Draft
+        };
     }
 }
 
