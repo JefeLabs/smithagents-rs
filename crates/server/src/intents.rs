@@ -3,18 +3,25 @@
 //!
 //! Mutations of one intent are serialized through [`IntentService::reserve`].
 //! The choice is a per-intent `tokio::sync::Mutex`: a second mutation waits
-//! its turn instead of failing. A mutation that finds the stored phase to be
-//! `Polishing` returns [`IntentError::Polishing`] (the polish job itself holds
-//! the reservation only while it applies results, never across harness calls).
+//! its turn instead of failing. `update` and `retry_polish` refuse an intent
+//! whose stored phase is `Polishing` with [`IntentError::Polishing`]; `answer`
+//! is valid only in the questions phase and refuses every other phase with
+//! [`IntentError::InvalidState`], naming the phase. The polish job itself
+//! holds the reservation only while it applies results, never across harness
+//! calls.
 //!
 //! A polish pass runs as a background job whose claim on the intent is the
 //! stored `Polishing{pass}` phase. The job always moves the intent on: to its
 //! result, or to `Failed{pass, message}` on an error or a (caught) panic, with
 //! a drop guard as the backstop when the job ends any other way. Jobs lost
-//! with a daemon restart are failed by [`IntentService::recover`].
+//! with a daemon restart are failed by [`IntentService::recover`]. The calls
+//! that write `Polishing{pass}` (`create`, `answer`, `retry_polish`) run on
+//! their own task, so a caller that stops waiting cannot separate that write
+//! from the start of the pass.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -65,10 +72,12 @@ pub enum IntentError {
     RepoNotFound,
     #[error("agent not found")]
     AgentNotFound,
-    #[error("intent is {actual:?}, expected {expected}")]
+    /// Wrong state, or (`phase` set) a draft in the wrong phase.
+    #[error("intent is {}, expected {expected}", state_text(.actual, .phase))]
     InvalidState {
         expected: &'static str,
         actual: IntentState,
+        phase: Option<Phase>,
     },
     #[error("intent is being polished")]
     Polishing,
@@ -130,14 +139,14 @@ struct Inner {
     paths: Paths,
     /// `None`: the service's own background runner.
     polish: Mutex<Option<Arc<dyn PolishRunner>>>,
+    /// Model for polish runs; `None` leaves the CLI's default.
+    polish_model: Mutex<Option<String>>,
     locks: Mutex<HashMap<IntentId, Arc<AsyncMutex<()>>>>,
 }
 
 #[derive(Clone)]
 pub struct IntentService {
     inner: Arc<Inner>,
-    /// Model for polish runs; `None` leaves the CLI's default.
-    polish_model: Option<String>,
 }
 
 impl IntentService {
@@ -156,16 +165,29 @@ impl IntentService {
                 agents,
                 paths,
                 polish: Mutex::new(None),
+                polish_model: Mutex::new(None),
                 locks: Mutex::new(HashMap::new()),
             }),
-            polish_model: None,
         }
     }
 
-    /// Sets the model polish passes ask the harness for.
-    pub fn with_polish_model(mut self, model: Option<String>) -> Self {
-        self.polish_model = model;
+    /// Sets the model polish passes ask the harness for (shared by all
+    /// clones of this service).
+    pub fn with_polish_model(self, model: Option<String>) -> Self {
+        *self
+            .inner
+            .polish_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = model;
         self
+    }
+
+    fn polish_model(&self) -> Option<String> {
+        self.inner
+            .polish_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Replaces the polish runner (builder form of [`Self::set_polish_runner`]).
@@ -246,7 +268,14 @@ impl IntentService {
         Ok(self.inner.store.list_versions(id).await?)
     }
 
+    /// Creates a draft from a chat or text seed and starts polish pass 1.
     pub async fn create(&self, req: CreateIntentRequest) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.create_now(req).await }).await
+    }
+
+    /// Body of [`Self::create`], run detached from the caller.
+    async fn create_now(&self, req: CreateIntentRequest) -> Result<Intent, IntentError> {
         let store = &self.inner.store;
         let (repo_id, seed) = match req.seed {
             SeedInput::Chat {
@@ -355,6 +384,7 @@ impl IntentService {
                 return Err(IntentError::InvalidState {
                     expected: "draft or complete",
                     actual,
+                    phase: None,
                 })
             }
         }
@@ -406,13 +436,21 @@ impl IntentService {
         question_id: QuestionId,
         answer: AnswerInput,
     ) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.answer_now(id, question_id, answer).await }).await
+    }
+
+    /// Body of [`Self::answer`], run detached from the caller.
+    async fn answer_now(
+        &self,
+        id: IntentId,
+        question_id: QuestionId,
+        answer: AnswerInput,
+    ) -> Result<Intent, IntentError> {
         let reservation = self.reserve(id).await;
         let mut intent = self.get(id).await?;
-        if intent.state != IntentState::Draft || intent.phase != Phase::Questions {
-            return Err(IntentError::InvalidState {
-                expected: "draft in the questions phase",
-                actual: intent.state,
-            });
+        if intent.phase != Phase::Questions || intent.state != IntentState::Draft {
+            return Err(wrong_state_or_phase(&intent, "the questions phase"));
         }
         let question = intent
             .content
@@ -448,18 +486,19 @@ impl IntentService {
 
     /// Re-runs the pass recorded in `Phase::Failed`.
     pub async fn retry_polish(&self, id: IntentId) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.retry_polish_now(id).await }).await
+    }
+
+    /// Body of [`Self::retry_polish`], run detached from the caller.
+    async fn retry_polish_now(&self, id: IntentId) -> Result<Intent, IntentError> {
         let reservation = self.reserve(id).await;
         let mut intent = self.get(id).await?;
         let pass = match (intent.state, &intent.phase) {
             (IntentState::Draft, Phase::Failed { pass: 2, .. }) => 2,
             (IntentState::Draft, Phase::Failed { .. }) => 1,
             (IntentState::Draft, Phase::Polishing { .. }) => return Err(IntentError::Polishing),
-            (actual, _) => {
-                return Err(IntentError::InvalidState {
-                    expected: "draft with a failed polish",
-                    actual,
-                })
-            }
+            _ => return Err(wrong_state_or_phase(&intent, "a failed polish")),
         };
         intent.phase = Phase::Polishing { pass };
         touch(&mut intent);
@@ -543,7 +582,7 @@ impl IntentService {
             return Ok(());
         };
         let root = self.repo_root(&intent).await?;
-        let request = pass1_request(&intent, &root, self.polish_model.clone());
+        let request = pass1_request(&intent, &root, self.polish_model());
         let raw = self.inner.harness.run_structured(request).await?.value;
         let mut polished = intent.content.clone();
         apply_pass1(&mut polished, &raw)?;
@@ -582,7 +621,7 @@ impl IntentService {
         };
         let root = self.repo_root(&intent).await?;
         let ctx = self.dep_context(&intent).await?;
-        let request = pass2_request(&intent, &root, self.polish_model.clone(), &ctx.candidates);
+        let request = pass2_request(&intent, &root, self.polish_model(), &ctx.candidates);
         let raw = self.inner.harness.run_structured(request).await?.value;
         let mut polished = intent.content.clone();
         let report = apply_pass2(&mut polished, &raw, &ctx)?;
@@ -775,6 +814,48 @@ async fn load_messages(
     agent_id: AgentId,
 ) -> Result<Vec<smithagents_core::agent::ChatMessage>, StoreError> {
     store.list_messages(agent_id, 0, u32::MAX).await
+}
+
+/// Runs an intent mutation on its own task and waits for it, so a caller
+/// that stops waiting (a dropped request) cannot cut the mutation between
+/// its store write of `Polishing{pass}` and the start of that pass, which
+/// would leave the intent polishing with no job until a restart.
+async fn detached<F>(op: F) -> Result<Intent, IntentError>
+where
+    F: Future<Output = Result<Intent, IntentError>> + Send + 'static,
+{
+    match tokio::spawn(op).await {
+        Ok(result) => result,
+        Err(e) => match e.try_into_panic() {
+            // Surface a panic to the caller as if it had run inline.
+            Ok(payload) => std::panic::resume_unwind(payload),
+            // The handle is never aborted, so only a runtime shutdown cancels
+            // the task, and that drops this caller too.
+            Err(e) => panic!("intent operation cancelled: {e}"),
+        },
+    }
+}
+
+/// `InvalidState` for an intent outside `expected_phase`: names the phase
+/// for a draft, the state otherwise (phases only matter in Draft).
+fn wrong_state_or_phase(intent: &Intent, expected_phase: &'static str) -> IntentError {
+    let draft = intent.state == IntentState::Draft;
+    IntentError::InvalidState {
+        expected: expected_phase,
+        actual: intent.state,
+        phase: draft.then(|| intent.phase.clone()),
+    }
+}
+
+/// `Queued`, or `in the polishing phase (pass 2)` for a draft in a phase.
+fn state_text(actual: &IntentState, phase: &Option<Phase>) -> String {
+    match phase {
+        None => format!("{actual:?}"),
+        Some(Phase::Polishing { pass }) => format!("in the polishing phase (pass {pass})"),
+        Some(Phase::Questions) => "in the questions phase".into(),
+        Some(Phase::Review) => "in the review phase".into(),
+        Some(Phase::Failed { pass, .. }) => format!("in the failed phase (pass {pass})"),
+    }
 }
 
 /// Sets `updated_at` to now, and strictly after its previous value, so the

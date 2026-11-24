@@ -1,5 +1,6 @@
 mod common;
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use smithagents_core::event::EventKind;
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     Answer, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentKind, IntentState, Item,
-    ItemStatus, Patch, Phase, SeedInput, SeedSource, VersionAuthor,
+    ItemStatus, Patch, Phase, Question, QuestionOption, SeedInput, SeedSource, VersionAuthor,
 };
 use smithagents_server::events::{EventBus, Subscription};
 use smithagents_server::harness::fake::FakeHarness;
@@ -39,6 +40,11 @@ impl PolishRunner for Recorder {
 /// holds each run until released, and panics injected inside `run_structured`.
 struct TestHarness {
     fake: FakeHarness,
+    /// Structured runs started, counted on entry (before the gate), so a
+    /// duplicate pass cannot hide behind a held gate.
+    entered: AtomicUsize,
+    /// Structured runs that returned (not counting panics).
+    finished: AtomicUsize,
     panics: AtomicUsize,
     gated: AtomicBool,
     gate: Semaphore,
@@ -48,6 +54,8 @@ impl TestHarness {
     fn new() -> Self {
         TestHarness {
             fake: FakeHarness::scripted(vec![]),
+            entered: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
             panics: AtomicUsize::new(0),
             gated: AtomicBool::new(false),
             gate: Semaphore::new(0),
@@ -58,8 +66,38 @@ impl TestHarness {
         self.fake.script_structured(results);
     }
 
+    /// Requests of the runs that got past the gate (and did not panic).
     fn calls(&self) -> Vec<StructuredRequest> {
         self.fake.structured_calls()
+    }
+
+    fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    fn finished(&self) -> usize {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    /// Waits until `n` structured runs have entered the harness.
+    async fn wait_entered(&self, n: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.entered() < n {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} of {n} structured runs entered", self.entered()));
+    }
+
+    async fn wait_finished(&self, n: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.finished() < n {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} of {n} structured runs finished", self.finished()));
     }
 
     /// The next structured run panics instead of answering.
@@ -90,6 +128,7 @@ impl Harness for TestHarness {
         &self,
         req: StructuredRequest,
     ) -> Result<StructuredResult, HarnessError> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
         if self.gated.load(Ordering::SeqCst) {
             self.gate.acquire().await.unwrap().forget();
         }
@@ -100,7 +139,9 @@ impl Harness for TestHarness {
         {
             panic!("test harness panic inside run_structured");
         }
-        self.fake.run_structured(req).await
+        let result = self.fake.run_structured(req).await;
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        result
     }
 }
 
@@ -117,17 +158,30 @@ struct Fx {
 
 /// Service whose polish runner only records starts (nothing polishes).
 async fn fx() -> Fx {
-    build(false).await
+    build(false, false).await
 }
 
 /// Service with its real background polish runner over [`TestHarness`].
 async fn real_fx() -> Fx {
-    build(true).await
+    build(true, false).await
 }
 
-async fn build(real_runner: bool) -> Fx {
+/// `fx`/`real_fx` over a database file, as the daemon runs. Needed where a
+/// caller is dropped mid-query: sqlx then closes that connection, which
+/// would erase the single-connection in-memory database.
+async fn file_fx(real_runner: bool) -> Fx {
+    build(real_runner, true).await
+}
+
+async fn build(real_runner: bool, file_db: bool) -> Fx {
     let tmp = TempDir::new().unwrap();
-    let store = Store::open_in_memory().await.unwrap();
+    let store = if file_db {
+        Store::open(&tmp.path().join("smithagents.db"))
+            .await
+            .unwrap()
+    } else {
+        Store::open_in_memory().await.unwrap()
+    };
     let bus = EventBus::new(1024);
     let paths = Paths {
         home: tmp.path().join("home"),
@@ -886,7 +940,7 @@ async fn polish_asks_questions_then_pass_two_reaches_review() {
         last = u.updated_at;
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(f.h.calls().len(), 2, "pass 2 ran more than once");
+    assert_eq!(f.h.entered(), 2, "pass 2 ran more than once");
 }
 
 #[tokio::test]
@@ -1013,10 +1067,12 @@ async fn polish_model_is_passed_to_the_harness() {
         f.h.clone(),
         f.agents.clone(),
         f.paths.clone(),
-    )
-    .with_polish_model(Some("haiku".into()));
+    );
+    // A clone taken before the model is set sees it too (shared state).
+    let early = svc.clone();
+    let _svc = svc.with_polish_model(Some("haiku".into()));
     f.h.script(vec![pass1("T", 0), pass2(&[])]);
-    let i = svc
+    let i = early
         .create(CreateIntentRequest {
             repo_id: Some(repo.id),
             seed: SeedInput::Text("x".into()),
@@ -1180,7 +1236,7 @@ async fn answer_validation_and_already_answered() {
         }
     );
     assert_eq!(stored.phase, Phase::Questions);
-    assert!(f.h.calls().len() == 1, "no pass 2 while a question is open");
+    assert_eq!(f.h.entered(), 1, "no pass 2 while a question is open");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1225,7 +1281,7 @@ async fn concurrent_answers_to_the_last_two_questions_run_pass_two_once() {
     let r = f.wait_phase(i.id, Phase::Review).await;
     assert_eq!(r.content.questions_open(), 0);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(f.h.calls().len(), 2, "pass 2 must run exactly once");
+    assert_eq!(f.h.entered(), 2, "pass 2 must run exactly once");
     let versions = f.versions_of(i.id).await;
     assert_eq!(
         versions
@@ -1272,10 +1328,15 @@ async fn concurrent_answers_to_the_same_last_question_one_wins() {
         matches!(err, IntentError::InvalidState { .. }),
         "conflict expected, got {err:?}"
     );
+    // Pass 2 is held at the gate; a second pass-2 job would be counted on
+    // entry while still held.
+    f.h.wait_entered(2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(f.h.entered(), 2, "pass 2 started more than once");
     f.h.release(1);
     f.wait_phase(i.id, Phase::Review).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(f.h.calls().len(), 2);
+    assert_eq!(f.h.entered(), 2);
 }
 
 #[tokio::test]
@@ -1313,6 +1374,10 @@ async fn answer_and_retry_while_polishing_are_conflicts() {
         .unwrap_err();
     assert!(matches!(err, IntentError::InvalidState { .. }), "{err:?}");
     assert_eq!(err.code(), "invalid_state");
+    assert_eq!(
+        err.to_string(),
+        "intent is in the polishing phase (pass 2), expected the questions phase"
+    );
     let err = f.svc.retry_polish(i.id).await.unwrap_err();
     assert!(matches!(err, IntentError::Polishing), "{err:?}");
 
@@ -1326,7 +1391,11 @@ async fn answer_and_retry_while_polishing_are_conflicts() {
         .await
         .unwrap_err();
     assert!(matches!(err, IntentError::InvalidState { .. }), "{err:?}");
-    assert_eq!(f.h.calls().len(), 2);
+    assert_eq!(
+        err.to_string(),
+        "intent is in the review phase, expected the questions phase"
+    );
+    assert_eq!(f.h.entered(), 2);
     let err = f.svc.retry_polish(IntentId::new()).await.unwrap_err();
     assert!(matches!(err, IntentError::NotFound), "{err:?}");
 }
@@ -1446,4 +1515,203 @@ async fn pass_two_sees_same_repo_candidates_and_skip_marker() {
     let refs: Vec<_> = r.content.depends_on.iter().map(|d| d.intent_ref).collect();
     assert_eq!(refs, [Some(gamma.id)]);
     assert_eq!(r.content.depends_on[0].status, ItemStatus::Pending);
+}
+
+#[tokio::test]
+async fn recover_during_pass_one_discards_its_late_result() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    f.h.hold();
+    f.h.script(vec![pass1("Late result", 1)]);
+    let i = f.text_intent(&repo).await;
+    f.h.wait_entered(1).await;
+
+    assert_eq!(f.svc.recover().await.unwrap(), 1);
+    f.h.release(1);
+    f.h.wait_finished(1).await;
+    // Give the job time to apply its result, which it must not do.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let after = f.svc.get(i.id).await.unwrap();
+    assert_eq!(
+        after.phase,
+        Phase::Failed {
+            pass: 1,
+            message: RESTART_MESSAGE.into()
+        }
+    );
+    assert_eq!(after.content, i.content);
+    assert_eq!(after.slug, i.slug);
+    assert_eq!(f.versions_of(i.id).await, [VersionAuthor::Seed]);
+}
+
+// ------------------------------------------------- callers that stop waiting
+
+/// Polls `fut` without pause until it finishes or `budget` of wall-clock
+/// time has passed, then drops it unfinished, as a server drops the handler
+/// of a client that went away. Sweeping `budget` lands the drop at every
+/// stage of the call, including while a store write is in flight.
+async fn run_then_drop<F: Future>(fut: F, budget: Duration) {
+    let mut fut = std::pin::pin!(fut);
+    let start = std::time::Instant::now();
+    while futures::poll!(fut.as_mut()).is_pending() {
+        if start.elapsed() >= budget {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// `runs` budgets spread evenly over 0 to 1.5 times `full` (the duration of
+/// a whole call), so the drops cover the call from start to finish.
+fn budgets(full: Duration, runs: u32) -> impl Iterator<Item = Duration> {
+    (1..=runs).map(move |k| full * 3 * k / (2 * runs))
+}
+
+/// Puts a seeded intent into the questions phase with one open question.
+async fn with_one_question(f: &Fx, id: IntentId) -> QuestionId {
+    let mut i = f.store.get_intent(id).await.unwrap().unwrap();
+    let qid = QuestionId::new();
+    i.phase = Phase::Questions;
+    i.content.questions = vec![Question {
+        id: qid,
+        text: "Which one?".into(),
+        options: vec![
+            QuestionOption {
+                id: "o1".into(),
+                label: "This".into(),
+            },
+            QuestionOption {
+                id: "o2".into(),
+                label: "That".into(),
+            },
+        ],
+        answer: Answer::Unanswered,
+    }];
+    f.store.save_intent(&i).await.unwrap();
+    qid
+}
+
+/// Stopping at every point of the call: whether or not the answer was
+/// written, the intent never stays in `Polishing` without a job, and every
+/// written last answer runs pass 2 exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_answer_calls_never_strand_pass_two() {
+    const RUNS: u32 = 40;
+    let f = file_fx(true).await;
+    let repo = f.repo("r1").await;
+    let seeder = f.seeder();
+    let seeded = || async {
+        let i = seeder
+            .create(CreateIntentRequest {
+                repo_id: Some(repo.id),
+                seed: SeedInput::Text("x".into()),
+            })
+            .await
+            .unwrap();
+        let qid = with_one_question(&f, i.id).await;
+        (i.id, qid)
+    };
+    f.h.script((0..=RUNS).map(|_| pass2(&[])).collect());
+    // One whole call, to size the budgets.
+    let (id, qid) = seeded().await;
+    let started = std::time::Instant::now();
+    f.svc.answer(id, qid, AnswerInput::Skip).await.unwrap();
+    let full = started.elapsed();
+    f.wait_phase(id, Phase::Review).await;
+
+    let mut reviewed = 1;
+    for budget in budgets(full, RUNS) {
+        let (id, qid) = seeded().await;
+        run_then_drop(f.svc.answer(id, qid, AnswerInput::Skip), budget).await;
+        // Let a write that was already on its way land.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let end = f
+            .wait(id, |x| x.phase != Phase::Polishing { pass: 2 })
+            .await;
+        match end.phase {
+            Phase::Review => reviewed += 1,
+            Phase::Questions => {}
+            other => panic!("dropped after {budget:?}: unexpected {other:?}"),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        f.h.entered(),
+        reviewed,
+        "one pass 2 per written last answer"
+    );
+}
+
+/// Same for `create` and `retry_polish`, which write `Polishing{pass}` and
+/// then start it: a written `Polishing` always comes with exactly one start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_create_and_retry_calls_never_strand_polishing() {
+    const RUNS: u32 = 80;
+    let f = file_fx(false).await;
+    let repo = f.repo("r1").await;
+    let create = || {
+        f.svc.create(CreateIntentRequest {
+            repo_id: Some(repo.id),
+            seed: SeedInput::Text("x".into()),
+        })
+    };
+    let starts = |id: IntentId, pass: u8| {
+        f.runner
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| **s == (id, pass))
+            .count()
+    };
+    let fail = |i: &Intent| {
+        let mut failed = i.clone();
+        failed.phase = Phase::Failed {
+            pass: 2,
+            message: "x".into(),
+        };
+        let store = f.store.clone();
+        async move { store.save_intent(&failed).await.unwrap() }
+    };
+
+    let started = std::time::Instant::now();
+    let first = create().await.unwrap();
+    let full_create = started.elapsed();
+    fail(&first).await;
+    let started = std::time::Instant::now();
+    f.svc.retry_polish(first.id).await.unwrap();
+    let full_retry = started.elapsed();
+
+    for budget in budgets(full_create, RUNS) {
+        run_then_drop(create(), budget).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let created: Vec<Intent> = f
+        .svc
+        .list(IntentFilter::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.id != first.id)
+        .collect();
+    for i in &created {
+        assert_eq!(i.phase, Phase::Polishing { pass: 1 });
+        assert_eq!(starts(i.id, 1), 1, "created {} without a start", i.id);
+    }
+
+    for (i, budget) in created.iter().zip(budgets(full_retry, RUNS)) {
+        fail(i).await;
+        run_then_drop(f.svc.retry_polish(i.id), budget).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for i in &created {
+        let now = f.svc.get(i.id).await.unwrap();
+        let expected = match now.phase {
+            Phase::Polishing { pass: 2 } => 1,
+            Phase::Failed { .. } => 0,
+            ref other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(starts(i.id, 2), expected, "{} is {:?}", i.id, now.phase);
+    }
 }
