@@ -245,25 +245,33 @@ fn spawn_daemon(
     cmd.spawn()
 }
 
-/// Opens the log for appending (0600), creating `run/` (0700) if needed. The
-/// daemon tightens `run/` itself as well.
+/// Opens the log for appending (0600), creating the home and `run/` (both
+/// 0700) if needed. The daemon tightens existing ones itself.
 fn open_log(log: &Path) -> io::Result<File> {
     let run = log.parent().expect("the log lives in run/");
     if let Some(home) = run.parent() {
-        fs::create_dir_all(home)?;
+        if let Some(parent) = home.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        create_private_dir(home)?;
     }
-    let mut dir = fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
-    match dir.create(run) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-        _ => {}
-    }
+    create_private_dir(run)?;
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     opts.open(log)
+}
+
+/// Creates `dir` with mode 0700 unless it exists; its parent must exist.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
 }
 
 enum Started {

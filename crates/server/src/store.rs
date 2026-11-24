@@ -20,10 +20,41 @@ pub enum StoreError {
     DuplicateRepoPath,
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
+    #[error("database file: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 fn corrupt(e: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt(e.to_string())
+}
+
+/// Creates the database file with mode 0600 if it does not exist, and sets
+/// 0600 on it and on its `-wal` and `-shm` files where they exist.
+#[cfg(unix)]
+fn restrict_db_files(db: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // An empty file is a valid, empty SQLite database.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(db)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        match std::fs::set_permissions(&name, std::fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_db_files(_db: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn ts(t: DateTime<Utc>) -> String {
@@ -100,7 +131,13 @@ pub struct Store {
 
 impl Store {
     /// Opens (creating if needed) the database file and runs migrations.
+    ///
+    /// The database and its `-wal`/`-shm` files hold chat transcripts, so they
+    /// are owner-only (0600): a new database file is created that way before
+    /// SQLite opens it (SQLite gives the `-wal` and `-shm` files the mode of
+    /// the database), and existing files are tightened.
     pub async fn open(path: &Path) -> Result<Store, StoreError> {
+        restrict_db_files(path)?;
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -111,7 +148,10 @@ impl Store {
             .max_connections(8)
             .connect_with(opts)
             .await?;
-        Self::migrated(pool).await
+        let store = Self::migrated(pool).await?;
+        // The -wal and -shm files exist now; tighten any left by an older build.
+        restrict_db_files(path)?;
+        Ok(store)
     }
 
     /// Opens a private in-memory database (single connection, so it is not shared).
@@ -373,6 +413,59 @@ mod tests {
         assert_eq!(store.get_repo(r.id).await.unwrap(), Some(r.clone()));
         assert_eq!(store.repo_by_path(&r.path).await.unwrap(), Some(r.clone()));
         assert_eq!(store.list_repos().await.unwrap(), vec![r]);
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// `<db>-wal` or `<db>-shm`.
+    #[cfg(unix)]
+    fn sidecar(db: &Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        name.into()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_files_are_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sa.db");
+        let store = Store::open(&db).await.unwrap();
+        store.insert_repo(&repo("/repos/a")).await.unwrap();
+        assert_eq!(mode(&db), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let file = sidecar(&db, suffix);
+            assert!(file.exists(), "no {}", file.display());
+            assert_eq!(mode(&file), 0o600, "{}", file.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_tightens_existing_database_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sa.db");
+        {
+            let store = Store::open(&db).await.unwrap();
+            store.insert_repo(&repo("/repos/a")).await.unwrap();
+        }
+        // As left by an earlier build, readable by everyone.
+        for file in [db.clone(), sidecar(&db, "-wal"), sidecar(&db, "-shm")] {
+            if file.exists() {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let store = Store::open(&db).await.unwrap();
+        store.insert_repo(&repo("/repos/b")).await.unwrap();
+        for file in [db.clone(), sidecar(&db, "-wal"), sidecar(&db, "-shm")] {
+            assert_eq!(mode(&file), 0o600, "{}", file.display());
+        }
     }
 
     #[tokio::test]

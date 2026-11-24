@@ -17,7 +17,7 @@ use rand::TryRng;
 use smithagents_core::daemon::{lockfile_path, read_lockfile, DaemonInfo};
 use tokio::time::Instant;
 
-use crate::paths::Paths;
+use crate::paths::{ensure_private_dir, Paths};
 
 const INSTANCE_LOCK_FILE: &str = "daemon.lock";
 const TOKEN_BYTES: usize = 32;
@@ -130,21 +130,12 @@ pub fn acquire_instance_lock(paths: &Paths) -> Result<InstanceLock, LockError> {
     }
 }
 
-/// Creates `run/` (mode 0700) and tightens an existing one to 0700.
+/// Creates the home and `run/` in it (mode 0700 both), tightening existing
+/// ones to 0700.
 fn ensure_run_dir(paths: &Paths) -> io::Result<PathBuf> {
+    paths.ensure_home()?;
     let dir = paths.run_dir();
-    if let Some(parent) = dir.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    match builder.create(&dir) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-        _ => {}
-    }
-    #[cfg(unix)]
-    fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -237,10 +228,12 @@ mod tests {
         assert_eq!(mode(&lockfile_path(&paths.home)), 0o600);
         assert_eq!(mode(&paths.run_dir()), 0o700);
 
-        // The instance lock, taken first at startup, creates the run dir the same way.
+        // The instance lock, taken first at startup, creates the run dir the
+        // same way, and the home it lives in too.
         let (_tmp, paths) = temp_paths();
         let _lock = acquire_instance_lock(&paths).unwrap();
         assert_eq!(mode(&paths.run_dir()), 0o700);
+        assert_eq!(mode(&paths.home), 0o700);
     }
 
     #[cfg(unix)]

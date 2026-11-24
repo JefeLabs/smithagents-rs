@@ -158,6 +158,13 @@ async fn daemon_writes_lockfile_and_serves_health() {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&home.join("run").join("daemon.json")), 0o600);
         assert_eq!(mode(&home.join("run")), 0o700);
+        // Chat transcripts live in the database: owner only, like the home.
+        assert_eq!(mode(&home), 0o700);
+        for name in ["smithagents.db", "smithagents.db-wal", "smithagents.db-shm"] {
+            let file = home.join(name);
+            assert!(file.exists(), "no {name}");
+            assert_eq!(mode(&file), 0o600, "{name}");
+        }
     }
 
     assert_eq!(http_get(info.port, "/v1/health", None).await.0, 401);

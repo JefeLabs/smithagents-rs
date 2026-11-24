@@ -316,6 +316,28 @@ async fn ensure_deletes_only_a_stale_lockfile() {
 }
 
 #[tokio::test]
+async fn ensure_creates_the_home_owner_only() {
+    // The home (transcripts, worktrees, the lockfile's run/) is created by
+    // whoever comes first; here the client, since this daemon fails at once.
+    use std::os::unix::fs::PermissionsExt;
+    let home = TestHome::new();
+    bounded(async {
+        let failing = shell_script(&home.scratch().join("failing-daemon"), "exit 1");
+        assert!(!home.path().exists());
+        within(
+            "ensure_daemon",
+            ensure_daemon(home.path(), &failing, VERSION),
+        )
+        .await
+        .expect_err("the daemon binary fails");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(home.path()), 0o700);
+        assert_eq!(mode(&home.path().join("run")), 0o700);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn ensure_starts_over_when_the_lock_holder_has_no_lockfile() {
     // The first start loses the instance lock (exit 3) to a daemon that has
     // already removed its lockfile on the way out; a later start wins.

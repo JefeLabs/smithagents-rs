@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The state root (`~/.smithagents` unless `SMITHAGENTS_HOME` is set) and
 /// everything placed under it.
@@ -40,16 +40,42 @@ impl Paths {
         self.home.join("worktrees")
     }
 
-    /// Creates the home, worktrees and database directories. The run directory
-    /// is left to the daemon, which creates it with owner-only permissions.
+    /// Creates the home with owner-only permissions (0700), tightening an
+    /// existing one: it holds the chat transcripts and the token's lockfile.
+    pub fn ensure_home(&self) -> io::Result<()> {
+        ensure_private_dir(&self.home)
+    }
+
+    /// Creates the home (owner-only, see [`Paths::ensure_home`]), worktrees and
+    /// database directories. The run directory is left to the daemon, which
+    /// creates it with owner-only permissions.
     pub fn ensure_dirs(&self) -> io::Result<()> {
-        std::fs::create_dir_all(&self.home)?;
+        self.ensure_home()?;
         std::fs::create_dir_all(self.worktrees_dir())?;
         if let Some(parent) = self.db_path().parent() {
             std::fs::create_dir_all(parent)?;
         }
         Ok(())
     }
+}
+
+/// Creates `dir` with mode 0700 (its missing parents with the default mode)
+/// and sets 0700 on it if it already existed.
+pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    // The umask can only clear bits; this also tightens an existing directory.
+    #[cfg(unix)]
+    std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -83,5 +109,28 @@ mod tests {
         assert!(paths.home.is_dir());
         assert!(paths.worktrees_dir().is_dir());
         assert!(paths.db_path().parent().unwrap().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dirs_makes_home_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            home: tmp.path().join("new-home"),
+        };
+        paths.ensure_dirs().unwrap();
+        assert_eq!(mode(&paths.home), 0o700);
+
+        // An existing home that others can read is tightened.
+        let paths = Paths {
+            home: tmp.path().join("old-home"),
+        };
+        std::fs::create_dir(&paths.home).unwrap();
+        std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        paths.ensure_dirs().unwrap();
+        assert_eq!(mode(&paths.home), 0o700);
     }
 }
