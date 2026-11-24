@@ -80,6 +80,12 @@ pub enum ValidationError {
     MissingAppearance { appearance: Appearance },
     #[error("system_pair.{which:?} names `{id}`, which is not a theme of that appearance")]
     BadSystemPair { which: Appearance, id: String },
+    #[error("reserved hue range `{name}` is missing")]
+    MissingReservedHueRange { name: String },
+    #[error("font id `{id}` must match ^[a-z][a-z0-9-]*$")]
+    BadFontId { id: String },
+    #[error("duplicate font id `{id}`")]
+    DuplicateFontId { id: String },
     #[error("no fonts defined")]
     NoFonts,
     #[error("text scale must satisfy min <= default <= max with finite values")]
@@ -91,6 +97,12 @@ fn valid_id(id: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && id != "system"
+}
+
+fn valid_font_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn in_range(h: f64, (start, end): (f64, f64)) -> bool {
@@ -231,8 +243,23 @@ pub fn validate(set: &ThemeSet) -> Result<(), Vec<ValidationError>> {
         }
     }
 
+    for name in ["red", "yellow", "green"] {
+        if !set.reserved_hue_ranges.contains_key(name) {
+            errs.push(ValidationError::MissingReservedHueRange { name: name.into() });
+        }
+    }
+
     if set.base.fonts.is_empty() {
         errs.push(ValidationError::NoFonts);
+    }
+    let mut seen_fonts = HashSet::new();
+    for f in &set.base.fonts {
+        if !valid_font_id(&f.id) {
+            errs.push(ValidationError::BadFontId { id: f.id.clone() });
+        }
+        if !seen_fonts.insert(f.id.as_str()) {
+            errs.push(ValidationError::DuplicateFontId { id: f.id.clone() });
+        }
     }
     let s = &set.base.text_scale;
     let finite = s.min.is_finite() && s.default.is_finite() && s.max.is_finite();

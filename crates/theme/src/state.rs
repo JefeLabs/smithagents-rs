@@ -32,11 +32,32 @@ impl From<ThemeChoice> for String {
 }
 
 /// What the shell persists.
+///
+/// Deserialization is lenient: missing fields take defaults and a non-numeric
+/// `text_scale` (a NaN is persisted as `null`) becomes NaN, which resolution
+/// replaces with the default scale.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppearanceSettings {
     pub theme: ThemeChoice,
+    #[serde(deserialize_with = "lenient_f64")]
     pub text_scale: f64,
     pub font: String,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeChoice::System,
+            text_scale: 1.0,
+            font: "system".into(),
+        }
+    }
+}
+
+fn lenient_f64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_f64().unwrap_or(f64::NAN))
 }
 
 /// What is pushed to views.

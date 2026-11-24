@@ -203,3 +203,47 @@ fn two_mutations_report_both() {
     assert!(e.iter().any(|e| matches!(e, E::MissingToken { .. })));
     assert!(e.iter().any(|e| matches!(e, E::NoFonts)));
 }
+
+#[test]
+fn missing_reserved_hue_range_is_reported_and_other_rules_still_run() {
+    let mut s = set();
+    s.reserved_hue_ranges.remove("yellow");
+    // Break an unrelated rule to prove validation continues.
+    of(&mut s, Appearance::Dark).colors.remove("border");
+    let e = errors(&s);
+    assert_eq!(
+        e.iter()
+            .filter(|x| matches!(x, E::MissingReservedHueRange { name } if name == "yellow"))
+            .count(),
+        1,
+        "{e:?}"
+    );
+    assert!(e
+        .iter()
+        .any(|x| matches!(x, E::MissingToken { token, .. } if token == "border")));
+}
+
+#[test]
+fn bad_font_id() {
+    let mut s = set();
+    s.base.fonts[0].id = "a\"b".into();
+    let e = errors(&s);
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, E::BadFontId { id } if id == "a\"b")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn duplicate_font_id() {
+    let mut s = set();
+    let dup = s.base.fonts[0].clone();
+    s.base.fonts.push(dup.clone());
+    let e = errors(&s);
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, E::DuplicateFontId { id } if *id == dup.id)),
+        "{e:?}"
+    );
+}

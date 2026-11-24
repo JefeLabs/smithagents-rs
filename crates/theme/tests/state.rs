@@ -135,3 +135,31 @@ fn third_theme_is_honored() {
     assert_eq!(c.state().theme, "third");
     assert_eq!(c.state().appearance, Appearance::Dark);
 }
+
+#[test]
+fn settings_with_null_text_scale_parses_and_resolves() {
+    let s: AppearanceSettings =
+        serde_json::from_str(r#"{"theme":"deleted","text_scale":null}"#).unwrap();
+    let c = ThemeController::new(ThemeSet::embedded().clone(), s, Appearance::Dark);
+    let st = c.state();
+    assert_eq!(st.theme, "smith-dark");
+    assert_eq!(st.text_scale, 1.0);
+    assert_eq!(st.font, "system");
+}
+
+#[test]
+fn empty_settings_parse_to_defaults() {
+    let s: AppearanceSettings = serde_json::from_str("{}").unwrap();
+    assert_eq!(s, AppearanceSettings::default());
+    assert_eq!(s.theme, ThemeChoice::System);
+    assert_eq!(s.text_scale, 1.0);
+    assert_eq!(s.font, "system");
+}
+
+#[test]
+fn settings_round_trip() {
+    let s = settings(ThemeChoice::Id("smith-light".into()), 1.25, "mono");
+    let back: AppearanceSettings =
+        serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(back, s);
+}

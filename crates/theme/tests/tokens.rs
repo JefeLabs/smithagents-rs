@@ -106,3 +106,11 @@ fn missing_base_is_io_error() {
         Err(TokenError::Io { .. })
     ));
 }
+
+#[test]
+fn embedded_equals_design_tokens_dir() {
+    assert_eq!(
+        ThemeSet::embedded(),
+        &ThemeSet::load_dir(&tokens_dir()).unwrap()
+    );
+}
