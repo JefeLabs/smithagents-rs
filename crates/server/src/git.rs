@@ -142,6 +142,11 @@ async fn default_branch(root: &Path) -> Result<String, GitError> {
     Err(GitError::NoDefaultBranch)
 }
 
+/// Branch an intent's agent works on.
+pub fn branch_name_for_intent(slug: &str) -> String {
+    format!("intent/{slug}")
+}
+
 /// Creates `branch` from `base` in a new worktree under `worktrees_dir`.
 ///
 /// The directory is `worktrees_dir/<branch with '/' replaced by '-'>`.

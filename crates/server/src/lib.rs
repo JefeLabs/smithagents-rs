@@ -1,4 +1,5 @@
 pub mod api;
+pub mod brief;
 pub mod events;
 pub mod git;
 pub mod harness;

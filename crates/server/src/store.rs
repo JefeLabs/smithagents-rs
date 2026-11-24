@@ -294,10 +294,19 @@ impl Store {
     }
 
     pub async fn insert_agent(&self, agent: &Agent) -> Result<(), StoreError> {
+        self.insert_agent_with_append(agent, None).await
+    }
+
+    /// Inserts the agent row together with its system prompt append, atomically.
+    pub async fn insert_agent_with_append(
+        &self,
+        agent: &Agent,
+        system_prompt_append: Option<&str>,
+    ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO agents (id, name, color_json, repo_id, worktree_path, branch, \
-             harness_session_id, state, created_at, closed_at, intent_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             harness_session_id, state, created_at, closed_at, intent_id, system_prompt_append) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(agent.id.to_string())
         .bind(&agent.name)
@@ -310,6 +319,7 @@ impl Store {
         .bind(ts(agent.created_at))
         .bind(agent.closed_at.map(ts))
         .bind(agent.intent_id.map(|i| i.to_string()))
+        .bind(system_prompt_append)
         .execute(&self.pool)
         .await?;
         Ok(())

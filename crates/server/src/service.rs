@@ -21,7 +21,7 @@ use smithagents_core::agent::{
     next_agent_name, next_color, Agent, AgentState, ChatMessage, Repo, Role, PLANETS,
 };
 use smithagents_core::event::EventKind;
-use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, RepoId};
 use smithagents_core::palette::AgentColor;
 
 use crate::events::EventBus;
@@ -51,6 +51,14 @@ pub enum ServiceError {
     Git(#[from] GitError),
     #[error("store: {0}")]
     Store(#[from] StoreError),
+}
+
+/// Optional settings for `create_agent_with`.
+#[derive(Debug, Default, Clone)]
+pub struct CreateAgentOptions {
+    pub branch: Option<String>,
+    pub intent_id: Option<IntentId>,
+    pub system_prompt_append: Option<String>,
 }
 
 /// What an agent is reserved for.
@@ -193,6 +201,17 @@ impl AgentService {
     /// Creates an idle agent with the first free planet name and palette color,
     /// in a new worktree on its own branch off the repo's default branch.
     pub async fn create_agent(&self, repo_id: RepoId) -> Result<Agent, ServiceError> {
+        self.create_agent_with(repo_id, CreateAgentOptions::default())
+            .await
+    }
+
+    /// Like `create_agent`, with an explicit branch (which must not exist yet),
+    /// an owning intent and a system prompt append saved with the agent row.
+    pub async fn create_agent_with(
+        &self,
+        repo_id: RepoId,
+        opts: CreateAgentOptions,
+    ) -> Result<Agent, ServiceError> {
         // Held from name/color selection through the insert.
         let _serialized = self.inner.create_lock.lock().await;
         let store = &self.inner.store;
@@ -206,7 +225,7 @@ impl AgentService {
         let name = next_agent_name(&PLANETS, &names);
         let color = next_color(&colors);
         let id = AgentId::new();
-        let branch = agent_branch(&name, id);
+        let branch = opts.branch.unwrap_or_else(|| agent_branch(&name, id));
         let worktrees = self.inner.paths.worktrees_dir().join(repo_dir_name(&repo));
         let worktree_path =
             git::create_worktree(&repo.path, &worktrees, &branch, &repo.default_branch).await?;
@@ -221,9 +240,12 @@ impl AgentService {
             state: AgentState::Idle,
             created_at: Utc::now(),
             closed_at: None,
-            intent_id: None,
+            intent_id: opts.intent_id,
         };
-        if let Err(e) = store.insert_agent(&agent).await {
+        let inserted = store
+            .insert_agent_with_append(&agent, opts.system_prompt_append.as_deref())
+            .await;
+        if let Err(e) = inserted {
             if let Err(cleanup) = git::remove_worktree(&repo.path, &agent.worktree_path).await {
                 tracing::warn!(agent_id = %id, "could not remove worktree of unsaved agent: {cleanup}");
             }
@@ -375,7 +397,7 @@ impl AgentService {
             cwd: agent.worktree_path,
             resume_session_id: agent.harness_session_id,
             model: None,
-            system_prompt_append: None,
+            system_prompt_append: self.inner.store.agent_system_prompt_append(id).await?,
         };
         let mut stream = match self.inner.harness.run_turn(request).await {
             Ok(stream) => stream,
@@ -816,6 +838,95 @@ mod tests {
             rx.recv().await.unwrap().kind,
             EventKind::AgentCreated(agent)
         );
+    }
+
+    #[tokio::test]
+    async fn create_agent_with_saves_branch_intent_and_append() {
+        let fx = fixture(vec![]).await;
+        let intent_id = IntentId::new();
+        let agent = fx
+            .svc
+            .create_agent_with(
+                fx.repo.id,
+                CreateAgentOptions {
+                    branch: Some(git::branch_name_for_intent("fix-it")),
+                    intent_id: Some(intent_id),
+                    system_prompt_append: Some("do the thing".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent.branch, "intent/fix-it");
+        assert_eq!(agent.intent_id, Some(intent_id));
+        assert_eq!(fx.agent(agent.id).await, agent);
+        assert_eq!(
+            git(&agent.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "intent/fix-it"
+        );
+        assert_eq!(
+            fx.store
+                .agent_system_prompt_append(agent.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("do the thing")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_turn_passes_the_saved_system_prompt_append() {
+        let fx = fixture(vec![
+            vec![started("s1"), completed("s1", Some("one"))],
+            vec![completed("s1", Some("two"))],
+        ])
+        .await;
+        let agent = fx
+            .svc
+            .create_agent_with(
+                fx.repo.id,
+                CreateAgentOptions {
+                    system_prompt_append: Some("rules".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut rx = fx.live();
+        fx.svc.send_message(agent.id, "a".into()).await.unwrap();
+        until_turn_ends(&mut rx, agent.id).await;
+        fx.svc.send_message(agent.id, "b".into()).await.unwrap();
+        until_turn_ends(&mut rx, agent.id).await;
+        let reqs = fx.harness.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].system_prompt_append.as_deref(), Some("rules"));
+        assert_eq!(reqs[1].system_prompt_append.as_deref(), Some("rules"));
+        assert_eq!(reqs[1].resume_session_id.as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn existing_branch_is_branch_exists_and_leaves_nothing_behind() {
+        let fx = fixture(vec![]).await;
+        git(&fx.repo_dir, &["branch", "intent/taken"]);
+        let err = fx
+            .svc
+            .create_agent_with(
+                fx.repo.id,
+                CreateAgentOptions {
+                    branch: Some("intent/taken".into()),
+                    intent_id: Some(IntentId::new()),
+                    system_prompt_append: Some("x".into()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Git(GitError::BranchExists(b)) if b == "intent/taken"));
+        assert!(fx.store.list_agents(true).await.unwrap().is_empty());
+        assert!(!fx
+            .paths
+            .worktrees_dir()
+            .join("my-repo")
+            .join("intent-taken")
+            .exists());
     }
 
     #[tokio::test]
