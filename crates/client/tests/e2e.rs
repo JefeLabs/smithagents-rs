@@ -93,10 +93,11 @@ fn fixture() -> Fixture {
     Fixture { session_id, reply }
 }
 
-/// fake-claude's side of one test: the argv of its latest run, and the
-/// control directory that decides what its next run does.
+/// fake-claude's side of one test: the argv and stdin of its latest run, and
+/// the control directory that decides what its next run does.
 struct FakeClaude {
     args_file: PathBuf,
+    stdin_file: PathBuf,
     control_dir: PathBuf,
 }
 
@@ -106,6 +107,7 @@ impl FakeClaude {
         std::fs::create_dir(&control_dir).unwrap();
         FakeClaude {
             args_file: scratch.join("fake-claude-args"),
+            stdin_file: scratch.join("fake-claude-stdin"),
             control_dir,
         }
     }
@@ -121,6 +123,10 @@ impl FakeClaude {
                 (
                     "FAKE_CLAUDE_ARGS_FILE".into(),
                     self.args_file.clone().into(),
+                ),
+                (
+                    "FAKE_CLAUDE_STDIN_FILE".into(),
+                    self.stdin_file.clone().into(),
                 ),
                 (
                     "FAKE_CLAUDE_CONTROL_DIR".into(),
@@ -152,6 +158,19 @@ impl FakeClaude {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    /// The prompt of the latest run: everything it read on stdin. Also checks
+    /// that the prompt stayed off the command line, where `-p` is a flag.
+    fn last_prompt(&self) -> String {
+        let prompt = std::fs::read_to_string(&self.stdin_file).unwrap();
+        let args = self.last_args();
+        assert!(args.iter().any(|arg| arg == "-p"), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg == &prompt),
+            "the prompt is in argv: {args:?}"
+        );
+        prompt
     }
 }
 
@@ -282,8 +301,8 @@ async fn chat_flow_end_to_end() {
             first.harness_session_id.as_deref(),
             Some(fx.session_id.as_str())
         );
+        assert_eq!(fake.last_prompt(), "hello");
         let args = fake.last_args();
-        assert_eq!(arg_after(&args, "-p"), Some("hello"), "{args:?}");
         assert_eq!(arg_after(&args, "--resume"), None, "{args:?}");
 
         client.send_message(agent.id, "again").await.unwrap();
@@ -296,8 +315,8 @@ async fn chat_flow_end_to_end() {
             home.log()
         );
         // The second turn resumed the session the first one started.
+        assert_eq!(fake.last_prompt(), "again");
         let args = fake.last_args();
-        assert_eq!(arg_after(&args, "-p"), Some("again"), "{args:?}");
         assert_eq!(
             arg_after(&args, "--resume"),
             Some(fx.session_id.as_str()),
@@ -500,8 +519,8 @@ async fn failed_turn_marks_agent_dead_then_resume_works() {
             "chat: {messages:?}; daemon log:\n{}",
             home.log()
         );
+        assert_eq!(fake.last_prompt(), "again");
         let args = fake.last_args();
-        assert_eq!(arg_after(&args, "-p"), Some("again"), "{args:?}");
         assert_eq!(
             arg_after(&args, "--resume"),
             Some(fx.session_id.as_str()),
@@ -540,8 +559,9 @@ async fn real_claude_smoke() {
         let client = ensure(&home, bin, &SpawnOptions::default()).await;
         let mut events = client.events(None).await.unwrap();
         let agent = new_agent(&client, &repo_tmp.path().join("repo")).await;
+        // Starts with "- ": the CLI must get it as the prompt, not as an option.
         client
-            .send_message(agent.id, "reply with the word pong")
+            .send_message(agent.id, "- reply with the word pong")
             .await
             .unwrap();
         let end = turn_end(&mut events, agent.id).await;

@@ -66,8 +66,10 @@ async fn args_include_stream_json_and_bypass_permissions() {
     r.system_prompt_append = Some("be brief".into());
     collect(&env, r).await;
     let args = std::fs::read_to_string(env.args_file()).unwrap();
+    // `-p` is a flag; the prompt goes to stdin, never on the command line.
+    assert!(args.lines().any(|arg| arg == "-p"), "{args:?}");
+    assert!(!args.contains("hello there"), "{args:?}");
     for needle in [
-        "-p\nhello there",
         "--output-format\nstream-json",
         "--verbose",
         "--include-partial-messages",
@@ -77,6 +79,72 @@ async fn args_include_stream_json_and_bypass_permissions() {
     ] {
         assert!(args.contains(needle), "missing {needle:?} in {args:?}");
     }
+}
+
+/// Runs one turn with `prompt` against a fake-claude that records its stdin,
+/// and returns the events, what arrived on stdin and the argv.
+async fn turn_with_prompt(prompt: &str) -> (Vec<HarnessEvent>, Vec<u8>, String) {
+    let scratch = tempfile::tempdir().unwrap();
+    let stdin_file = scratch.path().join("stdin");
+    let env = setup(&[
+        ("FAKE_CLAUDE_FIXTURE", FIXTURE),
+        ("FAKE_CLAUDE_STDIN_FILE", stdin_file.to_str().unwrap()),
+    ]);
+    let mut r = req(env.dir.path(), None);
+    r.prompt = prompt.to_owned();
+    let events = collect_within(&env, r, LINGER_LIMIT).await;
+    let stdin = std::fs::read(&stdin_file).unwrap();
+    let args = std::fs::read_to_string(env.args_file()).unwrap();
+    (events, stdin, args)
+}
+
+#[tokio::test]
+async fn prompt_goes_to_stdin_even_when_it_looks_like_options() {
+    // A markdown list and a diff header would be parsed as options in argv.
+    let prompt = "- item\n--- a/x";
+    let (events, stdin, args) = turn_with_prompt(prompt).await;
+    assert!(
+        matches!(events.last(), Some(HarnessEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(String::from_utf8(stdin).unwrap(), prompt);
+    assert!(
+        !args.contains("item") && !args.contains("a/x"),
+        "the prompt leaked into argv: {args:?}"
+    );
+}
+
+#[tokio::test]
+async fn large_prompt_arrives_intact_on_stdin() {
+    // Several hundred KB, far beyond a pipe buffer, with multi-byte characters.
+    let prompt: String = (0..12_000)
+        .map(|i| format!("line {i}: naïve résumé — {}\n", "x".repeat(20)))
+        .collect();
+    assert!(prompt.len() > 500 * 1024, "{}", prompt.len());
+    let (events, stdin, _) = turn_with_prompt(&prompt).await;
+    assert!(
+        matches!(events.last(), Some(HarnessEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    assert_eq!(stdin.len(), prompt.len());
+    assert!(stdin == prompt.as_bytes(), "the prompt arrived altered");
+}
+
+#[tokio::test]
+async fn claude_that_never_reads_stdin_does_not_block_the_turn() {
+    // This fake-claude ignores stdin: writing a prompt bigger than the pipe
+    // buffer fails once it exits, and the turn ends normally.
+    let env = setup(&[("FAKE_CLAUDE_FIXTURE", FIXTURE)]);
+    let mut r = req(env.dir.path(), None);
+    r.prompt = "y".repeat(2 * 1024 * 1024);
+    let events = collect_within(&env, r, LINGER_LIMIT).await;
+    assert!(
+        matches!(events.last(), Some(HarnessEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, HarnessEvent::Failed { .. })));
 }
 
 #[tokio::test]

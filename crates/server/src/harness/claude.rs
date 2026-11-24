@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -34,10 +34,12 @@ pub struct ClaudeCodeHarness {
     pub bin: PathBuf,
 }
 
+/// The command line of a turn. `-p` is a flag: the prompt itself is written
+/// to claude's stdin, so a prompt starting with `-` is never read as an
+/// option and its size is not bounded by the argv limit.
 fn build_args(req: &TurnRequest) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
-        &req.prompt,
         "--output-format",
         "stream-json",
         "--verbose",
@@ -100,13 +102,26 @@ impl Harness for ClaudeCodeHarness {
         let mut child = Command::new(&self.bin)
             .args(build_args(&req))
             .current_dir(&req.cwd)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let mut stderr = child.stderr.take().expect("stderr piped");
+
+        // Written from its own task: a prompt larger than the pipe buffer must
+        // not hold up reading claude's output. Dropping `stdin` at the end
+        // closes it, which ends the prompt.
+        let prompt = req.prompt;
+        let stdin_task = AbortOnDrop(tokio::spawn(async move {
+            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+                // claude exited (or closed stdin) before reading all of it;
+                // how the turn ended is reported from its exit and output.
+                tracing::debug!("could not write the whole prompt to claude: {e}");
+            }
+        }));
 
         // Drain stderr concurrently so a full pipe can never block the child.
         let tail: StderrTail = Arc::default();
@@ -129,7 +144,10 @@ impl Harness for ClaudeCodeHarness {
         let (tx, rx) = mpsc::channel::<HarnessEvent>(64);
         tokio::spawn(async move {
             // `child` lives in this task; dropping it (kill_on_drop) kills the
-            // process, and dropping `stderr_task` stops its reader.
+            // process, and dropping the task handles stops the prompt writer
+            // (which a process holding stdin open could otherwise block
+            // forever) and the stderr reader.
+            let _stdin_task = stdin_task;
             let mut stderr_task = stderr_task;
             let mut lines = BufReader::new(stdout).lines();
             let mut status = None;

@@ -2,6 +2,8 @@
 # Test double for the `claude` CLI. Behavior is driven by environment:
 #   FAKE_CLAUDE_FIXTURE      file to print on stdout
 #   FAKE_CLAUDE_ARGS_FILE    overwritten each run with argv, one entry per line
+#   FAKE_CLAUDE_STDIN_FILE   overwritten each run with everything read from stdin
+#                            (stdin is not read at all when unset)
 #   FAKE_CLAUDE_EXIT         exit code (default 0)
 #   FAKE_CLAUDE_SLEEP        seconds to sleep before exiting
 #   FAKE_CLAUDE_PID_FILE     receives this process's pid
@@ -18,6 +20,9 @@ if [ -n "$FAKE_CLAUDE_ARGS_FILE" ]; then
   for a in "$@"; do
     printf '%s\n' "$a" >> "$FAKE_CLAUDE_ARGS_FILE"
   done
+fi
+if [ -n "$FAKE_CLAUDE_STDIN_FILE" ]; then
+  cat > "$FAKE_CLAUDE_STDIN_FILE"
 fi
 exit_code="${FAKE_CLAUDE_EXIT:-0}"
 sleep_secs="${FAKE_CLAUDE_SLEEP:-}"
