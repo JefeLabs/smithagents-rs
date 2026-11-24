@@ -5,10 +5,12 @@ mod common;
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use futures::{SinkExt, Stream, StreamExt};
+use serde_json::json;
 use smithagents_client::{
     ensure_daemon, ensure_daemon_with, Client, ClientError, EnsureError, SpawnOptions,
 };
@@ -18,7 +20,7 @@ use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, MessageId};
 use smithagents_core::VERSION;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -400,6 +402,92 @@ async fn ensure_keeps_waiting_while_the_lock_holder_has_a_lockfile() {
     .await;
 }
 
+/// An HTTP server, not a daemon, that answers every request with `health`
+/// as JSON and records each request head it receives.
+async fn impostor(health: serde_json::Value) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&heads);
+    tokio::spawn(async move {
+        let answer = response("200 OK", "application/json", &health.to_string());
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let Some(head) = read_head(&mut socket).await else {
+                continue;
+            };
+            seen.lock().unwrap().push(head);
+            let _ = socket.write_all(answer.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (port, heads)
+}
+
+#[tokio::test]
+async fn ensure_never_sends_the_token_to_a_dead_daemons_port() {
+    // The lockfile's daemon is dead and another process now listens on its
+    // port, answering health the way the daemon would.
+    let home = TestHome::new();
+    bounded(async {
+        let (port, heads) = impostor(json!({
+            "version": VERSION, "pid": DEAD_PID, "running_agents": 0, "ws_clients": 0,
+        }))
+        .await;
+        let token = "secret-daemon-token";
+        write_lockfile(
+            &home,
+            &DaemonInfo {
+                pid: DEAD_PID,
+                port,
+                token: token.into(),
+                version: VERSION.into(),
+            },
+        );
+
+        let health = ensure(&home).await.health().await.unwrap();
+        assert_ne!(health.pid, DEAD_PID, "the impostor was accepted");
+        assert_eq!(read_lockfile(home.path()).unwrap().unwrap().pid, health.pid);
+        let heads = heads.lock().unwrap();
+        assert!(
+            heads.iter().all(|head| {
+                !head.to_ascii_lowercase().contains("\r\nauthorization:") && !head.contains(token)
+            }),
+            "the token was sent to the impostor: {heads:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ensure_rejects_a_daemon_reporting_another_pid() {
+    // The lockfile's pid is alive (here: this test process), but what answers
+    // on its port reports another pid: it is not the daemon that wrote it.
+    let home = TestHome::new();
+    bounded(async {
+        let (port, heads) = impostor(json!({
+            "version": VERSION, "pid": 1, "running_agents": 0, "ws_clients": 0,
+        }))
+        .await;
+        write_lockfile(
+            &home,
+            &DaemonInfo {
+                pid: std::process::id(),
+                port,
+                token: "token".into(),
+                version: VERSION.into(),
+            },
+        );
+
+        let health = ensure(&home).await.health().await.unwrap();
+        assert_ne!(health.pid, 1, "the impostor was accepted");
+        assert_ne!(health.pid, std::process::id());
+        assert_eq!(read_lockfile(home.path()).unwrap().unwrap().pid, health.pid);
+        // It was asked, so the pid check (not the liveness check) rejected it.
+        assert!(!heads.lock().unwrap().is_empty());
+    })
+    .await;
+}
+
 // ------------------------------------------------------------------ client
 
 #[tokio::test]
@@ -524,6 +612,19 @@ fn stub_info(port: u16) -> DaemonInfo {
     }
 }
 
+/// Reads an HTTP request head; `None` if the peer goes away first.
+async fn read_head(socket: &mut TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match socket.read(&mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
 /// Serves one HTTP connection per canned response, in order; resolves to the
 /// request heads it received.
 async fn http_stub(responses: Vec<String>) -> (DaemonInfo, JoinHandle<Vec<String>>) {
@@ -533,16 +634,12 @@ async fn http_stub(responses: Vec<String>) -> (DaemonInfo, JoinHandle<Vec<String
         let mut heads = Vec::new();
         for response in responses {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut head = Vec::new();
-            let mut buf = [0u8; 1024];
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = socket.read(&mut buf).await.unwrap();
-                assert!(n > 0, "client closed before sending a request");
-                head.extend_from_slice(&buf[..n]);
-            }
+            let head = read_head(&mut socket)
+                .await
+                .expect("client closed before sending a request");
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.shutdown().await.unwrap();
-            heads.push(String::from_utf8(head).unwrap());
+            heads.push(head);
         }
         heads
     });

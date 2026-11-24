@@ -68,11 +68,13 @@ pub async fn ensure_daemon(
 
 /// Returns a client for the daemon of `home`, starting one if none is running.
 ///
-/// - A lockfile whose daemon answers: its client, or
+/// - A lockfile whose daemon answers with the lockfile's pid: its client, or
 ///   [`EnsureError::VersionMismatch`] when it runs another version.
-/// - A lockfile whose daemon does not answer and whose pid is dead is stale and
-///   deleted. One whose pid is alive is kept (the pid may be a daemon that is
-///   shutting down, or a reused pid); the started daemon replaces it if it wins.
+/// - A lockfile whose pid is dead is stale: it is deleted and its port is
+///   never sent the token. One whose pid is alive but whose port does not
+///   answer, or answers with another pid, is kept but not trusted (the pid may
+///   be a daemon that is shutting down, or a reused pid); the started daemon
+///   replaces it if it wins.
 /// - Start: `daemon_bin --home <home> <options.args>` in its own process group,
 ///   stdin null, stdout and stderr appended to `<home>/run/daemon.log`. The
 ///   lockfile is then polled every 50 ms for up to 5 s until it names a daemon
@@ -103,19 +105,17 @@ pub async fn ensure_daemon_with(
     Err(EnsureError::StartTimeout)
 }
 
-/// The daemon the lockfile names, if it answers. Deletes the lockfile when its
-/// daemon does not answer and its pid is dead.
+/// The daemon the lockfile names, if it answers. A lockfile whose pid is dead
+/// is stale: it is deleted, and its port is never contacted.
 async fn connect_existing(home: &Path, expected: &str) -> Result<Option<Client>, EnsureError> {
     let Some(info) = lockfile(home)? else {
         return Ok(None);
     };
-    if let Some(client) = connect(&info, expected).await? {
-        return Ok(Some(client));
-    }
     if !pid_alive(info.pid) {
         remove_stale_lockfile(home, &info);
+        return Ok(None);
     }
-    Ok(None)
+    connect(&info, expected).await
 }
 
 /// The lockfile, or `None` when it is absent or unreadable as JSON (the daemon
@@ -132,9 +132,30 @@ fn lockfile(home: &Path) -> io::Result<Option<DaemonInfo>> {
 
 /// A client for `info` if its daemon answers in time; an error if it answers
 /// with another version.
+///
+/// The health request carries the token, so it is only sent while the
+/// lockfile's pid is alive: once that daemon is gone, any local process may
+/// hold its port. An answer from another pid is not the daemon that wrote the
+/// lockfile and is not trusted. (This narrows, but does not close, the window
+/// in which an impostor on a live daemon's port sees the token; a challenge
+/// on the health check would close it.)
 async fn connect(info: &DaemonInfo, expected: &str) -> Result<Option<Client>, EnsureError> {
+    if !pid_alive(info.pid) {
+        return Ok(None);
+    }
     let client = Client::new(info);
     match client.health_within(HEALTH_TIMEOUT).await {
+        Ok(health) if health.pid != info.pid => {
+            // Debug, not warn: it repeats on every poll until a new daemon
+            // replaces the lockfile.
+            tracing::debug!(
+                lockfile_pid = info.pid,
+                answering_pid = health.pid,
+                port = info.port,
+                "the lockfile's port is answered by another process; not trusting it"
+            );
+            Ok(None)
+        }
         Ok(health) if health.version == expected => Ok(Some(client)),
         Ok(health) => Err(EnsureError::VersionMismatch {
             running: health.version,
