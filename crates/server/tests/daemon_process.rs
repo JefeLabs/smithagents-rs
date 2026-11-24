@@ -169,6 +169,11 @@ async fn daemon_writes_lockfile_and_serves_health() {
     assert_eq!(health["pid"], daemon.pid());
     assert_eq!(health["version"], smithagents_core::VERSION);
     assert_eq!(health["running_agents"], 0);
+    assert_eq!(health["latest_seq"], 0);
+    let instance_id = health["instance_id"].as_str().unwrap();
+    assert_eq!(instance_id.len(), 16, "{health}");
+    assert!(instance_id.chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(!info.token.contains(instance_id), "derived from the token");
 
     assert!(daemon.exited().is_none(), "daemon stopped serving");
     assert!(

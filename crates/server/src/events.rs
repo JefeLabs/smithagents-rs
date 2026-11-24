@@ -17,6 +17,10 @@ pub enum BusError {
     /// Events between the requested position and the oldest retained one were evicted.
     #[error("requested position is older than the oldest retained event ({oldest_retained})")]
     TooOld { oldest_retained: u64 },
+    /// The requested position is past the latest event: it was seen on an
+    /// earlier daemon, whose sequence this one does not continue.
+    #[error("requested position is beyond the latest event ({latest})")]
+    FromTheFuture { latest: u64 },
 }
 
 /// A resumed view of the bus: replayed `backlog`, then the `live` stream.
@@ -89,13 +93,21 @@ impl EventBus {
     /// Subscribes, optionally resuming after `since`.
     ///
     /// `None` gives live events only. `Some(n)` gives retained events with
-    /// `seq > n`; `n` at or beyond the latest seq (including `Some(0)` on an
-    /// empty bus) yields an empty backlog. Fails with [`BusError::TooOld`] when
-    /// an event in `(n, oldest_retained)` has been evicted.
+    /// `seq > n`; `n` equal to the latest seq (including `Some(0)` on an empty
+    /// bus) yields an empty backlog. Fails with [`BusError::TooOld`] when an
+    /// event in `(n, oldest_retained)` has been evicted, and with
+    /// [`BusError::FromTheFuture`] when `n` is beyond the latest seq: sequence
+    /// numbers restart with each daemon, so such an `n` was seen on an earlier
+    /// one and resuming from it would silently skip this daemon's events.
     pub fn subscribe(&self, since: Option<u64>) -> Result<Subscription, BusError> {
         let inner = self.lock();
         let backlog = match since {
             None => Vec::new(),
+            Some(n) if n > inner.last_seq => {
+                return Err(BusError::FromTheFuture {
+                    latest: inner.last_seq,
+                });
+            }
             Some(n) => {
                 if let Some(oldest) = inner.ring.front().map(|e| e.seq) {
                     if n.saturating_add(1) < oldest {
@@ -209,12 +221,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn since_greater_than_latest_gives_empty_backlog() {
+    async fn since_beyond_latest_is_from_the_future() {
+        // Seqs restart with each daemon: a `since` past the latest comes from a
+        // previous daemon, and resuming from it would silently skip events.
         let bus = bus_with(8, 3);
-        let mut sub = bus.subscribe(Some(100)).unwrap();
-        assert!(sub.backlog.is_empty());
-        bus.publish(kind(3));
-        assert_eq!(sub.live.recv().await.unwrap().seq, 4);
+        assert!(matches!(
+            bus.subscribe(Some(4)).err().unwrap(),
+            BusError::FromTheFuture { latest: 3 }
+        ));
+        assert!(matches!(
+            bus.subscribe(Some(100)).err().unwrap(),
+            BusError::FromTheFuture { latest: 3 }
+        ));
+        assert!(matches!(
+            EventBus::new(4).subscribe(Some(1)).err().unwrap(),
+            BusError::FromTheFuture { latest: 0 }
+        ));
     }
 
     #[tokio::test]

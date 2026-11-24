@@ -21,6 +21,7 @@ use crate::paths::Paths;
 
 const INSTANCE_LOCK_FILE: &str = "daemon.lock";
 const TOKEN_BYTES: usize = 32;
+const INSTANCE_ID_BYTES: usize = 8;
 const MIN_IDLE_SAMPLE: Duration = Duration::from_millis(10);
 const MAX_IDLE_SAMPLE: Duration = Duration::from_secs(1);
 
@@ -71,13 +72,25 @@ pub fn remove_lockfile(paths: &Paths) {
 /// A fresh API token: 32 bytes from the operating system's CSPRNG, as 64
 /// lowercase hex digits.
 pub fn generate_token() -> io::Result<String> {
-    let mut bytes = [0u8; TOKEN_BYTES];
+    random_hex(TOKEN_BYTES)
+}
+
+/// A fresh id for this daemon process (8 random bytes as 16 hex digits),
+/// reported by `/v1/health`. Event sequence numbers restart with every
+/// daemon; a changed id tells a client that its last seen seq is void.
+pub fn generate_instance_id() -> io::Result<String> {
+    random_hex(INSTANCE_ID_BYTES)
+}
+
+/// `len` bytes from the operating system's CSPRNG as lowercase hex.
+fn random_hex(len: usize) -> io::Result<String> {
+    let mut bytes = vec![0u8; len];
     SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(io::Error::other)?;
     Ok(bytes
         .iter()
-        .fold(String::with_capacity(TOKEN_BYTES * 2), |mut hex, b| {
+        .fold(String::with_capacity(len * 2), |mut hex, b| {
             let _ = write!(hex, "{b:02x}");
             hex
         }))
@@ -296,6 +309,17 @@ mod tests {
         let a = generate_token().unwrap();
         let b = generate_token().unwrap();
         assert_eq!(a.len(), 64);
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn instance_id_is_16_hex_chars_and_unique() {
+        let a = generate_instance_id().unwrap();
+        let b = generate_instance_id().unwrap();
+        assert_eq!(a.len(), 16);
         assert!(a
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));

@@ -93,6 +93,9 @@ async fn ensure_starts_daemon_when_none_running() {
         assert_eq!(health.pid, info.pid);
         assert_eq!(health.version, VERSION);
         assert_eq!(health.running_agents, 0);
+        assert_eq!(health.latest_seq, 0);
+        assert_eq!(health.instance_id.len(), 16, "{health:?}");
+        assert!(health.instance_id.chars().all(|c| c.is_ascii_hexdigit()));
 
         // Detached into its own process group, so signals aimed at the caller's
         // group (ctrl-c in a terminal) do not reach it.
@@ -487,6 +490,79 @@ async fn ensure_rejects_a_daemon_reporting_another_pid() {
         assert_eq!(read_lockfile(home.path()).unwrap().unwrap().pid, health.pid);
         // It was asked, so the pid check (not the liveness check) rejected it.
         assert!(!heads.lock().unwrap().is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn version_mismatch_is_reported_for_a_health_answer_without_newer_fields() {
+    // A daemon of an older version answers without `instance_id` and
+    // `latest_seq`; it must still be recognized, as a version mismatch.
+    let home = TestHome::new();
+    bounded(async {
+        let (port, _heads) = impostor(json!({
+            "version": "0.0.1-old", "pid": std::process::id(), "running_agents": 0, "ws_clients": 0,
+        }))
+        .await;
+        write_lockfile(
+            &home,
+            &DaemonInfo {
+                pid: std::process::id(),
+                port,
+                token: "token".into(),
+                version: "0.0.1-old".into(),
+            },
+        );
+        let err = within(
+            "ensure_daemon",
+            ensure_daemon(home.path(), daemon_bin(), VERSION),
+        )
+        .await
+        .expect_err("another version is running");
+        assert!(
+            matches!(&err, EnsureError::VersionMismatch { running, .. } if running == "0.0.1-old"),
+            "{err:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn restarted_daemon_rejects_a_seq_from_before_the_restart() {
+    let home = TestHome::new();
+    bounded(async {
+        let repo_dir = home.scratch().join("repo");
+        init_repo(&repo_dir);
+        let client = ensure(&home).await;
+        let repo = client.add_repo(&repo_dir).await.unwrap();
+        client.create_agent(repo.id).await.unwrap();
+        client.create_agent(repo.id).await.unwrap();
+        let before = client.health().await.unwrap();
+        assert_eq!(before.latest_seq, 2, "{before:?}");
+        // The latest seq is a valid position on this daemon.
+        drop(client.events(Some(before.latest_seq)).await.unwrap());
+        drop(client);
+
+        common::stop_daemon(home.path());
+        let client = ensure(&home).await;
+        let after = client.health().await.unwrap();
+        assert_ne!(after.pid, before.pid, "the daemon was not restarted");
+        assert_ne!(after.instance_id, before.instance_id);
+        assert_eq!(after.latest_seq, 0);
+
+        // Resuming from the old daemon's seq would silently skip events.
+        let err = within("events", client.events(Some(before.latest_seq)))
+            .await
+            .err()
+            .expect("a seq from before the restart must be refused");
+        let (status, code, message) = api_error(err);
+        assert_eq!((status, code.as_str()), (410, "events_too_old"));
+        assert!(message.contains("restarted"), "{message}");
+        // Subscribing without `since` works.
+        let mut events = within("events", client.events(None)).await.unwrap();
+        client.create_agent(repo.id).await.unwrap();
+        let next = next_event(&mut events).await.expect("stream ended");
+        assert_eq!(next.seq, 1);
     })
     .await;
 }

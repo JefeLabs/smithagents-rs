@@ -32,10 +32,21 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MESSAGE_PAGE: usize = 1000;
 
 /// `GET /v1/health`.
+///
+/// Fields added after the first version are defaulted when absent, so the
+/// answer of a daemon of another version still decodes and is reported as a
+/// version mismatch.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Health {
     pub version: String,
     pub pid: u32,
+    /// Identifies this daemon process. It changes when the daemon restarts,
+    /// and with it the event sequence: seqs seen before are then void.
+    #[serde(default)]
+    pub instance_id: String,
+    /// Seq of the latest event this daemon published (0 before the first).
+    #[serde(default)]
+    pub latest_seq: u64,
     pub running_agents: usize,
     pub ws_clients: usize,
 }
@@ -176,7 +187,10 @@ impl Client {
     /// after that seq come first, then live ones.
     ///
     /// Fails with `ClientError::Api { status: 410, code: "events_too_old", .. }`
-    /// when events after `since` are no longer retained.
+    /// when events after `since` are no longer retained, or when `since` is
+    /// beyond the daemon's latest seq because the daemon restarted (seqs
+    /// restart with it; see [`Health::instance_id`]). Either way the caller
+    /// refetches the state it shows and subscribes again without `since`.
     ///
     /// The stream ends when the connection does. In particular the daemon
     /// closes it (reason `lagged`) when this subscriber falls too far behind;

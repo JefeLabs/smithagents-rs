@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token-123";
+const INSTANCE_ID: &str = "0123456789abcdef";
 
 struct Fx {
     tmp: TempDir,
@@ -52,6 +53,7 @@ async fn fixture(harness: FakeHarness, bus_capacity: usize) -> Fx {
         bus,
         store,
         token: Arc::from(TOKEN),
+        instance_id: Arc::from(INSTANCE_ID),
         ws_clients: Arc::new(AtomicUsize::new(0)),
         started_at: Instant::now(),
     };
@@ -229,6 +231,13 @@ async fn health_returns_version_and_counts() {
     assert_eq!(body["pid"], std::process::id());
     assert_eq!(body["running_agents"], 0);
     assert_eq!(body["ws_clients"], 0);
+    assert_eq!(body["instance_id"], INSTANCE_ID);
+    assert_eq!(body["latest_seq"], 0);
+
+    closed_event(&fx.state.bus);
+    closed_event(&fx.state.bus);
+    let (_, body) = fx.call(Method::GET, "/v1/health", None).await;
+    assert_eq!(body["latest_seq"], 2);
 }
 
 #[tokio::test]
@@ -480,6 +489,36 @@ async fn events_since_too_old_is_410() {
     let body: Value = serde_json::from_slice(resp.body().as_deref().unwrap()).unwrap();
     assert_error(&body, "events_too_old");
     assert!(body["message"].as_str().unwrap().contains('4'), "{body}");
+}
+
+#[tokio::test]
+async fn events_since_beyond_latest_is_410_sequence_reset() {
+    // A client resuming with a seq it saw on a previous daemon.
+    let fx = default_fx().await;
+    closed_event(&fx.state.bus);
+    let addr = fx.serve().await;
+    let mut req = format!("ws://{addr}/v1/events?since=7")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {TOKEN}").parse().unwrap(),
+    );
+    let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
+    let tokio_tungstenite::tungstenite::Error::Http(resp) = err else {
+        panic!("expected an HTTP rejection, got {err:?}");
+    };
+    assert_eq!(resp.status(), StatusCode::GONE);
+    let body: Value = serde_json::from_slice(resp.body().as_deref().unwrap()).unwrap();
+    assert_error(&body, "events_too_old");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("restarted"), "{body}");
+    assert!(message.contains("without `since`"), "{body}");
+
+    // The latest seq itself is still a valid position.
+    let mut ws = ws_connect(addr, "?since=1").await;
+    let live = closed_event(&fx.state.bus);
+    assert_eq!(next_event(&mut ws).await, live);
 }
 
 #[tokio::test]

@@ -22,7 +22,8 @@ use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::harness::claude::ClaudeCodeHarness;
 use smithagents_server::lifecycle::{
-    acquire_instance_lock, generate_token, remove_lockfile, write_lockfile, IdleMonitor, LockError,
+    acquire_instance_lock, generate_instance_id, generate_token, remove_lockfile, write_lockfile,
+    IdleMonitor, LockError,
 };
 use smithagents_server::paths::Paths;
 use smithagents_server::service::AgentService;
@@ -178,6 +179,7 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
     let token = generate_token()?;
+    let instance_id = generate_instance_id()?;
 
     let bus = EventBus::new(EVENT_BUFFER);
     let harness = Arc::new(ClaudeCodeHarness {
@@ -196,6 +198,7 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
         bus,
         store,
         token: Arc::from(token.as_str()),
+        instance_id: Arc::from(instance_id.as_str()),
         ws_clients: Arc::clone(&ws_clients),
         started_at: Instant::now(),
     };

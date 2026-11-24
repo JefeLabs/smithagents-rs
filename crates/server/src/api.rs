@@ -43,6 +43,8 @@ pub struct AppState {
     pub bus: EventBus,
     pub store: Store,
     pub token: Arc<str>,
+    /// Identifies this daemon process; see `lifecycle::generate_instance_id`.
+    pub instance_id: Arc<str>,
     pub ws_clients: Arc<AtomicUsize>,
     pub started_at: Instant,
 }
@@ -205,10 +207,14 @@ fn agent_id(raw: &str) -> Result<AgentId, ApiError> {
 
 // -------------------------------------------------------------- handlers
 
+/// `latest_seq` and `instance_id` let a client tell whether its last seen
+/// event seq still means anything: seqs restart with every daemon.
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "version": smithagents_core::VERSION,
         "pid": std::process::id(),
+        "instance_id": &*s.instance_id,
+        "latest_seq": s.bus.latest_seq(),
         "running_agents": s.service.running_agent_count(),
         "ws_clients": s.ws_clients.load(Ordering::SeqCst),
     }))
@@ -324,12 +330,22 @@ async fn events(
     let q: EventsQuery = query(&uri)?;
     // Subscribing before the upgrade lets TooOld be a plain HTTP 410 and leaves
     // no gap between the backlog and the live stream.
+    // Both errors mean the same to a client: it cannot resume from `since`,
+    // so it refetches the state it shows and subscribes again.
     let sub = s.bus.subscribe(q.since).map_err(|e| match e {
         BusError::TooOld { oldest_retained } => ApiError::new(
             StatusCode::GONE,
             "events_too_old",
             format!(
                 "requested events are no longer retained; oldest retained seq is {oldest_retained}"
+            ),
+        ),
+        BusError::FromTheFuture { latest } => ApiError::new(
+            StatusCode::GONE,
+            "events_too_old",
+            format!(
+                "requested seq is beyond the latest event ({latest}): the daemon restarted and \
+                 its event sequence was reset; refetch the state and subscribe again without `since`"
             ),
         ),
     })?;
