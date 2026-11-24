@@ -234,6 +234,19 @@ impl Store {
         Ok(())
     }
 
+    /// Marks every agent stored as `Working` or `Quiet` as `Dead` and returns
+    /// how many changed. Run at daemon startup: such a turn belonged to a
+    /// previous process and died with it.
+    pub async fn mark_stale_running_agents_dead(&self) -> Result<u64, StoreError> {
+        let res = sqlx::query("UPDATE agents SET state = ? WHERE state IN (?, ?)")
+            .bind(enum_to_str(&AgentState::Dead)?)
+            .bind(enum_to_str(&AgentState::Working)?)
+            .bind(enum_to_str(&AgentState::Quiet)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Marks the agent closed at `at`. Closing an already-closed agent is a
     /// no-op (the original `closed_at` is kept); an unknown id is also a no-op.
     pub async fn close_agent(&self, id: AgentId, at: DateTime<Utc>) -> Result<(), StoreError> {
@@ -451,6 +464,41 @@ mod tests {
         assert_eq!(all.len(), 2);
         let closed = store.get_agent(agents[0].id).await.unwrap().unwrap();
         assert_eq!(closed.closed_at, Some(first_close));
+    }
+
+    #[tokio::test]
+    async fn stale_running_agents_are_marked_dead() {
+        let store = Store::open_in_memory().await.unwrap();
+        let agents = seeded(&store, &["Mercury", "Venus", "Earth", "Mars", "Jupiter"]).await;
+        let states = [
+            AgentState::Idle,
+            AgentState::Working,
+            AgentState::Quiet,
+            AgentState::Done,
+            AgentState::Blocked,
+        ];
+        for (a, s) in agents.iter().zip(states) {
+            store.update_agent_state(a.id, s).await.unwrap();
+        }
+        // A closed agent left Quiet is stale too.
+        store.close_agent(agents[2].id, Utc::now()).await.unwrap();
+
+        assert_eq!(store.mark_stale_running_agents_dead().await.unwrap(), 2);
+        let mut after = Vec::new();
+        for a in &agents {
+            after.push(store.get_agent(a.id).await.unwrap().unwrap().state);
+        }
+        assert_eq!(
+            after,
+            [
+                AgentState::Idle,
+                AgentState::Dead,
+                AgentState::Dead,
+                AgentState::Done,
+                AgentState::Blocked,
+            ]
+        );
+        assert_eq!(store.mark_stale_running_agents_dead().await.unwrap(), 0);
     }
 
     #[tokio::test]

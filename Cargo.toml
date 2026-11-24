@@ -21,6 +21,7 @@ uuid = { version = "1.29.3", features = ["v4", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 thiserror = "2.0.21"
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 fs2 = "0.4.3"
 subtle = "2.6.1"
 rand = "0.10.4"

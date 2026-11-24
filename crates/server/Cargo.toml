@@ -23,12 +23,25 @@ tokio-stream.workspace = true
 futures.workspace = true
 axum.workspace = true
 subtle.workspace = true
+fs2.workspace = true
+rand.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 test-util = []
 
+[[bin]]
+name = "smithagentsd"
+path = "src/bin/smithagentsd.rs"
+
+[[test]]
+name = "api"
+path = "tests/api.rs"
+required-features = ["test-util"]
+
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true
