@@ -18,6 +18,16 @@
 //! that write `Polishing{pass}` (`create`, `answer`, `retry_polish`) run on
 //! their own task, so a caller that stops waiting cannot separate that write
 //! from the start of the pass.
+//!
+//! Execution: [`IntentService::send`] accepts a `Complete` intent and either
+//! starts its agent at once or leaves it `Queued` for the scheduler
+//! ([`crate::queue`]), which calls [`IntentService::start`] when its
+//! dependencies are `Resolved` and a slot is free. Deciding to start and
+//! starting happen under one service-wide start lock (`send` and every
+//! scheduler pass take it), so the queue limit is never overrun by a race.
+//! A start re-reads the intent under its reservation and does nothing to an
+//! intent already `Sent`, so an intent never gets a second agent. `send`,
+//! `start`, `resolve` and `set_agent_defaults` run detached like `create`.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -29,24 +39,39 @@ use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
 use futures::FutureExt;
-use smithagents_core::event::EventKind;
+use smithagents_core::agent::AgentState;
+use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
-    slugify, Answer, AnswerInput, Content, CreateIntentRequest, Intent, IntentFilter, IntentKind,
-    IntentState, IntentVersion, ItemStatus, Patch, Phase, ReviewAction, Seed, SeedInput,
-    SeedSource, VersionAuthor,
+    slugify, AgentDefaults, Answer, AnswerInput, Content, CreateIntentRequest, Intent,
+    IntentFilter, IntentKind, IntentState, IntentVersion, ItemStatus, Patch, Phase, ReviewAction,
+    Seed, SeedInput, SeedSource, VersionAuthor,
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard};
 
+use crate::brief::{self, DepSummary};
 use crate::events::EventBus;
+use crate::git::{self, GitError};
 use crate::harness::{Harness, HarnessError};
 use crate::paths::Paths;
 use crate::polish::{
     apply_pass1, apply_pass2, pass1_request, pass2_request, seed_from_transcript,
     would_create_cycle, Candidate, DepContext, PolishError, SeedError, MAX_SEED_BYTES,
 };
-use crate::service::{AgentService, ServiceError};
+use crate::queue::{self, Kicker};
+use crate::service::{AgentService, CreateAgentOptions, ServiceError};
 use crate::store::{Store, StoreError};
+
+/// Settings key of [`AgentDefaults`].
+const AGENT_DEFAULTS_KEY: &str = "agent_defaults";
+/// Highest queue limit accepted (0 or none means no limit).
+const QUEUE_LIMIT_MAX: u32 = 64;
+/// Hex digits of the intent id appended to an intent branch name that is taken.
+const BRANCH_SUFFIX_HEX: usize = 6;
+/// How long to wait for a turn to end before trying again to close the agent
+/// of a failed start (in case the end of the turn was never published).
+const CLOSE_RETRY: Duration = Duration::from_secs(30);
 
 const TITLE_MAX: usize = 120;
 const ITEM_MAX: usize = 2000;
@@ -143,6 +168,11 @@ struct Inner {
     /// Model for polish runs; `None` leaves the CLI's default.
     polish_model: Mutex<Option<String>>,
     locks: Mutex<HashMap<IntentId, Arc<AsyncMutex<()>>>>,
+    /// Wakes the queue scheduler; `None` until one is connected.
+    scheduler: Mutex<Option<Kicker>>,
+    /// Held while deciding whether to start intents and starting them (by
+    /// `send` and by each scheduler pass). Taken before any reservation.
+    starts: AsyncMutex<()>,
 }
 
 #[derive(Clone)]
@@ -168,8 +198,38 @@ impl IntentService {
                 polish: Mutex::new(None),
                 polish_model: Mutex::new(None),
                 locks: Mutex::new(HashMap::new()),
+                scheduler: Mutex::new(None),
+                starts: AsyncMutex::new(()),
             }),
         }
+    }
+
+    /// Connects the queue scheduler, which `send`, `resolve` and
+    /// `set_agent_defaults` then wake ([`crate::queue::Scheduler::start`]
+    /// does this). Holds only the kick channel, never the scheduler task.
+    pub fn set_scheduler(&self, kicker: Kicker) {
+        *self
+            .inner
+            .scheduler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(kicker);
+    }
+
+    fn kick_scheduler(&self) {
+        let kicker = self
+            .inner
+            .scheduler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(kicker) = kicker {
+            kicker.kick();
+        }
+    }
+
+    /// The start lock (see the module docs).
+    pub(crate) async fn lock_starts(&self) -> AsyncMutexGuard<'_, ()> {
+        self.inner.starts.lock().await
     }
 
     /// Sets the model polish passes ask the harness for (shared by all
@@ -662,6 +722,270 @@ impl IntentService {
         Ok(changed)
     }
 
+    // ------------------------------------------------------------- execution
+
+    /// Sends a `Complete` intent to a new agent, writing its `Send` version.
+    /// It starts now when every accepted dependency is `Resolved` and the
+    /// queue has a slot for it (older ready intents go first); otherwise it
+    /// becomes `Queued` for the scheduler. A failed immediate start returns
+    /// the error and leaves the intent `Complete` with `last_start_error` set.
+    pub async fn send(&self, id: IntentId) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.send_now(id).await }).await
+    }
+
+    /// Body of [`Self::send`], run detached from the caller.
+    async fn send_now(&self, id: IntentId) -> Result<Intent, IntentError> {
+        let starts = self.lock_starts().await;
+        let reservation = self.reserve(id).await;
+        let mut intent = self.get(id).await?;
+        if intent.state != IntentState::Complete {
+            return Err(wrong_state_or_phase(&intent, "complete"));
+        }
+        let store = &self.inner.store;
+        let now = Utc::now();
+        // Decide as the scheduler would, with this intent queued last.
+        let mut candidate = intent.clone();
+        candidate.state = IntentState::Queued;
+        candidate.queued_at = Some(now);
+        let mut queued = store.queued_intents().await?;
+        queued.push(candidate);
+        let resolved = queue::resolved_ids(store).await?;
+        let running = queue::running_count(store, &self.inner.agents).await?;
+        let limit = self.agent_defaults().await?.queue_limit;
+        if queue::next_startable(&queued, &resolved, running, limit).contains(&id) {
+            return self.start_reserved(intent).await;
+        }
+        intent.state = IntentState::Queued;
+        intent.queued_at = Some(now);
+        intent.last_start_error = None;
+        touch(&mut intent);
+        store
+            .save_intent_with_version(&intent, &snapshot(&intent, VersionAuthor::Send))
+            .await?;
+        self.publish_updated(&intent);
+        drop(reservation);
+        drop(starts);
+        self.kick_scheduler();
+        Ok(intent)
+    }
+
+    /// Starts the intent's agent now, from `Complete` (writing the `Send`
+    /// version, as `send` does) or `Queued`. An intent already `Sent` is
+    /// returned unchanged, so repeated or concurrent starts make one agent.
+    /// Dependencies and the queue limit are not checked here: the scheduler
+    /// and [`Self::send`] decide when to start.
+    pub async fn start(&self, id: IntentId) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move {
+            let _reservation = svc.reserve(id).await;
+            let intent = svc.get(id).await?;
+            match intent.state {
+                IntentState::Sent => Ok(intent),
+                IntentState::Complete | IntentState::Queued => svc.start_reserved(intent).await,
+                _ => Err(wrong_state_or_phase(&intent, "complete or queued")),
+            }
+        })
+        .await
+    }
+
+    /// The start itself; the caller holds the intent's reservation and has
+    /// checked that it is `Complete` or `Queued`. In order: the agent (its
+    /// branch and worktree), its first message (the brief), then the intent
+    /// saved as `Sent`. On a failure the intent keeps its state, with the
+    /// error in `last_start_error`; an agent already made is closed.
+    async fn start_reserved(&self, mut intent: Intent) -> Result<Intent, IntentError> {
+        let agent_id = match self.launch_agent(&intent).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(intent_id = %intent.id, "could not start the intent's agent: {e}");
+                self.record_start_error(&mut intent, format!("could not start the agent: {e}"))
+                    .await;
+                return Err(e);
+            }
+        };
+        let mut sent = intent.clone();
+        sent.state = IntentState::Sent;
+        sent.agent_id = Some(agent_id);
+        sent.sent_at = Some(Utc::now());
+        sent.last_start_error = None;
+        touch(&mut sent);
+        let store = &self.inner.store;
+        let saved = if intent.state == IntentState::Complete {
+            // Sent straight from `Complete`: the Send version goes in with it.
+            store
+                .save_intent_with_version(&sent, &snapshot(&sent, VersionAuthor::Send))
+                .await
+                .map(|_version| ())
+        } else {
+            store.save_intent(&sent).await
+        };
+        if let Err(e) = saved {
+            tracing::error!(intent_id = %intent.id, agent_id = %agent_id, "started an agent but could not save its intent: {e}");
+            self.discard_agent(agent_id).await;
+            self.record_start_error(
+                &mut intent,
+                format!("could not save the intent after starting its agent: {e}"),
+            )
+            .await;
+            return Err(e.into());
+        }
+        self.publish_updated(&sent);
+        Ok(sent)
+    }
+
+    /// Creates the intent's agent on `intent/<slug>` (or, if that branch
+    /// exists, `intent/<slug>-<6 hex of the id>`) and sends it the brief.
+    /// An agent whose first message is refused is closed again.
+    async fn launch_agent(&self, intent: &Intent) -> Result<AgentId, IntentError> {
+        let brief = brief::compose(intent, &self.dep_summaries(intent).await?);
+        let agents = &self.inner.agents;
+        let options = |branch: String| CreateAgentOptions {
+            branch: Some(branch),
+            intent_id: Some(intent.id),
+            system_prompt_append: Some(brief.system_append.clone()),
+        };
+        let branch = git::branch_name_for_intent(&intent.slug);
+        let agent = match agents
+            .create_agent_with(intent.repo_id, options(branch.clone()))
+            .await
+        {
+            Err(ServiceError::Git(GitError::BranchExists(_))) => {
+                let hex = intent.id.0.simple().to_string();
+                let suffixed = format!("{branch}-{}", &hex[..BRANCH_SUFFIX_HEX]);
+                agents
+                    .create_agent_with(intent.repo_id, options(suffixed))
+                    .await?
+            }
+            other => other?,
+        };
+        if let Err(e) = agents.send_message(agent.id, brief.first_message).await {
+            self.discard_agent(agent.id).await;
+            return Err(e.into());
+        }
+        Ok(agent.id)
+    }
+
+    /// Title, slug and current behavior of each accepted dependency's target.
+    async fn dep_summaries(&self, intent: &Intent) -> Result<Vec<DepSummary>, StoreError> {
+        let mut deps = Vec::new();
+        let targets = intent
+            .content
+            .depends_on
+            .iter()
+            .filter(|d| d.status == ItemStatus::Accepted)
+            .filter_map(|d| d.intent_ref);
+        for target in targets {
+            if let Some(t) = self.inner.store.get_intent(target).await? {
+                deps.push(DepSummary {
+                    slug: t.slug,
+                    title: t.content.title,
+                    current_behavior: t.content.current_behavior,
+                });
+            }
+        }
+        Ok(deps)
+    }
+
+    /// Closes the agent of a failed start (its worktree is kept, as for any
+    /// closed agent). An agent whose turn already runs cannot be closed
+    /// yet; it is closed in the background as soon as that turn ends.
+    async fn discard_agent(&self, id: AgentId) {
+        // Subscribed before the close, so the end of the turn cannot be missed.
+        let live = self.inner.bus.subscribe(None).map(|s| s.live);
+        match self.inner.agents.close_agent(id).await {
+            Ok(()) => {}
+            Err(ServiceError::TurnInProgress) => match live {
+                Ok(live) => {
+                    tracing::warn!(agent_id = %id, "the agent of a failed start is busy; closing it when its turn ends");
+                    tokio::spawn(close_after_turn(self.inner.agents.clone(), id, live));
+                }
+                Err(e) => {
+                    tracing::error!(agent_id = %id, "could not close the agent of a failed start: {e}");
+                }
+            },
+            Err(e) => {
+                tracing::error!(agent_id = %id, "could not close the agent of a failed start: {e}");
+            }
+        }
+    }
+
+    /// Saves `message` as the intent's `last_start_error`, leaving its state.
+    /// The same error again (a queued start retried on every pass) is not
+    /// written or published again.
+    async fn record_start_error(&self, intent: &mut Intent, message: String) {
+        if intent.last_start_error.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        intent.last_start_error = Some(message);
+        touch(intent);
+        match self.inner.store.save_intent(intent).await {
+            Ok(()) => self.publish_updated(intent),
+            Err(e) => {
+                tracing::error!(intent_id = %intent.id, "could not record a start failure: {e}");
+            }
+        }
+    }
+
+    /// Marks a `Sent` intent `Resolved` (whatever its agent is doing), which
+    /// may let intents depending on it start.
+    pub async fn resolve(&self, id: IntentId) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.resolve_now(id).await }).await
+    }
+
+    /// Body of [`Self::resolve`], run detached from the caller.
+    async fn resolve_now(&self, id: IntentId) -> Result<Intent, IntentError> {
+        let reservation = self.reserve(id).await;
+        let mut intent = self.get(id).await?;
+        if intent.state != IntentState::Sent {
+            return Err(wrong_state_or_phase(&intent, "sent"));
+        }
+        intent.state = IntentState::Resolved;
+        intent.resolved_at = Some(Utc::now());
+        touch(&mut intent);
+        self.inner.store.save_intent(&intent).await?;
+        self.publish_updated(&intent);
+        drop(reservation);
+        self.kick_scheduler();
+        Ok(intent)
+    }
+
+    /// The stored agent defaults; a queue limit of 0 reads as none.
+    pub async fn agent_defaults(&self) -> Result<AgentDefaults, IntentError> {
+        let stored: Option<AgentDefaults> =
+            self.inner.store.get_setting(AGENT_DEFAULTS_KEY).await?;
+        let mut defaults = stored.unwrap_or_default();
+        defaults.queue_limit = defaults.queue_limit.filter(|&n| n > 0);
+        Ok(defaults)
+    }
+
+    /// Stores the agent defaults and wakes the scheduler. A queue limit of 0
+    /// is stored as none (no limit); above [`QUEUE_LIMIT_MAX`] is `Invalid`.
+    /// Returns what was stored.
+    pub async fn set_agent_defaults(
+        &self,
+        defaults: AgentDefaults,
+    ) -> Result<AgentDefaults, IntentError> {
+        let svc = self.clone();
+        detached(async move {
+            let queue_limit = defaults.queue_limit.filter(|&n| n > 0);
+            if queue_limit.is_some_and(|n| n > QUEUE_LIMIT_MAX) {
+                return Err(IntentError::Invalid(format!(
+                    "queue limit must be 0 to {QUEUE_LIMIT_MAX} (0 or none means no limit)"
+                )));
+            }
+            let defaults = AgentDefaults { queue_limit };
+            svc.inner
+                .store
+                .set_setting(AGENT_DEFAULTS_KEY, &defaults)
+                .await?;
+            svc.kick_scheduler();
+            Ok(defaults)
+        })
+        .await
+    }
+
     fn publish_updated(&self, intent: &Intent) {
         self.inner
             .bus
@@ -844,13 +1168,7 @@ impl IntentService {
     ) -> Result<u32, StoreError> {
         self.inner
             .store
-            .append_version(&IntentVersion {
-                intent_id: intent.id,
-                version: 0,
-                author,
-                content: intent.content.clone(),
-                at: intent.updated_at,
-            })
+            .append_version(&snapshot(intent, author))
             .await
     }
 
@@ -951,13 +1269,64 @@ async fn load_messages(
     store.list_messages(agent_id, 0, u32::MAX).await
 }
 
-/// Runs an intent mutation on its own task and waits for it, so a caller
-/// that stops waiting (a dropped request) cannot cut the mutation between
-/// its store write of `Polishing{pass}` and the start of that pass, which
-/// would leave the intent polishing with no job until a restart.
-async fn detached<F>(op: F) -> Result<Intent, IntentError>
+/// The intent's current content as a version by `author`; the store numbers it.
+fn snapshot(intent: &Intent, author: VersionAuthor) -> IntentVersion {
+    IntentVersion {
+        intent_id: intent.id,
+        version: 0,
+        author,
+        content: intent.content.clone(),
+        at: intent.updated_at,
+    }
+}
+
+/// Closes an agent whose turn is running once that turn ends. `live` must
+/// have been subscribed before the refused close, so the end of the turn
+/// cannot be missed; without an event it tries again every [`CLOSE_RETRY`].
+async fn close_after_turn(agents: AgentService, id: AgentId, mut live: broadcast::Receiver<Event>) {
+    loop {
+        let turn_over = async {
+            loop {
+                match live.recv().await {
+                    Ok(Event {
+                        kind: EventKind::AgentUpdated(a),
+                        ..
+                    }) if a.id == id
+                        && !matches!(a.state, AgentState::Working | AgentState::Quiet) =>
+                    {
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) => return,
+                    // The bus is gone: fall back to the periodic retry.
+                    Err(RecvError::Closed) => std::future::pending::<()>().await,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(CLOSE_RETRY, turn_over).await;
+        match agents.close_agent(id).await {
+            Ok(()) => {
+                tracing::info!(agent_id = %id, "closed the agent of a failed start");
+                return;
+            }
+            Err(ServiceError::TurnInProgress) => {}
+            Err(e) => {
+                tracing::error!(agent_id = %id, "could not close the agent of a failed start: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Runs an intent operation on its own task and waits for it, so a caller
+/// that stops waiting (a dropped request) cannot cut it short: between its
+/// store write of `Polishing{pass}` and the start of that pass, which would
+/// leave the intent polishing with no job until a restart, or between
+/// creating an agent and saving the intent that owns it.
+async fn detached<T, F>(op: F) -> Result<T, IntentError>
 where
-    F: Future<Output = Result<Intent, IntentError>> + Send + 'static,
+    T: Send + 'static,
+    F: Future<Output = Result<T, IntentError>> + Send + 'static,
 {
     match tokio::spawn(op).await {
         Ok(result) => result,

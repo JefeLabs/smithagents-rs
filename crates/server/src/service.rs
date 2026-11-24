@@ -296,6 +296,14 @@ impl AgentService {
             .count()
     }
 
+    /// Whether a turn is in flight for agent `id`: from the moment
+    /// `send_message` accepts the message until the turn's final state is
+    /// recorded. That is state `Working` or `Quiet`, plus the instant before
+    /// the turn's task records `Working`.
+    pub fn turn_in_flight(&self, id: AgentId) -> bool {
+        self.inner.reserved().get(&id) == Some(&Slot::Turn)
+    }
+
     /// Atomically claims `id` for `slot`, failing if it is already claimed.
     fn reserve(&self, id: AgentId, slot: Slot) -> Result<Reservation, ServiceError> {
         match self.inner.reserved().entry(id) {
@@ -991,8 +999,11 @@ mod tests {
         let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
         let mut rx = fx.live();
 
+        assert!(!fx.svc.turn_in_flight(agent.id));
         fx.svc.send_message(agent.id, "first".into()).await.unwrap();
         assert_eq!(fx.svc.running_agent_count(), 1);
+        // In flight from the moment the message is accepted.
+        assert!(fx.svc.turn_in_flight(agent.id));
         let err = fx
             .svc
             .send_message(agent.id, "second".into())
@@ -1010,6 +1021,7 @@ mod tests {
             ]
         );
         assert_eq!(fx.svc.running_agent_count(), 0);
+        assert!(!fx.svc.turn_in_flight(agent.id));
     }
 
     #[tokio::test]

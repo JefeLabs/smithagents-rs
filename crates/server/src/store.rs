@@ -204,6 +204,47 @@ async fn insert_version(
     Ok(())
 }
 
+async fn next_version(
+    tx: &mut sqlx::SqliteConnection,
+    intent_id: IntentId,
+) -> Result<i64, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM intent_versions WHERE intent_id = ?",
+    )
+    .bind(intent_id.to_string())
+    .fetch_one(tx)
+    .await?)
+}
+
+async fn update_intent(
+    conn: &mut sqlx::SqliteConnection,
+    intent: &Intent,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE intents SET repo_id = ?, slug = ?, state = ?, phase_json = ?, \
+         seed_json = ?, content_json = ?, agent_id = ?, created_at = ?, updated_at = ?, \
+         queued_at = ?, sent_at = ?, resolved_at = ?, last_start_error = ? WHERE id = ?",
+    )
+    .bind(intent.repo_id.to_string())
+    .bind(&intent.slug)
+    .bind(enum_to_str(&intent.state)?)
+    .bind(serde_json::to_string(&intent.phase).map_err(corrupt)?)
+    .bind(serde_json::to_string(&intent.seed).map_err(corrupt)?)
+    .bind(serde_json::to_string(&intent.content).map_err(corrupt)?)
+    .bind(intent.agent_id.map(|a| a.to_string()))
+    .bind(ts(intent.created_at))
+    .bind(ts(intent.updated_at))
+    .bind(intent.queued_at.map(ts))
+    .bind(intent.sent_at.map(ts))
+    .bind(intent.resolved_at.map(ts))
+    .bind(intent.last_start_error.as_deref())
+    .bind(intent.id.to_string())
+    .execute(conn)
+    .await
+    .map_err(map_intent_conflict)?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -513,29 +554,8 @@ impl Store {
 
     /// Full row update; touches no timestamp itself.
     pub async fn save_intent(&self, intent: &Intent) -> Result<(), StoreError> {
-        sqlx::query(
-            "UPDATE intents SET repo_id = ?, slug = ?, state = ?, phase_json = ?, \
-             seed_json = ?, content_json = ?, agent_id = ?, created_at = ?, updated_at = ?, \
-             queued_at = ?, sent_at = ?, resolved_at = ?, last_start_error = ? WHERE id = ?",
-        )
-        .bind(intent.repo_id.to_string())
-        .bind(&intent.slug)
-        .bind(enum_to_str(&intent.state)?)
-        .bind(serde_json::to_string(&intent.phase).map_err(corrupt)?)
-        .bind(serde_json::to_string(&intent.seed).map_err(corrupt)?)
-        .bind(serde_json::to_string(&intent.content).map_err(corrupt)?)
-        .bind(intent.agent_id.map(|a| a.to_string()))
-        .bind(ts(intent.created_at))
-        .bind(ts(intent.updated_at))
-        .bind(intent.queued_at.map(ts))
-        .bind(intent.sent_at.map(ts))
-        .bind(intent.resolved_at.map(ts))
-        .bind(intent.last_start_error.as_deref())
-        .bind(intent.id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(map_intent_conflict)?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        update_intent(&mut conn, intent).await
     }
 
     /// Stores `v` under the next version number (max + 1, computed inside a
@@ -543,12 +563,22 @@ impl Store {
     /// returns that number. `v.version` is ignored.
     pub async fn append_version(&self, v: &IntentVersion) -> Result<u32, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let next: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM intent_versions WHERE intent_id = ?",
-        )
-        .bind(v.intent_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
+        let next = next_version(&mut tx, v.intent_id).await?;
+        insert_version(&mut tx, v, next).await?;
+        tx.commit().await?;
+        u32::try_from(next).map_err(corrupt)
+    }
+
+    /// [`Self::save_intent`] and [`Self::append_version`] in one
+    /// transaction: both are stored or neither is. Returns the version number.
+    pub async fn save_intent_with_version(
+        &self,
+        intent: &Intent,
+        v: &IntentVersion,
+    ) -> Result<u32, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        update_intent(&mut tx, intent).await?;
+        let next = next_version(&mut tx, v.intent_id).await?;
         insert_version(&mut tx, v, next).await?;
         tx.commit().await?;
         u32::try_from(next).map_err(corrupt)
@@ -1040,6 +1070,39 @@ mod tests {
         store.insert_intent(&i, &version(&i, 1)).await.unwrap();
         assert_eq!(store.append_version(&version(&i, 0)).await.unwrap(), 2);
         assert_eq!(store.append_version(&version(&i, 0)).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn save_with_version_stores_both_or_neither() {
+        let (store, r) = store_with_repo().await;
+        let i = intent(r.id, "one");
+        store.insert_intent(&i, &version(&i, 1)).await.unwrap();
+        let mut sent = i.clone();
+        sent.state = IntentState::Sent;
+        sent.sent_at = Some(Utc::now());
+        let n = store
+            .save_intent_with_version(&sent, &version(&sent, 0))
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(store.get_intent(i.id).await.unwrap(), Some(sent.clone()));
+        assert_eq!(store.list_versions(i.id).await.unwrap().len(), 2);
+
+        // A failing save (slug taken) appends no version.
+        let other = intent(r.id, "two");
+        store
+            .insert_intent(&other, &version(&other, 1))
+            .await
+            .unwrap();
+        let mut clash = sent.clone();
+        clash.slug = "two".into();
+        let err = store
+            .save_intent_with_version(&clash, &version(&clash, 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "got {err:?}");
+        assert_eq!(store.get_intent(i.id).await.unwrap(), Some(sent));
+        assert_eq!(store.list_versions(i.id).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
