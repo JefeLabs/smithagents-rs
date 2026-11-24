@@ -24,12 +24,17 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
 use smithagents_core::agent::{Agent, ChatMessage, Repo};
-use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
+use smithagents_core::intent::{
+    AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentState,
+    IntentVersion, Patch, ReviewAction,
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::events::{BusError, EventBus, Subscription};
 use crate::git::GitError;
+use crate::intents::{IntentError, IntentService};
 use crate::service::{AgentService, ServiceError};
 use crate::store::{Store, StoreError};
 
@@ -40,6 +45,7 @@ const MAX_MESSAGE_LIMIT: u32 = 1000;
 #[derive(Clone)]
 pub struct AppState {
     pub service: AgentService,
+    pub intents: IntentService,
     pub bus: EventBus,
     pub store: Store,
     pub token: Arc<str>,
@@ -58,6 +64,23 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/agents/{id}/messages",
             post(send_message).get(list_messages),
+        )
+        .route("/v1/intents", post(create_intent).get(list_intents))
+        .route("/v1/intents/{id}", get(get_intent).patch(patch_intent))
+        .route("/v1/intents/{id}/versions", get(intent_versions))
+        .route(
+            "/v1/intents/{id}/questions/{qid}/answer",
+            post(answer_question),
+        )
+        .route("/v1/intents/{id}/polish/retry", post(retry_polish))
+        .route("/v1/intents/{id}/items/{iid}/accept", post(accept_item))
+        .route("/v1/intents/{id}/items/{iid}/drop", post(drop_item))
+        .route("/v1/intents/{id}/items/{iid}/edit", post(edit_item))
+        .route("/v1/intents/{id}/send", post(send_intent))
+        .route("/v1/intents/{id}/resolve", post(resolve_intent))
+        .route(
+            "/v1/settings/agent-defaults",
+            get(get_agent_defaults).put(put_agent_defaults),
         )
         .route("/v1/events", get(events))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -128,6 +151,32 @@ impl From<ServiceError> for ApiError {
     }
 }
 
+impl From<IntentError> for ApiError {
+    fn from(e: IntentError) -> Self {
+        use StatusCode as S;
+        if let IntentError::Service(inner) = e {
+            return inner.into();
+        }
+        let status = match &e {
+            IntentError::NotFound | IntentError::RepoNotFound | IntentError::AgentNotFound => {
+                S::NOT_FOUND
+            }
+            IntentError::InvalidState { .. }
+            | IntentError::Polishing
+            | IntentError::AlreadyAnswered
+            | IntentError::DependencyCycle
+            | IntentError::DependencyCrossRepo => S::CONFLICT,
+            IntentError::Invalid(_) => S::BAD_REQUEST,
+            IntentError::Service(_) => unreachable!("handled above"),
+            IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
+        };
+        if status.is_server_error() {
+            tracing::error!("request failed: {e}");
+        }
+        Self::new(status, e.code(), e.to_string())
+    }
+}
+
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         ServiceError::Store(e).into()
@@ -135,13 +184,14 @@ impl From<StoreError> for ApiError {
 }
 
 /// Runs `fut` to completion in its own task so a dropped request cannot cancel it.
-async fn detached<T, F>(fut: F) -> Result<T, ApiError>
+async fn detached<T, E, F>(fut: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
-    F: Future<Output = Result<T, ServiceError>> + Send + 'static,
+    E: Into<ApiError> + Send + 'static,
+    F: Future<Output = Result<T, E>> + Send + 'static,
 {
     match tokio::spawn(fut).await {
-        Ok(result) => result.map_err(ApiError::from),
+        Ok(result) => result.map_err(Into::into),
         Err(e) => {
             tracing::error!("service task failed: {e}");
             Err(ApiError::new(
@@ -199,6 +249,11 @@ fn query<T: DeserializeOwned>(uri: &Uri) -> Result<T, ApiError> {
 
 fn json_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid JSON: {e}")))
+}
+
+fn path_id<T: std::str::FromStr>(raw: &str, what: &str) -> Result<T, ApiError> {
+    raw.parse()
+        .map_err(|_| ApiError::bad_request(format!("invalid {what} id")))
 }
 
 fn agent_id(raw: &str) -> Result<AgentId, ApiError> {
@@ -314,6 +369,178 @@ async fn list_messages(
         .ok_or(ServiceError::AgentNotFound)?;
     let limit = q.limit.clamp(1, MAX_MESSAGE_LIMIT);
     Ok(Json(s.store.list_messages(id, q.after, limit).await?))
+}
+
+// --------------------------------------------------------------- intents
+
+async fn create_intent(
+    State(s): State<AppState>,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Intent>), ApiError> {
+    let req: CreateIntentRequest = json_body(&body)?;
+    let svc = s.intents;
+    let intent = detached(async move { svc.create(req).await }).await?;
+    Ok((StatusCode::CREATED, Json(intent)))
+}
+
+#[derive(Deserialize, Default)]
+struct ListIntentsQuery {
+    state: Option<String>,
+    repo_id: Option<String>,
+}
+
+fn invalid(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "invalid", message)
+}
+
+async fn list_intents(State(s): State<AppState>, uri: Uri) -> Result<Json<Vec<Intent>>, ApiError> {
+    let q: ListIntentsQuery = query(&uri)?;
+    let state = q
+        .state
+        .map(|raw| {
+            serde_json::from_value::<IntentState>(serde_json::Value::String(raw.clone()))
+                .map_err(|_| invalid(format!("unknown intent state '{raw}'")))
+        })
+        .transpose()?;
+    let repo_id = q
+        .repo_id
+        .map(|raw| {
+            raw.parse::<RepoId>()
+                .map_err(|_| invalid("invalid repo id"))
+        })
+        .transpose()?;
+    Ok(Json(s.intents.list(IntentFilter { state, repo_id }).await?))
+}
+
+async fn get_intent(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    Ok(Json(s.intents.get(id).await?))
+}
+
+async fn intent_versions(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<IntentVersion>>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    Ok(Json(s.intents.versions(id).await?))
+}
+
+async fn patch_intent(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    let patch: Patch = json_body(&body)?;
+    let svc = s.intents;
+    detached(async move { svc.update(id, patch).await })
+        .await
+        .map(Json)
+}
+
+async fn answer_question(
+    State(s): State<AppState>,
+    Path((id, qid)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    let qid: QuestionId = path_id(&qid, "question")?;
+    let answer: AnswerInput = json_body(&body)?;
+    let svc = s.intents;
+    detached(async move { svc.answer(id, qid, answer).await })
+        .await
+        .map(Json)
+}
+
+async fn retry_polish(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    let svc = s.intents;
+    detached(async move { svc.retry_polish(id).await })
+        .await
+        .map(Json)
+}
+
+async fn review_item(
+    s: AppState,
+    id: &str,
+    iid: &str,
+    action: ReviewAction,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(id, "intent")?;
+    let iid: ItemId = path_id(iid, "item")?;
+    let svc = s.intents;
+    detached(async move { svc.review(id, iid, action).await })
+        .await
+        .map(Json)
+}
+
+async fn accept_item(
+    State(s): State<AppState>,
+    Path((id, iid)): Path<(String, String)>,
+) -> Result<Json<Intent>, ApiError> {
+    review_item(s, &id, &iid, ReviewAction::Accept).await
+}
+
+async fn drop_item(
+    State(s): State<AppState>,
+    Path((id, iid)): Path<(String, String)>,
+) -> Result<Json<Intent>, ApiError> {
+    review_item(s, &id, &iid, ReviewAction::Drop).await
+}
+
+#[derive(Deserialize)]
+struct EditItemBody {
+    text: String,
+}
+
+async fn edit_item(
+    State(s): State<AppState>,
+    Path((id, iid)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Intent>, ApiError> {
+    let EditItemBody { text } = json_body(&body)?;
+    review_item(s, &id, &iid, ReviewAction::Edit(text)).await
+}
+
+async fn send_intent(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    let svc = s.intents;
+    detached(async move { svc.send(id).await }).await.map(Json)
+}
+
+async fn resolve_intent(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    let svc = s.intents;
+    detached(async move { svc.resolve(id).await })
+        .await
+        .map(Json)
+}
+
+async fn get_agent_defaults(State(s): State<AppState>) -> Result<Json<AgentDefaults>, ApiError> {
+    Ok(Json(s.intents.agent_defaults().await?))
+}
+
+async fn put_agent_defaults(
+    State(s): State<AppState>,
+    body: Bytes,
+) -> Result<Json<AgentDefaults>, ApiError> {
+    let defaults: AgentDefaults = json_body(&body)?;
+    let svc = s.intents;
+    detached(async move { svc.set_agent_defaults(defaults).await })
+        .await
+        .map(Json)
 }
 
 // ------------------------------------------------------------- websocket

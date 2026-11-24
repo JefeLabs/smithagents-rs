@@ -21,11 +21,13 @@ use smithagents_core::daemon::DaemonInfo;
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::harness::claude::ClaudeCodeHarness;
+use smithagents_server::intents::IntentService;
 use smithagents_server::lifecycle::{
     acquire_instance_lock, generate_instance_id, generate_token, remove_lockfile, write_lockfile,
     IdleMonitor, LockError,
 };
 use smithagents_server::paths::Paths;
+use smithagents_server::queue::Scheduler;
 use smithagents_server::service::AgentService;
 use smithagents_server::store::Store;
 use tokio::net::TcpListener;
@@ -188,13 +190,28 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     let service = AgentService::new(
         store.clone(),
         bus.clone(),
-        harness,
+        harness.clone(),
         paths.clone(),
         QUIET_AFTER,
     );
+    let intents = IntentService::new(
+        store.clone(),
+        bus.clone(),
+        harness,
+        service.clone(),
+        paths.clone(),
+    );
+    // Polish passes that were running when the last daemon died are marked
+    // failed, so the user can retry them. Must precede the scheduler.
+    let recovered = intents.recover().await?;
+    tracing::info!(count = recovered, "recovered intents left polishing");
+    // Runs a first pass at once, so queued intents whose dependencies
+    // resolved while the daemon was down start now.
+    let scheduler = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
     let ws_clients = Arc::new(AtomicUsize::new(0));
     let state = AppState {
         service: service.clone(),
+        intents,
         bus,
         store,
         token: Arc::from(token.as_str()),
@@ -227,6 +244,8 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
         }
     };
     let served = serve(listener, router(state), stop).await;
+    // Let a pass in progress finish before the runtime goes away.
+    scheduler.shutdown().await;
     remove_lockfile(paths);
     Ok(served?)
 }

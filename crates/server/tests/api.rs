@@ -17,7 +17,9 @@ use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::harness::HarnessEvent;
+use smithagents_server::intents::IntentService;
 use smithagents_server::paths::Paths;
+use smithagents_server::queue::{Scheduler, SchedulerHandle};
 use smithagents_server::service::AgentService;
 use smithagents_server::store::Store;
 use tempfile::TempDir;
@@ -31,6 +33,9 @@ const INSTANCE_ID: &str = "0123456789abcdef";
 struct Fx {
     tmp: TempDir,
     state: AppState,
+    harness: FakeHarness,
+    /// Keeps the queue scheduler running for the fixture's lifetime.
+    _sched: SchedulerHandle,
 }
 
 async fn fixture(harness: FakeHarness, bus_capacity: usize) -> Fx {
@@ -44,12 +49,21 @@ async fn fixture(harness: FakeHarness, bus_capacity: usize) -> Fx {
     let service = AgentService::new(
         store.clone(),
         bus.clone(),
-        Arc::new(harness),
-        paths,
+        Arc::new(harness.clone()),
+        paths.clone(),
         Duration::from_secs(3600),
     );
+    let intents = IntentService::new(
+        store.clone(),
+        bus.clone(),
+        Arc::new(harness.clone()),
+        service.clone(),
+        paths,
+    );
+    let sched = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
     let state = AppState {
         service,
+        intents,
         bus,
         store,
         token: Arc::from(TOKEN),
@@ -57,7 +71,12 @@ async fn fixture(harness: FakeHarness, bus_capacity: usize) -> Fx {
         ws_clients: Arc::new(AtomicUsize::new(0)),
         started_at: Instant::now(),
     };
-    Fx { tmp, state }
+    Fx {
+        tmp,
+        state,
+        harness,
+        _sched: sched,
+    }
 }
 
 async fn default_fx() -> Fx {
@@ -613,4 +632,688 @@ async fn lagging_client_is_closed_with_reason_lagged() {
     }
     assert_eq!(reason.as_deref(), Some("lagged"));
     wait_for_clients(&fx.state, 0).await;
+}
+
+// --------------------------------------------------------------- intents
+
+fn pass1(
+    title: &str,
+    questions: usize,
+) -> Result<Value, smithagents_server::harness::HarnessError> {
+    let questions: Vec<Value> = (1..=questions)
+        .map(|n| {
+            json!({
+                "text": format!("Question {n}?"),
+                "options": [{"label": "Yes"}, {"label": "No"}]
+            })
+        })
+        .collect();
+    Ok(json!({
+        "title": title,
+        "kind": "enhancement",
+        "current_behavior": "Builds are slow.",
+        "questions": questions,
+    }))
+}
+
+fn pass2(deps: &[Value]) -> Result<Value, smithagents_server::harness::HarnessError> {
+    let deps: Vec<Value> = deps
+        .iter()
+        .map(|d| json!({"intent_id": d, "reason": "it must land first"}))
+        .collect();
+    Ok(json!({
+        "preconditions": ["CI is green"],
+        "acceptance_criteria": ["Builds finish quickly"],
+        "stories": ["As a developer I get feedback quickly"],
+        "depends_on": deps,
+    }))
+}
+
+fn turn_done() -> Vec<HarnessEvent> {
+    vec![HarnessEvent::TurnCompleted {
+        session_id: "s".into(),
+        is_error: false,
+        result_text: None,
+    }]
+}
+
+impl Fx {
+    async fn get_intent(&self, id: &str) -> Value {
+        let (status, body) = self
+            .call(Method::GET, &format!("/v1/intents/{id}"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    async fn wait_intent(&self, id: &str, pred: impl Fn(&Value) -> bool) -> Value {
+        for _ in 0..400 {
+            let body = self.get_intent(id).await;
+            if pred(&body) {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "intent never reached the wanted state: {}",
+            self.get_intent(id).await
+        );
+    }
+
+    async fn text_intent(&self, repo: &Repo, text: &str) -> Value {
+        let (status, body) = self
+            .call(
+                Method::POST,
+                "/v1/intents",
+                Some(json!({ "repo_id": repo.id, "seed": { "text": text } })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body
+    }
+
+    /// A text intent taken through polish and review to `complete`.
+    async fn complete_intent(&self, repo: &Repo, title: &str, deps: &[Value]) -> Value {
+        self.harness
+            .script_structured(vec![pass1(title, 1), pass2(deps)]);
+        let created = self.text_intent(repo, title).await;
+        let id = created["id"].as_str().unwrap().to_owned();
+        let drafted = self
+            .wait_intent(&id, |i| i["phase"]["kind"] == "questions")
+            .await;
+        let q = &drafted["content"]["questions"][0];
+        let (status, body) = self
+            .call(
+                Method::POST,
+                &format!(
+                    "/v1/intents/{id}/questions/{}/answer",
+                    q["id"].as_str().unwrap()
+                ),
+                Some(json!({ "option_id": q["options"][0]["id"] })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reviewing = self
+            .wait_intent(&id, |i| i["phase"]["kind"] == "review")
+            .await;
+        let mut last = reviewing.clone();
+        for section in ["preconditions", "criteria", "stories", "depends_on"] {
+            for item in reviewing["content"][section].as_array().unwrap() {
+                let (status, body) = self
+                    .call(
+                        Method::POST,
+                        &format!(
+                            "/v1/intents/{id}/items/{}/accept",
+                            item["id"].as_str().unwrap()
+                        ),
+                        None,
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                last = body;
+            }
+        }
+        assert_eq!(last["state"], "complete", "{last}");
+        last
+    }
+}
+
+#[tokio::test]
+async fn intent_routes_require_a_token() {
+    let fx = default_fx().await;
+    let id = smithagents_core::ids::IntentId::new();
+    for (method, uri) in [
+        (Method::POST, "/v1/intents".to_owned()),
+        (Method::GET, "/v1/intents".to_owned()),
+        (Method::GET, format!("/v1/intents/{id}")),
+        (Method::POST, format!("/v1/intents/{id}/send")),
+        (Method::GET, "/v1/settings/agent-defaults".to_owned()),
+        (Method::PUT, "/v1/settings/agent-defaults".to_owned()),
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri(&uri)
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = raw(&fx.state, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+        assert_error(&body, "unauthorized");
+    }
+}
+
+#[tokio::test]
+async fn create_get_list_and_versions() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    fx.harness
+        .script_structured(vec![pass1("Faster builds", 1)]);
+    let created = fx.text_intent(&repo, "make builds faster").await;
+    let id = created["id"].as_str().unwrap();
+    assert_eq!(created["state"], "draft");
+    assert_eq!(created["repo_id"], json!(repo.id));
+
+    let got = fx.get_intent(id).await;
+    assert_eq!(got["id"], created["id"]);
+
+    let (status, list) = fx.call(Method::GET, "/v1/intents", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (_, list) = fx.call(Method::GET, "/v1/intents?state=draft", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (_, list) = fx.call(Method::GET, "/v1/intents?state=sent", None).await;
+    assert!(list.as_array().unwrap().is_empty());
+    let (_, list) = fx
+        .call(
+            Method::GET,
+            &format!("/v1/intents?repo_id={}&state=draft", repo.id),
+            None,
+        )
+        .await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let (_, list) = fx
+        .call(
+            Method::GET,
+            &format!(
+                "/v1/intents?repo_id={}",
+                smithagents_core::ids::RepoId::new()
+            ),
+            None,
+        )
+        .await;
+    assert!(list.as_array().unwrap().is_empty());
+
+    fx.wait_intent(id, |i| i["phase"]["kind"] == "questions")
+        .await;
+    let (status, versions) = fx
+        .call(Method::GET, &format!("/v1/intents/{id}/versions"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    assert!(versions.is_array());
+}
+
+#[tokio::test]
+async fn patch_updates_content() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    fx.harness
+        .script_structured(vec![pass1("Faster builds", 1)]);
+    let created = fx.text_intent(&repo, "make builds faster").await;
+    let id = created["id"].as_str().unwrap();
+    fx.wait_intent(id, |i| i["phase"]["kind"] == "questions")
+        .await;
+    let (status, body) = fx
+        .call(
+            Method::PATCH,
+            &format!("/v1/intents/{id}"),
+            Some(json!({ "title": "Renamed", "kind": "bug" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["content"]["title"], "Renamed");
+    assert_eq!(body["content"]["kind"], "bug");
+}
+
+#[tokio::test]
+async fn unknown_ids_are_404_and_bad_uuids_400() {
+    let fx = default_fx().await;
+    let id = smithagents_core::ids::IntentId::new();
+    let other = smithagents_core::ids::ItemId::new();
+    for (method, uri, body) in [
+        (Method::GET, format!("/v1/intents/{id}"), None),
+        (Method::GET, format!("/v1/intents/{id}/versions"), None),
+        (
+            Method::PATCH,
+            format!("/v1/intents/{id}"),
+            Some(json!({"title": "x"})),
+        ),
+        (
+            Method::POST,
+            format!("/v1/intents/{id}/questions/{other}/answer"),
+            Some(json!({"skip": true})),
+        ),
+        (Method::POST, format!("/v1/intents/{id}/polish/retry"), None),
+        (
+            Method::POST,
+            format!("/v1/intents/{id}/items/{other}/accept"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/intents/{id}/items/{other}/drop"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/intents/{id}/items/{other}/edit"),
+            Some(json!({"text": "t"})),
+        ),
+        (Method::POST, format!("/v1/intents/{id}/send"), None),
+        (Method::POST, format!("/v1/intents/{id}/resolve"), None),
+    ] {
+        let (status, resp) = fx.call(method, &uri, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {resp}");
+        assert_error(&resp, "intent_not_found");
+    }
+    for (method, uri, body) in [
+        (Method::GET, "/v1/intents/nope".to_owned(), None),
+        (Method::GET, "/v1/intents/nope/versions".to_owned(), None),
+        (
+            Method::PATCH,
+            "/v1/intents/nope".to_owned(),
+            Some(json!({})),
+        ),
+        (Method::POST, "/v1/intents/nope/send".to_owned(), None),
+        (Method::POST, "/v1/intents/nope/resolve".to_owned(), None),
+        (
+            Method::POST,
+            format!("/v1/intents/{id}/items/nope/accept"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/v1/intents/{id}/questions/nope/answer"),
+            Some(json!({"skip": true})),
+        ),
+    ] {
+        let (status, resp) = fx.call(method, &uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {resp}");
+        assert!(resp["error"].is_string(), "{resp}");
+    }
+}
+
+#[tokio::test]
+async fn create_errors() {
+    let fx = default_fx().await;
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            "/v1/intents",
+            Some(
+                json!({ "repo_id": smithagents_core::ids::RepoId::new(), "seed": { "text": "x" } }),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_error(&body, "repo_not_found");
+
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            "/v1/intents",
+            Some(json!({ "seed": { "chat": { "agent_id": AgentId::new() } } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_error(&body, "agent_not_found");
+
+    let (status, _) = fx
+        .call(Method::POST, "/v1/intents", Some(json!({ "nonsense": 1 })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn bad_state_filter_is_invalid() {
+    let fx = default_fx().await;
+    let (status, body) = fx.call(Method::GET, "/v1/intents?state=bogus", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_error(&body, "invalid");
+    let (status, body) = fx
+        .call(Method::GET, "/v1/intents?repo_id=bogus", None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_error(&body, "invalid");
+}
+
+#[tokio::test]
+async fn conflict_codes() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    fx.harness
+        .script_structured(vec![pass1("One", 1), pass2(&[])]);
+    let created = fx.text_intent(&repo, "one").await;
+    let id = created["id"].as_str().unwrap();
+
+    // Still polishing, or in the questions phase: cannot be sent.
+    let (status, body) = fx
+        .call(Method::POST, &format!("/v1/intents/{id}/send"), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        ["invalid_state", "polishing"].contains(&body["error"].as_str().unwrap()),
+        "{body}"
+    );
+
+    let drafted = fx
+        .wait_intent(id, |i| i["phase"]["kind"] == "questions")
+        .await;
+    let (status, body) = fx
+        .call(Method::POST, &format!("/v1/intents/{id}/send"), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error(&body, "invalid_state");
+    let (status, body) = fx
+        .call(Method::POST, &format!("/v1/intents/{id}/resolve"), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error(&body, "invalid_state");
+
+    // An unknown option is a plain invalid answer.
+    let q = drafted["content"]["questions"][0]["id"].as_str().unwrap();
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/intents/{id}/questions/{q}/answer"),
+            Some(json!({ "option_id": "nope" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_error(&body, "invalid");
+
+    // Answering twice is 409 already_answered; the first answer closes the
+    // last question, so the second may also find the draft polishing or in
+    // review. Skip the first so the question stays recorded as answered.
+    let (status, _) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/intents/{id}/questions/{q}/answer"),
+            Some(json!({ "skip": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/intents/{id}/questions/{q}/answer"),
+            Some(json!({ "skip": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        ["already_answered", "polishing", "invalid_state"]
+            .contains(&body["error"].as_str().unwrap()),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn already_answered_is_409() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    fx.harness.script_structured(vec![pass1("Two", 2)]);
+    let created = fx.text_intent(&repo, "two questions").await;
+    let id = created["id"].as_str().unwrap();
+    let drafted = fx
+        .wait_intent(id, |i| i["phase"]["kind"] == "questions")
+        .await;
+    let q = drafted["content"]["questions"][0]["id"].as_str().unwrap();
+    let uri = format!("/v1/intents/{id}/questions/{q}/answer");
+    let (status, _) = fx
+        .call(Method::POST, &uri, Some(json!({ "skip": true })))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = fx
+        .call(Method::POST, &uri, Some(json!({ "skip": true })))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_error(&body, "already_answered");
+}
+
+#[tokio::test]
+async fn polish_retry_after_failure() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    fx.harness.script_structured(vec![
+        Err(smithagents_server::harness::HarnessError::Failed(
+            "boom".into(),
+        )),
+        pass1("Recovered", 1),
+    ]);
+    let created = fx.text_intent(&repo, "retry me").await;
+    let id = created["id"].as_str().unwrap();
+    fx.wait_intent(id, |i| i["phase"]["kind"] == "failed").await;
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/intents/{id}/polish/retry"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fx.wait_intent(id, |i| i["phase"]["kind"] == "questions")
+        .await;
+}
+
+#[tokio::test]
+async fn edit_and_drop_items() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    fx.harness
+        .script_structured(vec![pass1("Review me", 1), pass2(&[])]);
+    let created = fx.text_intent(&repo, "review").await;
+    let id = created["id"].as_str().unwrap();
+    let drafted = fx
+        .wait_intent(id, |i| i["phase"]["kind"] == "questions")
+        .await;
+    let q = &drafted["content"]["questions"][0];
+    fx.call(
+        Method::POST,
+        &format!(
+            "/v1/intents/{id}/questions/{}/answer",
+            q["id"].as_str().unwrap()
+        ),
+        Some(json!({ "skip": true })),
+    )
+    .await;
+    let reviewing = fx.wait_intent(id, |i| i["phase"]["kind"] == "review").await;
+    let item = reviewing["content"]["preconditions"][0]["id"]
+        .as_str()
+        .unwrap();
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/intents/{id}/items/{item}/edit"),
+            Some(json!({ "text": "CI is very green" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["content"]["preconditions"][0]["text"],
+        "CI is very green"
+    );
+    assert_eq!(body["content"]["preconditions"][0]["status"], "accepted");
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/intents/{id}/items/{item}/drop"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["content"]["preconditions"][0]["status"], "dropped");
+}
+
+#[tokio::test]
+async fn agent_defaults_round_trip() {
+    let fx = default_fx().await;
+    let (status, body) = fx
+        .call(Method::GET, "/v1/settings/agent-defaults", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "queue_limit": null }));
+    let (status, body) = fx
+        .call(
+            Method::PUT,
+            "/v1/settings/agent-defaults",
+            Some(json!({ "queue_limit": 2 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "queue_limit": 2 }));
+    let (_, body) = fx
+        .call(Method::GET, "/v1/settings/agent-defaults", None)
+        .await;
+    assert_eq!(body, json!({ "queue_limit": 2 }));
+    let (status, body) = fx
+        .call(
+            Method::PUT,
+            "/v1/settings/agent-defaults",
+            Some(json!({ "queue_limit": null })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "queue_limit": null }));
+    let (status, body) = fx
+        .call(
+            Method::PUT,
+            "/v1/settings/agent-defaults",
+            Some(json!({ "queue_limit": 100000 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_error(&body, "invalid");
+}
+
+#[tokio::test]
+async fn oversized_intent_body_is_rejected() {
+    let fx = default_fx().await;
+    let huge = "x".repeat(2 * 1024 * 1024);
+    let (status, _) = fx
+        .call(
+            Method::POST,
+            "/v1/intents",
+            Some(json!({ "seed": { "text": huge } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn intent_events_arrive_over_the_websocket() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    let addr = fx.serve().await;
+    let mut ws = ws_connect(addr, "").await;
+    wait_for_clients(&fx.state, 1).await;
+
+    fx.harness.script_structured(vec![pass1("Events", 1)]);
+    let created = fx.text_intent(&repo, "watch me").await;
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let mut kinds = Vec::new();
+    let mut saw_created = false;
+    let mut saw_questions = false;
+    while !saw_questions {
+        let event = next_event(&mut ws).await;
+        match &event.kind {
+            EventKind::IntentCreated(i) if i.id.to_string() == id => {
+                saw_created = true;
+                kinds.push("intent_created");
+            }
+            EventKind::IntentUpdated(i) if i.id.to_string() == id => {
+                kinds.push("intent_updated");
+                saw_questions = matches!(i.phase, smithagents_core::intent::Phase::Questions);
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_created, "{kinds:?}");
+    assert_eq!(kinds[0], "intent_created");
+    assert!(kinds.contains(&"intent_updated"));
+}
+
+#[tokio::test]
+async fn full_loop_over_http_ends_with_the_dependent_starting() {
+    // Turns: the chat agent's reply, then the two intent agents.
+    let harness = FakeHarness::scripted(vec![turn_done(), turn_done(), turn_done()]);
+    let fx = fixture(harness, 4096).await;
+    let repo = fx.add_repo().await;
+    let chat = fx.create_agent(&repo).await;
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/agents/{}/messages", chat.id),
+            Some(json!({ "text": "we should make the build faster" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // Intent A from the chat.
+    fx.harness
+        .script_structured(vec![pass1("Speed up builds", 1), pass2(&[])]);
+    let (status, a) = fx
+        .call(
+            Method::POST,
+            "/v1/intents",
+            Some(json!({ "seed": { "chat": { "agent_id": chat.id } } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{a}");
+    let a_id = a["id"].as_str().unwrap().to_owned();
+    let drafted = fx
+        .wait_intent(&a_id, |i| i["phase"]["kind"] == "questions")
+        .await;
+    let q = &drafted["content"]["questions"][0];
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!(
+                "/v1/intents/{a_id}/questions/{}/answer",
+                q["id"].as_str().unwrap()
+            ),
+            Some(json!({ "option_id": q["options"][0]["id"] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reviewing = fx
+        .wait_intent(&a_id, |i| i["phase"]["kind"] == "review")
+        .await;
+    let mut last = reviewing.clone();
+    for section in ["preconditions", "criteria", "stories"] {
+        for item in reviewing["content"][section].as_array().unwrap() {
+            let (_, body) = fx
+                .call(
+                    Method::POST,
+                    &format!(
+                        "/v1/intents/{a_id}/items/{}/accept",
+                        item["id"].as_str().unwrap()
+                    ),
+                    None,
+                )
+                .await;
+            last = body;
+        }
+    }
+    assert_eq!(last["state"], "complete", "{last}");
+
+    // Intent B depends on A.
+    let b = fx
+        .complete_intent(&repo, "Cache the builds", &[json!(a_id)])
+        .await;
+    let b_id = b["id"].as_str().unwrap().to_owned();
+
+    // B waits for A.
+    let (status, sent_b) = fx
+        .call(Method::POST, &format!("/v1/intents/{b_id}/send"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent_b}");
+    assert_eq!(sent_b["state"], "queued");
+
+    // A starts at once.
+    let (status, sent_a) = fx
+        .call(Method::POST, &format!("/v1/intents/{a_id}/send"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{sent_a}");
+    let a_sent = fx.wait_intent(&a_id, |i| i["state"] == "sent").await;
+    assert!(a_sent["agent_id"].is_string());
+    assert_eq!(fx.get_intent(&b_id).await["state"], "queued");
+
+    // Resolving A lets the scheduler start B.
+    let (status, resolved) = fx
+        .call(Method::POST, &format!("/v1/intents/{a_id}/resolve"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{resolved}");
+    assert_eq!(resolved["state"], "resolved");
+    let b_sent = fx.wait_intent(&b_id, |i| i["state"] == "sent").await;
+    assert!(b_sent["agent_id"].is_string());
 }
