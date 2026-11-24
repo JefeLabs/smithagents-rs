@@ -25,8 +25,10 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 fs2 = "0.4.3"
 subtle = "2.6.1"
 rand = "0.10.4"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+# The client speaks plain HTTP to 127.0.0.1 only: no TLS backend, no OS proxy settings.
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 tokio-tungstenite = "0.30.0"
+rustix = "1.1.6"
 tempfile = "3.27.0"
 async-trait = "0.1.92"
 futures = "0.3.34"
