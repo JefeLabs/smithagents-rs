@@ -1,0 +1,25 @@
+{
+  "system_pair": { "dark": "smith-dark", "light": "smith-light" },
+  "radius_px": 8,
+  "spacing_rem": 0.25,
+  "text_scale": { "min": 0.85, "max": 1.5, "default": 1.0 },
+  "text_sizes_rem": { "xs": 0.75, "sm": 0.875, "base": 1, "lg": 1.125, "xl": 1.25 },
+  "fonts": [
+    {
+      "id": "system",
+      "label": "System",
+      "sans": "ui-sans-serif, system-ui, sans-serif",
+      "mono": "ui-monospace, SFMono-Regular, Menlo, monospace",
+      "native_sans": ".SystemUIFont",
+      "native_mono": "Menlo"
+    },
+    {
+      "id": "mono",
+      "label": "Monospace",
+      "sans": "ui-monospace, SFMono-Regular, Menlo, monospace",
+      "mono": "ui-monospace, SFMono-Regular, Menlo, monospace",
+      "native_sans": "Menlo",
+      "native_mono": "Menlo"
+    }
+  ]
+}

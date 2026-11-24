@@ -1,0 +1,31 @@
+{
+  "id": "smith-dark",
+  "name": "Smith Dark",
+  "appearance": "dark",
+  "colors": {
+    "background": { "l": 0.18, "c": 0.01, "h": 260 },
+    "foreground": { "l": 0.96, "c": 0.005, "h": 260 },
+    "card": { "l": 0.22, "c": 0.012, "h": 260 },
+    "card-foreground": { "l": 0.96, "c": 0.005, "h": 260 },
+    "popover": { "l": 0.25, "c": 0.014, "h": 260 },
+    "popover-foreground": { "l": 0.96, "c": 0.005, "h": 260 },
+    "primary": { "l": 0.92, "c": 0.01, "h": 260 },
+    "primary-foreground": { "l": 0.2, "c": 0.01, "h": 260 },
+    "secondary": { "l": 0.28, "c": 0.012, "h": 260 },
+    "secondary-foreground": { "l": 0.96, "c": 0.005, "h": 260 },
+    "muted": { "l": 0.26, "c": 0.01, "h": 260 },
+    "muted-foreground": { "l": 0.72, "c": 0.015, "h": 260 },
+    "accent": { "l": 0.3, "c": 0.015, "h": 260 },
+    "accent-foreground": { "l": 0.96, "c": 0.005, "h": 260 },
+    "destructive": { "l": 0.7, "c": 0.19, "h": 25 },
+    "border": { "l": 0.32, "c": 0.012, "h": 260 },
+    "input": { "l": 0.36, "c": 0.012, "h": 260 },
+    "ring": { "l": 0.65, "c": 0.05, "h": 260 },
+    "selection": { "l": 0.4, "c": 0.06, "h": 260 },
+    "status-ok": { "l": 0.75, "c": 0.17, "h": 150 },
+    "status-warn": { "l": 0.82, "c": 0.15, "h": 95 },
+    "status-error": { "l": 0.7, "c": 0.19, "h": 25 },
+    "status-info": { "l": 0.72, "c": 0.03, "h": 250 }
+  },
+  "agent": { "l": 0.72, "c": 0.12 }
+}

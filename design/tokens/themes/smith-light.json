@@ -1,0 +1,31 @@
+{
+  "id": "smith-light",
+  "name": "Smith Light",
+  "appearance": "light",
+  "colors": {
+    "background": { "l": 0.985, "c": 0.003, "h": 260 },
+    "foreground": { "l": 0.2, "c": 0.01, "h": 260 },
+    "card": { "l": 1, "c": 0, "h": 0 },
+    "card-foreground": { "l": 0.2, "c": 0.01, "h": 260 },
+    "popover": { "l": 1, "c": 0, "h": 0 },
+    "popover-foreground": { "l": 0.2, "c": 0.01, "h": 260 },
+    "primary": { "l": 0.22, "c": 0.01, "h": 260 },
+    "primary-foreground": { "l": 0.98, "c": 0.003, "h": 260 },
+    "secondary": { "l": 0.96, "c": 0.006, "h": 260 },
+    "secondary-foreground": { "l": 0.25, "c": 0.01, "h": 260 },
+    "muted": { "l": 0.955, "c": 0.006, "h": 260 },
+    "muted-foreground": { "l": 0.5, "c": 0.02, "h": 260 },
+    "accent": { "l": 0.94, "c": 0.008, "h": 260 },
+    "accent-foreground": { "l": 0.22, "c": 0.01, "h": 260 },
+    "destructive": { "l": 0.577, "c": 0.22, "h": 27 },
+    "border": { "l": 0.9, "c": 0.006, "h": 260 },
+    "input": { "l": 0.88, "c": 0.006, "h": 260 },
+    "ring": { "l": 0.6, "c": 0.04, "h": 260 },
+    "selection": { "l": 0.88, "c": 0.05, "h": 260 },
+    "status-ok": { "l": 0.55, "c": 0.15, "h": 150 },
+    "status-warn": { "l": 0.6, "c": 0.12, "h": 90 },
+    "status-error": { "l": 0.577, "c": 0.22, "h": 27 },
+    "status-info": { "l": 0.55, "c": 0.03, "h": 250 }
+  },
+  "agent": { "l": 0.62, "c": 0.1 }
+}
