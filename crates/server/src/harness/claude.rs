@@ -16,6 +16,7 @@ use super::{Harness, HarnessError, HarnessEvent, TurnRequest};
 
 const STDERR_MAX_LINES: usize = 20;
 const STDERR_MAX_BYTES: usize = 4096;
+const STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Runs turns by spawning the Claude Code CLI at `bin`.
 #[derive(Debug, Clone)]
@@ -79,7 +80,7 @@ impl Harness for ClaudeCodeHarness {
         let mut stderr = child.stderr.take().expect("stderr piped");
 
         // Drain stderr concurrently so a full pipe can never block the child.
-        let stderr_task = tokio::spawn(async move {
+        let mut stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(&mut stderr).lines();
             let mut tail: VecDeque<String> = VecDeque::new();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -99,7 +100,10 @@ impl Harness for ClaudeCodeHarness {
             let mut lines = BufReader::new(stdout).lines();
             loop {
                 let line = tokio::select! {
-                    () = tx.closed() => break,
+                    () = tx.closed() => {
+                        stderr_task.abort();
+                        break;
+                    }
                     l = lines.next_line() => l,
                 };
                 match line {
@@ -111,6 +115,7 @@ impl Harness for ClaudeCodeHarness {
                             Ok(events) => {
                                 for ev in events {
                                     if tx.send(ev).await.is_err() {
+                                        stderr_task.abort();
                                         return;
                                     }
                                 }
@@ -126,10 +131,20 @@ impl Harness for ClaudeCodeHarness {
                 }
             }
             let status = tokio::select! {
-                () = tx.closed() => return,
+                () = tx.closed() => {
+                    stderr_task.abort();
+                    return;
+                }
                 s = child.wait() => s,
             };
-            let tail = stderr_task.await.unwrap_or_default();
+            // A grandchild may keep stderr open after the child exits; do not wait for it.
+            let tail = match tokio::time::timeout(STDERR_DRAIN_TIMEOUT, &mut stderr_task).await {
+                Ok(joined) => joined.unwrap_or_default(),
+                Err(_) => {
+                    stderr_task.abort();
+                    String::new()
+                }
+            };
             let failure = match status {
                 Ok(s) if s.success() => None,
                 Ok(s) => Some(format!("claude exited with {s}")),

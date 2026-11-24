@@ -233,3 +233,20 @@ async fn dropping_stream_kills_process() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[tokio::test]
+async fn lingering_grandchild_holding_stderr_does_not_delay_failed() {
+    let env = setup(&[
+        ("FAKE_CLAUDE_FIXTURE", FIXTURE),
+        ("FAKE_CLAUDE_EXIT", "2"),
+        ("FAKE_CLAUDE_GRANDCHILD_SECS", "8"),
+    ]);
+    let start = Instant::now();
+    let events = collect(&env, req(env.dir.path(), None)).await;
+    assert!(matches!(events.last(), Some(HarnessEvent::Failed { .. })));
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        start.elapsed()
+    );
+}
