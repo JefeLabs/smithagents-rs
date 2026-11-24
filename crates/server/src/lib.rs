@@ -4,5 +4,6 @@ pub mod git;
 pub mod harness;
 pub mod lifecycle;
 pub mod paths;
+pub mod polish;
 pub mod service;
 pub mod store;
