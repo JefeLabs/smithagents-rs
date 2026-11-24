@@ -110,6 +110,47 @@ enum TurnEnd {
     Dead,
 }
 
+/// Assistant text of the running turn that is not saved yet.
+///
+/// Text is saved as its own message whenever a tool call follows it, so the
+/// transcript keeps the order in which things happened. Separate text blocks
+/// within one saved message are joined by a blank line.
+#[derive(Default)]
+struct Reply {
+    pending: String,
+    /// A text block started after the pending text.
+    new_block: bool,
+    /// Some assistant text of this turn has been taken for saving.
+    taken_any: bool,
+}
+
+impl Reply {
+    fn start_block(&mut self) {
+        self.new_block = !self.pending.is_empty();
+    }
+
+    fn push(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.new_block) {
+            self.pending.push_str("\n\n");
+        }
+        self.pending.push_str(text);
+    }
+
+    /// The pending text, if there is any worth saving; empties the buffer.
+    fn take(&mut self) -> Option<String> {
+        self.new_block = false;
+        let text = std::mem::take(&mut self.pending);
+        if text.trim().is_empty() {
+            return None;
+        }
+        self.taken_any = true;
+        Some(text)
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentService {
     inner: Arc<Inner>,
@@ -335,9 +376,9 @@ impl AgentService {
         };
         let mut stream = match self.inner.harness.run_turn(request).await {
             Ok(stream) => stream,
-            Err(e) => return self.record_failure(id, "", &e.to_string()).await,
+            Err(e) => return self.record_failure(id, None, &e.to_string()).await,
         };
-        let mut reply = String::new();
+        let mut reply = Reply::default();
         let mut quiet = false;
         loop {
             let next = if quiet {
@@ -353,7 +394,7 @@ impl AgentService {
                 }
             };
             let Some(event) = next else {
-                return self.record_failure(id, &reply, STREAM_ENDED).await;
+                return self.record_failure(id, reply.take(), STREAM_ENDED).await;
             };
             if quiet {
                 quiet = false;
@@ -363,14 +404,16 @@ impl AgentService {
                 HarnessEvent::SessionStarted { session_id } => {
                     self.save_session(id, &mut session, session_id).await?;
                 }
+                HarnessEvent::TextBlockStarted => reply.start_block(),
                 HarnessEvent::AssistantText { text } => {
-                    self.inner.bus.publish(EventKind::TurnDelta {
-                        agent_id: id,
-                        text: text.clone(),
-                    });
-                    reply.push_str(&text);
+                    reply.push(&text);
+                    self.inner
+                        .bus
+                        .publish(EventKind::TurnDelta { agent_id: id, text });
                 }
                 HarnessEvent::ToolUse { name, summary } => {
+                    // The text so far came before this call.
+                    self.save_reply(id, &mut reply).await?;
                     let text = if summary.is_empty() {
                         name
                     } else {
@@ -388,24 +431,26 @@ impl AgentService {
                         let reason = result_text
                             .filter(|t| !t.is_empty())
                             .unwrap_or_else(|| "the turn ended with an error".into());
-                        let end = self.record_failure(id, &reply, &reason).await?;
+                        let end = self.record_failure(id, reply.take(), &reason).await?;
                         wait_for_exit(id, stream).await;
                         return Ok(end);
                     }
-                    let text = if reply.is_empty() {
-                        result_text.unwrap_or_default()
-                    } else {
-                        reply
-                    };
-                    self.append(id, Role::Assistant, &text).await?;
+                    self.save_reply(id, &mut reply).await?;
+                    // The result repeats the final text, which normally
+                    // streamed already; it is only used when nothing did.
+                    if !reply.taken_any {
+                        if let Some(text) = result_text.filter(|t| !t.trim().is_empty()) {
+                            self.append(id, Role::Assistant, &text).await?;
+                        }
+                    }
                     // The reply is complete, but a process that then fails still failed.
                     return match wait_for_exit(id, stream).await {
-                        Some(failure) => self.record_failure(id, "", &failure).await,
+                        Some(failure) => self.record_failure(id, None, &failure).await,
                         None => Ok(TurnEnd::Done),
                     };
                 }
                 HarnessEvent::Failed { message } => {
-                    return self.record_failure(id, &reply, &message).await;
+                    return self.record_failure(id, reply.take(), &message).await;
                 }
             }
         }
@@ -428,15 +473,24 @@ impl AgentService {
         Ok(())
     }
 
-    /// Keeps any text already streamed, then records the failure. The session id is kept.
+    /// Saves the pending assistant text, if any, as its own message.
+    async fn save_reply(&self, id: AgentId, reply: &mut Reply) -> Result<(), ServiceError> {
+        if let Some(text) = reply.take() {
+            self.append(id, Role::Assistant, &text).await?;
+        }
+        Ok(())
+    }
+
+    /// Keeps the text streamed but not yet saved (`partial`), then records the
+    /// failure. The session id is kept.
     async fn record_failure(
         &self,
         id: AgentId,
-        partial: &str,
+        partial: Option<String>,
         reason: &str,
     ) -> Result<TurnEnd, ServiceError> {
-        if !partial.is_empty() {
-            self.append(id, Role::Assistant, partial).await?;
+        if let Some(partial) = partial {
+            self.append(id, Role::Assistant, &partial).await?;
         }
         self.append(id, Role::Assistant, &format!("{FAILURE_PREFIX}{reason}"))
             .await?;
@@ -446,7 +500,7 @@ impl AgentService {
     /// Best-effort failure record for a turn that could not finish normally.
     async fn abort_turn(&self, id: AgentId, reason: &str) -> TurnEnd {
         tracing::error!(agent_id = %id, "{reason}");
-        if let Err(e) = self.record_failure(id, "", reason).await {
+        if let Err(e) = self.record_failure(id, None, reason).await {
             tracing::error!(agent_id = %id, "could not record turn failure: {e}");
         }
         TurnEnd::Dead
@@ -1126,6 +1180,162 @@ mod tests {
                 (Role::Assistant, "listed".to_string()),
             ]
         );
+    }
+
+    fn block() -> HarnessEvent {
+        HarnessEvent::TextBlockStarted
+    }
+
+    fn tool(name: &str, summary: &str) -> HarnessEvent {
+        HarnessEvent::ToolUse {
+            name: name.into(),
+            summary: summary.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_around_a_tool_call_is_saved_in_order() {
+        let fx = fixture(vec![vec![
+            started("s1"),
+            block(),
+            text("I'll check."),
+            tool("Bash", "ls"),
+            block(),
+            text("Done."),
+            completed("s1", Some("Done.")),
+        ]])
+        .await;
+        let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let mut rx = fx.live();
+
+        fx.svc.send_message(agent.id, "go".into()).await.unwrap();
+        let events = until_turn_ends(&mut rx, agent.id).await;
+        assert_eq!(
+            describe_all(&events),
+            [
+                "User: go",
+                "state Working",
+                "delta I'll check.",
+                "Assistant: I'll check.",
+                "Tool: Bash: ls",
+                "delta Done.",
+                "Assistant: Done.",
+                "state Done",
+            ]
+        );
+        assert_eq!(
+            fx.messages(agent.id).await,
+            [
+                (Role::User, "go".to_string()),
+                (Role::Assistant, "I'll check.".to_string()),
+                (Role::Tool, "Bash: ls".to_string()),
+                (Role::Assistant, "Done.".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_text_blocks_are_saved_as_paragraphs() {
+        let fx = fixture(vec![vec![
+            started("s1"),
+            block(),
+            text("One"),
+            text(" more."),
+            block(),
+            text("Two."),
+            completed("s1", Some("Two.")),
+        ]])
+        .await;
+        let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let mut rx = fx.live();
+
+        fx.svc.send_message(agent.id, "go".into()).await.unwrap();
+        let events = until_turn_ends(&mut rx, agent.id).await;
+        // Live deltas are passed on as they came.
+        assert_eq!(
+            describe_all(&events),
+            [
+                "User: go",
+                "state Working",
+                "delta One",
+                "delta  more.",
+                "delta Two.",
+                "Assistant: One more.\n\nTwo.",
+                "state Done",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn result_text_is_not_saved_again_after_streamed_text() {
+        // The result repeats the last text; it was already saved before the tool.
+        let fx = fixture(vec![vec![
+            started("s1"),
+            text("Checking."),
+            tool("Read", "a.txt"),
+            completed("s1", Some("Checking.")),
+        ]])
+        .await;
+        let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let mut rx = fx.live();
+
+        fx.svc.send_message(agent.id, "go".into()).await.unwrap();
+        until_turn_ends(&mut rx, agent.id).await;
+        assert_eq!(
+            fx.messages(agent.id).await,
+            [
+                (Role::User, "go".to_string()),
+                (Role::Assistant, "Checking.".to_string()),
+                (Role::Tool, "Read: a.txt".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_without_any_text_saves_no_assistant_message() {
+        let fx = fixture(vec![vec![started("s1"), block(), completed("s1", None)]]).await;
+        let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let mut rx = fx.live();
+
+        fx.svc.send_message(agent.id, "go".into()).await.unwrap();
+        let events = until_turn_ends(&mut rx, agent.id).await;
+        assert_eq!(
+            describe_all(&events),
+            ["User: go", "state Working", "state Done"]
+        );
+        assert_eq!(
+            fx.messages(agent.id).await,
+            [(Role::User, "go".to_string())]
+        );
+        assert_eq!(fx.agent(agent.id).await.state, AgentState::Done);
+    }
+
+    #[tokio::test]
+    async fn failure_after_a_tool_keeps_text_in_order() {
+        let fx = fixture(vec![vec![
+            started("s1"),
+            text("I'll check."),
+            tool("Bash", "ls"),
+            text("half"),
+            failed("boom"),
+        ]])
+        .await;
+        let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let mut rx = fx.live();
+
+        fx.svc.send_message(agent.id, "go".into()).await.unwrap();
+        until_turn_ends(&mut rx, agent.id).await;
+        assert_eq!(
+            fx.messages(agent.id).await,
+            [
+                (Role::User, "go".to_string()),
+                (Role::Assistant, "I'll check.".to_string()),
+                (Role::Tool, "Bash: ls".to_string()),
+                (Role::Assistant, "half".to_string()),
+                (Role::Assistant, "Agent process failed: boom".to_string()),
+            ]
+        );
+        assert_eq!(fx.agent(agent.id).await.state, AgentState::Dead);
     }
 
     /// A harness whose stream panics, standing in for a bug in turn handling.

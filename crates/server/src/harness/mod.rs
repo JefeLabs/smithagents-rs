@@ -26,6 +26,9 @@ pub enum HarnessEvent {
     SessionStarted {
         session_id: String,
     },
+    /// A new block of assistant text begins. Text of separate blocks belongs
+    /// in separate paragraphs; the deltas themselves carry no separator.
+    TextBlockStarted,
     AssistantText {
         text: String,
     },

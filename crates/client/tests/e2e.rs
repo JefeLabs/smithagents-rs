@@ -25,7 +25,10 @@ use smithagents_core::ids::AgentId;
 use smithagents_core::palette::palette;
 use smithagents_core::VERSION;
 
-use common::{claude_fixture, daemon_bin, fake_claude, git, init_repo, pid_alive, TestHome};
+use common::{
+    claude_fixture, claude_tool_fixture, daemon_bin, fake_claude, git, init_repo, pid_alive,
+    TestHome,
+};
 
 /// Bounds each wait: a hang is a failure, not a stuck run.
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -96,16 +99,23 @@ fn fixture() -> Fixture {
 /// fake-claude's side of one test: the argv and stdin of its latest run, and
 /// the control directory that decides what its next run does.
 struct FakeClaude {
+    fixture: PathBuf,
     args_file: PathBuf,
     stdin_file: PathBuf,
     control_dir: PathBuf,
 }
 
 impl FakeClaude {
+    /// Replays the hello fixture on every run.
     fn new(scratch: &Path) -> Self {
+        Self::replaying(scratch, claude_fixture())
+    }
+
+    fn replaying(scratch: &Path, fixture: PathBuf) -> Self {
         let control_dir = scratch.join("fake-claude-control");
         std::fs::create_dir(&control_dir).unwrap();
         FakeClaude {
+            fixture,
             args_file: scratch.join("fake-claude-args"),
             stdin_file: scratch.join("fake-claude-stdin"),
             control_dir,
@@ -119,7 +129,7 @@ impl FakeClaude {
         let mut options = SpawnOptions {
             args: vec!["--claude-bin".into(), fake_claude().into()],
             env: vec![
-                ("FAKE_CLAUDE_FIXTURE".into(), claude_fixture().into()),
+                ("FAKE_CLAUDE_FIXTURE".into(), self.fixture.clone().into()),
                 (
                     "FAKE_CLAUDE_ARGS_FILE".into(),
                     self.args_file.clone().into(),
@@ -338,6 +348,67 @@ async fn chat_flow_end_to_end() {
         assert_eq!(all.len(), 1, "{all:?}");
         assert_eq!((all[0].id, all[0].name.as_str()), (agent.id, "Mercury"));
         assert!(all[0].closed_at.is_some(), "{all:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tool_using_turn_is_saved_in_the_order_it_happened() {
+    let bin = daemon_bin();
+    let home = TestHome::new();
+    bounded(TEST_DEADLINE, async {
+        let fake = FakeClaude::replaying(home.scratch(), claude_tool_fixture());
+        let client = ensure(&home, bin, &fake.daemon_options(&[], &[])).await;
+        let agent = new_agent(&client, &home.scratch().join("repo")).await;
+
+        let mut events = client.events(None).await.unwrap();
+        client.send_message(agent.id, "hello").await.unwrap();
+        // Collect the live deltas on the way to the end of the turn.
+        let mut deltas = String::new();
+        let end = within("the turn", async {
+            while let Some(event) = events.next().await {
+                match event.kind {
+                    EventKind::TurnDelta { agent_id, text } if agent_id == agent.id => {
+                        deltas.push_str(&text);
+                    }
+                    EventKind::AgentUpdated(a)
+                        if a.id == agent.id
+                            && matches!(a.state, AgentState::Done | AgentState::Dead) =>
+                    {
+                        return a;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("the event stream ended first");
+        })
+        .await;
+        let messages = chat(&client, agent.id).await;
+        assert_eq!(
+            end.state,
+            AgentState::Done,
+            "chat: {messages:?}; daemon log:\n{}",
+            home.log()
+        );
+        // Text before the tool call, the call, then the two closing text
+        // blocks as paragraphs of one message.
+        assert_eq!(
+            messages,
+            [
+                said(Role::User, "hello"),
+                said(Role::Assistant, "I'll check the file."),
+                said(Role::Tool, "Read: README.md"),
+                said(
+                    Role::Assistant,
+                    "The file is a short README.\n\nIt has one heading."
+                ),
+            ]
+        );
+        // Live deltas are passed on as claude streamed them.
+        assert_eq!(
+            deltas,
+            "I'll check the file.The file is a short README.It has one heading."
+        );
     })
     .await;
 }

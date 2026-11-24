@@ -17,7 +17,10 @@ const SUMMARY_MAX_CHARS: usize = 80;
 ///
 /// Whole-message `assistant` text blocks are ignored because the same text
 /// already arrived as `text_delta` stream events (with
-/// `--include-partial-messages`); mapping both would double-count. If one
+/// `--include-partial-messages`); mapping both would double-count. The start
+/// of each text block is reported, so separate blocks can be kept apart.
+/// Stream events of sub-agents (a non-null `parent_tool_use_id`) are ignored.
+/// If one
 /// `assistant` message holds several `tool_use` blocks only the first is
 /// returned here; use [`parse_events`] to get all of them.
 pub fn parse_line(line: &str) -> Result<Option<HarnessEvent>, ParseError> {
@@ -35,15 +38,28 @@ pub fn parse_events(line: &str) -> Result<Vec<HarnessEvent>, ParseError> {
                 .into_iter()
                 .collect()
         }
+        // A sub-agent (Task tool) streams its own messages, marked with the id
+        // of the tool call that started it; they are not this agent's reply.
+        Some("stream_event") if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) => {
+            Vec::new()
+        }
         Some("stream_event") => {
             let event = v.get("event");
-            let is_delta = event.and_then(|e| e.get("type")).and_then(Value::as_str)
-                == Some("content_block_delta");
-            let delta = event.and_then(|e| e.get("delta"));
-            let is_text =
-                delta.and_then(|d| d.get("type")).and_then(Value::as_str) == Some("text_delta");
-            match delta.and_then(|d| str_at(d, "text")) {
-                Some(text) if is_delta && is_text => vec![HarnessEvent::AssistantText { text }],
+            match type_of(event) {
+                Some("content_block_start")
+                    if type_of(event.and_then(|e| e.get("content_block"))) == Some("text") =>
+                {
+                    vec![HarnessEvent::TextBlockStarted]
+                }
+                Some("content_block_delta") => {
+                    let delta = event.and_then(|e| e.get("delta"));
+                    match delta.and_then(|d| str_at(d, "text")) {
+                        Some(text) if type_of(delta) == Some("text_delta") => {
+                            vec![HarnessEvent::AssistantText { text }]
+                        }
+                        _ => Vec::new(),
+                    }
+                }
                 _ => Vec::new(),
             }
         }
@@ -75,6 +91,11 @@ pub fn parse_events(line: &str) -> Result<Vec<HarnessEvent>, ParseError> {
         _ => Vec::new(),
     };
     Ok(events)
+}
+
+/// The `type` field of an optional JSON object.
+fn type_of(v: Option<&Value>) -> Option<&str> {
+    v.and_then(|v| v.get("type")).and_then(Value::as_str)
 }
 
 /// Short human-readable description of a tool call's input.
@@ -132,6 +153,42 @@ mod tests {
             Some(HarnessEvent::AssistantText {
                 text: "Hi! How".into()
             })
+        );
+    }
+
+    #[test]
+    fn text_block_start_marks_a_block_boundary() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}},"parent_tool_use_id":null}"#;
+        assert_eq!(
+            parse_line(line).unwrap(),
+            Some(HarnessEvent::TextBlockStarted)
+        );
+    }
+
+    #[test]
+    fn non_text_block_starts_are_ignored() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"Read","input":{}}}}"#;
+        assert_eq!(parse_line(line).unwrap(), None);
+    }
+
+    #[test]
+    fn sub_agent_stream_events_are_ignored() {
+        // A sub-agent (Task tool) streams its own messages, marked with the id
+        // of the tool call that started it; they are not the agent's reply.
+        for event in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"sub"}}"#,
+        ] {
+            let line = format!(
+                r#"{{"type":"stream_event","event":{event},"parent_tool_use_id":"toolu_01","session_id":"{SID}"}}"#
+            );
+            assert_eq!(parse_line(&line).unwrap(), None, "{line}");
+        }
+        // The agent's own deltas carry a null parent.
+        let own = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"own"}},"parent_tool_use_id":null}"#;
+        assert_eq!(
+            parse_line(own).unwrap(),
+            Some(HarnessEvent::AssistantText { text: "own".into() })
         );
     }
 
@@ -258,6 +315,41 @@ mod tests {
         assert_eq!(
             parse_line(&line).unwrap(),
             Some(HarnessEvent::AssistantText { text })
+        );
+    }
+
+    #[test]
+    fn tool_use_fixture_keeps_text_blocks_and_tool_call_in_order() {
+        let raw = include_str!("../../tests/fixtures/claude_stream_tool_use.jsonl");
+        let events: Vec<HarnessEvent> = raw
+            .lines()
+            .flat_map(|l| parse_events(l).expect("fixture line parses"))
+            .collect();
+        let text = |t: &str| HarnessEvent::AssistantText { text: t.into() };
+        assert_eq!(
+            events,
+            [
+                HarnessEvent::SessionStarted {
+                    session_id: "5d1c1e5a-0f3b-4c7e-9a52-7b0f3e9d2c41".into()
+                },
+                HarnessEvent::TextBlockStarted,
+                text("I'll check "),
+                text("the file."),
+                HarnessEvent::ToolUse {
+                    name: "Read".into(),
+                    summary: "README.md".into()
+                },
+                HarnessEvent::TextBlockStarted,
+                text("The file is "),
+                text("a short README."),
+                HarnessEvent::TextBlockStarted,
+                text("It has one heading."),
+                HarnessEvent::TurnCompleted {
+                    session_id: "5d1c1e5a-0f3b-4c7e-9a52-7b0f3e9d2c41".into(),
+                    is_error: false,
+                    result_text: Some("The file is a short README.\n\nIt has one heading.".into())
+                },
+            ]
         );
     }
 

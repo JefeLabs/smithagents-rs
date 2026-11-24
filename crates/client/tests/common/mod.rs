@@ -68,6 +68,11 @@ pub fn claude_fixture() -> PathBuf {
     workspace_root().join("crates/server/tests/fixtures/claude_stream_hello.jsonl")
 }
 
+/// A hand-written transcript of a turn that calls a tool between text blocks.
+pub fn claude_tool_fixture() -> PathBuf {
+    workspace_root().join("crates/server/tests/fixtures/claude_stream_tool_use.jsonl")
+}
+
 /// Writes an executable `sh` script, `body` after the shebang line.
 pub fn shell_script(path: &Path, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
