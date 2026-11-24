@@ -31,16 +31,24 @@ pub enum GitError {
     Io(#[from] std::io::Error),
 }
 
-async fn git_raw(cwd: &Path, args: &[&str]) -> Result<Output, GitError> {
+/// Builds a git command with a sanitized environment. `LC_ALL`/`LANGUAGE` are
+/// pinned to `C` so the stderr patterns we match are never localized.
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .kill_on_drop(true);
-    Ok(cmd.output().await?)
+    cmd
+}
+
+async fn git_raw(cwd: &Path, args: &[&str]) -> Result<Output, GitError> {
+    Ok(git_command(cwd, args).output().await?)
 }
 
 fn stderr_of(out: &Output) -> String {
@@ -174,6 +182,8 @@ mod tests {
             ])
             .args(args)
             .current_dir(cwd)
+            .env("LC_ALL", "C")
+            .env("LANGUAGE", "C")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .output()
@@ -194,6 +204,17 @@ mod tests {
 
     fn canon(p: &Path) -> PathBuf {
         std::fs::canonicalize(p).unwrap()
+    }
+
+    #[test]
+    fn git_command_pins_locale_and_clears_git_env() {
+        let cmd = git_command(Path::new("."), &["status"]);
+        let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+        let val = |k: &str| envs.get(std::ffi::OsStr::new(k)).copied();
+        assert_eq!(val("LC_ALL"), Some(Some(std::ffi::OsStr::new("C"))));
+        assert_eq!(val("LANGUAGE"), Some(Some(std::ffi::OsStr::new("C"))));
+        assert_eq!(val("GIT_DIR"), Some(None));
+        assert_eq!(val("GIT_WORK_TREE"), Some(None));
     }
 
     #[tokio::test]
