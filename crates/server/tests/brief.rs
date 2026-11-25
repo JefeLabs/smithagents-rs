@@ -123,7 +123,9 @@ Login fails for ünïcode names.
 
 ## Depends on
 
-- Auth core (auth-core): {}",
+- Auth core (auth-core): {}
+
+Before you start: if the repository has a remote, fetch it and rebase this branch onto the remote's default branch, so the merged work of these dependencies is present.",
         "a".repeat(300)
     );
     assert_eq!(brief.first_message, expected);

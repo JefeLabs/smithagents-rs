@@ -12,6 +12,11 @@ the intent you are given. Commit your work, and open the pull request when you a
 Check `git remote` yourself: a GitHub remote is not required, and if the repository has none, \
 leave the commits on your branch, skip the pull request, and say so.";
 
+/// Follows the "Depends on" section of an intent that has dependencies.
+const REBASE_ON_DEPENDENCIES: &str = "Before you start: if the repository has a remote, \
+fetch it and rebase this branch onto the remote's default branch, so the merged work of \
+these dependencies is present.";
+
 /// What the agent needs to know about an intent this one depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepSummary {
@@ -88,7 +93,11 @@ pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
             format!("- {} ({}): {}", d.title, d.slug, behavior)
         })
         .collect();
-    parts.extend(section("Depends on", depends));
+    if let Some(depends) = section("Depends on", depends) {
+        // The worktree branches off the local default branch, which may
+        // predate the dependencies' merges.
+        parts.push(format!("{depends}\n\n{REBASE_ON_DEPENDENCIES}"));
+    }
 
     Brief {
         system_append: SYSTEM_APPEND.to_string(),
