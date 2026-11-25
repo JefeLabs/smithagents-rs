@@ -6551,9 +6551,15 @@ dependencies = [
  "chrono",
  "futures",
  "gpui-kit",
+ "rustix",
  "serde_json",
  "signal-hook",
+ "smithagents-client",
  "smithagents-core",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
