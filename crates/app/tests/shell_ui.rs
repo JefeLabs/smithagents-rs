@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use gpui_kit::base::Root;
-use gpui_kit::component::dock::{DockAreaState, DockPlacement, DockState, PanelInfo, PanelState};
+use gpui_kit::component::dock::{
+    DockArea, DockAreaState, DockPlacement, DockState, PanelInfo, PanelState,
+};
 use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
 use gpui_kit::{
     point, px, size, AppContext as _, Bounds, Entity, MouseButton, Pixels, Point, TestAppContext,
@@ -1071,4 +1073,231 @@ fn the_left_pane_spans_the_height_and_the_rail_sits_at_the_far_right(cx: &mut Te
         assert!(banner.right() <= content.width - px(RAIL_WIDTH));
     })
     .unwrap();
+}
+
+// The right dock keeps the user's preferred width: the width it is drawn at
+// is only the part of it that fits beside the left pane.
+
+/// Seeds a layout file: the right dock `right` px wide (open or not) and the
+/// left pane in `left_mode`.
+fn seed_right_dock(store: &LayoutStore, right: f32, open: bool, left_mode: LeftPaneMode) {
+    let panel = |name: &str| PanelState {
+        panel_name: name.into(),
+        children: vec![],
+        info: PanelInfo::panel(serde_json::Value::Null),
+    };
+    store
+        .save(&with_left_pane(
+            DockAreaState {
+                version: Some(LAYOUT_VERSION),
+                center: panel("Center"),
+                left_dock: None,
+                right_dock: Some(DockState::new(
+                    panel("Settings"),
+                    DockPlacement::Right,
+                    px(right),
+                    open,
+                )),
+                bottom_dock: None,
+            },
+            LeftPaneLayout {
+                mode: left_mode,
+                expanded_width: DEFAULT_LEFT_PANE_WIDTH,
+            },
+        ))
+        .unwrap();
+}
+
+fn right_width(cx: &mut TestAppContext, dock: &Entity<DockArea>) -> Pixels {
+    dock.read_with(cx, |area, _| area.dock_size(DockPlacement::Right).unwrap())
+}
+
+/// The right dock's width in the layout file, once the debounce has elapsed.
+fn saved_right_width(cx: &mut TestAppContext, store: &LayoutStore) -> Pixels {
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    saved_dock(
+        &store.load().expect("the layout was written"),
+        DockPlacement::Right,
+    )
+    .expect("the right dock was written")
+    .size
+}
+
+fn center_width(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Root>,
+    state: &Entity<ShellState>,
+) -> f64 {
+    let mut scale = 1.0;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        scale = f64::from(window.scale_factor());
+    })
+    .unwrap();
+    state
+        .read_with(cx, |state, _| state.center_rect())
+        .unwrap()
+        .w
+        / scale
+}
+
+#[gpui_kit::test]
+fn the_preferred_right_dock_width_comes_back_when_the_left_pane_compacts(cx: &mut TestAppContext) {
+    let home = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(home.path());
+    seed_right_dock(&store, 500., true, LeftPaneMode::Compact);
+    let (window, shell) = open_shell_full(
+        cx,
+        ShellModel::new(),
+        Some(store.clone()),
+        None,
+        (1000., 700.),
+    );
+    let (state, dock) =
+        shell.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+    assert_eq!(right_width(cx, &dock), px(500.));
+
+    // Expanding makes the dock give way, keeping the center wide enough.
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+        .unwrap();
+    assert_eq!(mode(cx, &state), LeftPaneMode::Expanded);
+    let shrunk = right_width(cx, &dock);
+    assert_eq!(
+        shrunk,
+        px(1000. - RAIL_WIDTH) - DEFAULT_LEFT_PANE_WIDTH - MIN_CENTER_WIDTH
+    );
+    assert!(shrunk < px(500.));
+    assert!(center_width(cx, window, &state) >= f64::from(f32::from(MIN_CENTER_WIDTH)) - 1.0);
+    assert_eq!(
+        saved_right_width(cx, &store),
+        px(500.),
+        "the file keeps the preference"
+    );
+
+    // Compacting gives the dock its width back, exactly.
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+        .unwrap();
+    assert_eq!(mode(cx, &state), LeftPaneMode::Compact);
+    assert_eq!(right_width(cx, &dock), px(500.));
+    assert_eq!(saved_right_width(cx, &store), px(500.));
+}
+
+#[gpui_kit::test]
+fn a_fit_while_the_right_dock_is_closed_keeps_the_preference(cx: &mut TestAppContext) {
+    let home = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(home.path());
+    seed_right_dock(&store, 500., false, LeftPaneMode::Compact);
+    let (window, shell) = open_shell_full(
+        cx,
+        ShellModel::new(),
+        Some(store.clone()),
+        None,
+        (1000., 700.),
+    );
+    let (state, dock) =
+        shell.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+    assert!(!dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Right)));
+
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+        .unwrap();
+    assert_eq!(mode(cx, &state), LeftPaneMode::Expanded);
+    assert_eq!(
+        saved_right_width(cx, &store),
+        px(500.),
+        "closed: still 500 in the file"
+    );
+
+    // Opening it from the rail shows the fitted width.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(RailEntry::Settings.element_id(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Right)));
+    assert_eq!(
+        right_width(cx, &dock),
+        px(1000. - RAIL_WIDTH) - DEFAULT_LEFT_PANE_WIDTH - MIN_CENTER_WIDTH
+    );
+    assert!(center_width(cx, window, &state) >= f64::from(f32::from(MIN_CENTER_WIDTH)) - 1.0);
+
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+        .unwrap();
+    assert_eq!(right_width(cx, &dock), px(500.));
+    assert_eq!(saved_right_width(cx, &store), px(500.));
+}
+
+#[gpui_kit::test]
+fn dragging_the_right_docks_handle_sets_the_preferred_width(cx: &mut TestAppContext) {
+    let home = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(home.path());
+    seed_right_dock(&store, 300., true, LeftPaneMode::Compact);
+    let (window, shell) = open_shell_full(
+        cx,
+        ShellModel::new(),
+        Some(store.clone()),
+        None,
+        (1000., 700.),
+    );
+    let (state, dock) =
+        shell.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+
+    let mut from = point(px(0.), px(0.));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        from = window.find("resize-handle-right").bounds().center();
+    })
+    .unwrap();
+    // The dock's right edge is the rail's left edge.
+    let to = point(px(1000. - RAIL_WIDTH - 450.), from.y);
+    cx.update_window(window.into(), |_, window, cx| window.drag(from, to, cx))
+        .unwrap();
+    assert_eq!(right_width(cx, &dock), px(450.));
+    assert_eq!(
+        saved_right_width(cx, &store),
+        px(450.),
+        "the drag is the new preference"
+    );
+
+    // It survives an expand and compact cycle.
+    for _ in 0..2 {
+        cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+            .unwrap();
+    }
+    assert_eq!(mode(cx, &state), LeftPaneMode::Compact);
+    assert_eq!(right_width(cx, &dock), px(450.));
+    assert_eq!(saved_right_width(cx, &store), px(450.));
+}
+
+#[gpui_kit::test]
+fn resizing_the_window_refits_an_open_right_dock(cx: &mut TestAppContext) {
+    let home = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(home.path());
+    seed_right_dock(&store, 500., true, LeftPaneMode::Compact);
+    let (window, shell) = open_shell_full(
+        cx,
+        ShellModel::new(),
+        Some(store.clone()),
+        None,
+        (1000., 700.),
+    );
+    let (state, dock) =
+        shell.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+    assert_eq!(right_width(cx, &dock), px(500.));
+
+    cx.simulate_window_resize(window.into(), size(px(800.), px(700.)));
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert_eq!(
+        right_width(cx, &dock),
+        px(800. - RAIL_WIDTH) - COMPACT_LEFT_PANE_WIDTH - MIN_CENTER_WIDTH
+    );
+    assert!(center_width(cx, window, &state) >= f64::from(f32::from(MIN_CENTER_WIDTH)) - 1.0);
+    assert_eq!(saved_right_width(cx, &store), px(500.));
+
+    cx.simulate_window_resize(window.into(), size(px(1000.), px(700.)));
+    cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert_eq!(right_width(cx, &dock), px(500.));
+    assert_eq!(saved_right_width(cx, &store), px(500.));
 }

@@ -5,7 +5,8 @@
 //!   `left_dock` entry the shell writes for its left pane, which is not a
 //!   dock ([`with_left_pane`], [`saved_left_pane`]). The panel tree is fixed,
 //!   so what it restores is the right dock's size and open state
-//!   ([`saved_dock`]), fitted to the window ([`fit_panes`]), and the left
+//!   ([`saved_dock`]), taken as the user's preferred width and fitted to the window
+//!   ([`fitted_right_width`]), and the left
 //!   pane's mode and expanded width.
 //! - `<home>/app-window.json`, the main window's place and size
 //!   ([`SavedWindow`]), reused only where it can be seen
@@ -24,6 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::view_models::LeftPaneMode;
+use crate::views::rail::RAIL_WIDTH;
 
 pub const LAYOUT_FILE_NAME: &str = "app-layout.json";
 pub const WINDOW_FILE_NAME: &str = "app-window.json";
@@ -37,6 +39,9 @@ pub const LAYOUT_VERSION: usize = 1;
 /// out of a normal window. The lower bound is the dock's own minimum.
 pub const MIN_DOCK_SIZE: Pixels = px(100.);
 pub const MAX_DOCK_SIZE: Pixels = px(1000.);
+
+/// The right dock's width when nothing is saved.
+pub const DEFAULT_RIGHT_DOCK_SIZE: Pixels = px(300.);
 
 /// The width the center keeps when the side docks are fitted to a window.
 pub const MIN_CENTER_WIDTH: Pixels = px(320.);
@@ -228,23 +233,31 @@ pub fn restored_window_bounds(
     })
 }
 
-/// The right dock's width fitted beside the left pane in `available` (the
-/// width the panes share, rail excluded) so the center keeps
-/// [`MIN_CENTER_WIDTH`]: unchanged when it fits, otherwise shrunk, never below
-/// [`MIN_DOCK_SIZE`]. The left pane counts as [`COMPACT_LEFT_PANE_WIDTH`]
-/// when compact and as its expanded width when expanded. The expanded width
-/// is never changed here: when even a minimum right dock leaves too little
-/// room, the left pane is narrowed only where it is drawn
-/// ([`left_pane_extent`]), so a larger window shows the remembered width
-/// again. An unknown width changes nothing.
-pub fn fit_panes(left: LeftPaneLayout, right: Pixels, available: Pixels) -> Pixels {
-    let left_width = match left.mode {
-        LeftPaneMode::Compact => COMPACT_LEFT_PANE_WIDTH,
-        LeftPaneMode::Expanded => left.expanded_width,
+/// The width the right dock is drawn at: the user's `preferred` width (clamped
+/// to [`MIN_DOCK_SIZE`]..=[`MAX_DOCK_SIZE`]; [`DEFAULT_RIGHT_DOCK_SIZE`] when
+/// not finite), narrowed if needed so the center keeps [`MIN_CENTER_WIDTH`]
+/// in a window `window_width` wide (rail included) beside a left pane drawn
+/// `left_drawn_width` wide, but never below [`MIN_DOCK_SIZE`]. When even a
+/// minimum right dock leaves too little room, the left pane is narrowed where
+/// it is drawn ([`left_pane_extent`]), never this. Pure: the preferred width
+/// is an input and is never rewritten, so more room gives it back. An unknown
+/// window or left width changes nothing.
+pub fn fitted_right_width(
+    preferred: Pixels,
+    window_width: Pixels,
+    left_drawn_width: Pixels,
+) -> Pixels {
+    let preferred = if f32::from(preferred).is_finite() {
+        preferred.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE)
+    } else {
+        DEFAULT_RIGHT_DOCK_SIZE
     };
-    let room = f32::from(available) - f32::from(left_width) - f32::from(MIN_CENTER_WIDTH);
-    if !room.is_finite() || f32::from(right) <= room {
-        return right;
+    let room = f32::from(window_width)
+        - RAIL_WIDTH
+        - f32::from(left_drawn_width)
+        - f32::from(MIN_CENTER_WIDTH);
+    if !room.is_finite() || f32::from(preferred) <= room {
+        return preferred;
     }
     px(room.floor().max(f32::from(MIN_DOCK_SIZE)))
 }
@@ -316,6 +329,21 @@ pub fn with_left_pane(mut state: DockAreaState, left: LeftPaneLayout) -> DockAre
         left.expanded_width,
         left.mode == LeftPaneMode::Expanded,
     ));
+    state
+}
+
+/// `state` with the right dock's saved size set to the user's `preferred`
+/// width: the dock is dumped at the width it is drawn, which may be
+/// temporarily fitted narrower, and the file keeps what the user chose.
+pub fn with_right_preferred(mut state: DockAreaState, preferred: Pixels) -> DockAreaState {
+    state.right_dock = state.right_dock.map(|dock| {
+        DockState::new(
+            dock.panel().clone(),
+            dock.placement(),
+            preferred,
+            dock.open(),
+        )
+    });
     state
 }
 

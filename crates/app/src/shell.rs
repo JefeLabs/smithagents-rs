@@ -34,8 +34,9 @@ use gpui_kit::{
 use smithagents_theme::native::NativeTheme;
 
 use crate::layout_store::{
-    fit_panes, left_pane_extent, saved_dock, saved_left_pane, saved_window, with_left_pane,
-    LayoutStore, LeftPaneLayout, SavedWindow, LAYOUT_VERSION,
+    fitted_right_width, left_pane_extent, saved_dock, saved_left_pane, saved_window,
+    with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
+    DEFAULT_RIGHT_DOCK_SIZE, LAYOUT_VERSION, MIN_DOCK_SIZE,
 };
 use crate::link::{DaemonLink, LinkConfig};
 use crate::model::ShellModel;
@@ -66,7 +67,6 @@ pub const LEFT_PANE_ID: &str = "left-pane";
 pub const LEFT_PANE_RESIZE_ID: &str = "left-pane-resize";
 
 const DOCK_AREA_ID: &str = "smithagents-shell";
-const DEFAULT_RIGHT_DOCK: Pixels = px(300.);
 /// Layout changes (a resize drag fires many) are written this long after the
 /// last one.
 const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
@@ -112,6 +112,14 @@ pub struct Shell {
     /// The left pane's content (Task 13 replaces the placeholder).
     left_pane: Entity<LeftPanePlaceholder>,
     layout: Option<LayoutStore>,
+    /// The right dock's width the user chose (a drag of its handle, or the
+    /// saved layout). It is what the layout file keeps; the width drawn is
+    /// this, fitted beside the left pane and the window
+    /// ([`fitted_right_width`]) and so never above it.
+    preferred_right: Pixels,
+    /// The width this shell last put the right dock at, or saw it settle at.
+    /// A dock size different from this is a drag of the user's.
+    applied_right: Pixels,
     /// The window's place and size as last observed (not updated while
     /// fullscreen).
     window_place: Option<SavedWindow>,
@@ -141,9 +149,8 @@ impl Shell {
             .as_ref()
             .and_then(|saved| saved_dock(saved, DockPlacement::Right));
         let left = saved.as_ref().and_then(saved_left_pane).unwrap_or_default();
-        let available = window.viewport_size().width - px(RAIL_WIDTH);
-        let right_size = saved_right.map_or(DEFAULT_RIGHT_DOCK, |right| right.size);
-        let right_size = fit_panes(left, right_size, available);
+        let preferred_right = saved_right.map_or(DEFAULT_RIGHT_DOCK_SIZE, |right| right.size);
+        let right_size = fit_right(left, preferred_right, window);
         if saved.is_some() {
             tracing::debug!(
                 mode = ?left.mode,
@@ -193,6 +200,11 @@ impl Shell {
                     cx.notify();
                 }
             }),
+            // A drag of the right dock's handle changes its size without a
+            // layout event; this is how the user's width is noticed.
+            cx.observe_in(&dock, window, |this, _, window, cx| {
+                this.on_dock_notified(window, cx);
+            }),
             cx.subscribe_in(&state, window, |this, _, event: &ShellEvent, window, cx| {
                 match event {
                     ShellEvent::LeftPaneChanged => {
@@ -214,6 +226,8 @@ impl Shell {
                 );
             }),
             cx.observe_window_bounds(window, |this, window, cx| {
+                // The dock's room changed with the window.
+                this.refit_right_dock(window, cx);
                 let place = window_place(window, cx);
                 if place.is_some() && place != this.window_place {
                     this.window_place = place;
@@ -244,6 +258,8 @@ impl Shell {
             dock,
             left_pane,
             layout,
+            preferred_right,
+            applied_right: right_size,
             window_place: window_place(window, cx),
             last_saved_layout: None,
             last_saved_window: None,
@@ -284,16 +300,19 @@ impl Shell {
         }
     }
 
-    /// Shrinks the right dock if, beside the left pane, it would leave the
-    /// center less than its minimum width (see `layout_store::fit_panes`).
+    /// Draws the right dock at its preferred width fitted to the window and
+    /// the left pane (see [`fitted_right_width`]). Called when an input
+    /// changed: the left pane's mode or width, the window's size, the dock
+    /// opening. It rewrites only the drawn width, never the preference, and
+    /// does so open or closed, so a dock opened later is already fitted.
     fn refit_right_dock(&mut self, window: &mut Window, cx: &mut App) {
         let left = self.state.read(cx).left_pane_layout();
-        let available = window.viewport_size().width - px(RAIL_WIDTH);
+        let fitted = fit_right(left, self.preferred_right, window);
+        self.applied_right = fitted;
         self.dock.update(cx, |area, cx| {
             let Some(right) = area.dock_size(DockPlacement::Right) else {
                 return;
             };
-            let fitted = fit_panes(left, right, available);
             if fitted != right {
                 tracing::debug!(
                     ?right,
@@ -303,6 +322,33 @@ impl Shell {
                 area.set_dock_size(DockPlacement::Right, fitted, window, cx);
             }
         });
+    }
+
+    /// The dock changed. An open right dock whose size is not the one this
+    /// shell applied was resized by the user: that width becomes the
+    /// preference (as far as it fits).
+    fn on_dock_notified(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dock = self.dock.read(cx);
+        if !dock.is_dock_open(DockPlacement::Right) {
+            return;
+        }
+        let Some(size) = dock.dock_size(DockPlacement::Right) else {
+            return;
+        };
+        if size == self.applied_right {
+            return;
+        }
+        let left = self.state.read(cx).left_pane_layout();
+        let fitted = fit_right(left, size, window);
+        tracing::debug!(?size, ?fitted, "the right dock was resized by the user");
+        self.preferred_right = fitted;
+        self.applied_right = fitted;
+        if fitted != size {
+            self.dock.update(cx, |area, cx| {
+                area.set_dock_size(DockPlacement::Right, fitted, window, cx)
+            });
+        }
+        self.schedule_layout_save(cx);
     }
 
     fn on_toggle_agents(&mut self, _: &ToggleAgentsPane, _: &mut Window, cx: &mut Context<Self>) {
@@ -377,7 +423,7 @@ impl Shell {
             return;
         };
         let state = with_left_pane(
-            self.dock.read(cx).dump(cx),
+            with_right_preferred(self.dock.read(cx).dump(cx), self.preferred_right),
             self.state.read(cx).left_pane_layout(),
         );
         if self.last_saved_layout.as_ref() != Some(&state) {
@@ -411,6 +457,15 @@ impl Shell {
             }
         }
     }
+}
+
+/// The right dock's width for `preferred` beside the left pane `left` in
+/// `window`. The left pane counts as drawn with the right dock at its minimum,
+/// which is its remembered width unless the window is too small for both.
+fn fit_right(left: LeftPaneLayout, preferred: Pixels, window: &Window) -> Pixels {
+    let width = window.viewport_size().width;
+    let left_drawn = left_pane_extent(left, MIN_DOCK_SIZE, width - px(RAIL_WIDTH));
+    fitted_right_width(preferred, width, left_drawn)
 }
 
 /// The window's place and content size on its display, as saved (`None`
