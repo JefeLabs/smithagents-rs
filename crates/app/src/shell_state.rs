@@ -1,16 +1,23 @@
 //! The shell's state entity: the [`ShellModel`], the [`DaemonLink`], the
-//! [`Effect`]s for the tab lifecycle (Task 15) to carry out, the left pane's
+//! center tabs' [`TabManager`] (which carries the model's [`Effect`]s out on
+//! the web engine's host right after each dispatch), the left pane's
 //! [`LeftPaneLayout`], the remembered [`AppState`] and the appearance (the
 //! settings, the `ThemeController` that resolves them, and the theme in
 //! effect), plus the tasks that feed the link's actions in.
+//!
+//! The model and the host stay consistent: a tab the host could not open is
+//! closed again in the model (an `Action::CloseTab`), so the strip never
+//! shows a tab without a page, and the failure is reported
+//! ([`ShellEvent::TabOpenFailed`] and an Error status).
 
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
-use smithagents_center_host::PixelRect;
-use smithagents_core::ids::RepoId;
+use raw_window_handle::HasWindowHandle;
+use smithagents_center_host::{validated_origin, CenterTabHost, PixelRect};
+use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_theme::native::NativeTheme;
 use smithagents_theme::state::{AppearanceSettings, ThemeState};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
@@ -21,11 +28,12 @@ use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
 use crate::link::{AgentCommands, DaemonLink};
 use crate::model::{Action, Connection, Effect, ShellModel};
+use crate::tabs::{PlaceholderHost, TabError, TabManager, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::apply_framework_theme;
 use crate::update::{NoUpdater, UpdateState, Updater};
 use crate::view_models::{
-    banner_text, repository_added_text, status_to_show, LeftPaneMode, SettingsSection, StatusKind,
-    StatusMessage,
+    banner_text, repository_added_text, status_to_show, tab_error_text, LeftPaneMode,
+    SettingsSection, StatusKind, StatusMessage, OPEN_CHAT_FAILED,
 };
 
 /// How often the link's last error is re-read while the link is not
@@ -50,10 +58,19 @@ pub const DEFAULT_INFO_STATUS_DURATION: Duration = Duration::from_secs(5);
 ///   carries the current rectangle.
 /// - Setting a listener calls it once with the current rectangle, if one is
 ///   known yet (also deferred).
+///
+/// The shell sets the one listener to position the center tabs
+/// ([`TabManager::on_bounds`]); setting another replaces it, which detaches
+/// the tabs from the bounds (tests that only watch the rectangle may).
 pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
 
+/// Answers the daemon's port and token for new web tabs, or `None` while not
+/// connected. The shell asks the [`DaemonLink`]; headless tests inject a fake.
+/// Keep the token out of logs.
+pub type ConnectionInfoSource = Rc<dyn Fn() -> Option<(u16, String)>>;
+
 /// What `ShellState` tells the shell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellEvent {
     /// The left pane's mode or expanded width changed (save the layout).
     LeftPaneChanged,
@@ -68,18 +85,27 @@ pub enum ShellEvent {
     /// The theme in effect changed: [`ShellState::theme_state`] and
     /// [`ShellState::native_theme`] hold the new one. Emitted once per change,
     /// after both the native panes and gpui-component's theme have it, for
-    /// whatever must follow it (Task 15 pushes it to every web tab).
+    /// whatever must follow it: the shell pushes it to the web tabs.
     ThemeChanged,
+    /// A chat tab could not be opened (or re-opened after a reconnect) and was
+    /// closed again: show a notification with this sentence. The status bar
+    /// already has the error.
+    TabOpenFailed(String),
 }
 
 pub struct ShellState {
     model: ShellModel,
     /// The left pane is never hidden: expanded or compact.
     left_pane: LeftPaneLayout,
-    /// Effects not yet consumed, oldest first. Task 15 drains them with
-    /// [`ShellState::take_effects`]; until then they are only logged.
+    /// Effects not yet carried out, oldest first; drained through `tabs`
+    /// right after each action.
     effects: VecDeque<Effect>,
+    /// The center tabs on the web engine's host.
+    tabs: TabManager<Box<dyn CenterTabHost>>,
     link: Option<DaemonLink>,
+    /// Replaces the link as the source of the daemon's port and token
+    /// (headless tests).
+    connection_info: Option<ConnectionInfoSource>,
     /// Replaces the link for agent commands (headless tests).
     commands: Option<Rc<dyn AgentCommands>>,
     command_timeout: Duration,
@@ -135,11 +161,18 @@ impl ShellState {
         let theme_state = appearance.state();
         let native_theme = apply_framework_theme(appearance.set(), &theme_state, cx);
         tracing::debug!(?theme_state, "starting theme");
+        let tabs = TabManager::new(
+            Box::new(PlaceholderHost) as Box<dyn CenterTabHost>,
+            DEFAULT_PAGE_ORIGIN.to_owned(),
+            theme_state.clone(),
+        );
         let mut state = Self {
             model,
             left_pane,
             effects: VecDeque::new(),
+            tabs,
             link,
+            connection_info: None,
             commands,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             app_state_store,
@@ -308,7 +341,7 @@ impl ShellState {
                 Action::RepoAdded(repo) => Some(repository_added_text(&repo.path)),
                 _ => None,
             };
-            self.apply(action);
+            self.apply(action, cx);
             if let Some(text) = added {
                 self.set_status(StatusMessage::info(text), cx);
             }
@@ -331,25 +364,134 @@ impl ShellState {
         cx.notify();
     }
 
-    fn apply(&mut self, action: Action) {
+    /// Applies one action to the model and carries its effects out on the
+    /// tabs, in order. A connection that came up may be to a new daemon:
+    /// the tabs then re-open with its port and token.
+    fn apply(&mut self, action: Action, cx: &mut Context<Self>) {
+        let connected = action == Action::ConnectionChanged(Connection::Connected);
         if let Action::ConnectionChanged(connection) = &action {
             tracing::debug!(?connection, "daemon connection changed");
         }
         let effects = self.model.apply(action);
-        for effect in &effects {
-            tracing::debug!(?effect, "shell effect queued");
+        self.effects.extend(effects);
+        self.run_effects(cx);
+        if connected {
+            self.refresh_tab_connections(cx);
         }
+    }
+
+    /// Carries out the queued effects, oldest first. A tab that does not open
+    /// is closed in the model again, whose effects run here too.
+    fn run_effects(&mut self, cx: &mut Context<Self>) {
+        while let Some(effect) = self.effects.pop_front() {
+            tracing::debug!(?effect, "shell effect");
+            let opening = match effect {
+                Effect::OpenCenterTab(id) => Some(id),
+                _ => None,
+            };
+            let conn = opening.and_then(|_| self.connection_info());
+            let agent = opening.and_then(|id| self.model.agent(id));
+            let conn = conn.as_ref().map(|(port, token)| (*port, token.as_str()));
+            if let Err(error) = self.tabs.handle(effect, agent, conn) {
+                // Only an open fails.
+                if let Some(id) = opening {
+                    self.tab_failed(id, error, cx);
+                }
+            }
+        }
+    }
+
+    /// Re-opens the tabs whose pages were booted for another daemon port or
+    /// token (see [`TabManager::on_connection`]).
+    fn refresh_tab_connections(&mut self, cx: &mut Context<Self>) {
+        let conn = self.connection_info();
+        let model = &self.model;
+        let failed = self.tabs.on_connection(
+            conn.as_ref().map(|(port, token)| (*port, token.as_str())),
+            &|id| model.agent(id).cloned(),
+        );
+        for (id, error) in failed {
+            self.tab_failed(id, error, cx);
+        }
+        self.run_effects(cx);
+    }
+
+    /// `id`'s tab did not open: says so (an Error status and a notification
+    /// through [`ShellEvent::TabOpenFailed`]) and closes it in the model, so
+    /// the strip matches the host. The resulting effects are queued.
+    fn tab_failed(&mut self, id: AgentId, error: TabError, cx: &mut Context<Self>) {
+        tracing::warn!(agent = %id, %error, "a chat tab could not be opened");
+        self.set_status(
+            StatusMessage::error(format!("{OPEN_CHAT_FAILED}: {error}")),
+            cx,
+        );
+        cx.emit(ShellEvent::TabOpenFailed(tab_error_text(&error)));
+        let effects = self.model.apply(Action::CloseTab(id));
         self.effects.extend(effects);
     }
 
-    /// Effects not yet taken, oldest first.
-    pub fn pending_effects(&self) -> &VecDeque<Effect> {
-        &self.effects
+    /// The daemon's port and token: from the injected source if any, else
+    /// the link; `None` while not connected. Never log it.
+    fn connection_info(&self) -> Option<(u16, String)> {
+        match &self.connection_info {
+            Some(source) => source(),
+            None => self.link.as_ref().and_then(DaemonLink::connection_info),
+        }
     }
 
-    /// Takes every pending effect, oldest first.
-    pub fn take_effects(&mut self) -> Vec<Effect> {
-        self.effects.drain(..).collect()
+    /// Replaces the link as the source of the daemon's port and token.
+    pub(crate) fn set_connection_info(&mut self, source: ConnectionInfoSource) {
+        self.connection_info = Some(source);
+    }
+
+    /// Puts the center tabs on `host`, loading pages from `page_origin`.
+    /// Called once while the shell is built, before any tab opens. An
+    /// invalid origin is reported as an Error status now (it is a setting,
+    /// so a connection coming up does not clear it), and every open will
+    /// fail with it.
+    pub(crate) fn set_tab_host(
+        &mut self,
+        host: Box<dyn CenterTabHost>,
+        page_origin: String,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(
+            self.tabs.open_agents().is_empty(),
+            "the tab host is chosen before any tab opens"
+        );
+        tracing::debug!(%page_origin, "chat page origin");
+        if let Err(e) = validated_origin(&page_origin) {
+            tracing::error!(%page_origin, "invalid chat page origin: {e}");
+            self.set_status(
+                StatusMessage::error(format!(
+                    "Chats cannot open: invalid page origin {page_origin:?} ({e})"
+                )),
+                cx,
+            );
+            self.status_set_offline = false;
+        }
+        self.tabs = TabManager::new(host, page_origin, self.theme_state.clone());
+    }
+
+    /// Hands the window to the tab host (once, when the window exists). A
+    /// failure is an Error status.
+    pub(crate) fn attach_tab_host(&mut self, window: &dyn HasWindowHandle, cx: &mut Context<Self>) {
+        if let Err(e) = self.tabs.attach(window) {
+            tracing::error!("the chat view cannot attach to the window: {e}");
+            self.set_status(StatusMessage::error(format!("Chats cannot show: {e}")), cx);
+            self.status_set_offline = false;
+        }
+    }
+
+    /// Pushes the theme in effect to the web tabs (once, for all of them).
+    /// The shell calls it on [`ShellEvent::ThemeChanged`].
+    pub(crate) fn push_theme_to_tabs(&mut self) {
+        self.tabs.set_theme(self.theme_state.clone());
+    }
+
+    /// Positions the web tabs at the center's new rectangle.
+    pub(crate) fn set_tab_bounds(&mut self, rect: PixelRect) {
+        self.tabs.on_bounds(rect);
     }
 
     /// The banner line(s), or `None` while connected.
@@ -498,8 +640,8 @@ impl ShellState {
     }
 
     /// The theme in effect: what the native panes and gpui-component paint
-    /// with, and what web tabs must get (Task 15). [`ShellEvent::ThemeChanged`]
-    /// says when it changes.
+    /// with, and what the web tabs boot with and are pushed.
+    /// [`ShellEvent::ThemeChanged`] says when it changes.
     pub fn theme_state(&self) -> &ThemeState {
         &self.theme_state
     }

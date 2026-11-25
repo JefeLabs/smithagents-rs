@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 use smithagents_app::model::ShellModel;
 use smithagents_app::shell::{Shell, ShellOptions};
+use smithagents_app::shell_state::ConnectionInfoSource;
 use smithagents_app::theme_adapter::{srgb_to_hsla, AppearanceListener, SystemAppearanceSource};
 use smithagents_core::agent::{Agent, AgentState};
 use smithagents_core::ids::{AgentId, RepoId};
@@ -51,6 +52,18 @@ pub fn agent(name: &str) -> Agent {
         closed_at: None,
         intent_id: None,
     }
+}
+
+/// The daemon port the fake connection seam answers.
+pub const TEST_PORT: u16 = 4321;
+/// The daemon token the fake connection seam answers.
+pub const TEST_TOKEN: &str = "test-token-not-a-real-one";
+
+/// A connection seam (`ShellOptions::connection_info`) answering
+/// [`TEST_PORT`] and [`TEST_TOKEN`], as a connected link would, so tabs open
+/// without a daemon.
+pub fn fake_connection() -> ConnectionInfoSource {
+    Rc::new(|| Some((TEST_PORT, TEST_TOKEN.to_owned())))
 }
 
 /// Opens the shell, offline (no daemon link, no layout file), in a

@@ -229,6 +229,65 @@ fn trait_is_object_safe() {
     h.close(TabId(9));
 }
 
+/// Drives any host through every call, by the trait alone.
+fn drive<H: CenterTabHost>(host: &mut H) {
+    host.attach(&Win).unwrap();
+    let s = spec("a1");
+    let b = page_boot(&s, 4000, "t", &theme(), ORIGIN).unwrap();
+    host.open(s, b).unwrap();
+    host.show(TabId(1));
+    host.set_bounds(PixelRect {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+        scale: 1.0,
+    });
+    host.push_theme(&theme());
+    host.open_external(&external_target("https://example.com/").unwrap());
+    host.close(TabId(1));
+}
+
+#[test]
+fn a_boxed_host_is_a_host_and_forwards_every_call() {
+    let mut direct = RecordingHost::default();
+    drive(&mut direct);
+    let mut boxed: Box<RecordingHost> = Box::default();
+    drive(&mut boxed);
+    assert_eq!(boxed.calls(), direct.calls());
+    assert_eq!(boxed.calls().len(), 7);
+    // And through a trait object, as a shell holds it.
+    let mut dynamic: Box<dyn CenterTabHost> = Box::new(RecordingHost::default());
+    drive(&mut dynamic);
+}
+
+#[test]
+fn validated_origin_normalizes_the_accepted_origins_and_rejects_the_rest() {
+    assert_eq!(
+        validated_origin("smithagents://app").unwrap(),
+        "smithagents://app"
+    );
+    assert_eq!(
+        validated_origin("smithagents://app/").unwrap(),
+        "smithagents://app"
+    );
+    assert_eq!(
+        validated_origin("http://localhost:5173/").unwrap(),
+        "http://localhost:5173"
+    );
+    for bad in [
+        "file:///tmp/web",
+        "https://example.com",
+        "",
+        "http://localhost",
+    ] {
+        assert!(
+            matches!(validated_origin(bad), Err(HostError::InvalidOrigin)),
+            "{bad}"
+        );
+    }
+}
+
 #[test]
 fn recording_host_records_sequence_with_redaction() {
     let mut h = RecordingHost::default();

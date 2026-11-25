@@ -18,6 +18,12 @@
 //!
 //! State lives in a separate [`ShellState`] entity, which the panes observe,
 //! so no view holds a handle back to its owner.
+//!
+//! The center tabs' web engine is a [`CenterTabHost`] ([`ShellOptions::tab_host`],
+//! [`PlaceholderHost`] by default). The shell attaches it to the window once,
+//! feeds it the center's rectangle (the state's center-bounds listener) and
+//! every theme change ([`ShellEvent::ThemeChanged`]), and shows a
+//! notification when a tab does not open ([`ShellEvent::TabOpenFailed`]).
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -34,6 +40,7 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _, Pixels,
     Render, Styled as _, Subscription, Task, TestSupportExt as _, Window,
 };
+use smithagents_center_host::CenterTabHost;
 use smithagents_theme::tokens::ThemeSet;
 
 use crate::app_state::AppStateStore;
@@ -46,12 +53,13 @@ use crate::layout_store::{
 use crate::link::{AgentCommands, DaemonLink, LinkConfig};
 use crate::model::ShellModel;
 use crate::settings::AppSettingsStore;
-use crate::shell_state::{ShellEvent, ShellState};
+use crate::shell_state::{ConnectionInfoSource, ShellEvent, ShellState};
+use crate::tabs::{PlaceholderHost, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::{region_paint, OsAppearance, Region, SystemAppearanceSource};
 use crate::update::{NoUpdater, Updater};
 use crate::view_models::{update_button, LeftPaneMode};
 use crate::views::agents::AgentsPane;
-use crate::views::center::CenterPanel;
+use crate::views::center::{notify_tab_failure, CenterPanel};
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 use crate::views::settings::SettingsPane;
 use crate::views::status_bar::status_bar;
@@ -131,6 +139,20 @@ pub struct ShellOptions {
     /// How long an `Info` status message stays; `None` is
     /// [`DEFAULT_INFO_STATUS_DURATION`](crate::shell_state::DEFAULT_INFO_STATUS_DURATION).
     pub info_status_duration: Option<Duration>,
+    /// The web engine that draws the center tabs; `None` is
+    /// [`PlaceholderHost`], which draws nothing and logs. Tests inject a
+    /// recording host (through [`SharedHost`](crate::tabs::SharedHost) to
+    /// keep a handle on it).
+    pub tab_host: Option<Box<dyn CenterTabHost>>,
+    /// Where chat pages load from; `None` is [`DEFAULT_PAGE_ORIGIN`]. The app
+    /// passes `SMITHAGENTS_WEB_ORIGIN` when set (see
+    /// [`page_origin_from`](crate::tabs::page_origin_from)). An invalid one
+    /// is an Error status at startup and fails every open.
+    pub page_origin: Option<String>,
+    /// Answers the daemon's port and token for new tabs; `None` asks the
+    /// daemon link (and, offline, there is none). Headless tests inject a
+    /// fake.
+    pub connection_info: Option<ConnectionInfoSource>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -183,6 +205,9 @@ impl Shell {
             command_timeout,
             updater,
             info_status_duration,
+            tab_host,
+            page_origin,
+            connection_info,
         } = options;
         let link = link.map(DaemonLink::start);
 
@@ -224,7 +249,28 @@ impl Shell {
             if let Some(duration) = info_status_duration {
                 state.set_info_status_duration(duration);
             }
+            if let Some(source) = connection_info {
+                state.set_connection_info(source);
+            }
+            state.set_tab_host(
+                tab_host.unwrap_or_else(|| Box::new(PlaceholderHost)),
+                page_origin.unwrap_or_else(|| DEFAULT_PAGE_ORIGIN.to_owned()),
+                cx,
+            );
             state
+        });
+        // The web engine gets the window once, and the center's rectangle
+        // after every layout that changes it. The listener lives in the state,
+        // so it holds the state weakly; it may run after the shell is gone.
+        state.update(cx, |state, cx| {
+            state.attach_tab_host(&*window, cx);
+            let weak = cx.entity().downgrade();
+            state.set_center_bounds_listener(
+                move |rect, cx| {
+                    let _ = weak.update(cx, |state, _| state.set_tab_bounds(rect));
+                },
+                cx,
+            );
         });
 
         let (dock, skin) = DockSkin::dock_area(DOCK_AREA_ID, Some(LAYOUT_VERSION), window, cx);
@@ -290,9 +336,16 @@ impl Shell {
                             cx.notify();
                         }
                     }
-                    // The settings view handles its own focus; the views
-                    // repaint from the state's notify on a theme change.
-                    ShellEvent::FocusSettings(_) | ShellEvent::ThemeChanged => {}
+                    // The views repaint from the state's notify; the web
+                    // tabs get the new theme pushed.
+                    ShellEvent::ThemeChanged => {
+                        this.state.update(cx, |state, _| state.push_theme_to_tabs());
+                    }
+                    ShellEvent::TabOpenFailed(text) => {
+                        notify_tab_failure(text.clone(), window, cx);
+                    }
+                    // The settings view handles its own focus.
+                    ShellEvent::FocusSettings(_) => {}
                 }
             }),
             // Toggles made by the dock skin itself; the shell's own entry

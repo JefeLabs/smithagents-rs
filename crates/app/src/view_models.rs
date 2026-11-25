@@ -13,6 +13,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::link::LinkError;
 use crate::model::{Connection, ShellModel};
+use crate::tabs::TabError;
 use crate::update::UpdateState;
 
 /// The connection banner, or `None` when connected.
@@ -425,6 +426,27 @@ pub const NOT_CONNECTED_TEXT: &str = "Not connected to the daemon";
 pub const DAEMON_SILENT_TEXT: &str = "The daemon did not answer";
 /// What the New agent button says when there is no repository.
 pub const NEED_REPO_TEXT: &str = "Add a source repository first";
+
+/// The title of the notification for a chat tab that did not open, and the
+/// start of its status line ("Cannot open the chat: <error>").
+pub const OPEN_CHAT_FAILED: &str = "Cannot open the chat";
+
+/// A tab that did not open, as the notification's sentence: the error's
+/// words with a capital first letter ([`NOT_CONNECTED_TEXT`] when there is
+/// no connection). Never carries the token: no [`TabError`] does.
+pub fn tab_error_text(error: &TabError) -> String {
+    match error {
+        TabError::NotConnected => NOT_CONNECTED_TEXT.to_owned(),
+        error => {
+            let text = error.to_string();
+            let mut chars = text.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => text,
+            }
+        }
+    }
+}
 
 /// A failed command as one line for a notification: the daemon's own message
 /// when it sent one, else the error.

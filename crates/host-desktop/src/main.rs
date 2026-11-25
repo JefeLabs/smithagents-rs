@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use smithagents_app::link::LinkConfig;
+use smithagents_app::tabs::PlaceholderHost;
 
 /// The daemon's executable. It sits next to this one: in a dev build both
 /// land in `target/<profile>/`. `cargo run -p host-desktop` does not build
@@ -19,7 +20,9 @@ fn main() {
     // The daemon reports `smithagents_core::VERSION`; the link refuses any
     // other version, so both sides use the same constant.
     let config = LinkConfig::new(home, daemon_bin, smithagents_core::VERSION.to_owned());
-    smithagents_app::run(config)
+    // The chat tabs' web engine: a placeholder that draws nothing and logs
+    // (at debug) until the real engine lands.
+    smithagents_app::run(config, Box::new(PlaceholderHost))
 }
 
 fn daemon_bin() -> PathBuf {

@@ -68,6 +68,11 @@ impl ShellModel {
         agents
     }
 
+    /// The open agent `id`, if the model has it.
+    pub fn agent(&self, id: AgentId) -> Option<&Agent> {
+        self.agents.iter().find(|a| a.id == id)
+    }
+
     pub fn repos(&self) -> &[Repo] {
         &self.repos
     }

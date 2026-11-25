@@ -1,9 +1,10 @@
 //! SmithAgents native app shell, built on GPUI through `gpui-kit`.
 //!
 //! [`run`] opens the main window: the docked [`shell::Shell`] under the Kit's
-//! `Root`, connected to the local daemon through a [`link::DaemonLink`].
-//! `host-desktop` stays a thin `main` that builds the [`link::LinkConfig`]
-//! and calls [`run`].
+//! `Root`, connected to the local daemon through a [`link::DaemonLink`], with
+//! its chat tabs on the given web engine ([`tabs::TabManager`]).
+//! `host-desktop` stays a thin `main` that builds the [`link::LinkConfig`],
+//! picks the engine and calls [`run`].
 
 pub mod app_state;
 pub mod appearance;
@@ -14,6 +15,7 @@ pub mod model;
 pub mod settings;
 pub mod shell;
 pub mod shell_state;
+pub mod tabs;
 pub mod theme_adapter;
 pub mod update;
 pub mod view_models;
@@ -23,6 +25,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::{
     px, size, App, AppContext as _, Bounds, QuitMode, TitlebarOptions, WindowBounds, WindowOptions,
 };
+use smithagents_center_host::CenterTabHost;
 
 use crate::app_state::AppStateStore;
 use crate::layout_store::{restored_window_bounds, LayoutStore};
@@ -30,6 +33,7 @@ use crate::link::LinkConfig;
 use crate::model::ShellModel;
 use crate::settings::AppSettingsStore;
 use crate::shell::{Shell, ShellOptions};
+use crate::tabs::{page_origin_from, PAGE_ORIGIN_ENV};
 
 /// The main window's title.
 pub const WINDOW_TITLE: &str = "SmithAgents";
@@ -38,11 +42,15 @@ pub const WINDOW_TITLE: &str = "SmithAgents";
 ///
 /// `link` says where the daemon's home is (the app keeps its own files,
 /// such as `app-layout.json`, there too) and how to start the daemon.
+/// `tab_host` is the web engine for the chat tabs
+/// ([`tabs::PlaceholderHost`] until a real one lands). Pages load from
+/// `SMITHAGENTS_WEB_ORIGIN` when set (development: the Vite dev server,
+/// `http://localhost:5173`), else from `smithagents://app`.
 ///
 /// The app quits when its last window closes (not the macOS default, which
 /// keeps the app alive) and, on Unix, on the first SIGTERM or SIGINT. The
 /// daemon keeps running either way.
-pub fn run(link: LinkConfig) -> ! {
+pub fn run(link: LinkConfig, tab_host: Box<dyn CenterTabHost>) -> ! {
     gpui_kit::application()
         // The Kit's bundled icons; without them every icon draws blank.
         .with_assets(gpui_kit::assets::Assets)
@@ -54,7 +62,7 @@ pub fn run(link: LinkConfig) -> ! {
             quit_on_termination_signals(cx);
             // The shell applies the saved theme as it opens, before the first
             // frame (the Kit's forced light default never paints).
-            if let Err(e) = open_main_window(link, cx) {
+            if let Err(e) = open_main_window(link, tab_host, cx) {
                 eprintln!("smithagents: cannot open the main window: {e:#}");
                 std::process::exit(1);
             }
@@ -66,7 +74,13 @@ pub fn run(link: LinkConfig) -> ! {
     std::process::exit(0)
 }
 
-fn open_main_window(link: LinkConfig, cx: &mut App) -> gpui_kit::Result<()> {
+fn open_main_window(
+    link: LinkConfig,
+    tab_host: Box<dyn CenterTabHost>,
+    cx: &mut App,
+) -> gpui_kit::Result<()> {
+    let page_origin = page_origin_from(std::env::var(PAGE_ORIGIN_ENV).ok().as_deref());
+    tracing::info!(%page_origin, "chat pages load from this origin");
     let layout = LayoutStore::new(&link.home);
     let app_state = AppStateStore::new(&link.home);
     let settings = AppSettingsStore::new(&link.home);
@@ -113,6 +127,9 @@ fn open_main_window(link: LinkConfig, cx: &mut App) -> gpui_kit::Result<()> {
                     command_timeout: None,
                     updater: None,
                     info_status_duration: None,
+                    tab_host: Some(tab_host),
+                    page_origin: Some(page_origin),
+                    connection_info: None,
                 },
                 window,
                 cx,

@@ -2,7 +2,9 @@
 //! content area that reserves the web engine's rectangle.
 
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
-use gpui_kit::component::{v_flex, ActiveTheme as _, ElementExt as _};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::notification::{Notification, NotificationType};
+use gpui_kit::component::{v_flex, ActiveTheme as _, ElementExt as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -13,7 +15,7 @@ use gpui_kit::{
 use crate::model::Action;
 use crate::shell_state::{report_center_bounds, ShellState};
 use crate::theme_adapter::{agent_accent, region_paint, srgb_to_hsla, Region};
-use crate::view_models::{center_rect, tab_title, LeftPaneMode};
+use crate::view_models::{center_rect, tab_title, LeftPaneMode, OPEN_CHAT_FAILED};
 use crate::views::banner::banner;
 use crate::views::tabs::{tab_strip, TabItem, TabStripActions};
 
@@ -25,6 +27,33 @@ pub const CONTENT_ID: &str = "center-content";
 pub const EMPTY_HINT_ID: &str = "no-chat-hint";
 /// What the center says when no tab is open.
 pub const EMPTY_HINT: &str = "No chat open";
+/// Element id of the text of the notification for a chat that did not open.
+pub const CHAT_NOTICE_ID: &str = "chat-notice";
+
+/// The chat notifications replace each other rather than stack.
+struct ChatNotice;
+
+/// Shows that a chat tab did not open: an Error notification titled
+/// [`OPEN_CHAT_FAILED`] whose text is a [`Label`] with id [`CHAT_NOTICE_ID`]
+/// (readable by assistive technology and tests). A newer one replaces it.
+pub(crate) fn notify_tab_failure(text: String, window: &mut Window, cx: &mut App) {
+    let text = SharedString::from(text);
+    tracing::debug!(%text, "chat notice");
+    window.push_notification(
+        Notification::new()
+            .id::<ChatNotice>()
+            .with_type(NotificationType::Error)
+            .title(OPEN_CHAT_FAILED)
+            .content(move |_, _, cx| {
+                Label::new(text.clone())
+                    .id(CHAT_NOTICE_ID)
+                    .text_sm()
+                    .text_color(cx.theme().popover_foreground)
+                    .into_any_element()
+            }),
+        cx,
+    );
+}
 
 pub struct CenterPanel {
     state: Entity<ShellState>,

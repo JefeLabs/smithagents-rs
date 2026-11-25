@@ -1,11 +1,14 @@
 use chrono::{DateTime, Duration, Utc};
 use smithagents_app::link::LinkError;
 use smithagents_app::model::{Action, Connection, ShellModel};
+use smithagents_app::tabs::TabError;
 use smithagents_app::view_models::{
     agent_initial, agent_rows, banner_text, center_rect, command_error_text, new_agent_plan,
-    repo_choices, repo_title, state_dot, state_kind, state_label, state_token, tab_title, DotStyle,
-    LeftPaneMode, NewAgentPlan, StateKind, DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT,
+    repo_choices, repo_title, state_dot, state_kind, state_label, state_token, tab_error_text,
+    tab_title, DotStyle, LeftPaneMode, NewAgentPlan, StateKind, DAEMON_SILENT_TEXT,
+    NOT_CONNECTED_TEXT, OPEN_CHAT_FAILED,
 };
+use smithagents_center_host::HostError;
 use smithagents_client::ClientError;
 use smithagents_core::agent::{Agent, AgentState, Repo};
 use smithagents_core::ids::{AgentId, RepoId};
@@ -1111,4 +1114,24 @@ mod settings_pane {
             assert_eq!(section.index(), ix);
         }
     }
+}
+
+#[test]
+fn a_tab_that_did_not_open_reads_as_a_sentence() {
+    assert_eq!(OPEN_CHAT_FAILED, "Cannot open the chat");
+    assert_eq!(tab_error_text(&TabError::NotConnected), NOT_CONNECTED_TEXT);
+    assert_eq!(tab_error_text(&TabError::UnknownAgent), "The agent is gone");
+    assert_eq!(
+        tab_error_text(&TabError::Host(HostError::Engine(
+            "the engine is down".into()
+        ))),
+        "Web engine error: the engine is down"
+    );
+    assert!(tab_error_text(&TabError::Host(HostError::InvalidOrigin))
+        .starts_with("Page origin must be smithagents://app"));
+    // The status line keeps the error's own words after the title.
+    assert_eq!(
+        format!("{OPEN_CHAT_FAILED}: {}", TabError::NotConnected),
+        "Cannot open the chat: not connected to the daemon"
+    );
 }

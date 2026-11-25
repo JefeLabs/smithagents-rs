@@ -62,6 +62,32 @@ pub trait CenterTabHost {
     fn open_external(&mut self, url: &ExternalUrl);
 }
 
+/// A boxed host is a host, so a shell can hold `Box<dyn CenterTabHost>` and
+/// pick the engine at startup.
+impl<H: CenterTabHost + ?Sized> CenterTabHost for Box<H> {
+    fn attach(&mut self, window: &dyn HasWindowHandle) -> Result<(), HostError> {
+        (**self).attach(window)
+    }
+    fn open(&mut self, spec: TabSpec, boot: PageBoot) -> Result<(), HostError> {
+        (**self).open(spec, boot)
+    }
+    fn close(&mut self, id: TabId) {
+        (**self).close(id)
+    }
+    fn show(&mut self, id: TabId) {
+        (**self).show(id)
+    }
+    fn set_bounds(&mut self, rect: PixelRect) {
+        (**self).set_bounds(rect)
+    }
+    fn push_theme(&mut self, state: &ThemeState) {
+        (**self).push_theme(state)
+    }
+    fn open_external(&mut self, url: &ExternalUrl) {
+        (**self).open_external(url)
+    }
+}
+
 /// What the engine needs to boot a page. Only [`page_boot`] can build one.
 ///
 /// The host script carries the token. The page's Content-Security-Policy blocks
@@ -119,7 +145,9 @@ fn script(theme: &str, base_url: &str, token: &str, agent_id: &str) -> Result<St
 /// Validates a page origin and returns `scheme://host[:port]`. Only the product
 /// origin `smithagents://app` and the dev origins `http://localhost:<port>` and
 /// `http://127.0.0.1:<port>` are accepted, with no credentials, query or fragment.
-fn validated_origin(origin: &str) -> Result<String, HostError> {
+/// [`page_boot`] applies the same check; a shell calls this to report a bad
+/// configured origin at startup rather than at the first open.
+pub fn validated_origin(origin: &str) -> Result<String, HostError> {
     let u = Url::parse(origin).map_err(|_| HostError::InvalidOrigin)?;
     let clean = u.username().is_empty()
         && u.password().is_none()

@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use common::ui::{
-    agent, dark_native, open_shell, open_shell_options, painted_at, quad_at, theme_state,
-    token_background,
+    agent, dark_native, fake_connection, open_shell, open_shell_options, painted_at, quad_at,
+    theme_state, token_background,
 };
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
@@ -31,7 +31,7 @@ use gpui_kit::{
 use smithagents_app::app_state::{AppState, AppStateStore};
 use smithagents_app::layout_store::COMPACT_LEFT_PANE_WIDTH;
 use smithagents_app::link::{AgentCommands, LinkError};
-use smithagents_app::model::{Action, Connection, Effect, ShellModel};
+use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::shell::{ShellOptions, LEFT_PANE_ID};
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::theme_adapter::{agent_accent, region_tokens, srgb_to_hsla, Region};
@@ -138,7 +138,8 @@ fn connected(agents: Vec<Agent>, repos: Vec<Repo>) -> ShellModel {
     model
 }
 
-/// Opens the shell on `model` with `fake` for its agent commands.
+/// Opens the shell on `model` with `fake` for its agent commands and a
+/// connection seam answering a daemon port and token, so tabs open.
 fn open_with_commands(
     cx: &mut TestAppContext,
     model: ShellModel,
@@ -151,6 +152,7 @@ fn open_with_commands(
             model,
             commands: Some(fake.clone()),
             app_state,
+            connection_info: Some(fake_connection()),
             ..Default::default()
         },
     )
@@ -288,7 +290,7 @@ fn a_click_selects_a_row_and_a_double_click_opens_its_tab(cx: &mut TestAppContex
     assert_eq!(selected(cx, &state), Some(venus.id));
     state.read_with(cx, |state, _| {
         assert!(state.model().tabs().is_empty(), "a click only selects");
-        assert!(state.pending_effects().is_empty());
+        assert_eq!(state.model().active_tab(), None);
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -303,10 +305,7 @@ fn a_click_selects_a_row_and_a_double_click_opens_its_tab(cx: &mut TestAppContex
     state.read_with(cx, |state, _| {
         assert_eq!(state.model().selected(), Some(mercury.id));
         assert_eq!(state.model().tabs(), [mercury.id]);
-        assert_eq!(
-            state.pending_effects().iter().cloned().collect::<Vec<_>>(),
-            vec![Effect::OpenCenterTab(mercury.id)]
-        );
+        assert_eq!(state.model().active_tab(), Some(mercury.id));
     });
 }
 
@@ -344,10 +343,7 @@ fn arrows_move_the_selection_and_enter_opens_the_selected_row(cx: &mut TestAppCo
     state.read_with(cx, |state, _| {
         assert_eq!(state.model().selected(), Some(venus.id));
         assert_eq!(state.model().tabs(), [venus.id], "Enter opened Venus");
-        assert_eq!(
-            state.pending_effects().iter().cloned().collect::<Vec<_>>(),
-            vec![Effect::OpenCenterTab(venus.id)]
-        );
+        assert_eq!(state.model().active_tab(), Some(venus.id));
     });
 }
 

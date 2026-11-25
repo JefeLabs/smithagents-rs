@@ -28,7 +28,7 @@ use smithagents_app::layout_store::{
     MIN_LEFT_PANE_WIDTH, STATUS_BAR_HEIGHT,
 };
 use smithagents_app::link::LinkConfig;
-use smithagents_app::model::{Action, Connection, Effect, ShellModel};
+use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::shell::{
     Shell, ShellOptions, LEFT_PANE_ID, LEFT_PANE_RESIZE_ID, SETTINGS_PANEL,
 };
@@ -87,7 +87,7 @@ fn open_shell_full(
 }
 
 #[gpui_kit::test]
-fn the_close_button_closes_the_tab_and_queues_the_effect(cx: &mut TestAppContext) {
+fn the_close_button_closes_the_tab(cx: &mut TestAppContext) {
     let mercury = agent("Mercury");
     let (window, shell) = open_shell(cx, connected_with_tab(&mercury));
     let state = shell.read_with(cx, |shell, _| shell.state().clone());
@@ -103,10 +103,6 @@ fn the_close_button_closes_the_tab_and_queues_the_effect(cx: &mut TestAppContext
     state.read_with(cx, |state, _| {
         assert!(state.model().tabs().is_empty());
         assert_eq!(state.model().active_tab(), None);
-        assert_eq!(
-            state.pending_effects().iter().cloned().collect::<Vec<_>>(),
-            vec![Effect::CloseCenterTab(mercury.id)]
-        );
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -252,10 +248,6 @@ fn clicking_a_tab_activates_it(cx: &mut TestAppContext) {
     state.read_with(cx, |state, _| {
         assert_eq!(state.model().active_tab(), Some(mercury.id));
         assert_eq!(state.model().tabs(), [mercury.id, venus.id]);
-        assert_eq!(
-            state.pending_effects().iter().cloned().collect::<Vec<_>>(),
-            vec![Effect::FocusCenterTab(mercury.id)]
-        );
     });
 }
 
