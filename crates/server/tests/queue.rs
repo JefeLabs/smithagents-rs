@@ -85,7 +85,7 @@ impl Harness for GateHarness {
                 gate.acquire().await.unwrap().forget();
             }
             if die
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 HarnessEvent::Failed {
@@ -901,7 +901,7 @@ async fn a_panicking_start_does_not_stop_the_scheduler() {
     let left = panics.clone();
     f.svc.set_start_hook(Some(Arc::new(move |_id| {
         if left
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             panic!("test start panic");

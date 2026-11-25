@@ -136,7 +136,7 @@ impl Harness for TestHarness {
         }
         if self
             .panics
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             panic!("test harness panic inside run_structured");
