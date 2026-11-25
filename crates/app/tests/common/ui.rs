@@ -1,16 +1,20 @@
-//! Helpers shared by the headless shell tests (`shell_ui`, `agents_pane`):
-//! opening the shell in a test window, test agents, and reading the colors
-//! the last frame painted.
+//! Helpers shared by the headless shell tests (`shell_ui`, `agents_pane`,
+//! `status_bar`, `settings_pane`): opening the shell in a test window, test
+//! agents, a fake OS appearance, and reading the colors the last frame
+//! painted.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use gpui_kit::base::Root;
 use gpui_kit::{
-    px, size, AppContext as _, Background, Bounds, Entity, Pixels, Point, Quad, TestAppContext,
-    WindowBounds, WindowHandle, WindowOptions,
+    px, size, App, AppContext as _, Background, Bounds, Entity, Pixels, Point, Quad, Subscription,
+    TestAppContext, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use smithagents_app::model::ShellModel;
 use smithagents_app::shell::{Shell, ShellOptions};
-use smithagents_app::theme_adapter::srgb_to_hsla;
+use smithagents_app::theme_adapter::{srgb_to_hsla, AppearanceListener, SystemAppearanceSource};
 use smithagents_core::agent::{Agent, AgentState};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
@@ -65,22 +69,76 @@ pub fn open_shell(
     )
 }
 
-/// Opens the shell from `options` in the dark theme (which replaces
-/// `options.native_theme`).
+type SharedListener = Rc<RefCell<AppearanceListener>>;
+
+/// The OS appearance as a test sets it: [`FakeAppearance::set`] calls every
+/// listener the shell registered, as the OS would.
+pub struct FakeAppearance {
+    current: Cell<Appearance>,
+    next_id: Cell<usize>,
+    listeners: Rc<RefCell<Vec<(usize, SharedListener)>>>,
+}
+
+impl FakeAppearance {
+    pub fn new(appearance: Appearance) -> Rc<Self> {
+        Rc::new(Self {
+            current: Cell::new(appearance),
+            next_id: Cell::new(0),
+            listeners: Rc::default(),
+        })
+    }
+
+    /// Flips the OS appearance (listeners run even when it is unchanged, as
+    /// the OS may report a change of another kind).
+    pub fn set(&self, appearance: Appearance, cx: &mut App) {
+        self.current.set(appearance);
+        let listeners: Vec<_> = self
+            .listeners
+            .borrow()
+            .iter()
+            .map(|(_, listener)| listener.clone())
+            .collect();
+        for listener in listeners {
+            (listener.borrow_mut())(appearance, cx);
+        }
+    }
+
+    /// How many listeners are registered (dropped subscriptions are gone).
+    pub fn listener_count(&self) -> usize {
+        self.listeners.borrow().len()
+    }
+}
+
+impl SystemAppearanceSource for FakeAppearance {
+    fn current(&self, _: &App) -> Appearance {
+        self.current.get()
+    }
+
+    fn observe(&self, _: &Window, listener: AppearanceListener) -> Subscription {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        self.listeners
+            .borrow_mut()
+            .push((id, Rc::new(RefCell::new(listener))));
+        let listeners = self.listeners.clone();
+        Subscription::new(move || listeners.borrow_mut().retain(|(other, _)| *other != id))
+    }
+}
+
+/// Opens the shell from `options`. Unless `options` brings its own, the OS
+/// appearance is a fake set to dark, so the default "System" theme is the
+/// dark Smith theme.
 pub fn open_shell_options(
     cx: &mut TestAppContext,
     mut options: ShellOptions,
     (width, height): (f32, f32),
 ) -> (WindowHandle<Root>, Entity<Shell>) {
+    if options.system_appearance.is_none() {
+        options.system_appearance = Some(FakeAppearance::new(Appearance::Dark));
+    }
     cx.update(|cx| {
         gpui_kit::init(cx);
         smithagents_app::shell::init(cx);
-        options.native_theme = smithagents_app::theme_adapter::apply_theme(
-            ThemeSet::embedded(),
-            &theme_state(Appearance::Dark),
-            None,
-            cx,
-        );
         let bounds = Bounds {
             origin: Point::default(),
             size: size(px(width), px(height)),

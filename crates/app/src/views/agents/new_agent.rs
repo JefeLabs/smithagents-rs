@@ -16,15 +16,16 @@ use smithagents_core::agent::Agent;
 use smithagents_core::ids::{AgentId, RepoId};
 
 use super::{
-    answered, notify, notify_link_error, notify_unreachable, repo_choice_id, AgentsPane,
-    AwaitedAgent, Paint, NEW_AGENT_ID, NEW_AGENT_LABEL,
+    notify, notify_link_error, notify_unreachable, repo_choice_id, AgentsPane, AwaitedAgent, Paint,
+    NEW_AGENT_ID, NEW_AGENT_LABEL,
 };
 use crate::link::LinkError;
 use crate::model::Action;
 use crate::view_models::{
-    new_agent_plan, NewAgentPlan, RepoChoiceVm, StatusMessage, DAEMON_SILENT_TEXT, NEED_REPO_TEXT,
-    NOT_CONNECTED_TEXT,
+    new_agent_plan, NewAgentPlan, RepoChoiceVm, SettingsSection, StatusMessage, DAEMON_SILENT_TEXT,
+    NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
 };
+use crate::views::answered;
 
 impl AgentsPane {
     /// The New agent button's click when it is not a picker: follows the plan
@@ -40,7 +41,11 @@ impl AgentsPane {
         tracing::debug!(?plan, "new agent");
         match plan {
             NewAgentPlan::NeedRepo => {
-                self.state.update(cx, |state, cx| state.reveal_settings(cx));
+                // Settings opens on Source repositories with its path field
+                // focused.
+                self.state.update(cx, |state, cx| {
+                    state.request_settings_focus(SettingsSection::Repositories, cx)
+                });
                 notify(NotificationType::Info, None, NEED_REPO_TEXT, window, cx);
             }
             NewAgentPlan::Create(repo) => self.start_create(repo, window, cx),

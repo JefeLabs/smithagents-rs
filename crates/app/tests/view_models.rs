@@ -643,3 +643,394 @@ mod status_bar {
         );
     }
 }
+
+// ---- Settings pane -----------------------------------------------------------
+
+mod settings_pane {
+    use std::path::{Path, PathBuf};
+
+    use chrono::{DateTime, Utc};
+    use smithagents_app::link::LinkError;
+    use smithagents_app::view_models::{
+        font_options, nearest_step, repo_error_text, repo_rows, stepped_text_scale,
+        text_scale_label, text_scale_steps, theme_options, validate_repo_path_input_in,
+        FontOptionVm, RepoRowVm, SettingsSection, ThemeOptionVm, ABSOLUTE_PATH_TEXT,
+        CLONE_UNSUPPORTED_TEXT, DAEMON_UNREACHABLE_TEXT, ENTER_A_PATH_TEXT, NOT_CONNECTED_TEXT,
+        SYSTEM_THEME_LABEL,
+    };
+    use smithagents_client::ClientError;
+    use smithagents_core::agent::Repo;
+    use smithagents_core::ids::RepoId;
+    use smithagents_theme::state::ThemeChoice;
+    use smithagents_theme::tokens::{TextScale, ThemeSet};
+
+    fn set() -> &'static ThemeSet {
+        ThemeSet::embedded()
+    }
+
+    fn shown(options: &[ThemeOptionVm]) -> Vec<(&str, bool)> {
+        options
+            .iter()
+            .map(|o| (o.label.as_str(), o.selected))
+            .collect()
+    }
+
+    #[test]
+    fn theme_options_list_system_first_then_each_theme_by_name() {
+        let options = theme_options(set(), &ThemeChoice::System);
+        assert_eq!(SYSTEM_THEME_LABEL, "System");
+        assert_eq!(
+            shown(&options),
+            [
+                ("System", true),
+                ("Smith Dark", false),
+                ("Smith Light", false)
+            ]
+        );
+        assert_eq!(options[0].choice, ThemeChoice::System);
+        assert_eq!(options[1].choice, ThemeChoice::Id("smith-dark".into()));
+        assert_eq!(options[2].choice, ThemeChoice::Id("smith-light".into()));
+
+        let light = theme_options(set(), &ThemeChoice::Id("smith-light".into()));
+        assert_eq!(
+            shown(&light),
+            [
+                ("System", false),
+                ("Smith Dark", false),
+                ("Smith Light", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stale_saved_theme_selects_system() {
+        let options = theme_options(set(), &ThemeChoice::Id("retired-theme".into()));
+        assert_eq!(
+            shown(&options),
+            [
+                ("System", true),
+                ("Smith Dark", false),
+                ("Smith Light", false)
+            ]
+        );
+        assert_eq!(options.iter().filter(|o| o.selected).count(), 1);
+    }
+
+    fn scale(min: f64, max: f64, default: f64) -> TextScale {
+        TextScale { min, max, default }
+    }
+
+    #[test]
+    fn text_steps_run_from_min_to_max_by_five_hundredths() {
+        let steps = text_scale_steps(&set().base.text_scale);
+        assert_eq!(
+            steps,
+            [0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5]
+        );
+    }
+
+    #[test]
+    fn text_steps_stay_in_bounds_and_always_hold_the_default() {
+        for bounds in [
+            scale(0.85, 1.5, 1.0),
+            scale(0.8, 1.23, 1.13),
+            scale(0.9, 0.9, 0.9),
+            scale(0.71, 1.0, 0.71),
+        ] {
+            let steps = text_scale_steps(&bounds);
+            assert!(!steps.is_empty(), "{bounds:?}");
+            assert!(
+                steps
+                    .iter()
+                    .all(|s| *s >= bounds.min - 1e-9 && *s <= bounds.max + 1e-9),
+                "{bounds:?}: {steps:?}"
+            );
+            assert!(steps.contains(&bounds.default), "{bounds:?}: {steps:?}");
+            assert!(steps.windows(2).all(|w| w[0] < w[1]), "sorted, no repeats");
+            for s in &steps {
+                assert_eq!(*s, (s * 100.0).round() / 100.0, "two decimals: {s}");
+            }
+        }
+        let odd = text_scale_steps(&scale(0.8, 1.23, 1.13));
+        assert_eq!(odd.first(), Some(&0.8));
+        assert_eq!(odd.last(), Some(&1.23), "the max is reachable");
+    }
+
+    #[test]
+    fn broken_text_bounds_give_only_the_default() {
+        assert_eq!(text_scale_steps(&scale(1.5, 0.85, 1.0)), [1.0]);
+        assert_eq!(text_scale_steps(&scale(f64::NAN, 1.5, 1.0)), [1.0]);
+        assert_eq!(text_scale_steps(&scale(0.85, 1.5, f64::NAN)).len(), 14);
+    }
+
+    #[test]
+    fn the_nearest_step_falls_back_to_the_default() {
+        let steps = text_scale_steps(&set().base.text_scale);
+        assert_eq!(nearest_step(&steps, 1.0, 1.0), 1.0);
+        assert_eq!(nearest_step(&steps, 1.02, 1.0), 1.0);
+        assert_eq!(nearest_step(&steps, 1.03, 1.0), 1.05);
+        assert_eq!(nearest_step(&steps, 0.85, 1.0), 0.85);
+        assert_eq!(nearest_step(&steps, 1.5, 1.0), 1.5);
+        assert_eq!(nearest_step(&steps, f64::NAN, 1.0), 1.0, "NaN");
+        assert_eq!(nearest_step(&steps, f64::INFINITY, 1.0), 1.0);
+        assert_eq!(nearest_step(&steps, 0.5, 1.0), 1.0, "below min");
+        assert_eq!(nearest_step(&steps, 2.0, 1.0), 1.0, "above max");
+        assert_eq!(nearest_step(&[], 1.2, 1.0), 1.0);
+    }
+
+    #[test]
+    fn a_step_up_or_down_stops_at_the_ends() {
+        let steps = text_scale_steps(&set().base.text_scale);
+        assert_eq!(stepped_text_scale(&steps, 1.0, true), Some(1.05));
+        assert_eq!(stepped_text_scale(&steps, 1.0, false), Some(0.95));
+        assert_eq!(stepped_text_scale(&steps, 1.5, true), None);
+        assert_eq!(stepped_text_scale(&steps, 0.85, false), None);
+        // From between two steps, the nearest one counts as the current one.
+        assert_eq!(stepped_text_scale(&steps, 1.04, true), Some(1.1));
+        assert_eq!(stepped_text_scale(&[], 1.0, true), None);
+    }
+
+    #[test]
+    fn the_text_size_reads_as_a_percentage() {
+        assert_eq!(text_scale_label(1.0), "100%");
+        assert_eq!(text_scale_label(0.85), "85%");
+        assert_eq!(text_scale_label(1.15), "115%");
+        assert_eq!(text_scale_label(1.5), "150%");
+    }
+
+    #[test]
+    fn font_options_follow_the_set_and_an_unknown_font_selects_the_first() {
+        let shown = |current: &str| -> Vec<FontOptionVm> { font_options(set(), current) };
+        assert_eq!(
+            shown("mono"),
+            [
+                FontOptionVm {
+                    id: "system".into(),
+                    label: "System".into(),
+                    selected: false,
+                },
+                FontOptionVm {
+                    id: "mono".into(),
+                    label: "Monospace".into(),
+                    selected: true,
+                },
+            ]
+        );
+        let unknown = shown("comic-sans");
+        assert!(unknown[0].selected);
+        assert!(!unknown[1].selected);
+        let mut empty = set().clone();
+        empty.base.fonts.clear();
+        assert!(font_options(&empty, "system").is_empty());
+    }
+
+    fn repo(path: &str, branch: &str) -> Repo {
+        let at: DateTime<Utc> = "2026-11-20T09:00:00Z".parse().unwrap();
+        Repo {
+            id: RepoId::new(),
+            path: path.into(),
+            default_branch: branch.into(),
+            created_at: at,
+        }
+    }
+
+    #[test]
+    fn repo_rows_are_sorted_by_name_then_path_and_keep_unicode_and_spaces() {
+        let repos = vec![
+            repo("/src/Zeta", "main"),
+            repo("/src/ünïcode répo", "trunk"),
+            repo("/src/alpha", "main"),
+            repo("/work/My Project/", "develop"),
+            repo("/other/alpha", "main"),
+        ];
+        let rows = repo_rows(&repos);
+        let shown: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.path.as_str(), r.default_branch.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("alpha", "/other/alpha", "main"),
+                ("alpha", "/src/alpha", "main"),
+                ("My Project", "/work/My Project/", "develop"),
+                ("Zeta", "/src/Zeta", "main"),
+                ("ünïcode répo", "/src/ünïcode répo", "trunk"),
+            ]
+        );
+        assert_eq!(rows[4].id, repos[1].id);
+        let root = repo("/", "main");
+        assert_eq!(
+            repo_rows(std::slice::from_ref(&root)),
+            [RepoRowVm {
+                id: root.id,
+                name: "/".into(),
+                path: "/".into(),
+                default_branch: "main".into(),
+            }]
+        );
+    }
+
+    fn api(status: u16, code: &str, message: &str) -> LinkError {
+        LinkError::Client(ClientError::Api {
+            status,
+            code: code.into(),
+            message: message.into(),
+        })
+    }
+
+    #[test]
+    fn a_daemon_error_reads_as_the_daemons_message() {
+        // The real codes and messages from `crates/server/src/api.rs`.
+        for (code, message, want) in [
+            (
+                "path_not_found",
+                "no directory at /tmp/missing dir",
+                "No directory at /tmp/missing dir",
+            ),
+            (
+                "not_a_git_repo",
+                "not a git repository",
+                "Not a git repository",
+            ),
+            (
+                "bare_repo",
+                "bare repositories are not supported",
+                "Bare repositories are not supported",
+            ),
+            (
+                "repo_exists",
+                "a repo with this path already exists",
+                "A repo with this path already exists",
+            ),
+            (
+                "no_default_branch",
+                "could not determine the default branch",
+                "Could not determine the default branch",
+            ),
+        ] {
+            assert_eq!(repo_error_text(&api(400, code, message)), want, "{code}");
+        }
+        // Surrounding and inner whitespace never makes a second line.
+        assert_eq!(
+            repo_error_text(&api(400, "not_a_git_repo", "  not a\ngit repository \n")),
+            "Not a git repository"
+        );
+    }
+
+    #[test]
+    fn a_blank_daemon_message_falls_back_to_a_line_for_its_code() {
+        for (code, want) in [
+            ("path_not_found", "No directory at that path"),
+            ("not_a_git_repo", "Not a git repository"),
+            ("bare_repo", "Bare repositories are not supported"),
+            ("repo_exists", "This repository is already added"),
+            ("http_502", "The daemon could not add the repository"),
+        ] {
+            assert_eq!(repo_error_text(&api(400, code, " ")), want, "{code}");
+        }
+    }
+
+    #[test]
+    fn connection_and_transport_errors_read_as_generic_lines() {
+        assert_eq!(
+            repo_error_text(&LinkError::NotConnected),
+            NOT_CONNECTED_TEXT
+        );
+        assert_eq!(
+            repo_error_text(&LinkError::Stopped),
+            "The daemon link has stopped"
+        );
+        assert_eq!(DAEMON_UNREACHABLE_TEXT, "Could not reach the daemon");
+        // A transport error (an HTTP request that failed before an answer).
+        let http = reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("an invalid URL is a reqwest error");
+        let http = LinkError::Client(ClientError::Http(http));
+        assert_eq!(repo_error_text(&http), DAEMON_UNREACHABLE_TEXT);
+        assert!(!repo_error_text(&http).contains(&http.to_string()));
+        let ws = LinkError::Client(ClientError::Ws(
+            tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+        ));
+        assert_eq!(repo_error_text(&ws), DAEMON_UNREACHABLE_TEXT);
+    }
+
+    #[test]
+    fn an_unauthorized_answer_never_shows_a_token() {
+        // The daemon's 401 message names no token; the text is its message.
+        let text = repo_error_text(&api(401, "unauthorized", "missing or invalid bearer token"));
+        assert_eq!(text, "Missing or invalid bearer token");
+    }
+
+    fn validate(raw: &str) -> Result<PathBuf, &'static str> {
+        validate_repo_path_input_in(raw, Some(Path::new("/Users/me")))
+    }
+
+    #[test]
+    fn a_path_is_trimmed_and_must_not_be_empty() {
+        assert_eq!(ENTER_A_PATH_TEXT, "Enter a path");
+        assert_eq!(validate(""), Err(ENTER_A_PATH_TEXT));
+        assert_eq!(validate("  \t "), Err(ENTER_A_PATH_TEXT));
+        assert_eq!(validate("  /src/app  "), Ok(PathBuf::from("/src/app")));
+        assert_eq!(
+            validate("/tmp/ünïcode répo"),
+            Ok(PathBuf::from("/tmp/ünïcode répo"))
+        );
+    }
+
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        assert_eq!(
+            validate("~/code/my repo"),
+            Ok(PathBuf::from("/Users/me/code/my repo"))
+        );
+        assert_eq!(validate("~"), Ok(PathBuf::from("/Users/me")));
+        assert_eq!(validate("~/"), Ok(PathBuf::from("/Users/me")));
+        // Another user's home is not expanded.
+        assert_eq!(validate("~other/app"), Err(ABSOLUTE_PATH_TEXT));
+        // Without a known home, a tilde path cannot be made absolute.
+        assert_eq!(
+            validate_repo_path_input_in("~/app", None),
+            Err(ABSOLUTE_PATH_TEXT)
+        );
+    }
+
+    #[test]
+    fn a_relative_path_asks_for_an_absolute_one() {
+        assert_eq!(ABSOLUTE_PATH_TEXT, "Enter an absolute path");
+        for raw in ["src/app", "./app", "../app", "app"] {
+            assert_eq!(validate(raw), Err(ABSOLUTE_PATH_TEXT), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_url_says_cloning_is_not_supported_yet() {
+        assert_eq!(
+            CLONE_UNSUPPORTED_TEXT,
+            "Cloning from a URL is not supported yet. Enter a local path."
+        );
+        for raw in [
+            "https://github.com/acme/app.git",
+            "http://example.com/app",
+            "git@github.com:acme/app.git",
+            "  ssh://git@host/app ",
+            "git://host/app",
+            "HTTPS://GITHUB.COM/acme/app",
+        ] {
+            assert_eq!(validate(raw), Err(CLONE_UNSUPPORTED_TEXT), "{raw}");
+        }
+    }
+
+    #[test]
+    fn settings_sections_round_trip_their_persisted_names() {
+        for section in SettingsSection::ALL {
+            assert_eq!(SettingsSection::parse(section.as_str()), Some(section));
+        }
+        assert_eq!(SettingsSection::Appearance.as_str(), "appearance");
+        assert_eq!(SettingsSection::Repositories.as_str(), "repositories");
+        assert_eq!(SettingsSection::Appearance.title(), "Appearance");
+        assert_eq!(SettingsSection::Repositories.title(), "Source repositories");
+        assert_eq!(SettingsSection::parse("agent-defaults"), None);
+    }
+}

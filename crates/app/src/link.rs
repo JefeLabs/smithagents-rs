@@ -247,8 +247,9 @@ impl DaemonLink {
     }
 }
 
-/// The agent commands the shell's views send to the daemon. [`DaemonLink`] is
-/// the production implementation; headless tests inject a fake through
+/// The commands the shell's views send to the daemon: the agents pane's
+/// create and close, and the Settings pane's add repository. [`DaemonLink`]
+/// is the production implementation; headless tests inject a fake through
 /// `ShellOptions::commands` so they need no daemon.
 ///
 /// The futures are `'static` (a UI executor holds them without borrowing the
@@ -257,6 +258,10 @@ impl DaemonLink {
 pub trait AgentCommands {
     fn create_agent(&self, repo_id: RepoId) -> LocalBoxFuture<'static, Result<Agent, LinkError>>;
     fn close_agent(&self, id: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>>;
+    /// Adds the local git repository at `path`. The model learns of it
+    /// through `Action::RepoAdded`, which the link sends itself (a fake
+    /// leaves that to the test).
+    fn add_repo(&self, path: &Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>>;
 }
 
 impl AgentCommands for DaemonLink {
@@ -266,6 +271,10 @@ impl AgentCommands for DaemonLink {
 
     fn close_agent(&self, id: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>> {
         DaemonLink::close_agent(self, id).boxed_local()
+    }
+
+    fn add_repo(&self, path: &Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        DaemonLink::add_repo(self, path).boxed_local()
     }
 }
 

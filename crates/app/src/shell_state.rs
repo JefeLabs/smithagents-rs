@@ -1,7 +1,8 @@
 //! The shell's state entity: the [`ShellModel`], the [`DaemonLink`], the
 //! [`Effect`]s for the tab lifecycle (Task 15) to carry out, the left pane's
-//! [`LeftPaneLayout`] and the remembered [`AppState`], plus the tasks that
-//! feed the link's actions in.
+//! [`LeftPaneLayout`], the remembered [`AppState`] and the appearance (the
+//! settings, the `ThemeController` that resolves them, and the theme in
+//! effect), plus the tasks that feed the link's actions in.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -11,15 +12,20 @@ use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use smithagents_center_host::PixelRect;
 use smithagents_core::ids::RepoId;
 use smithagents_theme::native::NativeTheme;
+use smithagents_theme::state::{AppearanceSettings, ThemeState};
+use smithagents_theme::tokens::{Appearance, ThemeSet};
 use tokio::sync::mpsc;
 
 use crate::app_state::{AppState, AppStateStore};
+use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
 use crate::link::{AgentCommands, DaemonLink};
 use crate::model::{Action, Connection, Effect, ShellModel};
+use crate::theme_adapter::apply_framework_theme;
 use crate::update::{NoUpdater, UpdateState, Updater};
 use crate::view_models::{
-    banner_text, repository_added_text, status_to_show, LeftPaneMode, StatusKind, StatusMessage,
+    banner_text, repository_added_text, status_to_show, LeftPaneMode, SettingsSection, StatusKind,
+    StatusMessage,
 };
 
 /// How often the link's last error is re-read while the link is not
@@ -51,9 +57,17 @@ pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
 pub enum ShellEvent {
     /// The left pane's mode or expanded width changed (save the layout).
     LeftPaneChanged,
-    /// Show the Settings view in the right dock (the New agent button found
-    /// no repository; Task 14 scrolls it to Source repositories).
+    /// Show the Settings view in the right dock.
     RevealSettings,
+    /// Bring a Settings section into view (it is already expanded): the
+    /// Settings view scrolls to it and focuses its first field. Emitted after
+    /// [`ShellEvent::RevealSettings`].
+    FocusSettings(SettingsSection),
+    /// The theme in effect changed: [`ShellState::theme_state`] and
+    /// [`ShellState::native_theme`] hold the new one. Emitted once per change,
+    /// after both the native panes and gpui-component's theme have it, for
+    /// whatever must follow it (Task 15 pushes it to every web tab).
+    ThemeChanged,
 }
 
 pub struct ShellState {
@@ -72,6 +86,10 @@ pub struct ShellState {
     app_state: AppState,
     /// The link's last connect error as last read, for the banner.
     link_error: Option<String>,
+    /// The saved appearance settings and their resolution.
+    appearance: AppearanceRuntime,
+    /// The theme in effect (last applied).
+    theme_state: ThemeState,
     native_theme: Option<NativeTheme>,
     center_rect: Option<PixelRect>,
     center_listener: Option<CenterBoundsListener>,
@@ -93,9 +111,11 @@ pub struct ShellState {
 }
 
 impl ShellState {
+    /// Builds the state and applies the theme `appearance` resolves to, to
+    /// gpui-component's theme and the native panes, before the first frame.
     pub(crate) fn new(
         model: ShellModel,
-        native_theme: Option<NativeTheme>,
+        appearance: AppearanceRuntime,
         link: Option<(DaemonLink, mpsc::Receiver<Action>)>,
         left_pane: LeftPaneLayout,
         commands: Option<Rc<dyn AgentCommands>>,
@@ -110,6 +130,9 @@ impl ShellState {
             .as_ref()
             .map(AppStateStore::load)
             .unwrap_or_default();
+        let theme_state = appearance.state();
+        let native_theme = apply_framework_theme(appearance.set(), &theme_state, cx);
+        tracing::debug!(?theme_state, "starting theme");
         let mut state = Self {
             model,
             left_pane,
@@ -120,6 +143,8 @@ impl ShellState {
             app_state_store,
             app_state,
             link_error: None,
+            appearance,
+            theme_state,
             native_theme,
             center_rect: None,
             center_listener: None,
@@ -219,6 +244,10 @@ impl ShellState {
             return;
         }
         self.app_state.last_repo_id = Some(id);
+        self.save_app_state();
+    }
+
+    fn save_app_state(&self) {
         if let Some(store) = &self.app_state_store {
             if let Err(e) = store.save(&self.app_state) {
                 tracing::warn!("cannot save {}: {e}", store.path().display());
@@ -226,10 +255,41 @@ impl ShellState {
         }
     }
 
-    /// Asks the shell to show the Settings view.
-    pub fn reveal_settings(&mut self, cx: &mut Context<Self>) {
-        tracing::debug!("reveal settings");
+    /// Whether a Settings section is expanded (all are, until collapsed).
+    pub fn settings_section_expanded(&self, section: SettingsSection) -> bool {
+        !self.app_state.collapsed_sections.contains(&section)
+    }
+
+    /// Expands or collapses a Settings section and remembers it in
+    /// `app-state.json` (a failed write is logged; it still holds this run).
+    pub fn set_settings_section_expanded(
+        &mut self,
+        section: SettingsSection,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_section_expanded(section) == expanded {
+            return;
+        }
+        tracing::debug!(?section, expanded, "settings section");
+        let collapsed = &mut self.app_state.collapsed_sections;
+        if expanded {
+            collapsed.retain(|s| *s != section);
+        } else {
+            collapsed.push(section);
+        }
+        self.save_app_state();
+        cx.notify();
+    }
+
+    /// Shows the Settings view with `section` expanded, scrolled into view
+    /// and its first field focused (the New agent button, when there is no
+    /// repository, asks for Source repositories).
+    pub fn request_settings_focus(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        tracing::debug!(?section, "settings focus requested");
+        self.set_settings_section_expanded(section, true, cx);
         cx.emit(ShellEvent::RevealSettings);
+        cx.emit(ShellEvent::FocusSettings(section));
     }
 
     /// Applies one action (from the user or the link), queues its effects and
@@ -435,8 +495,83 @@ impl ShellState {
         self.native_theme.as_ref()
     }
 
+    /// Replaces the native panes' theme only (a test hook: it leaves the
+    /// theme state and gpui-component's theme alone, and emits nothing).
     pub fn set_native_theme(&mut self, theme: NativeTheme, cx: &mut Context<Self>) {
         self.native_theme = Some(theme);
+        cx.notify();
+    }
+
+    /// The theme in effect: what the native panes and gpui-component paint
+    /// with, and what web tabs must get (Task 15). [`ShellEvent::ThemeChanged`]
+    /// says when it changes.
+    pub fn theme_state(&self) -> &ThemeState {
+        &self.theme_state
+    }
+
+    /// The design tokens the themes come from.
+    pub fn theme_set(&self) -> &'static ThemeSet {
+        self.appearance.set()
+    }
+
+    /// The user's appearance choices as saved (a stale theme id stays as it
+    /// is; [`ShellState::theme_state`] has what it resolved to).
+    pub fn appearance_settings(&self) -> &AppearanceSettings {
+        self.appearance.settings()
+    }
+
+    /// Takes the user's new appearance settings: resolves them with the
+    /// `ThemeController`, saves changed settings to `app-settings.json`, and
+    /// applies a changed theme live. A failed save shows an error status; the
+    /// change still applies for this run.
+    pub fn set_appearance(&mut self, settings: AppearanceSettings, cx: &mut Context<Self>) {
+        tracing::debug!(?settings, "appearance settings");
+        let change = self.appearance.update_settings(settings);
+        if let Some(e) = change.save_error {
+            tracing::warn!("cannot save the app settings: {e}");
+            self.set_status(
+                StatusMessage::error(format!("Could not save settings: {e}")),
+                cx,
+            );
+        }
+        if let Some(state) = change.state {
+            self.apply_theme_state(state, cx);
+        }
+        // The choice shows even when the theme in effect did not change.
+        cx.notify();
+    }
+
+    /// The OS appearance changed. With "System" chosen, the theme follows it
+    /// live; an explicit theme stays.
+    pub fn set_system_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
+        tracing::debug!(?appearance, "system appearance");
+        if let Some(state) = self.appearance.set_system_appearance(appearance) {
+            self.apply_theme_state(state, cx);
+        }
+    }
+
+    /// Applies a resolved theme to gpui-component's theme and the native
+    /// panes, and records it.
+    fn apply_theme_state(&mut self, state: ThemeState, cx: &mut Context<Self>) {
+        let native = apply_framework_theme(self.appearance.set(), &state, cx);
+        self.record_theme(state, native, cx);
+    }
+
+    /// Records a theme already applied to gpui-component's theme (by
+    /// [`ShellState::apply_theme_state`] or
+    /// [`crate::theme_adapter::apply_theme`]) as the one in effect, and says so.
+    pub(crate) fn record_theme(
+        &mut self,
+        state: ThemeState,
+        native: Option<NativeTheme>,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::debug!(?state, "theme changed");
+        if let Some(native) = native {
+            self.native_theme = Some(native);
+        }
+        self.theme_state = state;
+        cx.emit(ShellEvent::ThemeChanged);
         cx.notify();
     }
 

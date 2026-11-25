@@ -1,12 +1,14 @@
 //! Pure view models for the shell: what the views show, computed without
 //! GPUI so it can be unit-tested.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use smithagents_center_host::PixelRect;
 use smithagents_client::ClientError;
 use smithagents_core::agent::{Agent, AgentState, Repo};
 use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_theme::state::ThemeChoice;
+use smithagents_theme::tokens::{TextScale, ThemeSet};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::link::LinkError;
@@ -435,4 +437,317 @@ pub fn command_error_text(error: &LinkError) -> String {
         }
         LinkError::Client(_) => error.to_string(),
     }
+}
+
+// ---- Settings pane -----------------------------------------------------------
+
+/// A collapsible section of the Settings pane, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingsSection {
+    /// App scope: theme, text size, font.
+    Appearance,
+    /// Space scope: the daemon's source repositories.
+    Repositories,
+}
+
+impl SettingsSection {
+    /// Every section, in the pane's order (the order is the scroll index).
+    pub const ALL: [SettingsSection; 2] =
+        [SettingsSection::Appearance, SettingsSection::Repositories];
+
+    /// The section's heading, also its accessible group name.
+    pub fn title(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "Appearance",
+            SettingsSection::Repositories => "Source repositories",
+        }
+    }
+
+    /// The persisted spelling (in `app-state.json`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => "appearance",
+            SettingsSection::Repositories => "repositories",
+        }
+    }
+
+    /// Reads [`SettingsSection::as_str`]'s spelling; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|section| section.as_str() == text)
+    }
+
+    /// The section's position in the pane.
+    pub fn index(self) -> usize {
+        match self {
+            SettingsSection::Appearance => 0,
+            SettingsSection::Repositories => 1,
+        }
+    }
+}
+
+/// What the theme choice calls following the OS appearance.
+pub const SYSTEM_THEME_LABEL: &str = "System";
+
+/// One entry of the theme choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeOptionVm {
+    pub choice: ThemeChoice,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// "System" first, then each theme of `set` by its name, in the set's order.
+/// Exactly one is selected: `current`, or "System" when `current` names a
+/// theme the set no longer has (the controller resolves such a choice to the
+/// system pair too).
+pub fn theme_options(set: &ThemeSet, current: &ThemeChoice) -> Vec<ThemeOptionVm> {
+    let known = match current {
+        ThemeChoice::System => None,
+        ThemeChoice::Id(id) => set.theme(id).map(|theme| theme.id.as_str()),
+    };
+    let system = ThemeOptionVm {
+        choice: ThemeChoice::System,
+        label: SYSTEM_THEME_LABEL.to_owned(),
+        selected: known.is_none(),
+    };
+    std::iter::once(system)
+        .chain(set.themes.iter().map(|theme| ThemeOptionVm {
+            choice: ThemeChoice::Id(theme.id.clone()),
+            label: theme.name.clone(),
+            selected: known == Some(theme.id.as_str()),
+        }))
+        .collect()
+}
+
+/// `value` in hundredths, for exact step arithmetic.
+fn hundredths(value: f64) -> i64 {
+    (value * 100.0).round() as i64
+}
+
+/// The text sizes the stepper offers: `min` to `max` in 0.05 steps, each
+/// rounded to two decimals, plus `max` itself and the default (clamped into
+/// the bounds) when they fall between steps; sorted, without repeats. Bounds
+/// that are not finite or are inverted give only the default (or 1.0).
+pub fn text_scale_steps(scale: &TextScale) -> Vec<f64> {
+    let default = if scale.default.is_finite() {
+        scale.default
+    } else {
+        1.0
+    };
+    if !(scale.min.is_finite() && scale.max.is_finite() && scale.min <= scale.max) {
+        return vec![hundredths(default) as f64 / 100.0];
+    }
+    let (min, max) = (hundredths(scale.min), hundredths(scale.max));
+    let mut steps: Vec<i64> = (min..=max).step_by(5).collect();
+    steps.push(max);
+    steps.push(hundredths(default).clamp(min, max));
+    steps.sort_unstable();
+    steps.dedup();
+    steps.into_iter().map(|c| c as f64 / 100.0).collect()
+}
+
+/// The step closest to `value`; `default` when `value` is not finite, lies
+/// outside the steps' range, or there are no steps.
+pub fn nearest_step(steps: &[f64], value: f64, default: f64) -> f64 {
+    const SLACK: f64 = 1e-9;
+    let (Some(first), Some(last)) = (steps.first(), steps.last()) else {
+        return default;
+    };
+    if !value.is_finite() || value < first - SLACK || value > last + SLACK {
+        return default;
+    }
+    steps
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - value).abs().total_cmp(&(b - value).abs()))
+        .unwrap_or(default)
+}
+
+/// The step after (or before) the one nearest `current`; `None` at either
+/// end, so the stepper's button there is disabled.
+pub fn stepped_text_scale(steps: &[f64], current: f64, up: bool) -> Option<f64> {
+    let nearest = nearest_step(steps, current, f64::NAN);
+    let ix = steps.iter().position(|step| *step == nearest)?;
+    let next = if up {
+        ix.checked_add(1)?
+    } else {
+        ix.checked_sub(1)?
+    };
+    steps.get(next).copied()
+}
+
+/// A text scale as the stepper shows it: "100%".
+pub fn text_scale_label(scale: f64) -> String {
+    let scale = if scale.is_finite() { scale } else { 1.0 };
+    format!("{}%", hundredths(scale))
+}
+
+/// One entry of the font choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontOptionVm {
+    pub id: String,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// Each font of `set` by its label; `current`, or the first font when
+/// `current` is unknown (as the controller resolves it), is selected.
+pub fn font_options(set: &ThemeSet, current: &str) -> Vec<FontOptionVm> {
+    let fonts = &set.base.fonts;
+    let selected = fonts
+        .iter()
+        .position(|font| font.id == current)
+        .unwrap_or(0);
+    fonts
+        .iter()
+        .enumerate()
+        .map(|(ix, font)| FontOptionVm {
+            id: font.id.clone(),
+            label: font.label.clone(),
+            selected: ix == selected,
+        })
+        .collect()
+}
+
+/// One row of the Source repositories list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRowVm {
+    pub id: RepoId,
+    /// The folder's name ([`repo_title`]).
+    pub name: String,
+    /// The full path, for display.
+    pub path: String,
+    pub default_branch: String,
+}
+
+/// The daemon's repositories by name (ignoring case), then path. Names and
+/// paths are shown as they are, spaces and any script included.
+pub fn repo_rows(repos: &[Repo]) -> Vec<RepoRowVm> {
+    let mut rows: Vec<RepoRowVm> = repos
+        .iter()
+        .map(|repo| RepoRowVm {
+            id: repo.id,
+            name: repo_title(&repo.path),
+            path: repo.path.display().to_string(),
+            default_branch: repo.default_branch.clone(),
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    rows
+}
+
+/// What a failed command says when the request never got an answer (the
+/// connection failed or broke). The error itself is not shown: it is
+/// transport detail.
+pub const DAEMON_UNREACHABLE_TEXT: &str = "Could not reach the daemon";
+
+/// A failed add as one line under the path field: the daemon's own message
+/// (first letter capitalized) for an answer it gave, a line for the code when
+/// that message is blank, or a generic line for a connection or transport
+/// failure. Nothing here prints a request (so never a token).
+pub fn repo_error_text(error: &LinkError) -> String {
+    match error {
+        LinkError::NotConnected => NOT_CONNECTED_TEXT.to_owned(),
+        LinkError::Stopped => "The daemon link has stopped".to_owned(),
+        LinkError::Client(ClientError::Api { code, message, .. }) => {
+            let message = one_line(message);
+            if message.is_empty() {
+                repo_code_text(code).to_owned()
+            } else {
+                capitalized(&message)
+            }
+        }
+        LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
+            DAEMON_UNREACHABLE_TEXT.to_owned()
+        }
+    }
+}
+
+/// A line for a daemon error code whose message was blank. The codes are the
+/// daemon's (`crates/server/src/api.rs`).
+fn repo_code_text(code: &str) -> &'static str {
+    match code {
+        "path_not_found" => "No directory at that path",
+        "not_a_git_repo" => "Not a git repository",
+        "bare_repo" => "Bare repositories are not supported",
+        "no_default_branch" => "Could not determine the default branch",
+        "repo_exists" => "This repository is already added",
+        _ => "The daemon could not add the repository",
+    }
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// What the path field says when it is empty.
+pub const ENTER_A_PATH_TEXT: &str = "Enter a path";
+/// What the path field says about a relative path.
+pub const ABSOLUTE_PATH_TEXT: &str = "Enter an absolute path";
+/// What the path field says about a URL: the daemon has no clone endpoint.
+pub const CLONE_UNSUPPORTED_TEXT: &str =
+    "Cloning from a URL is not supported yet. Enter a local path.";
+/// What the Source repositories section says when there is none.
+pub const NO_REPOS_TEXT: &str = "No repositories yet. Add a local git repository to create agents.";
+
+/// [`validate_repo_path_input_in`] with the user's home directory.
+pub fn validate_repo_path_input(raw: &str) -> Result<PathBuf, &'static str> {
+    validate_repo_path_input_in(raw, std::env::home_dir().as_deref())
+}
+
+/// The path to send to the daemon for the typed `raw`, or the line to show
+/// under the field. It trims, rejects an empty field and a URL (no clone
+/// yet), expands a leading `~` or `~/` to `home`, and requires an absolute
+/// path. Whether the path exists and is a git repository is the daemon's
+/// call: its answer is shown the same way.
+pub fn validate_repo_path_input_in(
+    raw: &str,
+    home: Option<&Path>,
+) -> Result<PathBuf, &'static str> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(ENTER_A_PATH_TEXT);
+    }
+    if looks_like_url(text) {
+        return Err(CLONE_UNSUPPORTED_TEXT);
+    }
+    let path = match text.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            let home = home.ok_or(ABSOLUTE_PATH_TEXT)?;
+            match rest.trim_start_matches('/') {
+                "" => home.to_path_buf(),
+                rest => home.join(rest),
+            }
+        }
+        _ => PathBuf::from(text),
+    };
+    if !path.is_absolute() {
+        return Err(ABSOLUTE_PATH_TEXT);
+    }
+    Ok(path)
+}
+
+/// A git remote rather than a local path: a URL scheme git clones from, or
+/// the scp-like `git@host:` form.
+fn looks_like_url(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["http://", "https://", "ssh://", "git://", "git@"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }

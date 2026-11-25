@@ -1,6 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 
 use smithagents_app::app_state::{AppState, AppStateStore};
+use smithagents_app::view_models::SettingsSection;
 use smithagents_core::ids::RepoId;
 
 #[test]
@@ -11,6 +12,7 @@ fn the_last_repo_round_trips() {
     store
         .save(&AppState {
             last_repo_id: Some(id),
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(store.load().last_repo_id, Some(id));
@@ -75,4 +77,55 @@ fn the_file_is_private_and_a_missing_home_is_created() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(names, ["app-state.json"], "no temp file left behind");
+}
+
+#[test]
+fn collapsed_settings_sections_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AppStateStore::new(dir.path());
+    assert!(store.load().collapsed_sections.is_empty(), "all expanded");
+    let id = RepoId::new();
+    store
+        .save(&AppState {
+            last_repo_id: Some(id),
+            collapsed_sections: vec![SettingsSection::Repositories],
+        })
+        .unwrap();
+    let loaded = store.load();
+    assert_eq!(loaded.collapsed_sections, [SettingsSection::Repositories]);
+    assert_eq!(loaded.last_repo_id, Some(id), "the other field survives");
+    let text = std::fs::read_to_string(dir.path().join("app-state.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        json["collapsed_settings_sections"],
+        serde_json::json!(["repositories"])
+    );
+}
+
+#[test]
+fn collapsed_sections_load_leniently() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AppStateStore::new(dir.path());
+    let file = dir.path().join("app-state.json");
+    let id = RepoId::new();
+    for (text, want) in [
+        (
+            r#"{"collapsed_settings_sections": ["appearance", "agent-defaults", 3, "appearance"]}"#,
+            vec![SettingsSection::Appearance],
+        ),
+        (r#"{"collapsed_settings_sections": "appearance"}"#, vec![]),
+        (r#"{"collapsed_settings_sections": null}"#, vec![]),
+    ] {
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(store.load().collapsed_sections, want, "{text}");
+    }
+    // A bad sections value does not lose the repository.
+    std::fs::write(
+        &file,
+        format!(r#"{{"last_repo_id": "{id}", "collapsed_settings_sections": {{}}}}"#),
+    )
+    .unwrap();
+    let loaded = store.load();
+    assert_eq!(loaded.last_repo_id, Some(id));
+    assert!(loaded.collapsed_sections.is_empty());
 }

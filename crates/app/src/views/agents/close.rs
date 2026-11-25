@@ -17,11 +17,12 @@ use gpui_kit::{App, Context, ParentElement as _, Styled as _, WeakEntity, Window
 use smithagents_core::ids::AgentId;
 
 use super::{
-    answered, notify_link_error, notify_unreachable, AgentsPane, CANCEL_CLOSE_ID,
-    CLOSE_AGENT_LABEL, CLOSE_TITLE_ID, CONFIRM_CLOSE_ID,
+    notify_link_error, notify_unreachable, AgentsPane, CANCEL_CLOSE_ID, CLOSE_AGENT_LABEL,
+    CLOSE_TITLE_ID, CONFIRM_CLOSE_ID,
 };
 use crate::link::LinkError;
 use crate::view_models::{StatusMessage, DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT};
+use crate::views::answered;
 
 const FAILED: &str = "Could not close the agent";
 

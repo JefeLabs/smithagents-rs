@@ -40,8 +40,6 @@ mod new_agent;
 
 use std::collections::HashMap;
 
-use futures::future::{select, Either, LocalBoxFuture};
-
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::notification::{Notification, NotificationType};
@@ -561,16 +559,6 @@ impl Render for AgentsPane {
                     ),
                 ),
             })
-    }
-}
-
-/// `command`'s answer, or `None` if `timer` (the command timeout) ends first.
-/// Giving up drops the future; the daemon may still finish the command, and
-/// its result then arrives through its events.
-async fn answered<T>(command: LocalBoxFuture<'static, T>, timer: Task<()>) -> Option<T> {
-    match select(command, timer).await {
-        Either::Left((answer, _)) => Some(answer),
-        Either::Right(((), _)) => None,
     }
 }
 

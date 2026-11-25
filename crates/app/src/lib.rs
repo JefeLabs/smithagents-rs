@@ -6,6 +6,7 @@
 //! and calls [`run`].
 
 pub mod app_state;
+pub mod appearance;
 mod atomic_file;
 pub mod layout_store;
 pub mod link;
@@ -22,12 +23,12 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::{
     px, size, App, AppContext as _, Bounds, QuitMode, TitlebarOptions, WindowBounds, WindowOptions,
 };
-use smithagents_theme::native::NativeTheme;
 
 use crate::app_state::AppStateStore;
 use crate::layout_store::{restored_window_bounds, LayoutStore};
 use crate::link::LinkConfig;
 use crate::model::ShellModel;
+use crate::settings::AppSettingsStore;
 use crate::shell::{Shell, ShellOptions};
 
 /// The main window's title.
@@ -49,10 +50,11 @@ pub fn run(link: LinkConfig) -> ! {
         .run(move |cx| {
             gpui_kit::init(cx);
             shell::init(cx);
-            let native_theme = apply_startup_theme(cx);
             #[cfg(unix)]
             quit_on_termination_signals(cx);
-            if let Err(e) = open_main_window(link, native_theme, cx) {
+            // The shell applies the saved theme as it opens, before the first
+            // frame (the Kit's forced light default never paints).
+            if let Err(e) = open_main_window(link, cx) {
                 eprintln!("smithagents: cannot open the main window: {e:#}");
                 std::process::exit(1);
             }
@@ -64,27 +66,10 @@ pub fn run(link: LinkConfig) -> ! {
     std::process::exit(0)
 }
 
-/// Applies the Smith theme before the first window opens, replacing the
-/// Kit's forced light default, and returns it for agent accents. Persisted
-/// settings arrive in a later task.
-fn apply_startup_theme(cx: &mut App) -> Option<NativeTheme> {
-    use smithagents_theme::state::{AppearanceSettings, ThemeController};
-    use smithagents_theme::tokens::{Appearance, ThemeSet};
-
-    let set = ThemeSet::embedded();
-    let controller =
-        ThemeController::new(set.clone(), AppearanceSettings::default(), Appearance::Dark);
-    let state = controller.state();
-    theme_adapter::apply_theme(set, &state, None, cx)
-}
-
-fn open_main_window(
-    link: LinkConfig,
-    native_theme: Option<NativeTheme>,
-    cx: &mut App,
-) -> gpui_kit::Result<()> {
+fn open_main_window(link: LinkConfig, cx: &mut App) -> gpui_kit::Result<()> {
     let layout = LayoutStore::new(&link.home);
     let app_state = AppStateStore::new(&link.home);
+    let settings = AppSettingsStore::new(&link.home);
     // The saved place, on its display if that display is still attached.
     let placed = layout.load_window().and_then(|saved| {
         let display = cx
@@ -120,7 +105,8 @@ fn open_main_window(
                     model: ShellModel::new(),
                     link: Some(link),
                     layout: Some(layout),
-                    native_theme,
+                    settings: Some(settings),
+                    system_appearance: None,
                     commands: None,
                     app_state: Some(app_state),
                     command_timeout: None,

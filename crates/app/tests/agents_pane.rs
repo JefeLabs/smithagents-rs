@@ -95,6 +95,10 @@ impl AgentCommands for FakeCommands {
             .unwrap_or(Ok(()));
         async move { result }.boxed_local()
     }
+    /// The agents pane never adds a repository.
+    fn add_repo(&self, path: &std::path::Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        panic!("the agents pane added a repository: {}", path.display())
+    }
 }
 
 /// An agent created `minutes` after the fixture start, with `hue` and `state`.
@@ -783,6 +787,7 @@ fn several_repositories_open_a_picker_with_the_last_used_first(cx: &mut TestAppC
     store
         .save(&AppState {
             last_repo_id: Some(older.id),
+            ..Default::default()
         })
         .unwrap();
     let fake = Rc::new(FakeCommands::default());

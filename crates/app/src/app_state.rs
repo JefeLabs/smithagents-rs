@@ -1,5 +1,6 @@
 //! What the app remembers between runs that is not a setting:
-//! `<home>/app-state.json`, for example `{ "last_repo_id": "<uuid>" }`.
+//! `<home>/app-state.json`, for example
+//! `{ "last_repo_id": "<uuid>", "collapsed_settings_sections": ["appearance"] }`.
 //!
 //! It is kept apart from `app-settings.json`, whose shape belongs to the theme
 //! crate's `AppearanceSettings`.
@@ -8,9 +9,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 use smithagents_core::ids::RepoId;
+
+use crate::view_models::SettingsSection;
 
 const FILE_NAME: &str = "app-state.json";
 
@@ -21,6 +24,17 @@ pub struct AppState {
     /// The repository the last agent was created in from the picker; the
     /// picker preselects it while it still exists.
     pub last_repo_id: Option<RepoId>,
+    /// The Settings pane's sections the user collapsed (all others are
+    /// expanded, so a new section starts expanded). Each name once.
+    #[serde(
+        rename = "collapsed_settings_sections",
+        serialize_with = "section_names"
+    )]
+    pub collapsed_sections: Vec<SettingsSection>,
+}
+
+fn section_names<S: Serializer>(sections: &[SettingsSection], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(sections.iter().map(|section| section.as_str()))
 }
 
 /// Loads and saves [`AppState`] under a home directory.
@@ -71,7 +85,35 @@ impl AppStateStore {
                     None
                 }
             });
-        AppState { last_repo_id }
+        let collapsed_sections = match value.get("collapsed_settings_sections") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(names)) => {
+                let mut sections = Vec::new();
+                for name in names {
+                    match name.as_str().and_then(SettingsSection::parse) {
+                        Some(section) if !sections.contains(&section) => sections.push(section),
+                        Some(_) => {}
+                        // A section of a newer app, or junk.
+                        None => tracing::debug!(
+                            "ignoring collapsed section {name} in {}",
+                            path.display()
+                        ),
+                    }
+                }
+                sections
+            }
+            Some(other) => {
+                tracing::warn!(
+                    "ignoring collapsed_settings_sections {other} in {}",
+                    path.display()
+                );
+                Vec::new()
+            }
+        };
+        AppState {
+            last_repo_id,
+            collapsed_sections,
+        }
     }
 
     /// Writes the state atomically, mode 0600 (see

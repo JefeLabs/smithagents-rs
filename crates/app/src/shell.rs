@@ -34,9 +34,10 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _, Pixels,
     Render, Styled as _, Subscription, Task, TestSupportExt as _, Window,
 };
-use smithagents_theme::native::NativeTheme;
+use smithagents_theme::tokens::ThemeSet;
 
 use crate::app_state::AppStateStore;
+use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{
     fitted_right_width, left_pane_extent, saved_dock, saved_left_pane, saved_window,
     with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
@@ -44,14 +45,15 @@ use crate::layout_store::{
 };
 use crate::link::{AgentCommands, DaemonLink, LinkConfig};
 use crate::model::ShellModel;
+use crate::settings::AppSettingsStore;
 use crate::shell_state::{ShellEvent, ShellState};
-use crate::theme_adapter::{region_paint, Region};
+use crate::theme_adapter::{region_paint, OsAppearance, Region, SystemAppearanceSource};
 use crate::update::{NoUpdater, Updater};
 use crate::view_models::{update_button, LeftPaneMode};
 use crate::views::agents::AgentsPane;
 use crate::views::center::CenterPanel;
-use crate::views::placeholder::PlaceholderPanel;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
+use crate::views::settings::SettingsPane;
 use crate::views::status_bar::status_bar;
 use crate::views::title_bar::title_bar;
 
@@ -102,10 +104,15 @@ pub struct ShellOptions {
     /// Where the dock layout and window bounds persist; `None` keeps them
     /// in memory only.
     pub layout: Option<LayoutStore>,
-    /// The current theme, for agent accents.
-    pub native_theme: Option<NativeTheme>,
-    /// Replaces the daemon link for agent commands (create, close), so
-    /// headless tests need no daemon; `None` sends them through the link.
+    /// Where the appearance settings persist (`app-settings.json`); `None`
+    /// starts from the defaults and keeps changes in memory only.
+    pub settings: Option<AppSettingsStore>,
+    /// Where the OS light/dark appearance comes from; `None` is the real one
+    /// ([`OsAppearance`]). Headless tests inject a fake they can flip.
+    pub system_appearance: Option<Rc<dyn SystemAppearanceSource>>,
+    /// Replaces the daemon link for the views' commands (create and close an
+    /// agent, add a repository), so headless tests need no daemon; `None`
+    /// sends them through the link.
     pub commands: Option<Rc<dyn AgentCommands>>,
     /// Where the app remembers small state such as the last repository
     /// chosen (`app-state.json`); `None` keeps it in memory only.
@@ -163,7 +170,8 @@ impl Shell {
             model,
             link,
             layout,
-            native_theme,
+            settings,
+            system_appearance,
             commands,
             app_state,
             command_timeout,
@@ -191,9 +199,17 @@ impl Shell {
                 "restoring the layout"
             );
         }
+        // The theme: the saved settings resolved against the OS appearance.
+        // The state applies it before the first frame and follows the OS
+        // from here on.
+        let system_appearance = system_appearance.unwrap_or_else(|| Rc::new(OsAppearance));
+        let appearance = AppearanceRuntime::new(
+            ThemeSet::embedded(),
+            settings,
+            system_appearance.current(cx),
+        );
         let state = cx.new(|cx| {
-            let mut state =
-                ShellState::new(model, native_theme, link, left, commands, app_state, cx);
+            let mut state = ShellState::new(model, appearance, link, left, commands, app_state, cx);
             if let Some(timeout) = command_timeout {
                 state.set_command_timeout(timeout);
             }
@@ -211,15 +227,7 @@ impl Shell {
         // carry the toggles instead.
         skin.set_toggle_button_visible(false, cx);
         let center = cx.new(|cx| CenterPanel::new(state.clone(), cx));
-        let settings = cx.new(|cx| {
-            PlaceholderPanel::new(
-                state.clone(),
-                SETTINGS_PANEL,
-                "Settings",
-                "Appearance and source repositories will be set here.",
-                cx,
-            )
-        });
+        let settings = cx.new(|cx| SettingsPane::new(state.clone(), window, cx));
         let left_pane = cx.new(|cx| AgentsPane::new(state.clone(), window, cx));
         dock.update(cx, |area, cx| {
             let center = DockLayout::tabs().panel_view(panel_handle(center), cx);
@@ -235,7 +243,17 @@ impl Shell {
             }
         });
 
+        let weak_state = state.downgrade();
+        let follow_os = system_appearance.observe(
+            window,
+            Box::new(move |appearance, cx| {
+                let _ =
+                    weak_state.update(cx, |state, cx| state.set_system_appearance(appearance, cx));
+            }),
+        );
         let subscriptions = vec![
+            // "System" follows the OS appearance live.
+            follow_os,
             // A theme change reaches the views through the state.
             cx.observe(&state, |_, _, cx| cx.notify()),
             cx.subscribe(&dock, |this, _, event: &DockEvent, cx| {
@@ -266,6 +284,9 @@ impl Shell {
                             cx.notify();
                         }
                     }
+                    // The settings view handles its own focus; the views
+                    // repaint from the state's notify on a theme change.
+                    ShellEvent::FocusSettings(_) | ShellEvent::ThemeChanged => {}
                 }
             }),
             // Toggles made by the dock skin itself; the shell's own entry

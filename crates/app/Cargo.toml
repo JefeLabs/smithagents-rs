@@ -33,6 +33,9 @@ signal-hook.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }
 chrono.workspace = true
 tempfile.workspace = true
+# Only to build the client's transport errors in the view-model tests.
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true, features = ["process"] }

@@ -1,10 +1,10 @@
 //! Maps the Smith design tokens onto gpui-component's theme system.
 //!
-//! Everything except [`apply_theme_state`], [`apply_theme`],
-//! [`system_appearance`] and [`observe_system_appearance`] is pure;
-//! [`region_paint`] and [`token_paint`] only read the framework theme as a
-//! fallback. Colors come only from [`NativeTheme`]; there are no literal
-//! colors here.
+//! Everything except [`apply_theme_state`], [`apply_framework_theme`],
+//! [`apply_theme`], [`system_appearance`], [`observe_system_appearance`] and
+//! [`OsAppearance`] is pure; [`region_paint`] and [`token_paint`] only read
+//! the framework theme as a fallback. Colors come only from [`NativeTheme`];
+//! there are no literal colors here.
 
 use std::collections::BTreeMap;
 
@@ -111,9 +111,12 @@ pub fn region_colors(native: &NativeTheme, region: Region) -> Option<(Hsla, Hsla
 /// falls back to the framework theme's base colors and logs once.
 ///
 /// The native theme the views read here (`ShellState::native_theme`) and the
-/// theme gpui-component paints with are two copies of one choice. Change the
-/// theme only through [`apply_theme`], which updates both; Task 15's runtime
-/// theme change must call it.
+/// theme gpui-component paints with are two copies of one choice. They change
+/// together, only through [`apply_framework_theme`] followed by recording the
+/// result on the shell state: the shell state does both itself for a settings
+/// or OS appearance change (`ShellState::set_appearance`,
+/// `ShellState::set_system_appearance`), and [`apply_theme`] does both for a
+/// caller outside it.
 pub fn region_paint(native: Option<&NativeTheme>, region: Region, cx: &App) -> (Hsla, Hsla) {
     native
         .and_then(|native| region_colors(native, region))
@@ -131,28 +134,55 @@ pub fn region_paint(native: Option<&NativeTheme>, region: Region, cx: &App) -> (
 }
 
 /// Applies `state` everywhere the theme lives: gpui-component's theme
-/// ([`apply_theme_state`]) and, when `shell` is given, the shell state's
-/// native theme (which the views' region colors and agent accents read).
-/// Returns the native theme. The shell is `None` only at startup, before it
-/// exists; it takes the returned theme through `ShellOptions`.
+/// ([`apply_framework_theme`]) and, when `shell` is given, the shell state,
+/// which records it as its theme state and native theme (the views' region
+/// colors and agent accents read the latter) and emits
+/// `ShellEvent::ThemeChanged`. Returns the native theme.
+///
+/// This forces a resolved state from outside the shell state (tests, and a
+/// caller without a shell). The app's own changes go through the shell
+/// state's appearance settings instead, which resolve the state with the
+/// `ThemeController` it owns and apply it the same way. Do not call this from
+/// inside a `ShellState` update (it updates that entity).
 pub fn apply_theme(
     set: &ThemeSet,
     state: &ThemeState,
     shell: Option<&gpui_kit::Entity<crate::shell_state::ShellState>>,
     cx: &mut App,
 ) -> Option<NativeTheme> {
+    let native = apply_framework_theme(set, state, cx);
+    if let Some(shell) = shell {
+        let recorded = native.clone();
+        shell.update(cx, |shell, cx| {
+            shell.record_theme(state.clone(), recorded, cx)
+        });
+    }
+    native
+}
+
+/// Applies `state` to gpui-component's theme ([`apply_theme_state`]) and
+/// returns the native theme the views must paint with
+/// ([`native_theme_for`]). The caller records that theme on the shell state
+/// in the same update, so the two copies never disagree.
+pub fn apply_framework_theme(
+    set: &ThemeSet,
+    state: &ThemeState,
+    cx: &mut App,
+) -> Option<NativeTheme> {
     apply_theme_state(set, state, cx);
-    let native = set.native(&state.theme).or_else(|| {
+    native_theme_for(set, state)
+}
+
+/// The native theme `state` names, or, for an unknown id, the system pair's
+/// theme for `state.appearance` (the fallback [`apply_theme_state`] uses).
+pub fn native_theme_for(set: &ThemeSet, state: &ThemeState) -> Option<NativeTheme> {
+    set.native(&state.theme).or_else(|| {
         let pair = &set.base.system_pair;
         set.native(match state.appearance {
             Appearance::Dark => &pair.dark,
             Appearance::Light => &pair.light,
         })
-    });
-    if let (Some(shell), Some(native)) = (shell, native.clone()) {
-        shell.update(cx, |shell, cx| shell.set_native_theme(native, cx));
-    }
-    native
+    })
 }
 
 /// The base font size gpui-component uses at text scale 1.0, in pixels. The
@@ -297,6 +327,35 @@ pub fn observe_system_appearance(
     window.observe_window_appearance(move |window, cx| {
         callback(appearance_from_window(window.appearance()), cx);
     })
+}
+
+/// Called with the OS appearance each time it changes.
+pub type AppearanceListener = Box<dyn FnMut(Appearance, &mut App)>;
+
+/// Where the shell learns the OS light/dark appearance. The app uses
+/// [`OsAppearance`]. A headless test window's appearance cannot be changed
+/// from outside GPUI (its `simulate_appearance_change` is crate-private), so
+/// tests inject a fake through `ShellOptions::system_appearance`.
+pub trait SystemAppearanceSource {
+    /// The appearance now.
+    fn current(&self, cx: &App) -> Appearance;
+    /// Calls `listener` on every change seen by `window`, until the returned
+    /// subscription is dropped.
+    fn observe(&self, window: &Window, listener: AppearanceListener) -> Subscription;
+}
+
+/// The real OS appearance ([`system_appearance`],
+/// [`observe_system_appearance`]).
+pub struct OsAppearance;
+
+impl SystemAppearanceSource for OsAppearance {
+    fn current(&self, cx: &App) -> Appearance {
+        system_appearance(cx)
+    }
+
+    fn observe(&self, window: &Window, listener: AppearanceListener) -> Subscription {
+        observe_system_appearance(window, listener)
+    }
 }
 
 /// Marks that the generated theme set is registered.

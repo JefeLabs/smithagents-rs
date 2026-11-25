@@ -455,6 +455,10 @@ impl AgentCommands for FakeCommands {
     fn close_agent(&self, _: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>> {
         async { Err(LinkError::NotConnected) }.boxed_local()
     }
+
+    fn add_repo(&self, _: &std::path::Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        async { Err(LinkError::NotConnected) }.boxed_local()
+    }
 }
 
 #[gpui_kit::test]

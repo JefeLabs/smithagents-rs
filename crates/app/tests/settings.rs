@@ -131,3 +131,118 @@ fn stale_temp_file_does_not_break_save_and_is_not_touched() {
         .mode();
     assert_eq!(mode & 0o777, 0o600);
 }
+
+mod runtime {
+    use smithagents_app::appearance::AppearanceRuntime;
+    use smithagents_app::settings::AppSettingsStore;
+    use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
+    use smithagents_theme::tokens::{Appearance, ThemeSet};
+
+    fn light() -> AppearanceSettings {
+        AppearanceSettings {
+            theme: ThemeChoice::Id("smith-light".into()),
+            ..AppearanceSettings::default()
+        }
+    }
+
+    #[test]
+    fn it_starts_from_the_saved_settings_and_the_system_appearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppSettingsStore::new(dir.path());
+        let runtime =
+            AppearanceRuntime::new(ThemeSet::embedded(), Some(store.clone()), Appearance::Light);
+        assert_eq!(runtime.settings(), &AppearanceSettings::default());
+        assert_eq!(
+            runtime.state().theme,
+            "smith-light",
+            "System follows the OS"
+        );
+
+        store
+            .save(&AppearanceSettings {
+                font: "mono".into(),
+                ..light()
+            })
+            .unwrap();
+        let runtime = AppearanceRuntime::new(ThemeSet::embedded(), Some(store), Appearance::Dark);
+        assert_eq!(
+            runtime.state().theme,
+            "smith-light",
+            "an explicit theme wins"
+        );
+        assert_eq!(runtime.state().font, "mono");
+    }
+
+    #[test]
+    fn a_change_is_resolved_and_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppSettingsStore::new(dir.path());
+        let mut runtime =
+            AppearanceRuntime::new(ThemeSet::embedded(), Some(store.clone()), Appearance::Dark);
+        let change = runtime.update_settings(light());
+        assert!(change.save_error.is_none());
+        assert_eq!(change.state.unwrap().theme, "smith-light");
+        assert_eq!(runtime.settings(), &light());
+        assert_eq!(store.load(), light());
+    }
+
+    #[test]
+    fn a_choice_that_resolves_to_the_same_theme_is_still_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppSettingsStore::new(dir.path());
+        let mut runtime =
+            AppearanceRuntime::new(ThemeSet::embedded(), Some(store.clone()), Appearance::Dark);
+        let dark = AppearanceSettings {
+            theme: ThemeChoice::Id("smith-dark".into()),
+            ..AppearanceSettings::default()
+        };
+        let change = runtime.update_settings(dark.clone());
+        assert!(
+            change.state.is_none(),
+            "System already resolved to Smith Dark"
+        );
+        assert_eq!(store.load(), dark, "but the explicit choice is remembered");
+        // An unchanged choice writes nothing.
+        std::fs::remove_file(dir.path().join("app-settings.json")).unwrap();
+        let change = runtime.update_settings(dark);
+        assert!(change.state.is_none() && change.save_error.is_none());
+        assert!(!dir.path().join("app-settings.json").exists());
+    }
+
+    #[test]
+    fn a_failed_save_is_reported_and_the_change_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the home directory should be: every write fails.
+        let home = dir.path().join("home");
+        std::fs::write(&home, "not a directory").unwrap();
+        let mut runtime = AppearanceRuntime::new(
+            ThemeSet::embedded(),
+            Some(AppSettingsStore::new(&home)),
+            Appearance::Dark,
+        );
+        let change = runtime.update_settings(light());
+        assert!(change.save_error.is_some());
+        assert_eq!(change.state.unwrap().theme, "smith-light");
+        assert_eq!(runtime.settings(), &light());
+    }
+
+    #[test]
+    fn system_follows_the_os_and_an_explicit_theme_does_not() {
+        let mut runtime = AppearanceRuntime::new(ThemeSet::embedded(), None, Appearance::Light);
+        assert_eq!(
+            runtime
+                .set_system_appearance(Appearance::Dark)
+                .unwrap()
+                .theme,
+            "smith-dark"
+        );
+        assert!(
+            runtime.set_system_appearance(Appearance::Dark).is_none(),
+            "no change"
+        );
+        runtime.update_settings(light());
+        assert!(runtime.set_system_appearance(Appearance::Light).is_none());
+        assert!(runtime.set_system_appearance(Appearance::Dark).is_none());
+        assert_eq!(runtime.state().theme, "smith-light");
+    }
+}
