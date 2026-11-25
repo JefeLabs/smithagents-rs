@@ -239,6 +239,114 @@ describe("click policy", () => {
   });
 });
 
+describe("click policy (right button)", () => {
+  it("right-click on a link prevents default but does not open it", () => {
+    const hook = vi.fn();
+    window.__smithagentsOpenExternal = hook;
+    const { container } = mount([{ id: "a", role: "assistant", parts: [{ type: "text", text: "[x](https://example.com)" }] }]);
+    const a = container.querySelector("a")!;
+    expect(fireEvent(a, new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 2 }))).toBe(false);
+    expect(hook).not.toHaveBeenCalled();
+  });
+});
+
+describe("network failure on send", () => {
+  it("keeps the bubble, keeps the draft empty, shows the error and resyncs history once", async () => {
+    let historyCalls = 0;
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/chat")) throw new TypeError("network down");
+      historyCalls++;
+      return new Response(
+        JSON.stringify([{ id: "s1", agent_id: "ag1", seq: 1, role: "user", text: "stored msg", created_at: "" }]),
+        { status: 200 },
+      );
+    });
+    mount([]);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    await userEvent.type(box, "stored msg{Enter}");
+    expect(await screen.findByText("Could not reach the daemon.")).toBeTruthy();
+    await waitFor(() => expect(historyCalls).toBe(1));
+    expect(screen.getByText("stored msg", { selector: "div" })).toBeTruthy();
+    expect(box.value).toBe("");
+    await waitFor(() => expect(box.disabled).toBe(false));
+  });
+});
+
+describe("poll hardening", () => {
+  const j = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status });
+  it("never overlaps ticks", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let release!: () => void;
+      const slow = new Promise<void>((r) => (release = r));
+      let agentCalls = 0;
+      fetchMock.mockImplementation(async (url: string) => {
+        if (url.includes("/v1/agents?")) {
+          agentCalls++;
+          await slow;
+          return j([{ ...agent, state: "working" }]);
+        }
+        return j([]);
+      });
+      render(<Chat cfg={cfg} agent={{ ...agent, state: "working" }} initialMessages={[]} />);
+      await vi.advanceTimersByTimeAsync(2100);
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(agentCalls).toBe(1);
+      release();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling on 404 and shows the error instead of the working note", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let agentCalls = 0;
+      fetchMock.mockImplementation(async () => {
+        agentCalls++;
+        return j({ error: "agent_not_found", message: "Agent gone." }, 404);
+      });
+      render(<Chat cfg={cfg} agent={{ ...agent, state: "quiet" }} initialMessages={[]} />);
+      await vi.advanceTimersByTimeAsync(2100);
+      await screen.findByText("Agent gone.");
+      expect(screen.queryByText(/still working\. The reply/)).toBeNull();
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(agentCalls).toBe(1);
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).disabled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("scroll-up", () => {
+  it("does not scroll to the bottom for new content when the user has scrolled up", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const spy = vi.fn();
+    Element.prototype.scrollIntoView = spy;
+    try {
+      fetchMock.mockImplementation(async (url: string) => {
+        const j = (b: unknown) => new Response(JSON.stringify(b), { status: 200 });
+        if (url.includes("/v1/agents?")) return j([{ ...agent, state: "idle" }]);
+        return j([{ id: "n1", agent_id: "ag1", seq: 1, role: "assistant", text: "arrived late", created_at: "" }]);
+      });
+      const { container } = render(<Chat cfg={cfg} agent={{ ...agent, state: "working" }} initialMessages={[]} />);
+      const list = container.querySelector(".overflow-y-auto") as HTMLElement;
+      Object.defineProperty(list, "scrollHeight", { value: 1000, configurable: true });
+      Object.defineProperty(list, "clientHeight", { value: 200, configurable: true });
+      list.scrollTop = 0;
+      fireEvent.scroll(list);
+      spy.mockClear();
+      await vi.advanceTimersByTimeAsync(2100);
+      await screen.findByText("arrived late");
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+});
+
 describe("App", () => {
   it("renders the error panel for a config failure and never the token", async () => {
     render(<App load={() => loadChatProps(() => { throw new HostConfigError("Host configuration is missing."); })} />);

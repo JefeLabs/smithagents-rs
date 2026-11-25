@@ -28,6 +28,8 @@ function openExternal(event: MouseEvent) {
   const anchor = (event.target as Element).closest("a");
   if (!anchor) return;
   event.preventDefault();
+  // auxclick also fires for the right button: only the middle button opens the link.
+  if (event.type === "auxclick" && event.button !== 1) return;
   const href = anchor.getAttribute("href");
   if (!isSafeHref(href)) return;
   if (window.__smithagentsOpenExternal) window.__smithagentsOpenExternal(href);
@@ -45,38 +47,53 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
     transport,
     messages: initialMessages,
     onError: (e) => {
-      // An ApiError is only thrown before any stream is read: the daemon did not accept the message.
-      if (e instanceof ApiError) {
+      if (!(e instanceof ApiError)) return;
+      if (e.status > 0) {
+        // The daemon answered with a rejection before any stream: it did not accept the message.
         setMessages((ms) => (ms[ms.length - 1]?.role === "user" ? ms.slice(0, -1) : ms));
         setDraft(lastSent.current);
+      } else {
+        // Network failure: the daemon may already have stored the message. Keep the bubble
+        // and resync once with what the daemon has.
+        void getMessages(cfg).then((h) => setMessages(toUiMessages(h)), () => {});
       }
     },
   });
+  const [pollError, setPollError] = useState<string | null>(null);
   const [agentWorking, setAgentWorking] = useState(isWorking(agent.state));
   const busy = status === "submitted" || status === "streaming" || agentWorking;
 
   useEffect(() => {
-    if (!agentWorking) return;
+    if (!agentWorking || pollError !== null) return;
     let live = true;
-    const timer = setInterval(() => {
-      void (async () => {
-        try {
-          const a = await getAgent(cfg);
-          if (!live || isWorking(a.state)) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = async () => {
+      try {
+        const a = await getAgent(cfg);
+        if (!live) return;
+        if (!isWorking(a.state)) {
           const history = toUiMessages(await getMessages(cfg));
           if (!live) return;
           setMessages(history);
           setAgentWorking(false);
-        } catch {
-          // transient: keep polling
+          return;
         }
-      })();
-    }, POLL_MS);
+      } catch (e) {
+        if (!live) return;
+        if (e instanceof ApiError && (e.status === 401 || e.status === 404)) {
+          setPollError(e.message);
+          return;
+        }
+        // transient: keep polling
+      }
+      timer = setTimeout(() => void tick(), POLL_MS);
+    };
+    timer = setTimeout(() => void tick(), POLL_MS);
     return () => {
       live = false;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
-  }, [agentWorking, cfg, setMessages]);
+  }, [agentWorking, pollError, cfg, setMessages]);
 
   const stick = useRef(true);
   const bottom = useRef<HTMLDivElement>(null);
@@ -122,9 +139,14 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
         ))}
         <div ref={bottom} />
       </div>
-      {agentWorking && (
+      {agentWorking && pollError === null && (
         <div role="status" className="text-muted-foreground border-border border-t px-4 py-2 text-sm">
           This agent is still working. The reply will appear here when it finishes.
+        </div>
+      )}
+      {pollError !== null && (
+        <div role="alert" className="text-status-error border-border border-t px-4 py-2 text-sm">
+          {pollError}
         </div>
       )}
       {error && (
