@@ -8,7 +8,9 @@
 //! is valid only in the questions phase and refuses every other phase with
 //! [`IntentError::InvalidState`], naming the phase. The polish job itself
 //! holds the reservation only while it applies results, never across harness
-//! calls.
+//! calls. A review that confirms a dependency also takes a service-wide
+//! dependency lock across its cycle check and save. Locks are always taken in
+//! one order: the start lock, then a reservation, then the dependency lock.
 //!
 //! A polish pass runs as a background job whose claim on the intent is the
 //! stored `Polishing{pass}` phase. The job always moves the intent on: to its
@@ -79,6 +81,8 @@ const CLOSE_RETRY: Duration = Duration::from_secs(30);
 
 const TITLE_MAX: usize = 120;
 const ITEM_MAX: usize = 2000;
+/// Characters allowed in a current behavior set through `update`.
+const BEHAVIOR_MAX: usize = 20_000;
 const DEFAULT_TITLE: &str = "Untitled intent";
 /// The length limit `slugify` applies; numbered slugs keep to it too.
 const SLUG_MAX: usize = 48;
@@ -177,6 +181,11 @@ struct Inner {
     /// Held while deciding whether to start intents and starting them (by
     /// `send` and by each scheduler pass). Taken before any reservation.
     starts: AsyncMutex<()>,
+    /// Held by a review that confirms a depends-on item, from its cycle
+    /// check (which reads other intents' edges) through its save, so two
+    /// confirmations cannot each pass the check and close a cycle together.
+    /// Taken after the intent's reservation.
+    dependencies: AsyncMutex<()>,
     /// Runs at the beginning of every start (see [`IntentService::set_start_hook`]).
     #[cfg(feature = "test-util")]
     start_hook: Mutex<Option<StartHook>>,
@@ -211,6 +220,7 @@ impl IntentService {
                 locks: Mutex::new(HashMap::new()),
                 scheduler: Mutex::new(None),
                 starts: AsyncMutex::new(()),
+                dependencies: AsyncMutex::new(()),
                 #[cfg(feature = "test-util")]
                 start_hook: Mutex::new(None),
             }),
@@ -410,6 +420,12 @@ impl IntentService {
                 if text.trim().is_empty() {
                     return Err(IntentError::Invalid("seed text is empty".into()));
                 }
+                // A chat seed is cut to this size; typed text is refused instead.
+                if text.len() > MAX_SEED_BYTES {
+                    return Err(IntentError::Invalid(format!(
+                        "seed text must be at most {MAX_SEED_BYTES} bytes"
+                    )));
+                }
                 (
                     repo_id,
                     Seed {
@@ -499,6 +515,15 @@ impl IntentService {
             }
             None => None,
         };
+        if patch
+            .current_behavior
+            .as_ref()
+            .is_some_and(|b| b.chars().count() > BEHAVIOR_MAX)
+        {
+            return Err(IntentError::Invalid(format!(
+                "current behavior must be at most {BEHAVIOR_MAX} characters"
+            )));
+        }
         let new_repo = patch.repo_id.filter(|r| *r != intent.repo_id);
         if title.is_none()
             && new_repo.is_none()
@@ -578,7 +603,9 @@ impl IntentService {
             _ => None,
         };
         let is_dep = intent.content.depends_on.iter().any(|d| d.id == item_id);
-        if is_dep && !matches!(action, ReviewAction::Drop) {
+        // Held until the save below (see `Inner::dependencies`).
+        let _confirming = if is_dep && !matches!(action, ReviewAction::Drop) {
+            let guard = self.inner.dependencies.lock().await;
             let target = intent
                 .content
                 .depends_on
@@ -586,7 +613,10 @@ impl IntentService {
                 .find(|d| d.id == item_id)
                 .and_then(|d| d.intent_ref);
             self.check_dependency(&intent, target).await?;
-        }
+            Some(guard)
+        } else {
+            None
+        };
         let c = &mut intent.content;
         let item = c
             .preconditions
@@ -1118,8 +1148,8 @@ impl IntentService {
             Phase::Questions
         };
         touch(&mut intent);
-        self.append_version(&intent, VersionAuthor::Polish1).await?;
-        self.save_with_title_slug(&mut intent).await?;
+        self.save_with_title_slug(&mut intent, VersionAuthor::Polish1)
+            .await?;
         self.publish_updated(&intent);
         drop(reservation);
         if start_pass2 {
@@ -1160,8 +1190,11 @@ impl IntentService {
             IntentState::Draft
         };
         touch(&mut intent);
-        self.append_version(&intent, VersionAuthor::Polish2).await?;
-        self.inner.store.save_intent(&intent).await?;
+        // The intent and its Polish2 version are stored together or not at all.
+        self.inner
+            .store
+            .save_intent_with_version(&intent, &snapshot(&intent, VersionAuthor::Polish2))
+            .await?;
         self.publish_updated(&intent);
         Ok(())
     }
@@ -1215,33 +1248,36 @@ impl IntentService {
         })
     }
 
-    async fn append_version(
+    /// Saves the intent together with a version of its content by `author`
+    /// (both stored or neither). While it has never been sent, its slug first
+    /// follows the title: `slugify(title)`, then `-2`, `-3`... until unique in
+    /// the repository. A concurrent writer taking the slug between the check
+    /// and the save makes the save conflict, which rolls the version back too,
+    /// and the slug is picked again.
+    async fn save_with_title_slug(
         &self,
-        intent: &Intent,
+        intent: &mut Intent,
         author: VersionAuthor,
-    ) -> Result<u32, StoreError> {
-        self.inner
-            .store
-            .append_version(&snapshot(intent, author))
-            .await
-    }
-
-    /// Saves the intent. While it has never been sent, its slug first follows
-    /// the title: `slugify(title)`, then `-2`, `-3`... until unique in the
-    /// repository. A concurrent writer taking the slug between the check and
-    /// the save makes the save conflict, and the slug is picked again.
-    async fn save_with_title_slug(&self, intent: &mut Intent) -> Result<(), StoreError> {
+    ) -> Result<(), StoreError> {
+        let store = &self.inner.store;
         if intent.sent_at.is_some() {
-            return self.inner.store.save_intent(intent).await;
+            store
+                .save_intent_with_version(intent, &snapshot(intent, author))
+                .await?;
+            return Ok(());
         }
         let stored_slug = intent.slug.clone();
         let base = slugify(&intent.content.title);
         let mut attempt = 1;
         loop {
             intent.slug = self.free_slug(intent.repo_id, &base, &stored_slug).await?;
-            match self.inner.store.save_intent(intent).await {
+            match store
+                .save_intent_with_version(intent, &snapshot(intent, author))
+                .await
+            {
+                Ok(_version) => return Ok(()),
                 Err(StoreError::Conflict(_)) if attempt < SLUG_SAVE_ATTEMPTS => attempt += 1,
-                other => return other,
+                Err(e) => return Err(e),
             }
         }
     }

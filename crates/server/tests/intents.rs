@@ -23,6 +23,7 @@ use smithagents_server::harness::{
 };
 use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
 use smithagents_server::paths::Paths;
+use smithagents_server::polish::MAX_SEED_BYTES;
 use smithagents_server::service::AgentService;
 use smithagents_server::store::Store;
 use tempfile::TempDir;
@@ -568,6 +569,36 @@ async fn blank_text_seed_is_invalid_and_unknown_repo_not_found() {
 }
 
 #[tokio::test]
+async fn text_seed_over_the_seed_limit_is_invalid() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let text_seed = |text: String| CreateIntentRequest {
+        repo_id: Some(repo.id),
+        seed: SeedInput::Text(text),
+    };
+    let err = f
+        .svc
+        .create(text_seed("x".repeat(MAX_SEED_BYTES + 1)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IntentError::Invalid(_)), "{err:?}");
+    assert!(f
+        .svc
+        .list(IntentFilter::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(f.runner.0.lock().unwrap().is_empty());
+
+    let ok = f
+        .svc
+        .create(text_seed("x".repeat(MAX_SEED_BYTES)))
+        .await
+        .unwrap();
+    assert_eq!(ok.seed.text.len(), MAX_SEED_BYTES);
+}
+
+#[tokio::test]
 async fn explicit_repo_overrides_agent_repo() {
     let f = fx().await;
     let r1 = f.repo("r1").await;
@@ -716,6 +747,30 @@ async fn blank_or_long_title_is_invalid() {
         )
         .await;
     assert!(ok.is_ok());
+}
+
+#[tokio::test]
+async fn current_behavior_over_20000_chars_is_invalid() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let i = f.text_intent(&repo).await;
+    f.finish_polish(i.id, IntentState::Draft).await;
+    let before = f.svc.get(i.id).await.unwrap();
+    let patch = |text: String| Patch {
+        current_behavior: Some(text),
+        ..Patch::default()
+    };
+    // Counted in characters: "é" is two bytes.
+    let err = f
+        .svc
+        .update(i.id, patch("é".repeat(20_001)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IntentError::Invalid(_)), "{err:?}");
+    assert_eq!(f.svc.get(i.id).await.unwrap(), before);
+
+    let ok = f.svc.update(i.id, patch("é".repeat(20_000))).await.unwrap();
+    assert_eq!(ok.content.current_behavior.chars().count(), 20_000);
 }
 
 #[tokio::test]
@@ -944,6 +999,57 @@ async fn polish_asks_questions_then_pass_two_reaches_review() {
     assert_eq!(f.h.entered(), 2, "pass 2 ran more than once");
 }
 
+/// Makes every save of an intent into the phase `kind` fail, through a
+/// trigger on the database file of a [`file_fx`]. Keep the pool alive.
+async fn refuse_saves_into_phase(f: &Fx, kind: &str) -> sqlx::SqlitePool {
+    let raw = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(f.tmp.path().join("smithagents.db")),
+    )
+    .await
+    .unwrap();
+    // `kind` is one of this file's own phase names, never outside input.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER refuse_{kind} BEFORE UPDATE ON intents \
+         WHEN json_extract(NEW.phase_json, '$.kind') = '{kind}' \
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+    )))
+    .execute(&raw)
+    .await
+    .unwrap();
+    raw
+}
+
+#[tokio::test]
+async fn a_failed_pass_one_save_leaves_no_polish_version() {
+    let f = file_fx(true).await;
+    let repo = f.repo("r1").await;
+    let _raw = refuse_saves_into_phase(&f, "questions").await;
+    f.h.script(vec![pass1("Add a build cache", 2)]);
+    let i = f.text_intent(&repo).await;
+
+    let failed = f.wait(i.id, is_failed).await;
+    assert_eq!(failure(&failed).0, 1);
+    assert_eq!(failed.content.title, "Untitled intent");
+    assert_eq!(f.versions_of(i.id).await, [VersionAuthor::Seed]);
+}
+
+#[tokio::test]
+async fn a_failed_pass_two_save_leaves_no_polish_version() {
+    let f = file_fx(true).await;
+    let repo = f.repo("r1").await;
+    let _raw = refuse_saves_into_phase(&f, "review").await;
+    f.h.script(vec![pass1("Add a build cache", 0), pass2(&[])]);
+    let i = f.text_intent(&repo).await;
+
+    let failed = f.wait(i.id, is_failed).await;
+    assert_eq!(failure(&failed).0, 2);
+    assert!(failed.content.criteria.is_empty());
+    assert_eq!(
+        f.versions_of(i.id).await,
+        [VersionAuthor::Seed, VersionAuthor::Polish1]
+    );
+}
+
 #[tokio::test]
 async fn zero_questions_goes_straight_to_pass_two() {
     let f = real_fx().await;
@@ -1013,14 +1119,21 @@ async fn concurrent_same_titles_get_unique_slugs() {
     // All four results land at once, so the slug checks and saves interleave.
     f.h.release(4);
     let mut slugs = Vec::new();
-    for id in ids {
-        slugs.push(f.wait_phase(id, Phase::Questions).await.slug);
+    for id in &ids {
+        slugs.push(f.wait_phase(*id, Phase::Questions).await.slug);
     }
     slugs.sort();
     assert_eq!(
         slugs,
         ["same-title", "same-title-2", "same-title-3", "same-title-4"]
     );
+    // A save retried after a slug conflict left no extra version behind.
+    for id in &ids {
+        assert_eq!(
+            f.versions_of(*id).await,
+            [VersionAuthor::Seed, VersionAuthor::Polish1]
+        );
+    }
 }
 
 #[tokio::test]
@@ -1938,6 +2051,40 @@ async fn accepting_a_dependency_that_closes_a_cycle_fails() {
     assert_eq!(s.content.depends_on[0].status, ItemStatus::Pending);
     // Dropping is still fine.
     f.svc.review(b.id, dep, ReviewAction::Drop).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_accepts_cannot_close_a_cycle() {
+    let f = file_fx(false).await;
+    let repo = f.repo("r1").await;
+    for round in 0..40 {
+        let (a, _) = f.review_intent(&repo).await;
+        let (b, _) = f.review_intent(&repo).await;
+        let a_on_b = f.add_dep(a.id, b.id, ItemStatus::Pending).await;
+        let b_on_a = f.add_dep(b.id, a.id, ItemStatus::Pending).await;
+
+        let (ra, rb) = tokio::join!(
+            f.svc.review(a.id, a_on_b, ReviewAction::Accept),
+            f.svc.review(b.id, b_on_a, ReviewAction::Accept)
+        );
+        let (ok, err) = match (ra, rb) {
+            (Ok(ok), Err(err)) | (Err(err), Ok(ok)) => (ok, err),
+            (ra, rb) => panic!(
+                "round {round}: expected one success, got {:?} and {:?}",
+                ra.map(|i| i.id),
+                rb.map(|i| i.id)
+            ),
+        };
+        assert!(
+            matches!(err, IntentError::DependencyCycle),
+            "round {round}: {err:?}"
+        );
+        assert_eq!(ok.content.depends_on[0].status, ItemStatus::Accepted);
+        // The refused one stays pending in the store.
+        let refused = if ok.id == a.id { b.id } else { a.id };
+        let stored = f.svc.get(refused).await.unwrap();
+        assert_eq!(stored.content.depends_on[0].status, ItemStatus::Pending);
+    }
 }
 
 #[tokio::test]
