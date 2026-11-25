@@ -751,7 +751,7 @@ impl IntentService {
         let mut queued = store.queued_intents().await?;
         queued.push(candidate);
         let resolved = queue::resolved_ids(store).await?;
-        let running = queue::running_count(store, &self.inner.agents).await?;
+        let running = queue::running_count(&self.inner.agents);
         let limit = self.agent_defaults().await?.queue_limit;
         if queue::next_startable(&queued, &resolved, running, limit).contains(&id) {
             return self.start_reserved(intent).await;

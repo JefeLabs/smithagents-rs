@@ -10,15 +10,16 @@
 //! holds the intent service's start lock, which `IntentService::send` takes
 //! too, so the limit is checked and used atomically by both.
 //!
-//! The slot rule: `running` counts intents in `Sent` whose agent has a turn
-//! in flight (`Working` or `Quiet`). Agents not started for an intent never
-//! count and are never held back.
+//! The slot rule (spec: "Agents working at once"): `running` counts every
+//! agent with a turn in flight (`Working` or `Quiet`), whatever started it:
+//! an intent (`Sent`, or already `Resolved` while its agent still works) or
+//! the user directly. Only intent starts wait for a slot; an agent the user
+//! messages directly is never held back, but takes a slot while it replies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use smithagents_core::agent::AgentState;
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::ids::{AgentId, IntentId};
+use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentFilter, IntentState, ItemStatus};
 use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
 use tokio::sync::{mpsc, oneshot};
@@ -77,39 +78,12 @@ pub(crate) async fn resolved_ids(store: &Store) -> Result<HashSet<IntentId>, Sto
     Ok(resolved.into_iter().map(|i| i.id).collect())
 }
 
-/// Intents in `Sent` whose agent is `Working` or `Quiet`. An agent whose
-/// message was just accepted counts already (its turn is in flight; the
-/// stored state follows a moment later), so a start is counted at once.
-pub(crate) async fn running_count(
-    store: &Store,
-    agents: &AgentService,
-) -> Result<usize, StoreError> {
-    let sent = store
-        .list_intents(IntentFilter {
-            state: Some(IntentState::Sent),
-            repo_id: None,
-        })
-        .await?;
-    if sent.is_empty() {
-        return Ok(0);
-    }
-    let states: HashMap<AgentId, AgentState> = store
-        .list_agents(true)
-        .await?
-        .into_iter()
-        .map(|a| (a.id, a.state))
-        .collect();
-    Ok(sent
-        .iter()
-        .filter_map(|i| i.agent_id)
-        .filter(|id| {
-            agents.turn_in_flight(*id)
-                || matches!(
-                    states.get(id),
-                    Some(AgentState::Working | AgentState::Quiet)
-                )
-        })
-        .count())
+/// Agents with a turn in flight, intent-started or not. An agent counts from
+/// the moment its message is accepted (before the turn's task records
+/// `Working`) until the turn's final state is recorded, so a start is counted
+/// at once and the slot frees exactly when the turn ends.
+pub(crate) fn running_count(agents: &AgentService) -> usize {
+    agents.running_agent_count()
 }
 
 enum Msg {
@@ -290,9 +264,11 @@ impl Scheduler {
             return Ok(());
         }
         let resolved = resolved_ids(&self.store).await?;
-        let mut running = running_count(&self.store, &self.agents).await?;
         let limit = self.intents.agent_defaults().await?.queue_limit;
         loop {
+            // Counted afresh for each start: the agent just started holds its
+            // slot already, and any turn that ended meanwhile has freed one.
+            let running = running_count(&self.agents);
             let Some(id) = next_startable(&queued, &resolved, running, limit)
                 .into_iter()
                 .next()
@@ -300,11 +276,10 @@ impl Scheduler {
                 return Ok(());
             };
             queued.retain(|i| i.id != id);
-            match self.intents.start(id).await {
-                Ok(_) => running += 1,
+            if let Err(e) = self.intents.start(id).await {
                 // `start` kept it queued and recorded the error; the next
                 // candidate may still take the slot.
-                Err(e) => tracing::warn!(intent_id = %id, "could not start a queued intent: {e}"),
+                tracing::warn!(intent_id = %id, "could not start a queued intent: {e}");
             }
         }
     }

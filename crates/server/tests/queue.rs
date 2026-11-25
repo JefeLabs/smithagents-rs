@@ -585,8 +585,21 @@ async fn limit_one_starts_queued_intents_one_at_a_time_in_queued_order() {
     }
 }
 
+/// Polls until exactly `n` agents have a turn in flight.
+async fn wait_running(agents: &AgentService, n: usize) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while agents.running_agent_count() != n {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out; {} agents running, expected {n}",
+            agents.running_agent_count()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[tokio::test]
-async fn manual_agents_neither_count_nor_wait() {
+async fn manual_agents_count_but_never_wait() {
     let f = fx().await;
     f.svc
         .set_agent_defaults(AgentDefaults {
@@ -603,27 +616,62 @@ async fn manual_agents_neither_count_nor_wait() {
     f.wait_agent(manual.id, |a| a.state == AgentState::Working)
         .await;
 
-    // A working manual agent does not take the slot.
+    // A replying manual agent takes the only slot: a sent intent queues.
     let x = f.intent("x", &[]).await;
-    let x_sent = f.svc.send(x.id).await.unwrap();
-    assert_eq!(x_sent.state, IntentState::Sent);
+    assert_eq!(f.svc.send(x.id).await.unwrap().state, IntentState::Queued);
+    f.sched().run_pass().await;
+    assert_eq!(f.state(x.id).await, IntentState::Queued);
+    assert!(f.agents_for(x.id).await.is_empty());
+
+    // The manual turn ends: x starts with no other call.
+    f.h.release(1);
+    let x_sent = f.wait_sent(x.id).await;
     f.wait_agent(x_sent.agent_id.unwrap(), |a| a.state == AgentState::Working)
         .await;
 
-    // With the slot taken by x, a manual agent still starts at once...
-    let manual2 = f.agents.create_agent(f.repo.id).await.unwrap();
+    // With the slot taken by x, the manual agent's next message is still
+    // accepted at once (over the limit)...
     f.agents
-        .send_message(manual2.id, "hello".into())
+        .send_message(manual.id, "again".into())
         .await
         .unwrap();
-    f.wait_agent(manual2.id, |a| a.state == AgentState::Working)
+    f.wait_agent(manual.id, |a| a.state == AgentState::Working)
         .await;
-    // ...while another intent waits for it.
+    // ...and counts: another intent waits while either turn runs.
     let y = f.intent("y", &[]).await;
     assert_eq!(f.svc.send(y.id).await.unwrap().state, IntentState::Queued);
+    f.h.release(1);
+    wait_running(&f.agents, 1).await;
+    f.sched().run_pass().await;
+    assert_eq!(f.state(y.id).await, IntentState::Queued);
 
-    // The manual agents finishing frees nothing; x finishing does.
-    f.h.release(3);
+    // The last turn ends, whichever it is: y starts.
+    f.h.release(1);
+    f.wait_sent(y.id).await;
+}
+
+#[tokio::test]
+async fn a_resolved_intent_whose_agent_still_works_counts() {
+    let f = fx().await;
+    f.svc
+        .set_agent_defaults(AgentDefaults {
+            queue_limit: Some(1),
+        })
+        .await
+        .unwrap();
+    f.h.hold();
+    let x = f.intent("x", &[]).await;
+    let agent = f.svc.send(x.id).await.unwrap().agent_id.unwrap();
+    f.wait_agent(agent, |a| a.state == AgentState::Working)
+        .await;
+    f.svc.resolve(x.id).await.unwrap();
+
+    let y = f.intent("y", &[]).await;
+    assert_eq!(f.svc.send(y.id).await.unwrap().state, IntentState::Queued);
+    f.sched().run_pass().await;
+    assert_eq!(f.state(y.id).await, IntentState::Queued);
+
+    f.h.release(1);
     f.wait_sent(y.id).await;
 }
 
