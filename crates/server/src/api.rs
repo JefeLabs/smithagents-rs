@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo};
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, ItemId, MessageId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentState,
     IntentVersion, Patch, ReviewAction,
@@ -386,15 +386,17 @@ async fn chat(
     if text.trim().is_empty() {
         return Err(ApiError::bad_request("text must not be empty"));
     }
+    // `subscribe(None)` cannot fail (only resuming with `since` can).
     let sub = s
         .bus
         .subscribe(None)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
     let svc = s.service.clone();
-    detached(async move { svc.send_message(id, text).await }).await?;
+    let msg = detached(async move { svc.send_message(id, text).await }).await?;
     let svc = s.service;
     let stream = chat_stream(ChatStream::new(
         id,
+        msg.id,
         sub.live,
         Box::new(move || svc.turn_in_flight(id)),
     ));
@@ -422,17 +424,19 @@ struct ChatStream {
     in_flight: Box<dyn Fn() -> bool + Send>,
     pending: VecDeque<String>,
     text_open: bool,
-    /// Set once this turn's own events are seen. A terminal `AgentUpdated`
-    /// of a previous turn can still be queued in `live` (it was published
-    /// before `send_message` reserved the agent); every turn publishes
-    /// `Working` before anything else, so terminal states count only after it.
-    started: bool,
+    /// Id of the user message that started this turn. Events of this agent
+    /// published before it were published by an earlier turn (it publishes
+    /// everything before releasing the agent, and our message is appended
+    /// after our reservation), so they are ignored until it is seen.
+    fence: MessageId,
+    fenced: bool,
     finished: bool,
 }
 
 impl ChatStream {
     fn new(
         agent: AgentId,
+        fence: MessageId,
         live: broadcast::Receiver<Event>,
         in_flight: Box<dyn Fn() -> bool + Send>,
     ) -> Self {
@@ -442,7 +446,8 @@ impl ChatStream {
             in_flight,
             pending: VecDeque::new(),
             text_open: false,
-            started: false,
+            fence,
+            fenced: false,
             finished: false,
         };
         me.push(&Chunk::Start {
@@ -458,7 +463,7 @@ impl ChatStream {
 
     fn finish(&mut self, error: Option<&str>) {
         if self.text_open {
-            self.push(&Chunk::TextEnd { id: "t1".into() });
+            self.push(&Chunk::TextEnd { id: TEXT_ID.into() });
             self.text_open = false;
         }
         if let Some(error) = error {
@@ -474,24 +479,26 @@ impl ChatStream {
 
     fn on_event(&mut self, event: Event) {
         match event.kind {
+            EventKind::MessageAppended(m) if m.agent_id == self.agent && m.id == self.fence => {
+                self.fenced = true;
+            }
+            _ if !self.fenced => {}
             EventKind::TurnDelta { agent_id, text } if agent_id == self.agent => {
-                self.started = true;
                 if text.is_empty() {
                     return;
                 }
                 if !self.text_open {
-                    self.push(&Chunk::TextStart { id: "t1".into() });
+                    self.push(&Chunk::TextStart { id: TEXT_ID.into() });
                     self.text_open = true;
                 }
                 self.push(&Chunk::TextDelta {
-                    id: "t1".into(),
+                    id: TEXT_ID.into(),
                     delta: text,
                 });
             }
             EventKind::AgentUpdated(agent) if agent.id == self.agent => match agent.state {
-                AgentState::Working | AgentState::Quiet => self.started = true,
-                AgentState::Done if self.started => self.finish(None),
-                AgentState::Dead if self.started => self.finish(Some(STOPPED)),
+                AgentState::Done => self.finish(None),
+                AgentState::Dead => self.finish(Some(STOPPED)),
                 _ => {}
             },
             _ => {}
@@ -499,6 +506,8 @@ impl ChatStream {
     }
 }
 
+const TEXT_ID: &str = "t1";
+const LAGGED: &str = "The stream fell behind; reload to see the full reply.";
 const STOPPED: &str = "The agent stopped unexpectedly.";
 
 fn chat_stream(state: ChatStream) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
@@ -515,18 +524,29 @@ fn chat_stream(state: ChatStream) -> impl futures::Stream<Item = Result<Bytes, I
             tokio::select! {
                 received = st.live.recv() => match received {
                     Ok(event) => st.on_event(event),
-                    Err(RecvError::Lagged(_)) => st.finish(Some(
-                        "The stream fell behind; reload to see the full reply.",
-                    )),
+                    Err(RecvError::Lagged(_)) => st.finish(Some(LAGGED)),
                     Err(RecvError::Closed) => st.finish(Some("The event stream closed.")),
                 },
                 _ = tick.tick() => {
                     // Safety net: a turn that ended without a terminal event
-                    // must not leave the stream open forever.
-                    if st.live.is_empty() && !(st.in_flight)() {
-                        st.finish(Some(STOPPED));
-                    } else {
+                    // must not leave the stream open forever. Check the turn
+                    // first, then drain what is already queued, so a turn
+                    // that finished is never mislabeled.
+                    if (st.in_flight)() {
                         st.pending.push_back(KEEP_ALIVE_SSE.to_string());
+                    } else {
+                        while !st.finished {
+                            match st.live.try_recv() {
+                                Ok(event) => st.on_event(event),
+                                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                                    st.finish(Some(LAGGED));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if !st.finished {
+                            st.finish(Some(STOPPED));
+                        }
                     }
                 }
             }
@@ -977,6 +997,32 @@ mod tests {
         }
     }
 
+    fn appended(agent: AgentId, id: MessageId) -> Event {
+        Event {
+            seq: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::MessageAppended(ChatMessage {
+                id,
+                agent_id: agent,
+                seq: 1,
+                role: smithagents_core::agent::Role::User,
+                text: "hi".into(),
+                created_at: chrono::Utc::now(),
+            }),
+        }
+    }
+
+    fn delta(agent: AgentId, text: &str) -> Event {
+        Event {
+            seq: 1,
+            at: chrono::Utc::now(),
+            kind: EventKind::TurnDelta {
+                agent_id: agent,
+                text: text.into(),
+            },
+        }
+    }
+
     async fn collect(stream: impl futures::Stream<Item = Result<Bytes, Infallible>>) -> String {
         use futures::StreamExt;
         let parts: Vec<_> = stream.collect().await;
@@ -986,25 +1032,80 @@ mod tests {
             .collect()
     }
 
+    fn stream_of(
+        id: AgentId,
+        fence: MessageId,
+        rx: broadcast::Receiver<Event>,
+        in_flight: bool,
+    ) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
+        chat_stream(ChatStream::new(id, fence, rx, Box::new(move || in_flight)))
+    }
+
     #[tokio::test]
-    async fn chat_stream_ignores_a_previous_turns_terminal_event() {
+    async fn chat_stream_fences_on_its_own_message() {
         let id = AgentId::new();
+        let fence = MessageId::new();
         let (tx, rx) = broadcast::channel(16);
-        // Queued before this turn's own events: the previous turn's Done.
-        tx.send(updated(id, AgentState::Done)).unwrap();
+        // The previous turn's tail, published before our message was appended.
+        tx.send(delta(id, "stale")).unwrap();
         tx.send(updated(id, AgentState::Working)).unwrap();
-        tx.send(Event {
-            seq: 2,
-            at: chrono::Utc::now(),
-            kind: EventKind::TurnDelta {
-                agent_id: id,
-                text: "hi".into(),
-            },
-        })
-        .unwrap();
         tx.send(updated(id, AgentState::Done)).unwrap();
-        let out = collect(chat_stream(ChatStream::new(id, rx, Box::new(|| true)))).await;
-        assert!(out.contains(r#""delta":"hi""#), "{out}");
+        // Another message of this agent is not the fence.
+        tx.send(appended(id, MessageId::new())).unwrap();
+        tx.send(delta(id, "stale2")).unwrap();
+        tx.send(appended(id, fence)).unwrap();
+        tx.send(delta(id, "own")).unwrap();
+        tx.send(updated(id, AgentState::Done)).unwrap();
+        let out = collect(stream_of(id, fence, rx, true)).await;
+        assert!(out.contains(r#""delta":"own""#), "{out}");
+        assert!(!out.contains("stale"), "{out}");
+        assert!(!out.contains("error"), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_dead_without_working_ends_immediately() {
+        let id = AgentId::new();
+        let fence = MessageId::new();
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(appended(id, fence)).unwrap();
+        tx.send(updated(id, AgentState::Dead)).unwrap();
+        let out = collect(stream_of(id, fence, rx, true)).await;
+        assert!(out.contains("stopped unexpectedly"), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_skips_other_agents_and_empty_deltas() {
+        let id = AgentId::new();
+        let fence = MessageId::new();
+        let (tx, rx) = broadcast::channel(16);
+        tx.send(appended(id, fence)).unwrap();
+        tx.send(delta(AgentId::new(), "other")).unwrap();
+        tx.send(delta(id, "")).unwrap();
+        tx.send(updated(AgentId::new(), AgentState::Dead)).unwrap();
+        tx.send(delta(id, "mine")).unwrap();
+        tx.send(updated(id, AgentState::Done)).unwrap();
+        let out = collect(stream_of(id, fence, rx, true)).await;
+        assert!(out.contains(r#""delta":"mine""#), "{out}");
+        assert!(!out.contains("other") && !out.contains("error"), "{out}");
+        assert_eq!(out.matches("text-delta").count(), 1, "{out}");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_lag_ends_with_an_error_and_finish_sequence() {
+        let id = AgentId::new();
+        let fence = MessageId::new();
+        let (tx, rx) = broadcast::channel(2);
+        for i in 0..6 {
+            tx.send(delta(id, &i.to_string())).unwrap();
+        }
+        let out = collect(stream_of(id, fence, rx, true)).await;
+        assert!(out.contains("fell behind"), "{out}");
+        assert!(
+            out.contains("finish-step") && out.contains(r#""type":"finish""#),
+            "{out}"
+        );
         assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
     }
 
@@ -1013,7 +1114,7 @@ mod tests {
         use futures::StreamExt;
         let id = AgentId::new();
         let (tx, rx) = broadcast::channel(16);
-        let mut s = Box::pin(chat_stream(ChatStream::new(id, rx, Box::new(|| true))));
+        let mut s = Box::pin(stream_of(id, MessageId::new(), rx, true));
         let _start = s.next().await;
         let _step = s.next().await;
         let next = s.next().await.unwrap().unwrap();
@@ -1025,8 +1126,24 @@ mod tests {
     async fn chat_stream_ends_when_the_turn_vanished_without_a_terminal_event() {
         let id = AgentId::new();
         let (_tx, rx) = broadcast::channel(16);
-        let out = collect(chat_stream(ChatStream::new(id, rx, Box::new(|| false)))).await;
+        let out = collect(stream_of(id, MessageId::new(), rx, false)).await;
         assert!(out.contains("stopped unexpectedly"), "{out}");
         assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chat_stream_streams_queued_events_even_when_the_turn_is_no_longer_in_flight() {
+        let id = AgentId::new();
+        let fence = MessageId::new();
+        let (tx, rx) = broadcast::channel(16);
+        let mut st = ChatStream::new(id, fence, rx, Box::new(|| false));
+        // Queued but not yet consumed when the tick finds the turn finished.
+        tx.send(appended(id, fence)).unwrap();
+        tx.send(delta(id, "ok")).unwrap();
+        tx.send(updated(id, AgentState::Done)).unwrap();
+        st.pending.clear();
+        let out = collect(chat_stream(st)).await;
+        assert!(out.contains(r#""delta":"ok""#), "{out}");
+        assert!(!out.contains("stopped unexpectedly"), "{out}");
     }
 }

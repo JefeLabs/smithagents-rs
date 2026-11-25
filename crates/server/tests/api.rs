@@ -1556,10 +1556,9 @@ async fn chat_rejects_unknown_agent_empty_text_and_missing_token() {
 async fn chat_failed_turn_streams_an_error_then_finishes_and_agent_is_dead() {
     let harness = FakeHarness::scripted(vec![vec![
         text("partial"),
-        HarnessEvent::TurnCompleted {
-            session_id: "s".into(),
-            is_error: true,
-            result_text: Some("boom".into()),
+        completed(),
+        HarnessEvent::Failed {
+            message: "exit status 1".into(),
         },
     ]]);
     let fx = fixture(harness, 1024).await;
@@ -1641,21 +1640,19 @@ async fn chat_without_deltas_has_no_text_part_but_still_finishes() {
 }
 
 #[tokio::test]
-async fn chat_after_a_finished_turn_ignores_the_old_terminal_event() {
-    let harness = FakeHarness::scripted(vec![
-        vec![text("first"), completed()],
-        vec![text("second"), completed()],
-    ]);
-    let fx = fixture(harness, 1024).await;
+async fn chat_to_a_closed_agent_is_409_agent_closed() {
+    let fx = default_fx().await;
     let agent = fx.create_agent(&fx.add_repo().await).await;
-    for expected in ["first", "second"] {
-        let resp = post_chat(&fx, agent.id, json!({ "text": "hi" })).await;
-        let events = parse_sse(&chat_body(resp).await);
-        let joined: String = events
-            .iter()
-            .filter(|e| e["type"] == "text-delta")
-            .map(|e| e["delta"].as_str().unwrap())
-            .collect();
-        assert_eq!(joined, expected);
-    }
+    let (status, _) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/agents/{}/close", agent.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let resp = post_chat(&fx, agent.id, json!({ "text": "hi" })).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = serde_json::from_str(&chat_body(resp).await).unwrap();
+    assert_error(&body, "agent_closed");
 }
