@@ -106,15 +106,7 @@ impl ShellModel {
                     .collect();
                 self.repos = repos;
                 self.last_seq = Some(latest_seq);
-                let gone: Vec<AgentId> = self
-                    .tabs
-                    .iter()
-                    .copied()
-                    .filter(|id| !self.has_agent(*id))
-                    .collect();
-                for id in gone {
-                    self.close_tab(id, &mut effects);
-                }
+                self.drop_missing_tabs(&mut effects);
                 self.fix_selection();
             }
             Action::Event(event) => self.apply_event(event, &mut effects),
@@ -174,6 +166,33 @@ impl ShellModel {
             | EventKind::IntentCreated(_)
             | EventKind::IntentUpdated(_) => {}
         }
+    }
+
+    /// Closes every tab whose agent is gone (one `CloseCenterTab` each, in tab
+    /// order), then, if the active tab was among them, focuses at most one
+    /// surviving tab: the nearest before it, else the nearest after.
+    fn drop_missing_tabs(&mut self, effects: &mut Vec<Effect>) {
+        let old = std::mem::take(&mut self.tabs);
+        let old_active = self
+            .active_tab
+            .and_then(|a| old.iter().position(|t| *t == a));
+        let (kept, gone): (Vec<AgentId>, Vec<AgentId>) =
+            old.iter().copied().partition(|id| self.has_agent(*id));
+        effects.extend(gone.iter().map(|id| Effect::CloseCenterTab(*id)));
+        if let Some(at) = old_active {
+            if !kept.contains(&old[at]) {
+                let survives = |id: &&AgentId| kept.contains(id);
+                let next = old[..at]
+                    .iter()
+                    .rev()
+                    .find(survives)
+                    .or_else(|| old[at..].iter().find(survives))
+                    .copied();
+                self.active_tab = next;
+                effects.extend(next.map(Effect::FocusCenterTab));
+            }
+        }
+        self.tabs = kept;
     }
 
     fn has_agent(&self, id: AgentId) -> bool {

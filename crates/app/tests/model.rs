@@ -112,7 +112,7 @@ fn snapshot_leaves_connection_alone() {
 }
 
 #[test]
-fn snapshot_after_restart_drops_vanished_agents_and_tabs() {
+fn snapshot_drops_vanished_agents_and_tabs() {
     let (a, b) = (agent("A", 1), agent("B", 2));
     let mut m = with(&[&a, &b]);
     m.apply(Action::OpenTab(a.id));
@@ -447,4 +447,60 @@ fn repo_added_upserts_by_id() {
     assert_eq!(m.repos()[0].default_branch, "trunk");
     m.apply(Action::RepoAdded(repo()));
     assert_eq!(m.repos().len(), 2);
+}
+
+#[test]
+fn snapshot_after_daemon_restart_resets_seq_and_accepts_new_events() {
+    let mut m = ShellModel::new();
+    m.apply(snapshot(vec![], 50));
+    assert_eq!(m.last_seq(), Some(50));
+    m.apply(snapshot(vec![], 2));
+    assert_eq!(m.last_seq(), Some(2));
+    m.apply(ev(3, EventKind::AgentCreated(agent("A", 1))));
+    assert_eq!(names(&m), ["A"]);
+    assert_eq!(m.last_seq(), Some(3));
+}
+
+#[test]
+fn seq_gap_is_accepted() {
+    let mut m = ShellModel::new();
+    m.apply(ev(1, EventKind::AgentCreated(agent("A", 1))));
+    m.apply(ev(7, EventKind::AgentCreated(agent("B", 2))));
+    assert_eq!(names(&m), ["A", "B"]);
+    assert_eq!(m.last_seq(), Some(7));
+}
+
+#[test]
+fn snapshot_dropping_all_tabs_emits_no_focus() {
+    let (a, b) = (agent("A", 1), agent("B", 2));
+    let mut m = with(&[&a, &b]);
+    m.apply(Action::OpenTab(b.id));
+    m.apply(Action::OpenTab(a.id));
+    let fx = m.apply(snapshot(vec![], 5));
+    assert_eq!(
+        fx,
+        [Effect::CloseCenterTab(b.id), Effect::CloseCenterTab(a.id)]
+    );
+    assert_eq!(m.active_tab(), None);
+    assert!(m.tabs().is_empty());
+}
+
+#[test]
+fn snapshot_dropping_active_and_earlier_tab_focuses_survivor_once() {
+    let (a, b, c) = (agent("A", 1), agent("B", 2), agent("C", 3));
+    let mut m = with(&[&a, &b, &c]);
+    for x in [&a, &b, &c] {
+        m.apply(Action::OpenTab(x.id));
+    }
+    m.apply(Action::OpenTab(b.id));
+    let fx = m.apply(snapshot(vec![c.clone()], 5));
+    assert_eq!(
+        fx,
+        [
+            Effect::CloseCenterTab(a.id),
+            Effect::CloseCenterTab(b.id),
+            Effect::FocusCenterTab(c.id)
+        ]
+    );
+    assert_eq!((m.tabs(), m.active_tab()), ([c.id].as_slice(), Some(c.id)));
 }
