@@ -1,6 +1,6 @@
 #!/bin/sh
 # Test double for the `claude` CLI. Behavior is driven by environment:
-#   FAKE_CLAUDE_FIXTURE      file to print on stdout
+#   FAKE_CLAUDE_FIXTURE      file to print on stdout (not on a run that printed a structured result)
 #   FAKE_CLAUDE_ARGS_FILE    overwritten each run with argv, one entry per line
 #   FAKE_CLAUDE_STDIN_FILE   overwritten each run with everything read from stdin
 #                            (stdin is not read at all when unset)
@@ -12,8 +12,10 @@
 #   FAKE_CLAUDE_STRUCTURED_FILE  JSON file; when argv has --json-schema it is printed as the
 #                            `--output-format json` result's structured_output
 #   FAKE_CLAUDE_STDERR       text written to stderr
-#   FAKE_CLAUDE_CONTROL_DIR  if it holds `exit` / `sleep` files, their trimmed
-#                            content overrides the values above (re-read per run)
+#   FAKE_CLAUDE_CONTROL_DIR  if it holds `exit` / `sleep` / `structured` files, their
+#                            trimmed content overrides the values above (re-read per
+#                            run); `structured` holds the path of a JSON file that
+#                            replaces FAKE_CLAUDE_STRUCTURED_FILE
 if [ -n "$FAKE_CLAUDE_PID_FILE" ]; then
   echo "$$" > "$FAKE_CLAUDE_PID_FILE"
 fi
@@ -35,6 +37,9 @@ if [ -n "$FAKE_CLAUDE_CONTROL_DIR" ]; then
   if [ -f "$FAKE_CLAUDE_CONTROL_DIR/sleep" ]; then
     sleep_secs=$(tr -d '[:space:]' < "$FAKE_CLAUDE_CONTROL_DIR/sleep")
   fi
+  if [ -f "$FAKE_CLAUDE_CONTROL_DIR/structured" ]; then
+    FAKE_CLAUDE_STRUCTURED_FILE=$(tr -d '\n' < "$FAKE_CLAUDE_CONTROL_DIR/structured")
+  fi
 fi
 if [ -n "$FAKE_CLAUDE_GRANDCHILD_SECS" ]; then
   # Grandchild keeps inheriting stderr (but not stdout) after we exit.
@@ -45,13 +50,15 @@ if [ -n "$FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS" ]; then
   sleep "$FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS" 2>/dev/null </dev/null &
 fi
 has_schema=""
+printed_structured=""
 for a in "$@"; do
   if [ "$a" = "--json-schema" ]; then has_schema=1; fi
 done
 if [ -n "$has_schema" ] && [ -n "$FAKE_CLAUDE_STRUCTURED_FILE" ]; then
   printf '{"type":"result","subtype":"success","is_error":false,"result":"","structured_output":%s,"total_cost_usd":0.007,"session_id":"fake"}\n' "$(cat "$FAKE_CLAUDE_STRUCTURED_FILE")"
+  printed_structured=1
 fi
-if [ -n "$FAKE_CLAUDE_FIXTURE" ]; then
+if [ -n "$FAKE_CLAUDE_FIXTURE" ] && [ -z "$printed_structured" ]; then
   cat "$FAKE_CLAUDE_FIXTURE"
 fi
 if [ -n "$FAKE_CLAUDE_STDERR" ]; then

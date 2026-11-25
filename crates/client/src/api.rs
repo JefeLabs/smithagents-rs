@@ -18,7 +18,10 @@ use serde_json::json;
 use smithagents_core::agent::{Agent, ChatMessage, Repo};
 use smithagents_core::daemon::DaemonInfo;
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
+use smithagents_core::intent::{
+    AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentVersion, Patch,
+};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -181,6 +184,122 @@ impl Client {
             }
             after = last_seq;
         }
+    }
+
+    // ------------------------------------------------------------ intents
+
+    pub async fn create_intent(&self, req: CreateIntentRequest) -> Result<Intent, ClientError> {
+        self.fetch(self.http.post(self.url("/v1/intents")).json(&req))
+            .await
+    }
+
+    /// Intents matching `filter`; an absent field matches everything.
+    pub async fn list_intents(&self, filter: IntentFilter) -> Result<Vec<Intent>, ClientError> {
+        let mut query = Vec::new();
+        if let Some(state) = filter.state {
+            // The daemon expects the snake_case name serde gives the state.
+            let name = serde_json::to_value(state)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            query.push(format!("state={name}"));
+        }
+        if let Some(repo_id) = filter.repo_id {
+            query.push(format!("repo_id={repo_id}"));
+        }
+        // Snake_case names and uuids need no escaping.
+        let mut url = self.url("/v1/intents");
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.join("&"));
+        }
+        self.fetch(self.http.get(url)).await
+    }
+
+    pub async fn get_intent(&self, id: IntentId) -> Result<Intent, ClientError> {
+        self.fetch(self.http.get(self.url(&format!("/v1/intents/{id}"))))
+            .await
+    }
+
+    pub async fn intent_versions(&self, id: IntentId) -> Result<Vec<IntentVersion>, ClientError> {
+        self.fetch(
+            self.http
+                .get(self.url(&format!("/v1/intents/{id}/versions"))),
+        )
+        .await
+    }
+
+    pub async fn update_intent(&self, id: IntentId, patch: Patch) -> Result<Intent, ClientError> {
+        self.fetch(
+            self.http
+                .patch(self.url(&format!("/v1/intents/{id}")))
+                .json(&patch),
+        )
+        .await
+    }
+
+    pub async fn answer_question(
+        &self,
+        id: IntentId,
+        question: QuestionId,
+        answer: AnswerInput,
+    ) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/questions/{question}/answer"));
+        self.fetch(self.http.post(url).json(&answer)).await
+    }
+
+    pub async fn retry_polish(&self, id: IntentId) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/polish/retry"));
+        self.fetch(self.http.post(url)).await
+    }
+
+    pub async fn accept_item(&self, id: IntentId, item: ItemId) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/items/{item}/accept"));
+        self.fetch(self.http.post(url)).await
+    }
+
+    pub async fn drop_item(&self, id: IntentId, item: ItemId) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/items/{item}/drop"));
+        self.fetch(self.http.post(url)).await
+    }
+
+    /// Replaces the item's text with `text`; the item stays pending.
+    pub async fn edit_item(
+        &self,
+        id: IntentId,
+        item: ItemId,
+        text: &str,
+    ) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/items/{item}/edit"));
+        self.fetch(self.http.post(url).json(&json!({ "text": text })))
+            .await
+    }
+
+    pub async fn send_intent(&self, id: IntentId) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/send"));
+        self.fetch(self.http.post(url)).await
+    }
+
+    pub async fn resolve_intent(&self, id: IntentId) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/resolve"));
+        self.fetch(self.http.post(url)).await
+    }
+
+    pub async fn agent_defaults(&self) -> Result<AgentDefaults, ClientError> {
+        self.fetch(self.http.get(self.url("/v1/settings/agent-defaults")))
+            .await
+    }
+
+    pub async fn set_agent_defaults(
+        &self,
+        defaults: AgentDefaults,
+    ) -> Result<AgentDefaults, ClientError> {
+        self.fetch(
+            self.http
+                .put(self.url("/v1/settings/agent-defaults"))
+                .json(&defaults),
+        )
+        .await
     }
 
     /// Subscribes to the daemon's events: with `since`, the retained events
