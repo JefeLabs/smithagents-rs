@@ -10,3 +10,4 @@ pub mod polish;
 pub mod queue;
 pub mod service;
 pub mod store;
+pub mod ui_stream;
