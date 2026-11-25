@@ -3,8 +3,8 @@ use smithagents_app::link::LinkError;
 use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::view_models::{
     agent_initial, agent_rows, banner_text, center_rect, command_error_text, new_agent_plan,
-    repo_choices, repo_title, state_kind, state_label, state_token, tab_title, LeftPaneMode,
-    NewAgentPlan, StateKind, NOT_CONNECTED_TEXT,
+    repo_choices, repo_title, state_dot, state_kind, state_label, state_token, tab_title, DotStyle,
+    LeftPaneMode, NewAgentPlan, StateKind, DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT,
 };
 use smithagents_client::ClientError;
 use smithagents_core::agent::{Agent, AgentState, Repo};
@@ -272,10 +272,59 @@ fn the_accessibility_label_is_name_comma_state() {
 #[test]
 fn each_state_uses_its_status_token() {
     assert_eq!(state_token(StateKind::Working), "status-info");
+    assert_eq!(
+        state_token(StateKind::Quiet),
+        "status-info",
+        "a turn is running"
+    );
     assert_eq!(state_token(StateKind::Done), "status-ok");
     assert_eq!(state_token(StateKind::Dead), "status-error");
     assert_eq!(state_token(StateKind::Idle), "muted-foreground");
-    assert_eq!(state_token(StateKind::Quiet), "muted-foreground");
+}
+
+#[test]
+fn each_state_has_a_dot_shape_so_color_is_not_the_only_cue() {
+    let dot = |token, filled, dimmed| DotStyle {
+        token,
+        filled,
+        dimmed,
+    };
+    assert_eq!(
+        state_dot(StateKind::Idle),
+        dot("muted-foreground", false, false),
+        "idle: a hollow ring"
+    );
+    assert_eq!(
+        state_dot(StateKind::Working),
+        dot("status-info", true, false)
+    );
+    assert_eq!(
+        state_dot(StateKind::Quiet),
+        dot("status-info", true, true),
+        "quiet: running but silent, a dimmed dot"
+    );
+    assert_eq!(state_dot(StateKind::Done), dot("status-ok", true, false));
+    assert_eq!(state_dot(StateKind::Dead), dot("status-error", true, false));
+    let kinds = [
+        StateKind::Idle,
+        StateKind::Working,
+        StateKind::Quiet,
+        StateKind::Done,
+        StateKind::Dead,
+    ];
+    for kind in kinds {
+        assert_eq!(state_token(kind), state_dot(kind).token, "{kind:?}");
+    }
+    // The two states sharing a color differ in shape.
+    assert_ne!(state_dot(StateKind::Working), state_dot(StateKind::Quiet));
+    // Idle is the only hollow one.
+    let hollow: Vec<_> = kinds.iter().filter(|k| !state_dot(**k).filled).collect();
+    assert_eq!(hollow, [&StateKind::Idle]);
+}
+
+#[test]
+fn a_silent_daemon_has_its_own_words() {
+    assert_eq!(DAEMON_SILENT_TEXT, "The daemon did not answer");
 }
 
 #[test]

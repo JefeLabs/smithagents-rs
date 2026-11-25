@@ -356,7 +356,7 @@ fn an_initial_is_readable_on_every_agent_color_in_both_themes() {
                 color.h
             );
             assert!(
-                contrast_ratio(chosen, accent) >= 3.0,
+                contrast_ratio(chosen, accent) >= 4.5,
                 "{} hue {}: {:.2}",
                 theme.id,
                 color.h,

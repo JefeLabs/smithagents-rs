@@ -135,15 +135,47 @@ pub fn state_label(kind: StateKind) -> &'static str {
     }
 }
 
-/// The theme token a state's status dot paints with. Status colors (red,
-/// yellow, green, and the info blue) are reserved; idle and quiet stay muted.
-pub fn state_token(kind: StateKind) -> &'static str {
-    match kind {
-        StateKind::Working => "status-info",
-        StateKind::Done => "status-ok",
-        StateKind::Dead => "status-error",
-        StateKind::Idle | StateKind::Quiet => "muted-foreground",
+/// How a state's status dot is drawn. The shape is a second cue next to the
+/// color, so no state is told apart by color alone (in the dark theme
+/// `status-info` and `muted-foreground` are close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DotStyle {
+    /// The theme token the dot (or its ring) paints with.
+    pub token: &'static str,
+    /// A filled dot; `false` draws a hollow ring.
+    pub filled: bool,
+    /// Drawn at reduced opacity.
+    pub dimmed: bool,
+}
+
+/// The status dot of a state:
+/// - idle: a hollow ring in `muted-foreground`;
+/// - working: a filled `status-info` dot;
+/// - quiet (a turn is running but silent): the working dot, dimmed;
+/// - done: a filled `status-ok` dot;
+/// - dead: a filled `status-error` dot.
+///
+/// Only the red, yellow and green hues are reserved for status (agent colors
+/// avoid them; the agent palette does include blues). `status-info` is the
+/// theme's low-chroma info color.
+pub fn state_dot(kind: StateKind) -> DotStyle {
+    let (token, filled, dimmed) = match kind {
+        StateKind::Idle => ("muted-foreground", false, false),
+        StateKind::Working => ("status-info", true, false),
+        StateKind::Quiet => ("status-info", true, true),
+        StateKind::Done => ("status-ok", true, false),
+        StateKind::Dead => ("status-error", true, false),
+    };
+    DotStyle {
+        token,
+        filled,
+        dimmed,
     }
+}
+
+/// The theme token a state's status dot paints with ([`state_dot`]).
+pub fn state_token(kind: StateKind) -> &'static str {
+    state_dot(kind).token
 }
 
 /// One agent as the pane shows it, in either mode.
@@ -291,6 +323,9 @@ pub fn repo_title(path: &Path) -> String {
 
 /// What a failed command says when the daemon cannot be reached.
 pub const NOT_CONNECTED_TEXT: &str = "Not connected to the daemon";
+/// What a command says when the daemon took the request but never answered
+/// in time, or the connection dropped while it waited.
+pub const DAEMON_SILENT_TEXT: &str = "The daemon did not answer";
 /// What the New agent button says when there is no repository.
 pub const NEED_REPO_TEXT: &str = "Add a source repository first";
 

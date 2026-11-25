@@ -302,14 +302,23 @@ This is **Plan 3a, the chat-only shell**. Plan 3b (intent list, intent editor wi
 ### Task 13: Agents pane and the New agent flow
 
 **Files:**
-- Create: `crates/app/src/views/agents.rs`
+- Create: `crates/app/src/views/agents/{mod.rs,new_agent.rs,close.rs}`, `crates/app/src/app_state.rs`
 - Modify: `crates/app/src/view_models.rs`, `crates/app/src/shell.rs`
-- Test: extend `crates/app/tests/view_models.rs`
+- Test: extend `crates/app/tests/view_models.rs`; headless `crates/app/tests/agents_pane.rs`
 
 **Interfaces:**
 - Produces:
   - Pure view models: `struct AgentRowVm { id, name, state_label: &'static str, state_kind: StateKind, accent_hue: f32, selected: bool }` and `fn agent_rows(model: &ShellModel) -> Vec<AgentRowVm>`; `enum StateKind { Idle, Working, Quiet, Done, Dead }` with `fn state_label` giving "idle", "working", "quiet", "done", "stopped unexpectedly" (Dead).
-  - Native pane: header with a "New agent" button; rows with a left accent bar (color from `agent_accent` with the row's hue), the name, and a status dot whose color is a status token (working: info token pulse-free static dot; done: ok; dead: error; idle/quiet: muted). Double-click or Enter opens the agent's tab; single click selects. A context action "Close agent" calls `close_agent` after a confirmation popover.
+  - Native pane: header with a "New agent" button; rows with a left accent bar (color from `agent_accent` with the row's hue), the name, and a status dot.
+  - Status dot: a status token plus a shape, so state never rests on color alone (pure `state_dot(StateKind) -> DotStyle { token, filled, dimmed }`, used by rows and markers):
+    - idle: a hollow ring in `muted-foreground`;
+    - working: a filled `status-info` dot (static, no pulse);
+    - quiet: the working dot at 50% opacity (the turn runs but is silent);
+    - done: a filled `status-ok` dot;
+    - dead: a filled `status-error` dot.
+  - Single click selects; double-click opens the agent's tab. On the focused row or marker (listbox keys): Space selects, Enter opens, Up/Down move the selection, the focus and the scroll position (the new selection scrolls into view).
+  - A context action "Close agent" calls `close_agent` after a confirmation. The confirmation is a modal dialog whose default action is Cancel: it opens with the focus on Cancel; Enter (the dialog's Confirm) and Escape dismiss it without closing; only its danger "Close agent" button closes. A close in flight is sent once.
+  - A create or close the daemon does not answer within the command timeout (60 s, injectable), or that is waiting when the connection drops, is given up with the notification "The daemon did not answer", so the New agent button never stays disabled.
   - Compact rendering (`LeftPaneMode::Compact`):
     - One marker per agent with its color, its status dot and the initial of its name. The full name is in a tooltip, so color is never the only identifier.
     - Markers are keyboard-focusable. Each one's accessibility label is "<name>, <state>".
@@ -318,7 +327,7 @@ This is **Plan 3a, the chat-only shell**. Plan 3b (intent list, intent editor wi
     - Selecting and opening work as in the expanded pane.
     - Keep `track_focus` on the pane's root in both modes.
     - The strip has about 55 px of content width.
-  - New agent flow: if no repositories exist, the button opens the Settings pane's Source repositories section (Task 14) instead of failing; with exactly one repository it creates immediately; with several it shows a repository picker popover (default: last used, stored in app settings as `last_repo_id`, loaded leniently). Daemon errors show in a transient notification with the daemon's message.
+  - New agent flow: if no repositories exist, the button opens the Settings pane's Source repositories section (Task 14) instead of failing; with exactly one repository it creates immediately; with several it shows a repository picker popover (default: last used, stored as `last_repo_id` in `<home>/app-state.json`, loaded leniently). Daemon errors show in a transient notification with the daemon's message.
 - [ ] **Step 1: Write failing tests:** rows sorted by creation, `selected` follows the model, Dead shows "stopped unexpectedly", the accent hue passes through unchanged, an empty model yields no rows; picker logic as a pure function `fn new_agent_plan(repos: &[Repo], last_used: Option<RepoId>) -> NewAgentPlan { NeedRepo | Create(RepoId) | Pick{ repos, preselected } }` with cases (0 repos, 1 repo, 2 repos with and without a valid last-used id, last-used id no longer present).
 - [ ] **Step 2: Run `cargo test -p smithagents-app --test view_models`.** Expected: FAIL.
 - [ ] **Step 3: Implement the view models, then the pane;** run the app against a real daemon and create two agents, check names (Mercury, Venus), distinct colors and the open-tab effect (manual).

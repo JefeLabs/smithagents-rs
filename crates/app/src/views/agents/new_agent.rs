@@ -2,7 +2,6 @@
 //! are, the picker, the create in flight, and selecting the created agent.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::{
@@ -10,28 +9,28 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    px, AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, WeakEntity, Window,
+    div, px, AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    Role, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, WeakEntity, Window,
 };
 use smithagents_core::agent::Agent;
 use smithagents_core::ids::{AgentId, RepoId};
 
 use super::{
-    notify, notify_failure, repo_choice_id, AgentsPane, AwaitedAgent, Paint, NEW_AGENT_ID,
-    NEW_AGENT_LABEL,
+    answered, notify, notify_failure, repo_choice_id, AgentsPane, AwaitedAgent, Paint,
+    NEW_AGENT_ID, NEW_AGENT_LABEL,
 };
 use crate::link::LinkError;
 use crate::model::Action;
 use crate::view_models::{
-    command_error_text, new_agent_plan, NewAgentPlan, RepoChoiceVm, NEED_REPO_TEXT,
-    NOT_CONNECTED_TEXT,
+    command_error_text, new_agent_plan, NewAgentPlan, RepoChoiceVm, DAEMON_SILENT_TEXT,
+    NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
 };
 
 impl AgentsPane {
     /// The New agent button's click when it is not a picker: follows the plan
     /// for the repositories there are now.
     fn on_new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.creating {
+        if self.creating() {
             return;
         }
         let plan = {
@@ -58,18 +57,22 @@ impl AgentsPane {
         self.start_create(repo, window, cx);
     }
 
+    /// Sends the create and waits for it, at most the shell's command
+    /// timeout. The task is kept in `self.create`; dropping it (the
+    /// connection dropped) gives the create up.
     fn start_create(&mut self, repo: RepoId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.creating {
+        if self.creating() {
             tracing::debug!("a create is already in flight");
             return;
         }
-        let (create, selected_before) = {
+        let (create, selected_before, timeout) = {
             let state = self.state.read(cx);
             (
                 state
                     .agent_commands()
                     .map(|commands| commands.create_agent(repo)),
                 state.model().selected(),
+                state.command_timeout(),
             )
         };
         let Some(create) = create else {
@@ -77,25 +80,31 @@ impl AgentsPane {
             return;
         };
         tracing::debug!(%repo, "creating an agent");
-        self.creating = true;
-        cx.spawn_in(window, async move |this, cx| {
-            let result = create.await;
+        let timer = cx.background_executor().timer(timeout);
+        self.create = Some(cx.spawn_in(window, async move |this, cx| {
+            let answer = answered(create, timer).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.finish_create(result, selected_before, window, cx)
+                this.finish_create(answer, selected_before, window, cx)
             });
-        })
-        .detach();
+        }));
         cx.notify();
     }
 
+    /// `answer` is `None` when the daemon did not answer in time.
     fn finish_create(
         &mut self,
-        result: Result<Agent, LinkError>,
+        answer: Option<Result<Agent, LinkError>>,
         selected_before: Option<AgentId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.creating = false;
+        self.create = None;
+        let Some(result) = answer else {
+            tracing::warn!("the daemon did not answer a create in time");
+            notify_failure("Could not create the agent", DAEMON_SILENT_TEXT, window, cx);
+            cx.notify();
+            return;
+        };
         match result {
             Ok(agent) => {
                 tracing::debug!(agent = %agent.id, name = %agent.name, "agent created");
@@ -157,10 +166,10 @@ impl AgentsPane {
                     button.label(NEW_AGENT_LABEL)
                 }
             })
-            .loading(self.creating)
-            .disabled(self.creating);
+            .loading(self.creating())
+            .disabled(self.creating());
         match repos_plan {
-            (NewAgentPlan::Pick { .. }, choices) if !self.creating => {
+            (NewAgentPlan::Pick { .. }, choices) if !self.creating() => {
                 let pane = cx.entity().downgrade();
                 button
                     .dropdown_menu(move |menu, _, cx| picker_menu(menu, &choices, &pane, cx))
@@ -187,19 +196,25 @@ fn picker_menu(
         let (title, path, repo) = (choice.title.clone(), choice.path.clone(), choice.id);
         let pane = pane.clone();
         menu = menu.item(
+            // gpui-component gives an element item's menu-item node no name
+            // (`PopupMenuItem::a11y_label` is `None` for it), so the entry
+            // carries its own named node; its two lines are plain text, so a
+            // screen reader does not read them a second time.
             PopupMenuItem::element(move |_, _| {
                 v_flex()
                     .id(repo_choice_id(ix))
+                    .role(Role::Group)
                     .test_support()
                     .aria_label(format!("{title}, {path}"))
                     .min_w_0()
                     .py_0p5()
-                    .child(Label::new(title.clone()).text_sm())
+                    .child(div().text_sm().child(title.clone()))
                     .child(
-                        Label::new(path.clone())
+                        div()
                             .text_xs()
                             .text_color(muted)
-                            .truncate(),
+                            .truncate()
+                            .child(path.clone()),
                     )
             })
             .checked(choice.preselected)

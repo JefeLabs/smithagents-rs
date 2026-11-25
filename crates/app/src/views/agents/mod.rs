@@ -10,11 +10,15 @@
 //!   label carry "<name>, <state>", so the color is never the only identifier
 //!   and colliding initials (Mercury, Mars) are told apart.
 //!
-//! In both modes a click selects, a double-click opens the agent's chat tab,
-//! Enter or Space on the focused row or marker opens it too, Up and Down move
-//! the selection (and the keyboard focus with it), and the context menu's
-//! "Close agent" asks for confirmation before closing. A row and a marker of
-//! the same agent share one focus handle, so switching modes keeps the focus.
+//! The status dot's shape is a second cue next to its color ([`state_dot`]):
+//! idle is a hollow ring, quiet is the working dot dimmed.
+//!
+//! In both modes a click selects and a double-click opens the agent's chat
+//! tab. On the focused row or marker (listbox keys), Space selects and Enter
+//! opens; Up and Down move the selection, the keyboard focus and the scroll
+//! position with it. The context menu's "Close agent" asks first; the
+//! confirmation's default (Enter) is Cancel. A row and a marker of the same
+//! agent share one focus handle, so switching modes keeps the focus.
 //!
 //! The New agent button follows [`new_agent_plan`]: with no repository it
 //! shows the Settings view and a hint; with one it creates right away; with
@@ -22,7 +26,10 @@
 //! A create in flight disables the button. Agents are never inserted here: a
 //! created agent arrives through the daemon's events and is selected when it
 //! appears, unless the user selected another agent meanwhile. A failed
-//! command shows a transient notification with the daemon's message.
+//! command shows a transient notification with the daemon's message. A
+//! command the daemon does not answer within the shell's command timeout, or
+//! that is still waiting when the connection drops, is given up with "The
+//! daemon did not answer", so the button never stays disabled.
 //!
 //! Every color comes from the theme: the region's surface and foreground
 //! ([`region_paint`]), the status and selection tokens ([`token_paint`]) and
@@ -31,7 +38,9 @@
 mod close;
 mod new_agent;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use futures::future::{select, Either, LocalBoxFuture};
 
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -40,21 +49,22 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, App, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Role,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
-    Window,
+    div, px, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight,
+    Hsla, InteractiveElement as _, IntoElement, KeyBinding, KeyboardButton, KeyboardClickEvent,
+    ParentElement as _, Pixels, Render, Role, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
 };
 use smithagents_core::ids::AgentId;
 use smithagents_theme::native::NativeTheme;
 
-use crate::model::Action;
+use crate::model::{Action, Connection};
 use crate::shell_state::ShellState;
 use crate::theme_adapter::{
-    agent_accent, initial_text_color, region_paint, srgb_to_hsla, token_paint, Region,
+    agent_accent, initial_text_color, region_paint, srgb_to_hsla, token_color, token_paint, Region,
 };
 use crate::view_models::{
-    agent_rows, new_agent_plan, repo_choices, state_token, AgentRowVm, LeftPaneMode, NewAgentPlan,
+    agent_rows, new_agent_plan, repo_choices, state_dot, AgentRowVm, DotStyle, LeftPaneMode,
+    NewAgentPlan, DAEMON_SILENT_TEXT,
 };
 
 gpui_kit::actions!(
@@ -93,8 +103,14 @@ pub const NOTICE_ID: &str = "agents-notice";
 /// The New agent button's words (its label when expanded, its tooltip and
 /// accessible name always).
 pub const NEW_AGENT_LABEL: &str = "New agent";
-/// The context action's words, and the confirmation's OK button.
+/// The context action's words, and the confirmation's close button.
 pub const CLOSE_AGENT_LABEL: &str = "Close agent";
+/// Element id of the confirmation's title ("Close <name>?").
+pub const CLOSE_TITLE_ID: &str = "close-agent-title";
+/// Element id of the confirmation's Cancel button (focused when it opens).
+pub const CANCEL_CLOSE_ID: &str = "cancel-close-agent";
+/// Element id of the confirmation's "Close agent" button.
+pub const CONFIRM_CLOSE_ID: &str = "confirm-close-agent";
 /// What the expanded pane says when there is no agent.
 pub const NO_AGENTS_TEXT: &str = "No agents yet";
 
@@ -109,9 +125,13 @@ const MARKER_INSET: f32 = 2.;
 /// A marker's status dot, including its 2 px ring in the pane's surface color
 /// that sets it off from the agent color.
 const MARKER_DOT: f32 = 12.;
+const MARKER_DOT_GAP: f32 = 2.;
+/// The opacity of a dimmed (quiet) dot.
+const DIMMED: f32 = 0.5;
 
 /// Registers the pane's key bindings: Up and Down move the selection.
-/// Enter and Space need no binding: they activate the focused row or marker.
+/// Enter and Space need no binding: they activate the focused row or marker
+/// (a GPUI keyboard click), Enter to open and Space to select.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectPreviousAgent, Some(KEY_CONTEXT)),
@@ -152,28 +172,71 @@ pub struct AgentsPane {
     focus: FocusHandle,
     /// One focus handle per agent, shared by its row and its marker.
     item_focus: HashMap<AgentId, FocusHandle>,
-    /// A create is in flight; the New agent button is disabled.
-    creating: bool,
+    /// The list's scroll position, so the keyboard keeps the selection in
+    /// view.
+    scroll: ScrollHandle,
+    /// The create in flight, if any; the New agent button is disabled while
+    /// it runs. Dropping it gives the create up.
+    create: Option<Task<()>>,
     awaiting: Option<AwaitedAgent>,
-    /// Agents whose close is in flight, so a second request sends nothing.
-    closing: HashSet<AgentId>,
+    /// Closes in flight, so a second request for the same agent sends
+    /// nothing. Dropping one gives it up.
+    closing: HashMap<AgentId, Task<()>>,
+    /// The connection as last seen, to notice it dropping.
+    connection: Connection,
     _observe: Subscription,
 }
 
 impl AgentsPane {
-    pub fn new(state: Entity<ShellState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<ShellState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
-            _observe: cx.observe(&state, |this, _, cx| {
-                this.select_awaited(cx);
-                cx.notify();
+            connection: state.read(cx).model().connection(),
+            _observe: cx.observe_in(&state, window, |this, _, window, cx| {
+                this.on_state_changed(window, cx)
             }),
             state,
             focus: cx.focus_handle(),
             item_focus: HashMap::new(),
-            creating: false,
+            scroll: ScrollHandle::new(),
+            create: None,
             awaiting: None,
-            closing: HashSet::new(),
+            closing: HashMap::new(),
         }
+    }
+
+    fn on_state_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let connection = self.state.read(cx).model().connection();
+        let dropped =
+            self.connection == Connection::Connected && connection != Connection::Connected;
+        self.connection = connection;
+        if dropped {
+            self.give_up_commands(window, cx);
+        }
+        self.select_awaited(cx);
+        cx.notify();
+    }
+
+    /// The connection dropped while commands waited: their answers may never
+    /// come (the daemon may still have done the work, which then arrives with
+    /// the next snapshot), so stop waiting and say so.
+    fn give_up_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = if self.create.take().is_some() {
+            Some("Could not create the agent")
+        } else if !self.closing.is_empty() {
+            Some("Could not close the agent")
+        } else {
+            None
+        };
+        self.closing.clear();
+        if let Some(title) = title {
+            tracing::warn!("the connection dropped while a command waited");
+            notify_failure(title, DAEMON_SILENT_TEXT, window, cx);
+        }
+    }
+
+    /// Whether a create is in flight.
+    fn creating(&self) -> bool {
+        self.create.is_some()
     }
 
     fn dispatch(&self, action: Action, cx: &mut Context<Self>) {
@@ -181,10 +244,16 @@ impl AgentsPane {
             .update(cx, |state, cx| state.dispatch(action, cx));
     }
 
-    /// A click selects; a second click of a double-click, or Enter or Space
-    /// on the focused item, opens the agent's tab.
+    /// A click or Space on the focused item selects; the second click of a
+    /// double-click, or Enter on the focused item, opens the agent's tab.
     fn on_item_click(&mut self, id: AgentId, event: &ClickEvent, cx: &mut Context<Self>) {
-        if event.is_keyboard() || event.click_count() >= 2 {
+        let opens = match event {
+            ClickEvent::Keyboard(KeyboardClickEvent { button, .. }) => {
+                *button == KeyboardButton::Enter
+            }
+            _ => event.click_count() >= 2,
+        };
+        if opens {
             tracing::debug!(agent = %id, keyboard = event.is_keyboard(), "open agent tab");
             self.dispatch(Action::OpenTab(id), cx);
         } else {
@@ -205,8 +274,9 @@ impl AgentsPane {
         self.move_selection(true, window, cx);
     }
 
-    /// Moves the selection one agent down (or up), stopping at the ends, and
-    /// focuses the newly selected item so Enter opens it.
+    /// Moves the selection one agent down (or up), stopping at the ends,
+    /// focuses the newly selected item so Enter opens it, and scrolls it into
+    /// view.
     fn move_selection(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (ids, selected) = {
             let model = self.state.read(cx).model();
@@ -225,6 +295,8 @@ impl AgentsPane {
         };
         let id = ids[next];
         self.dispatch(Action::SelectAgent(id), cx);
+        // The list's children are the rows (or markers), in this order.
+        self.scroll.scroll_to_item(next);
         if let Some(focus) = self.item_focus.get(&id) {
             focus.focus(window, cx);
         }
@@ -297,15 +369,12 @@ impl AgentsPane {
                             .min_w_0()
                             .gap_1p5()
                             .items_center()
-                            .child(
-                                div()
+                            .child({
+                                let (style, color) = paint.dot(&row);
+                                status_dot(style, ROW_DOT, color)
                                     .id(STATUS_DOT_ID)
                                     .test_support()
-                                    .flex_none()
-                                    .size(px(ROW_DOT))
-                                    .rounded_full()
-                                    .bg(paint.status(&row)),
-                            )
+                            })
                             .child(
                                 Label::new(row.state_label)
                                     .text_xs()
@@ -324,16 +393,7 @@ impl AgentsPane {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let id = row.id;
-        let accent = paint
-            .native
-            .as_ref()
-            .map(|native| agent_accent(native, row.accent_hue));
-        let initial_color = paint
-            .native
-            .as_ref()
-            .zip(accent)
-            .and_then(|(native, accent)| initial_text_color(native, accent))
-            .map_or(paint.foreground, srgb_to_hsla);
+        let (dot_style, dot_color) = paint.dot(&row);
         let label: SharedString = row.a11y_label.clone().into();
         let tooltip = label.clone();
         let focus_ring = paint.foreground;
@@ -371,26 +431,30 @@ impl AgentsPane {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .when_some(accent, |this, accent| this.bg(srgb_to_hsla(accent)))
+                    .when_some(paint.accent(row.accent_hue), |this, accent| this.bg(accent))
                     .child(
                         Label::new(row.initial.clone())
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(initial_color),
+                            .text_color(paint.initial_color(row.accent_hue)),
                     ),
             )
             .child(
+                // A ring in the pane's surface sets the dot off from the
+                // agent color.
                 div()
-                    .id(STATUS_DOT_ID)
-                    .test_support()
                     .absolute()
                     .right_0()
                     .bottom_0()
                     .size(px(MARKER_DOT))
+                    .p(px(MARKER_DOT_GAP))
                     .rounded_full()
-                    .bg(paint.status(&row))
-                    .border_2()
-                    .border_color(paint.surface),
+                    .bg(paint.surface)
+                    .child(
+                        status_dot(dot_style, MARKER_DOT - 2. * MARKER_DOT_GAP, dot_color)
+                            .id(STATUS_DOT_ID)
+                            .test_support(),
+                    ),
             )
             .context_menu(self.close_menu(id, row.name, cx))
     }
@@ -428,7 +492,8 @@ impl Render for AgentsPane {
             .flex_1()
             .min_h_0()
             .w_full()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll);
 
         // The focus is tracked on the root in both modes, so switching modes
         // never drops a focused pane out of the tree.
@@ -498,6 +563,33 @@ impl Render for AgentsPane {
     }
 }
 
+/// `command`'s answer, or `None` if `timer` (the command timeout) ends first.
+/// Giving up drops the future; the daemon may still finish the command, and
+/// its result then arrives through its events.
+async fn answered<T>(command: LocalBoxFuture<'static, T>, timer: Task<()>) -> Option<T> {
+    match select(command, timer).await {
+        Either::Left((answer, _)) => Some(answer),
+        Either::Right(((), _)) => None,
+    }
+}
+
+/// A status dot of `size` px in `style` ([`state_dot`]): a filled disc, or a
+/// hollow 2 px ring; dimmed at half opacity.
+fn status_dot(style: DotStyle, size: f32, color: Hsla) -> Div {
+    div()
+        .flex_none()
+        .size(px(size))
+        .rounded_full()
+        .map(|this| {
+            if style.filled {
+                this.bg(color)
+            } else {
+                this.border_2().border_color(color)
+            }
+        })
+        .when(style.dimmed, |this| this.opacity(DIMMED))
+}
+
 /// The colors one frame of the pane paints with, all from the theme.
 struct Paint {
     native: Option<NativeTheme>,
@@ -537,12 +629,24 @@ impl Paint {
             .map(|native| srgb_to_hsla(agent_accent(native, hue)))
     }
 
-    fn status(&self, row: &AgentRowVm) -> Hsla {
-        let token = state_token(row.state_kind);
+    /// The text color of an initial drawn on the agent color for `hue`: the
+    /// more readable of two theme tokens ([`initial_text_color`]).
+    fn initial_color(&self, hue: f32) -> Hsla {
         self.native
             .as_ref()
-            .and_then(|native| native.colors.get(token))
-            .map_or(self.muted_foreground, |color| srgb_to_hsla(*color))
+            .and_then(|native| initial_text_color(native, agent_accent(native, hue)))
+            .map_or(self.foreground, srgb_to_hsla)
+    }
+
+    /// A row's status dot: its shape ([`state_dot`]) and its token's color.
+    fn dot(&self, row: &AgentRowVm) -> (DotStyle, Hsla) {
+        let style = state_dot(row.state_kind);
+        let color = self
+            .native
+            .as_ref()
+            .and_then(|native| token_color(native, style.token))
+            .unwrap_or(self.muted_foreground);
+        (style, color)
     }
 }
 

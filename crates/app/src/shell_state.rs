@@ -23,6 +23,10 @@ use crate::view_models::{banner_text, LeftPaneMode};
 /// connected: it changes the error between retries without sending an action.
 const LINK_ERROR_POLL: Duration = Duration::from_secs(1);
 
+/// How long the views wait for the daemon to answer a command (create or
+/// close an agent) before they give up on it and say so.
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Receives the center content area's rectangle.
 ///
 /// The contract:
@@ -56,6 +60,7 @@ pub struct ShellState {
     link: Option<DaemonLink>,
     /// Replaces the link for agent commands (headless tests).
     commands: Option<Rc<dyn AgentCommands>>,
+    command_timeout: Duration,
     /// Where [`AppState`] persists; `None` keeps it in memory.
     app_state_store: Option<AppStateStore>,
     app_state: AppState,
@@ -94,6 +99,7 @@ impl ShellState {
             effects: VecDeque::new(),
             link,
             commands,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
             app_state_store,
             app_state,
             link_error: None,
@@ -165,6 +171,16 @@ impl ShellState {
             Some(commands) => Some(commands.as_ref()),
             None => self.link.as_ref().map(|link| link as &dyn AgentCommands),
         }
+    }
+
+    /// How long a command may go unanswered before the views give up on it
+    /// ([`DEFAULT_COMMAND_TIMEOUT`] unless set).
+    pub fn command_timeout(&self) -> Duration {
+        self.command_timeout
+    }
+
+    pub fn set_command_timeout(&mut self, timeout: Duration) {
+        self.command_timeout = timeout;
     }
 
     /// The repository the picker preselects while it still exists.

@@ -106,6 +106,9 @@ pub struct ShellOptions {
     /// Where the app remembers small state such as the last repository
     /// chosen (`app-state.json`); `None` keeps it in memory only.
     pub app_state: Option<AppStateStore>,
+    /// How long a command may go unanswered; `None` is
+    /// [`DEFAULT_COMMAND_TIMEOUT`](crate::shell_state::DEFAULT_COMMAND_TIMEOUT).
+    pub command_timeout: Option<Duration>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -153,6 +156,7 @@ impl Shell {
             native_theme,
             commands,
             app_state,
+            command_timeout,
         } = options;
         let link = link.map(DaemonLink::start);
 
@@ -175,8 +179,14 @@ impl Shell {
                 "restoring the layout"
             );
         }
-        let state =
-            cx.new(|cx| ShellState::new(model, native_theme, link, left, commands, app_state, cx));
+        let state = cx.new(|cx| {
+            let mut state =
+                ShellState::new(model, native_theme, link, left, commands, app_state, cx);
+            if let Some(timeout) = command_timeout {
+                state.set_command_timeout(timeout);
+            }
+            state
+        });
 
         let (dock, skin) = DockSkin::dock_area(DOCK_AREA_ID, Some(LAYOUT_VERSION), window, cx);
         // The skin's own collapse buttons sit in the center's title bar, which
@@ -193,7 +203,7 @@ impl Shell {
                 cx,
             )
         });
-        let left_pane = cx.new(|cx| AgentsPane::new(state.clone(), cx));
+        let left_pane = cx.new(|cx| AgentsPane::new(state.clone(), window, cx));
         dock.update(cx, |area, cx| {
             let center = DockLayout::tabs().panel_view(panel_handle(center), cx);
             let right = DockLayout::tabs().panel_view(panel_handle(settings), cx);

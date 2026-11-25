@@ -7,24 +7,26 @@
 
 mod common;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use common::ui::{
-    agent, dark_native, open_shell, open_shell_options, painted_at, token_background,
+    agent, dark_native, open_shell, open_shell_options, painted_at, quad_at, theme_state,
+    token_background,
 };
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
 use gpui_kit::base::{test_support, Root};
 use gpui_kit::component::dock::DockPlacement;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
-    point, px, AppContext as _, Background, Bounds, ElementId, Entity, MouseButton, Pixels, Role,
-    TestAppContext, WindowHandle,
+    point, px, AppContext as _, Background, Bounds, ElementId, Entity, MouseButton, Pixels, Quad,
+    Role, ScrollDelta, TestAppContext, WindowHandle,
 };
 use smithagents_app::app_state::{AppState, AppStateStore};
 use smithagents_app::layout_store::COMPACT_LEFT_PANE_WIDTH;
@@ -32,12 +34,14 @@ use smithagents_app::link::{AgentCommands, LinkError};
 use smithagents_app::model::{Action, Connection, Effect, ShellModel};
 use smithagents_app::shell::{ShellOptions, LEFT_PANE_ID};
 use smithagents_app::shell_state::ShellState;
-use smithagents_app::theme_adapter::{agent_accent, srgb_to_hsla};
-use smithagents_app::view_models::{LeftPaneMode, NEED_REPO_TEXT, NOT_CONNECTED_TEXT};
+use smithagents_app::theme_adapter::{agent_accent, region_tokens, srgb_to_hsla, Region};
+use smithagents_app::view_models::{
+    LeftPaneMode, DAEMON_SILENT_TEXT, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
+};
 use smithagents_app::views::agents::{
-    agent_marker_id, agent_row_id, repo_choice_id, ACCENT_BAR_ID, AGENTS_EMPTY_ID,
-    CLOSE_AGENT_LABEL, LEFT_PANE_CONTENT_ID, NEW_AGENT_ID, NOTICE_ID, NO_AGENTS_TEXT,
-    STATUS_DOT_ID, SWATCH_ID,
+    agent_marker_id, agent_row_id, repo_choice_id, ACCENT_BAR_ID, AGENTS_EMPTY_ID, AGENT_LIST_ID,
+    CANCEL_CLOSE_ID, CLOSE_AGENT_LABEL, CLOSE_TITLE_ID, CONFIRM_CLOSE_ID, LEFT_PANE_CONTENT_ID,
+    NEW_AGENT_ID, NOTICE_ID, NO_AGENTS_TEXT, STATUS_DOT_ID, SWATCH_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_client::ClientError;
@@ -45,15 +49,19 @@ use smithagents_core::agent::{Agent, AgentState, Repo};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
+use smithagents_theme::tokens::{Appearance, ThemeSet};
 
 /// Agent commands that record each call. A create answers with the next
 /// queued result, or waits until the test answers it with
-/// [`FakeCommands::answer_create`]; a close answers `Ok`.
+/// [`FakeCommands::answer_create`] (or forever); a close answers with the next
+/// queued result, else `Ok`, unless `hold_closes` keeps it waiting forever.
 #[derive(Default)]
 struct FakeCommands {
     creates: RefCell<Vec<RepoId>>,
     closes: RefCell<Vec<AgentId>>,
     create_results: RefCell<VecDeque<Result<Agent, LinkError>>>,
+    close_results: RefCell<VecDeque<Result<(), LinkError>>>,
+    hold_closes: Cell<bool>,
     pending: RefCell<Vec<oneshot::Sender<Result<Agent, LinkError>>>>,
 }
 
@@ -77,7 +85,15 @@ impl AgentCommands for FakeCommands {
 
     fn close_agent(&self, id: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>> {
         self.closes.borrow_mut().push(id);
-        async { Ok(()) }.boxed_local()
+        if self.hold_closes.get() {
+            return futures::future::pending().boxed_local();
+        }
+        let result = self
+            .close_results
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Ok(()));
+        async move { result }.boxed_local()
     }
 }
 
@@ -124,7 +140,7 @@ fn open_with_commands(
     fake: &Rc<FakeCommands>,
     app_state: Option<AppStateStore>,
 ) -> (WindowHandle<Root>, Entity<ShellState>) {
-    let (window, shell) = open_shell_options(
+    open_pane(
         cx,
         ShellOptions {
             model,
@@ -132,8 +148,15 @@ fn open_with_commands(
             app_state,
             ..Default::default()
         },
-        (1200., 800.),
-    );
+    )
+}
+
+/// Opens the shell from `options` in a 1200x800 window and draws a frame.
+fn open_pane(
+    cx: &mut TestAppContext,
+    options: ShellOptions,
+) -> (WindowHandle<Root>, Entity<ShellState>) {
+    let (window, shell) = open_shell_options(cx, options, (1200., 800.));
     let state = shell.read_with(cx, |shell, _| shell.state().clone());
     cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();
@@ -319,12 +342,8 @@ fn a_row_paints_its_agent_color_and_its_status_token(cx: &mut TestAppContext) {
         agent_with("Earth", 2, 300.0, AgentState::Dead),
         agent_with("Mars", 3, 330.0, AgentState::Quiet),
     ];
-    let tokens = [
-        "status-info",
-        "status-ok",
-        "status-error",
-        "muted-foreground",
-    ];
+    // Quiet: the working color, dimmed.
+    let tokens = ["status-info", "status-ok", "status-error", "status-info"];
     let fake = Rc::new(FakeCommands::default());
     let (window, _) = open_with_commands(cx, connected(agents.to_vec(), vec![]), &fake, None);
     let native = dark_native();
@@ -341,9 +360,15 @@ fn a_row_paints_its_agent_color_and_its_status_token(cx: &mut TestAppContext) {
                 agent.name
             );
             let dot = window.within(id).find(STATUS_DOT_ID).bounds();
+            let color = srgb_to_hsla(native.colors[token]);
+            let want = if agent.state == AgentState::Quiet {
+                color.opacity(0.5)
+            } else {
+                color
+            };
             assert_eq!(
                 painted_at(window, dot.center()),
-                token_background(&native, token),
+                Background::from(want),
                 "{}'s status dot",
                 agent.name
             );
@@ -744,10 +769,11 @@ fn several_repositories_open_a_picker_with_the_last_used_first(cx: &mut TestAppC
         window.click(NEW_AGENT_ID, cx);
         window.render_frame(cx);
         let mut menu = window.within("popup-menu");
+        let first = menu.find(repo_choice_id(0));
         assert_eq!(
-            menu.find(repo_choice_id(0)).label(),
-            Some("older, /src/older"),
-            "the last used first"
+            (first.role(), first.label()),
+            (Some(Role::Group), Some("older, /src/older")),
+            "the last used first, as a named node"
         );
         assert_eq!(
             menu.find(repo_choice_id(1)).label(),
@@ -789,30 +815,502 @@ fn ask_to_close(cx: &mut TestAppContext, window: WindowHandle<Root>, id: Element
         .unwrap();
 }
 
+fn dialog_open(cx: &mut TestAppContext, window: WindowHandle<Root>) -> bool {
+    let mut open = false;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        open = window.has_active_dialog(cx);
+    })
+    .unwrap();
+    open
+}
+
 #[gpui_kit::test]
-fn close_agent_asks_first_and_closes_once(cx: &mut TestAppContext) {
+fn the_close_confirmation_names_the_agent_and_enter_cancels(cx: &mut TestAppContext) {
     let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
     let fake = Rc::new(FakeCommands::default());
     let (window, state) =
         open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
 
     ask_to_close(cx, window, agent_row_id(mercury.id));
+    assert!(dialog_open(cx, window), "a confirmation is showing");
     cx.update_window(window.into(), |_, window, cx| {
-        assert!(window.find("ok").visible(), "a confirmation is showing");
-        assert!(fake.closes.borrow().is_empty(), "nothing closes before OK");
-        window.click("cancel", cx);
+        assert_eq!(
+            window.find(CLOSE_TITLE_ID).value(),
+            Some("Close Mercury?"),
+            "the title names the agent"
+        );
+        assert_eq!(
+            window.find(CANCEL_CLOSE_ID).focused(),
+            Some(true),
+            "Cancel is the default"
+        );
+        window.press("enter", cx);
     })
     .unwrap();
     cx.run_until_parked();
-    assert!(fake.closes.borrow().is_empty(), "Cancel closes nothing");
+    assert!(fake.closes.borrow().is_empty(), "Enter closes nothing");
+    assert!(
+        !dialog_open(cx, window),
+        "Enter dismissed the dialog, like Cancel"
+    );
 
-    // From the compact strip this time.
-    compact(cx, window, &state);
-    ask_to_close(cx, window, agent_marker_id(mercury.id));
-    cx.update_window(window.into(), |_, window, cx| window.click("ok", cx))
+    // Escape and Cancel dismiss too.
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| window.press("escape", cx))
         .unwrap();
     cx.run_until_parked();
-    assert_eq!(*fake.closes.borrow(), [mercury.id], "closed exactly once");
+    assert!(!dialog_open(cx, window));
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(CANCEL_CLOSE_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!dialog_open(cx, window));
+    assert!(fake.closes.borrow().is_empty(), "nothing closed");
+    assert_eq!(
+        state.read_with(cx, |state, _| state.model().agents().len()),
+        1
+    );
+}
+
+#[gpui_kit::test]
+fn close_agent_closes_once_even_when_asked_again_while_in_flight(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    // The daemon takes its time: the first close stays in flight.
+    fake.hold_closes.set(true);
+    let (window, state) =
+        open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.double_click(CONFIRM_CLOSE_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*fake.closes.borrow(), [mercury.id]);
+    assert!(!dialog_open(cx, window));
+
+    // Asked again, from the compact strip, before the daemon answered.
+    compact(cx, window, &state);
+    ask_to_close(cx, window, agent_marker_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(CONFIRM_CLOSE_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*fake.closes.borrow(), [mercury.id], "sent exactly once");
     // The agent leaves only when the daemon says so.
-    assert!(state.read_with(cx, |state, _| state.model().agents().len() == 1));
+    assert_eq!(
+        state.read_with(cx, |state, _| state.model().agents().len()),
+        1
+    );
+}
+
+#[gpui_kit::test]
+fn a_failed_close_shows_the_daemons_message_and_keeps_the_row(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Working);
+    let fake = Rc::new(FakeCommands::default());
+    fake.close_results
+        .borrow_mut()
+        .push_back(Err(LinkError::Client(ClientError::Api {
+            status: 409,
+            code: "turn_in_progress".into(),
+            message: "a turn is already in progress for this agent".into(),
+        })));
+    let (window, _) = open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(CONFIRM_CLOSE_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*fake.closes.borrow(), [mercury.id]);
+    assert_eq!(
+        notice(cx, window).as_deref(),
+        Some("a turn is already in progress for this agent")
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find(agent_row_id(mercury.id)).visible(),
+            "the row stays"
+        );
+    })
+    .unwrap();
+}
+
+/// The topmost quads painted at the center of the status dot inside `item`
+/// and 1 px inside its left edge (on a hollow dot's ring).
+fn dot_quads(window: &mut gpui_kit::Window, item: ElementId) -> (Quad, Quad) {
+    let dot = window.within(item).find(STATUS_DOT_ID).bounds();
+    let edge = point(dot.left() + px(1.), dot.center().y);
+    (quad_at(window, dot.center()), quad_at(window, edge))
+}
+
+#[gpui_kit::test]
+fn idle_is_a_hollow_ring_and_working_a_filled_dot(cx: &mut TestAppContext) {
+    let idle = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let working = agent_with("Venus", 1, 260.0, AgentState::Working);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) = open_with_commands(
+        cx,
+        connected(vec![idle.clone(), working.clone()], vec![]),
+        &fake,
+        None,
+    );
+    let native = dark_native();
+    let muted = srgb_to_hsla(native.colors["muted-foreground"]);
+    let info = token_background(&native, "status-info");
+    // Neither row is selected and a marker's dot sits on a surface-colored
+    // disc, so a hole shows the pane's surface.
+    let surface = token_background(&native, region_tokens(Region::LeftPane).0);
+    let check = |window: &mut gpui_kit::Window, idle_item: ElementId, working_item: ElementId| {
+        let (center, edge) = dot_quads(window, idle_item);
+        assert_eq!(
+            center.background, surface,
+            "idle: hollow, the surface shows"
+        );
+        assert_eq!(edge.border_color, muted, "idle: a muted ring");
+        assert!(edge.border_widths.left.0 > 0.0, "idle: a ring");
+        let (center, edge) = dot_quads(window, working_item);
+        assert_eq!(center.background, info, "working: filled");
+        assert_eq!(edge.background, info, "working: filled to the edge");
+        assert_eq!(center.border_widths.left.0, 0.0, "working: no ring");
+    };
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        check(window, agent_row_id(idle.id), agent_row_id(working.id));
+    })
+    .unwrap();
+    compact(cx, window, &state);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        check(
+            window,
+            agent_marker_id(idle.id),
+            agent_marker_id(working.id),
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn space_selects_the_focused_row_and_enter_opens_it(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let venus = agent_with("Venus", 1, 260.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) = open_with_commands(
+        cx,
+        connected(vec![mercury.clone(), venus.clone()], vec![]),
+        &fake,
+        None,
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(agent_row_id(mercury.id), cx);
+        // Tab moves the focus without selecting.
+        window.press("tab", cx);
+        assert_eq!(window.find(agent_row_id(venus.id)).focused(), Some(true));
+    })
+    .unwrap();
+    assert_eq!(selected(cx, &state), Some(mercury.id));
+
+    cx.update_window(window.into(), |_, window, cx| window.press("space", cx))
+        .unwrap();
+    state.read_with(cx, |state, _| {
+        assert_eq!(state.model().selected(), Some(venus.id), "Space selected");
+        assert!(state.model().tabs().is_empty(), "Space opens nothing");
+    });
+    cx.update_window(window.into(), |_, window, cx| window.press("enter", cx))
+        .unwrap();
+    assert_eq!(
+        state.read_with(cx, |state, _| state.model().tabs().to_vec()),
+        [venus.id],
+        "Enter opened it"
+    );
+}
+
+/// `count` idle agents, a minute apart.
+fn many_agents(count: usize) -> Vec<Agent> {
+    (0..count)
+        .map(|ix| {
+            agent_with(
+                &format!("Agent {ix:02}"),
+                ix as i64,
+                200.0,
+                AgentState::Idle,
+            )
+        })
+        .collect()
+}
+
+/// Whether `item` lies wholly inside the agent list's visible area.
+fn shown_in_list(window: &gpui_kit::Window, item: ElementId) -> bool {
+    let list = window.find(AGENT_LIST_ID).bounds();
+    let item = window.find(item).bounds();
+    item.top() >= list.top() && item.bottom() <= list.bottom()
+}
+
+#[gpui_kit::test]
+fn arrow_keys_scroll_the_selection_into_view(cx: &mut TestAppContext) {
+    let agents = many_agents(30);
+    let (first, last) = (agents[0].id, agents[29].id);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) = open_with_commands(cx, connected(agents, vec![]), &fake, None);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            !shown_in_list(window, agent_row_id(last)),
+            "off screen at first"
+        );
+        window.click(agent_row_id(first), cx);
+        for _ in 0..29 {
+            window.press("down", cx);
+        }
+        window.render_frame(cx);
+        assert!(
+            shown_in_list(window, agent_row_id(last)),
+            "the last row scrolled into view"
+        );
+        assert!(!shown_in_list(window, agent_row_id(first)));
+    })
+    .unwrap();
+    assert_eq!(selected(cx, &state), Some(last));
+}
+
+#[gpui_kit::test]
+fn a_long_compact_list_scrolls_and_new_agent_stays_reachable(cx: &mut TestAppContext) {
+    let agents = many_agents(30);
+    let last = agents[29].id;
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) = open_with_commands(cx, connected(agents, vec![]), &fake, None);
+    compact(cx, window, &state);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!shown_in_list(window, agent_marker_id(last)));
+        window.scroll(
+            AGENT_LIST_ID,
+            ScrollDelta::Pixels(point(px(0.), px(-5000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(
+            shown_in_list(window, agent_marker_id(last)),
+            "the wheel scrolls the strip"
+        );
+        let new_agent = window.find(NEW_AGENT_ID);
+        assert!(new_agent.visible(), "New agent stays put above the list");
+        assert!(new_agent.bounds().bottom() <= window.find(AGENT_LIST_ID).bounds().top());
+        window.click(NEW_AGENT_ID, cx);
+    })
+    .unwrap();
+    // No repository: the click still reaches the button.
+    assert_eq!(notice(cx, window).as_deref(), Some(NEED_REPO_TEXT));
+}
+
+#[gpui_kit::test]
+fn cmd_b_still_toggles_after_clicking_a_row_and_after_arrow_keys(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let venus = agent_with("Venus", 1, 260.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) = open_with_commands(
+        cx,
+        connected(vec![mercury.clone(), venus.clone()], vec![]),
+        &fake,
+        None,
+    );
+    let mode = |cx: &mut TestAppContext| state.read_with(cx, |state, _| state.left_pane_mode());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(agent_row_id(mercury.id), cx);
+        window.press("cmd-b", cx);
+    })
+    .unwrap();
+    assert_eq!(mode(cx), LeftPaneMode::Compact, "after a row click");
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.press("down", cx);
+        assert_eq!(window.find(agent_marker_id(venus.id)).focused(), Some(true));
+        window.press("cmd-b", cx);
+    })
+    .unwrap();
+    assert_eq!(mode(cx), LeftPaneMode::Expanded, "after arrow keys");
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("up", cx);
+        window.press("cmd-b", cx);
+    })
+    .unwrap();
+    assert_eq!(mode(cx), LeftPaneMode::Compact);
+    assert_eq!(selected(cx, &state), Some(mercury.id));
+}
+
+#[gpui_kit::test]
+fn new_agent_without_a_repository_keeps_an_open_settings_dock_open(cx: &mut TestAppContext) {
+    let fake = Rc::new(FakeCommands::default());
+    let (window, shell) = open_shell_options(
+        cx,
+        ShellOptions {
+            model: connected(vec![], vec![]),
+            commands: Some(fake.clone()),
+            ..Default::default()
+        },
+        (1200., 800.),
+    );
+    let dock = shell.read_with(cx, |shell, _| shell.dock().clone());
+    let open = |cx: &mut TestAppContext| {
+        dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Right))
+    };
+    assert!(open(cx), "the Settings dock starts open");
+    for click in 1..=2 {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(NEW_AGENT_ID, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(open(cx), "click {click}: still open, not toggled closed");
+        let mut count = 0;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            count = window.notifications(cx).len();
+        })
+        .unwrap();
+        assert_eq!(count, 1, "click {click}: one hint, not a stack");
+        assert_eq!(notice(cx, window).as_deref(), Some(NEED_REPO_TEXT));
+    }
+}
+
+#[gpui_kit::test]
+fn a_theme_switch_recolors_the_row_accents(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Working);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) =
+        open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    let accent_and_dot = |cx: &mut TestAppContext| {
+        let mut painted = None;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let row = agent_row_id(mercury.id);
+            let bar = window.within(row.clone()).find(ACCENT_BAR_ID).bounds();
+            let dot = window.within(row).find(STATUS_DOT_ID).bounds();
+            painted = Some((
+                painted_at(window, bar.center()),
+                painted_at(window, dot.center()),
+            ));
+        })
+        .unwrap();
+        painted.unwrap()
+    };
+    let dark = accent_and_dot(cx);
+    let set = ThemeSet::embedded();
+    let light_state = theme_state(Appearance::Light);
+    cx.update(|cx| {
+        smithagents_app::theme_adapter::apply_theme(set, &light_state, Some(&state), cx);
+    });
+    let light = accent_and_dot(cx);
+    let native = set.native(&light_state.theme).unwrap();
+    assert_eq!(
+        light.0,
+        Background::from(srgb_to_hsla(agent_accent(&native, mercury.color.h)))
+    );
+    assert_eq!(light.1, token_background(&native, "status-info"));
+    assert_ne!(dark.0, light.0, "the accent follows the theme");
+}
+
+#[gpui_kit::test]
+fn a_create_the_daemon_never_answers_is_given_up_after_the_timeout(cx: &mut TestAppContext) {
+    let only = repo("/src/app", 0);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, _) = open_pane(
+        cx,
+        ShellOptions {
+            model: connected(vec![], vec![only.clone()]),
+            commands: Some(fake.clone()),
+            command_timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    );
+    let disabled = |cx: &mut TestAppContext| {
+        let mut disabled = None;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            disabled = window.find(NEW_AGENT_ID).disabled();
+        })
+        .unwrap();
+        disabled == Some(true)
+    };
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(NEW_AGENT_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(disabled(cx));
+    cx.executor().advance_clock(Duration::from_secs(4));
+    cx.run_until_parked();
+    assert!(disabled(cx), "still waiting before the timeout");
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert!(!disabled(cx), "given up after the timeout");
+    assert_eq!(notice(cx, window).as_deref(), Some(DAEMON_SILENT_TEXT));
+    // The fake still holds the first create; a new one can start.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(NEW_AGENT_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(fake.creates.borrow().len(), 2);
+}
+
+#[gpui_kit::test]
+fn a_create_waiting_when_the_connection_drops_is_given_up(cx: &mut TestAppContext) {
+    let only = repo("/src/app", 0);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) =
+        open_with_commands(cx, connected(vec![], vec![only.clone()]), &fake, None);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(NEW_AGENT_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    state.update(cx, |state, cx| {
+        state.dispatch(Action::ConnectionChanged(Connection::Reconnecting), cx)
+    });
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_ne!(window.find(NEW_AGENT_ID).disabled(), Some(true));
+    })
+    .unwrap();
+    assert_eq!(notice(cx, window).as_deref(), Some(DAEMON_SILENT_TEXT));
+}
+
+#[gpui_kit::test]
+fn enter_never_closes_even_on_the_focused_close_button_but_space_does(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, _) = open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.press("tab", cx);
+        assert_eq!(window.find(CONFIRM_CLOSE_ID).focused(), Some(true));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(fake.closes.borrow().is_empty(), "Enter still dismisses");
+    assert!(!dialog_open(cx, window));
+
+    // The keyboard can still close: Space activates the focused button.
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.press("tab", cx);
+        window.press("space", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*fake.closes.borrow(), [mercury.id]);
+    assert!(!dialog_open(cx, window));
 }

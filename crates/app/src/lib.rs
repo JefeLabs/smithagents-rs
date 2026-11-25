@@ -122,6 +122,7 @@ fn open_main_window(
                     native_theme,
                     commands: None,
                     app_state: Some(app_state),
+                    command_timeout: None,
                 },
                 window,
                 cx,
