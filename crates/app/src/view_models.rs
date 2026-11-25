@@ -52,3 +52,39 @@ pub fn center_rect(x: f32, y: f32, w: f32, h: f32, scale: f32) -> PixelRect {
         scale,
     }
 }
+
+/// The left pane's two modes. It is never hidden: compact is a narrow,
+/// fixed-width strip (markers only), expanded is the resizable full pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LeftPaneMode {
+    #[default]
+    Expanded,
+    Compact,
+}
+
+impl LeftPaneMode {
+    /// The other mode: what the left-pane toggle switches to.
+    pub fn toggled(self) -> Self {
+        match self {
+            LeftPaneMode::Expanded => LeftPaneMode::Compact,
+            LeftPaneMode::Compact => LeftPaneMode::Expanded,
+        }
+    }
+
+    /// The persisted spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeftPaneMode::Expanded => "expanded",
+            LeftPaneMode::Compact => "compact",
+        }
+    }
+
+    /// Reads [`LeftPaneMode::as_str`]'s spelling; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "expanded" => Some(LeftPaneMode::Expanded),
+            "compact" => Some(LeftPaneMode::Compact),
+            _ => None,
+        }
+    }
+}

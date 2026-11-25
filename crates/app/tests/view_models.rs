@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use smithagents_app::model::Connection;
-use smithagents_app::view_models::{banner_text, center_rect, tab_title};
+use smithagents_app::view_models::{banner_text, center_rect, tab_title, LeftPaneMode};
 use smithagents_core::agent::{Agent, AgentState};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
@@ -134,4 +134,11 @@ fn center_rect_never_reports_a_negative_size_or_a_bad_scale() {
         (0.0, 0.0, 0.0, 0.0),
         "non-finite input becomes 0"
     );
+}
+
+#[test]
+fn the_left_pane_starts_expanded_and_toggles_between_two_modes() {
+    assert_eq!(LeftPaneMode::default(), LeftPaneMode::Expanded);
+    assert_eq!(LeftPaneMode::Expanded.toggled(), LeftPaneMode::Compact);
+    assert_eq!(LeftPaneMode::Compact.toggled(), LeftPaneMode::Expanded);
 }

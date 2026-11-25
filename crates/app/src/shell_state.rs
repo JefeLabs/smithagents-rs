@@ -1,19 +1,20 @@
-//! The shell's state entity: the [`ShellModel`], the [`DaemonLink`] and the
-//! [`Effect`]s for the tab lifecycle (Task 15) to carry out, plus the tasks
-//! that feed the link's actions in.
+//! The shell's state entity: the [`ShellModel`], the [`DaemonLink`], the
+//! [`Effect`]s for the tab lifecycle (Task 15) to carry out and the left
+//! pane's [`LeftPaneLayout`], plus the tasks that feed the link's actions in.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_kit::{App, Context, Task, WeakEntity};
+use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use smithagents_center_host::PixelRect;
 use smithagents_theme::native::NativeTheme;
 use tokio::sync::mpsc;
 
+use crate::layout_store::{LeftPaneLayout, MAX_DOCK_SIZE, MIN_DOCK_SIZE};
 use crate::link::DaemonLink;
 use crate::model::{Action, Connection, Effect, ShellModel};
-use crate::view_models::banner_text;
+use crate::view_models::{banner_text, LeftPaneMode};
 
 /// How often the link's last error is re-read while the link is not
 /// connected: it changes the error between retries without sending an action.
@@ -32,8 +33,17 @@ const LINK_ERROR_POLL: Duration = Duration::from_secs(1);
 ///   known yet (also deferred).
 pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
 
+/// What `ShellState` tells the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellEvent {
+    /// The left pane's mode or expanded width changed (save the layout).
+    LeftPaneChanged,
+}
+
 pub struct ShellState {
     model: ShellModel,
+    /// The left pane is never hidden: expanded or compact.
+    left_pane: LeftPaneLayout,
     /// Effects not yet consumed, oldest first. Task 15 drains them with
     /// [`ShellState::take_effects`]; until then they are only logged.
     effects: VecDeque<Effect>,
@@ -54,6 +64,7 @@ impl ShellState {
         model: ShellModel,
         native_theme: Option<NativeTheme>,
         link: Option<(DaemonLink, mpsc::Receiver<Action>)>,
+        left_pane: LeftPaneLayout,
         cx: &mut Context<Self>,
     ) -> Self {
         let (link, pump) = match link {
@@ -62,6 +73,7 @@ impl ShellState {
         };
         let mut state = Self {
             model,
+            left_pane,
             effects: VecDeque::new(),
             link,
             link_error: None,
@@ -78,6 +90,46 @@ impl ShellState {
 
     pub fn model(&self) -> &ShellModel {
         &self.model
+    }
+
+    /// The left pane's mode and remembered expanded width.
+    pub fn left_pane_layout(&self) -> LeftPaneLayout {
+        self.left_pane
+    }
+
+    pub fn left_pane_mode(&self) -> LeftPaneMode {
+        self.left_pane.mode
+    }
+
+    /// Switches the left pane between expanded and compact.
+    pub fn toggle_left_pane(&mut self, cx: &mut Context<Self>) {
+        self.set_left_pane_mode(self.left_pane.mode.toggled(), cx);
+    }
+
+    pub fn set_left_pane_mode(&mut self, mode: LeftPaneMode, cx: &mut Context<Self>) {
+        if self.left_pane.mode == mode {
+            return;
+        }
+        tracing::debug!(?mode, "left pane mode");
+        self.left_pane.mode = mode;
+        cx.emit(ShellEvent::LeftPaneChanged);
+        cx.notify();
+    }
+
+    /// Sets the width the left pane has when expanded, clamped like a dock's
+    /// (a non-finite width is ignored). It is kept while compact.
+    pub fn set_left_expanded_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if !f32::from(width).is_finite() {
+            return;
+        }
+        let width = width.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+        if self.left_pane.expanded_width == width {
+            return;
+        }
+        tracing::trace!(?width, "left pane expanded width");
+        self.left_pane.expanded_width = width;
+        cx.emit(ShellEvent::LeftPaneChanged);
+        cx.notify();
     }
 
     /// The daemon link, when the shell runs one.
@@ -202,6 +254,8 @@ impl ShellState {
         }
     }
 }
+
+impl EventEmitter<ShellEvent> for ShellState {}
 
 /// Feeds the link's actions into the state on GPUI's foreground executor.
 /// tokio's receiver needs no tokio runtime to be awaited. Each wake-up

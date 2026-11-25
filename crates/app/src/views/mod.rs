@@ -4,6 +4,7 @@
 
 pub mod banner;
 pub mod center;
+pub mod left_pane;
 pub mod placeholder;
 pub mod rail;
 pub mod tabs;

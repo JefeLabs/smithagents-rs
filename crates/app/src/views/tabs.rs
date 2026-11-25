@@ -1,5 +1,5 @@
 //! The center tab strip: one tab per open agent chat, plus the control that
-//! collapses the left (agents) dock.
+//! switches the left (agents) pane between expanded and compact.
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -15,7 +15,7 @@ pub fn close_button_id(ix: usize) -> (&'static str, usize) {
     ("close-tab", ix)
 }
 
-/// Element id of the button that collapses or expands the agents dock.
+/// Element id of the button that compacts or expands the agents pane.
 pub const TOGGLE_AGENTS_ID: &str = "toggle-agents-pane";
 
 /// What one tab shows.
@@ -36,15 +36,15 @@ pub type StripCallback = Box<dyn Fn(&mut Window, &mut App)>;
 pub struct TabStripActions {
     pub activate: TabCallback,
     pub close: TabCallback,
-    pub toggle_left_dock: StripCallback,
+    pub toggle_left_pane: StripCallback,
 }
 
-/// Draws the strip. `active` is highlighted; `left_open` picks the toggle's
-/// icon (the same icons the dock skin uses).
+/// Draws the strip. `active` is highlighted; `left_expanded` picks the
+/// toggle's icon (the same icons the dock skin uses).
 pub fn tab_strip(
     items: Vec<TabItem>,
     active: Option<AgentId>,
-    left_open: bool,
+    left_expanded: bool,
     actions: TabStripActions,
     cx: &App,
 ) -> impl IntoElement {
@@ -54,12 +54,12 @@ pub fn tab_strip(
     let TabStripActions {
         activate,
         close,
-        toggle_left_dock,
+        toggle_left_pane,
     } = actions;
     let close = std::rc::Rc::new(close);
 
     let toggle = Button::new(TOGGLE_AGENTS_ID)
-        .icon(if left_open {
+        .icon(if left_expanded {
             IconName::PanelLeft
         } else {
             IconName::PanelLeftOpen
@@ -67,13 +67,13 @@ pub fn tab_strip(
         .ghost()
         .xsmall()
         .tab_stop(false)
-        .tooltip(if left_open {
-            "Hide agents"
+        .tooltip(if left_expanded {
+            "Compact the agents pane"
         } else {
-            "Show agents"
+            "Expand the agents pane"
         })
-        .accessibility_label("Toggle the agents pane")
-        .on_click(move |_, window, cx| toggle_left_dock(window, cx));
+        .accessibility_label("Compact or expand the agents pane")
+        .on_click(move |_, window, cx| toggle_left_pane(window, cx));
 
     let tabs = items.into_iter().enumerate().map(|(ix, item)| {
         let close = close.clone();

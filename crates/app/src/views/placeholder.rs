@@ -1,6 +1,6 @@
-//! Stand-in dock panels for the left (Agents, Task 13) and right (Settings,
-//! Task 14) docks. They draw their own heading, so the dock draws no title
-//! bar for them.
+//! A stand-in dock panel for the right (Settings) dock until Task 14 fills
+//! it. It draws its own heading, so the dock draws no title bar for it. (The
+//! left pane is not a dock; its stand-in is `views::left_pane`.)
 
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
 use gpui_kit::component::{v_flex, ActiveTheme as _};

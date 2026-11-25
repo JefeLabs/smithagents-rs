@@ -1,9 +1,12 @@
 //! The persisted window layout:
 //!
-//! - `<home>/app-layout.json`, a gpui-component [`DockAreaState`] as written
-//!   by `DockArea::dump`. The shell's panel tree is fixed (the dock is
-//!   locked), so what it restores is each side dock's size and open state;
-//!   see [`saved_dock`] and [`fit_side_docks`].
+//! - `<home>/app-layout.json`, a gpui-component [`DockAreaState`]: what
+//!   `DockArea::dump` writes for the center and the right dock, plus a
+//!   `left_dock` entry the shell writes for its left pane, which is not a
+//!   dock ([`with_left_pane`], [`saved_left_pane`]). The panel tree is fixed,
+//!   so what it restores is the right dock's size and open state
+//!   ([`saved_dock`]) and the left pane's mode and expanded width, fitted to
+//!   the window ([`fit_panes`]).
 //! - `<home>/app-window.json`, the main window's place and size
 //!   ([`SavedWindow`]), reused only where it can be seen
 //!   ([`restored_window_bounds`]).
@@ -15,10 +18,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use gpui_kit::component::dock::{DockAreaState, DockPlacement};
+use gpui_kit::component::dock::{DockAreaState, DockPlacement, DockState, PanelInfo, PanelState};
 use gpui_kit::{px, size, Bounds, Pixels, Size, WindowBounds};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::view_models::LeftPaneMode;
 
 pub const LAYOUT_FILE_NAME: &str = "app-layout.json";
 pub const WINDOW_FILE_NAME: &str = "app-window.json";
@@ -35,6 +40,15 @@ pub const MAX_DOCK_SIZE: Pixels = px(1000.);
 
 /// The width the center keeps when the side docks are fitted to a window.
 pub const MIN_CENTER_WIDTH: Pixels = px(320.);
+
+/// The left pane's width while compact: a fixed strip, never resized.
+pub const COMPACT_LEFT_PANE_WIDTH: Pixels = px(56.);
+/// The left pane's expanded width when nothing is saved.
+pub const DEFAULT_LEFT_PANE_WIDTH: Pixels = px(240.);
+/// The persisted name of the left pane's panel. Never change it.
+pub const LEFT_PANE_PANEL: &str = "Agents";
+/// The persisted name gpui-base gives a tab group.
+const TAB_GROUP_PANEL: &str = "TabPanel";
 
 /// A saved window smaller than this is not reused.
 const MIN_WINDOW_WIDTH: f32 = 640.;
@@ -210,6 +224,51 @@ pub fn restored_window_bounds(
     })
 }
 
+/// The left pane's expanded width and the right dock's width fitted to
+/// `available` (the width the panes share, rail excluded) so the center keeps
+/// [`MIN_CENTER_WIDTH`] with the right dock open. Expanded, the two give way
+/// like two docks ([`fit_side_docks`]). Compact, the left pane counts as its
+/// fixed width: only the right dock gives way (never below
+/// [`MIN_DOCK_SIZE`]), and the remembered expanded width is kept (it is
+/// fitted when drawn, see [`left_pane_extent`]).
+pub fn fit_panes(left: LeftPaneLayout, right: Pixels, available: Pixels) -> (Pixels, Pixels) {
+    match left.mode {
+        LeftPaneMode::Expanded => fit_side_docks(left.expanded_width, right, available),
+        LeftPaneMode::Compact => {
+            let room = f32::from(available)
+                - f32::from(COMPACT_LEFT_PANE_WIDTH)
+                - f32::from(MIN_CENTER_WIDTH);
+            if !room.is_finite() || f32::from(right) <= room {
+                return (left.expanded_width, right);
+            }
+            let right = room.floor().max(f32::from(MIN_DOCK_SIZE));
+            (left.expanded_width, px(right))
+        }
+    }
+}
+
+/// The width the left pane is drawn at: [`COMPACT_LEFT_PANE_WIDTH`] when
+/// compact; when expanded, its expanded width, narrowed if needed so the
+/// center keeps [`MIN_CENTER_WIDTH`] beside `right_extent` (the right dock's
+/// drawn width, 0 when hidden), but never below [`MIN_DOCK_SIZE`]. Never
+/// zero, whatever the inputs.
+pub fn left_pane_extent(left: LeftPaneLayout, right_extent: Pixels, available: Pixels) -> Pixels {
+    match left.mode {
+        LeftPaneMode::Compact => COMPACT_LEFT_PANE_WIDTH,
+        LeftPaneMode::Expanded => {
+            let mut width = f32::from(left.expanded_width);
+            if !width.is_finite() {
+                width = f32::from(DEFAULT_LEFT_PANE_WIDTH);
+            }
+            let room = f32::from(available) - f32::from(right_extent) - f32::from(MIN_CENTER_WIDTH);
+            if room.is_finite() {
+                width = width.min(room);
+            }
+            px(width.max(f32::from(MIN_DOCK_SIZE)))
+        }
+    }
+}
+
 /// Side dock widths that leave the center at least [`MIN_CENTER_WIDTH`] of
 /// `available` (the width the dock area gets) with both docks open. Docks
 /// that fit are returned unchanged; otherwise both shrink in proportion, and
@@ -234,6 +293,89 @@ pub fn fit_side_docks(left: Pixels, right: Pixels, available: Pixels) -> (Pixels
         fitted_l = (budget - min).floor().clamp(min, l.max(min));
     }
     (px(fitted_l), px(fitted_r))
+}
+
+/// The left pane's layout: its mode and the width it has when expanded
+/// (remembered while compact).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LeftPaneLayout {
+    pub mode: LeftPaneMode,
+    pub expanded_width: Pixels,
+}
+
+impl Default for LeftPaneLayout {
+    fn default() -> Self {
+        Self {
+            mode: LeftPaneMode::Expanded,
+            expanded_width: DEFAULT_LEFT_PANE_WIDTH,
+        }
+    }
+}
+
+/// Writes the left pane into `state` as a `left_dock` entry shaped like the
+/// one gpui-base dumps (a tab group holding the Agents panel), so the file
+/// stays a plain [`DockAreaState`]:
+/// - `size` is the expanded width;
+/// - `open` is true when expanded;
+/// - the Agents panel's info spells the mode out: `{"mode": "compact"}`.
+///
+/// Builds before the compact mode wrote a closed dock for a hidden pane;
+/// [`saved_left_pane`] reads that as compact.
+pub fn with_left_pane(mut state: DockAreaState, left: LeftPaneLayout) -> DockAreaState {
+    let agents = PanelState {
+        panel_name: LEFT_PANE_PANEL.into(),
+        children: vec![],
+        info: PanelInfo::panel(serde_json::json!({ "mode": left.mode.as_str() })),
+    };
+    let group = PanelState {
+        panel_name: TAB_GROUP_PANEL.into(),
+        children: vec![agents],
+        info: PanelInfo::tabs(0),
+    };
+    state.left_dock = Some(DockState::new(
+        group,
+        DockPlacement::Left,
+        left.expanded_width,
+        left.mode == LeftPaneMode::Expanded,
+    ));
+    state
+}
+
+/// The saved left pane, or `None` (use the default) when the file has no
+/// usable `left_dock` (see [`saved_dock`]). The expanded width is clamped
+/// like a dock's. The mode is the Agents panel's `mode` when it is one this
+/// build knows; otherwise an open dock is expanded and a closed one compact,
+/// which is how a layout from before the compact mode, whose closed left dock
+/// meant hidden, comes back.
+pub fn saved_left_pane(state: &DockAreaState) -> Option<LeftPaneLayout> {
+    let dock = saved_dock(state, DockPlacement::Left)?;
+    let written_mode = state
+        .left_dock
+        .as_ref()
+        .and_then(|left| find_panel(left.panel(), LEFT_PANE_PANEL))
+        .and_then(|agents| match &agents.info {
+            PanelInfo::Panel(info) => info.get("mode")?.as_str().and_then(LeftPaneMode::parse),
+            _ => None,
+        });
+    let mode = written_mode.unwrap_or(if dock.open {
+        LeftPaneMode::Expanded
+    } else {
+        LeftPaneMode::Compact
+    });
+    Some(LeftPaneLayout {
+        mode,
+        expanded_width: dock.size,
+    })
+}
+
+fn find_panel<'a>(state: &'a PanelState, name: &str) -> Option<&'a PanelState> {
+    if state.panel_name == name {
+        return Some(state);
+    }
+    state
+        .children
+        .iter()
+        .find_map(|child| find_panel(child, name))
 }
 
 /// What a saved layout restores for one side dock.

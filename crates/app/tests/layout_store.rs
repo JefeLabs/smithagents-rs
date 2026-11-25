@@ -4,10 +4,12 @@ use std::os::unix::fs::PermissionsExt as _;
 use gpui_kit::component::dock::{DockAreaState, DockPlacement, DockState, PanelInfo, PanelState};
 use gpui_kit::{point, px, size, Bounds, Pixels, WindowBounds};
 use smithagents_app::layout_store::{
-    fit_side_docks, restored_window_bounds, saved_dock, saved_window, LayoutStore, SavedDock,
-    LAYOUT_FILE_NAME, LAYOUT_VERSION, MAX_DOCK_SIZE, MIN_CENTER_WIDTH, MIN_DOCK_SIZE,
-    WINDOW_FILE_NAME,
+    fit_panes, fit_side_docks, left_pane_extent, restored_window_bounds, saved_dock,
+    saved_left_pane, saved_window, with_left_pane, LayoutStore, LeftPaneLayout, SavedDock,
+    COMPACT_LEFT_PANE_WIDTH, DEFAULT_LEFT_PANE_WIDTH, LAYOUT_FILE_NAME, LAYOUT_VERSION,
+    MAX_DOCK_SIZE, MIN_CENTER_WIDTH, MIN_DOCK_SIZE, WINDOW_FILE_NAME,
 };
+use smithagents_app::view_models::LeftPaneMode;
 
 fn panel(name: &str) -> PanelState {
     PanelState {
@@ -297,4 +299,167 @@ fn a_saved_window_reopens_only_where_it_can_be_seen_and_grabbed() {
     assert_eq!(restored_window_bounds(&tiny, display), None, "too small");
     let nan = windowed(f32::NAN, 80., 1200., 760.);
     assert_eq!(restored_window_bounds(&nan, display), None, "not finite");
+}
+
+fn left(mode: LeftPaneMode, width: f32) -> LeftPaneLayout {
+    LeftPaneLayout {
+        mode,
+        expanded_width: px(width),
+    }
+}
+
+/// The left dock as older builds wrote it: a tab group holding the Agents
+/// panel, with no mode of its own.
+fn old_format(size: f32, open: bool) -> DockAreaState {
+    let mut s = state(None, Some((300.0, true)));
+    s.left_dock = Some(DockState::new(
+        PanelState {
+            panel_name: "TabPanel".into(),
+            children: vec![panel("Agents")],
+            info: PanelInfo::tabs(0),
+        },
+        DockPlacement::Left,
+        px(size),
+        open,
+    ));
+    s
+}
+
+#[test]
+fn the_left_pane_defaults_to_expanded_at_the_default_width() {
+    assert_eq!(
+        LeftPaneLayout::default(),
+        left(LeftPaneMode::Expanded, f32::from(DEFAULT_LEFT_PANE_WIDTH))
+    );
+}
+
+#[test]
+fn the_left_pane_mode_and_expanded_width_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(tmp.path());
+    for pane in [
+        left(LeftPaneMode::Compact, 310.0),
+        left(LeftPaneMode::Expanded, 275.0),
+    ] {
+        let written = with_left_pane(state(None, Some((300.0, false))), pane);
+        assert_eq!(saved_left_pane(&written), Some(pane));
+        store.save(&written).unwrap();
+        let loaded = store.load().expect("the file loads");
+        assert_eq!(saved_left_pane(&loaded), Some(pane));
+        // The right dock is untouched.
+        assert_eq!(
+            saved_dock(&loaded, DockPlacement::Right),
+            Some(SavedDock {
+                size: px(300.0),
+                open: false
+            })
+        );
+    }
+    let text = fs::read_to_string(store.path()).unwrap();
+    assert!(
+        text.contains("\"mode\": \"expanded\""),
+        "the mode is spelled out: {text}"
+    );
+}
+
+#[test]
+fn an_old_layout_with_the_left_dock_closed_restores_as_compact() {
+    assert_eq!(
+        saved_left_pane(&old_format(260.0, false)),
+        Some(left(LeftPaneMode::Compact, 260.0)),
+        "closed meant hidden; it is now compact, keeping the width"
+    );
+    assert_eq!(
+        saved_left_pane(&old_format(260.0, true)),
+        Some(left(LeftPaneMode::Expanded, 260.0))
+    );
+}
+
+#[test]
+fn a_bad_left_pane_entry_restores_nothing_or_a_clamped_width() {
+    assert_eq!(saved_left_pane(&state(None, None)), None, "no left dock");
+    assert_eq!(saved_left_pane(&old_format(f32::NAN, true)), None);
+    assert_eq!(
+        saved_left_pane(&old_format(3.0, true)).map(|p| p.expanded_width),
+        Some(MIN_DOCK_SIZE)
+    );
+    assert_eq!(
+        saved_left_pane(&old_format(99_999.0, false)).map(|p| p.expanded_width),
+        Some(MAX_DOCK_SIZE)
+    );
+    let mut wrong_side = old_format(260.0, true);
+    let dock = wrong_side.left_dock.take().unwrap();
+    wrong_side.left_dock = Some(DockState::new(
+        dock.panel().clone(),
+        DockPlacement::Right,
+        dock.size(),
+        dock.open(),
+    ));
+    assert_eq!(saved_left_pane(&wrong_side), None);
+
+    // A mode this build does not know falls back to the open flag.
+    let mut unknown = with_left_pane(state(None, None), left(LeftPaneMode::Compact, 260.0));
+    let text = serde_json::to_string(&unknown)
+        .unwrap()
+        .replace("\"compact\"", "\"sideways\"");
+    unknown = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        saved_left_pane(&unknown),
+        Some(left(LeftPaneMode::Compact, 260.0))
+    );
+}
+
+#[test]
+fn a_compact_left_pane_counts_as_its_fixed_width_when_fitting() {
+    // Compact: only the right dock gives way; the expanded width is kept.
+    let (expanded, right) = fit_panes(left(LeftPaneMode::Compact, 300.0), px(800.), px(1000.));
+    assert_eq!(expanded, px(300.));
+    assert!(
+        px(1000.) - COMPACT_LEFT_PANE_WIDTH - right >= MIN_CENTER_WIDTH,
+        "{right:?}"
+    );
+    assert_eq!(
+        right,
+        px(1000.) - COMPACT_LEFT_PANE_WIDTH - MIN_CENTER_WIDTH
+    );
+    // Room enough: nothing changes.
+    assert_eq!(
+        fit_panes(left(LeftPaneMode::Compact, 300.0), px(300.), px(1000.)),
+        (px(300.), px(300.))
+    );
+    // Expanded fits like two docks.
+    assert_eq!(
+        fit_panes(left(LeftPaneMode::Expanded, 400.0), px(400.), px(1000.)),
+        fit_side_docks(px(400.), px(400.), px(1000.))
+    );
+    // A tiny window still leaves the right dock its minimum.
+    let (_, right) = fit_panes(left(LeftPaneMode::Compact, 300.0), px(800.), px(300.));
+    assert_eq!(right, MIN_DOCK_SIZE);
+}
+
+#[test]
+fn the_left_pane_is_never_zero_wide() {
+    assert_eq!(
+        left_pane_extent(left(LeftPaneMode::Compact, 300.0), px(300.), px(1160.)),
+        COMPACT_LEFT_PANE_WIDTH
+    );
+    assert_eq!(
+        left_pane_extent(left(LeftPaneMode::Expanded, 240.0), px(300.), px(1160.)),
+        px(240.)
+    );
+    // Expanded gives way so the center keeps its minimum...
+    assert_eq!(
+        left_pane_extent(left(LeftPaneMode::Expanded, 600.0), px(300.), px(1160.)),
+        px(1160.) - px(300.) - MIN_CENTER_WIDTH
+    );
+    // ...but never below the minimum, and never to nothing.
+    for available in [0.0, 50.0, 400.0, f32::NAN, f32::INFINITY] {
+        for mode in [LeftPaneMode::Expanded, LeftPaneMode::Compact] {
+            let width = left_pane_extent(left(mode, 240.0), px(300.), px(available));
+            assert!(
+                width >= COMPACT_LEFT_PANE_WIDTH && f32::from(width).is_finite(),
+                "{mode:?} at {available}: {width:?}"
+            );
+        }
+    }
 }

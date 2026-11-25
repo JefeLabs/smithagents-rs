@@ -1,42 +1,55 @@
 //! The main window's root view.
 //!
-//! Layout: a gpui-component [`DockArea`] (left dock, center, right dock; no
-//! bottom dock) followed by the icon rail at the far right edge. The dock
-//! area lays its left dock out full height and puts the center between the
-//! two docks; the center panel ([`CenterPanel`]) stacks the connection
-//! banner, the tab strip and the content area the web engine will cover.
+//! Layout, left to right, full height: the left pane, a gpui-component
+//! [`DockArea`] (the center and the right dock; no left or bottom dock), and
+//! the icon rail at the far right edge. The center panel ([`CenterPanel`])
+//! stacks the connection banner, the tab strip and the content area the web
+//! engine will cover.
 //!
-//! State lives in a separate [`ShellState`] entity, which the center panel
-//! observes, so no view holds a handle back to its owner.
+//! The left pane is never hidden. It is expanded (resizable from its trailing
+//! edge) or compact (a fixed
+//! [`COMPACT_LEFT_PANE_WIDTH`](crate::layout_store::COMPACT_LEFT_PANE_WIDTH) strip). It is the
+//! shell's own flex child rather than a dock: gpui-base floors every dock at
+//! 100 px (`Dock::set_size`), its skin always draws a resize handle, and a
+//! dock can be closed, so a dock cannot express a fixed narrow strip that
+//! never hides. The right pane is a dock and hides as before.
+//!
+//! State lives in a separate [`ShellState`] entity, which the panes observe,
+//! so no view holds a handle back to its owner.
 
 use std::time::Duration;
 
+use gpui_kit::base::HandleEdge;
 use gpui_kit::component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSkin,
     DockToggleEvent,
 };
-use gpui_kit::component::h_flex;
+use gpui_kit::component::{h_flex, resize_handle, ActiveTheme as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled as _, Subscription, Task,
-    Window,
+    div, px, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
+    Styled as _, Subscription, Task, TestSupportExt as _, Window,
 };
 use smithagents_theme::native::NativeTheme;
 
 use crate::layout_store::{
-    fit_side_docks, saved_dock, saved_window, LayoutStore, SavedWindow, LAYOUT_VERSION,
+    fit_panes, left_pane_extent, saved_dock, saved_left_pane, saved_window, with_left_pane,
+    LayoutStore, LeftPaneLayout, SavedWindow, LAYOUT_VERSION,
 };
 use crate::link::{DaemonLink, LinkConfig};
 use crate::model::ShellModel;
-use crate::shell_state::ShellState;
+use crate::shell_state::{ShellEvent, ShellState};
+use crate::view_models::LeftPaneMode;
 use crate::views::center::CenterPanel;
+use crate::views::left_pane::LeftPanePlaceholder;
 use crate::views::placeholder::PlaceholderPanel;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 
 gpui_kit::actions!(
     smithagents_shell,
     [
-        /// Collapse or expand the left (agents) dock.
+        /// Switch the left (agents) pane between expanded and compact.
         ToggleAgentsPane,
         /// Collapse or expand the right dock with the Settings view.
         ToggleSettingsPane,
@@ -45,19 +58,22 @@ gpui_kit::actions!(
 
 /// Key context of the shell, for its key bindings.
 pub const KEY_CONTEXT: &str = "SmithAgentsShell";
-/// Persisted panel names. Never change them once shipped.
-pub const AGENTS_PANEL: &str = "Agents";
+/// The right dock's persisted panel name. Never change it once shipped.
 pub const SETTINGS_PANEL: &str = "Settings";
+/// Element id of the left pane's frame.
+pub const LEFT_PANE_ID: &str = "left-pane";
+/// Element id of the left pane's resize handle (expanded only).
+pub const LEFT_PANE_RESIZE_ID: &str = "left-pane-resize";
 
 const DOCK_AREA_ID: &str = "smithagents-shell";
-const DEFAULT_LEFT_DOCK: Pixels = px(240.);
 const DEFAULT_RIGHT_DOCK: Pixels = px(300.);
 /// Layout changes (a resize drag fires many) are written this long after the
 /// last one.
 const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
-/// Registers the shell's key bindings: `cmd-b` toggles the agents dock,
-/// `cmd-alt-b` the settings dock. (v1 is macOS only. `KeyBinding::new` does
+/// Registers the shell's key bindings: `cmd-b` switches the agents pane
+/// between expanded and compact, `cmd-alt-b` hides or shows the settings
+/// dock. (v1 is macOS only. `KeyBinding::new` does
 /// not resolve the portable `secondary-` modifier and panics on it.)
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -79,10 +95,22 @@ pub struct ShellOptions {
     pub native_theme: Option<NativeTheme>,
 }
 
+/// The drag payload of the left pane's resize handle; draws nothing.
+#[derive(Clone)]
+struct LeftPaneResize;
+
+impl Render for LeftPaneResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 /// The root view of the main window.
 pub struct Shell {
     state: Entity<ShellState>,
     dock: Entity<DockArea>,
+    /// The left pane's content (Task 13 replaces the placeholder).
+    left_pane: Entity<LeftPanePlaceholder>,
     layout: Option<LayoutStore>,
     /// The window's place and size as last observed (not updated while
     /// fullscreen).
@@ -104,22 +132,37 @@ impl Shell {
             native_theme,
         } = options;
         let link = link.map(DaemonLink::start);
-        let state = cx.new(|cx| ShellState::new(model, native_theme, link, cx));
+
+        // The saved layout, fitted to this window so the center keeps its
+        // minimum width.
+        let saved = layout.as_ref().and_then(LayoutStore::load);
+        let saved_right = saved
+            .as_ref()
+            .and_then(|saved| saved_dock(saved, DockPlacement::Right));
+        let left = saved.as_ref().and_then(saved_left_pane).unwrap_or_default();
+        let available = window.viewport_size().width - px(RAIL_WIDTH);
+        let right_size = saved_right.map_or(DEFAULT_RIGHT_DOCK, |right| right.size);
+        let (left_width, right_size) = fit_panes(left, right_size, available);
+        if saved.is_some() {
+            tracing::debug!(
+                mode = ?left.mode,
+                expanded_width = ?left_width,
+                right = ?saved_right,
+                "restoring the layout"
+            );
+        }
+        let left = LeftPaneLayout {
+            expanded_width: left_width,
+            ..left
+        };
+        let state = cx.new(|cx| ShellState::new(model, native_theme, link, left, cx));
 
         let (dock, skin) = DockSkin::dock_area(DOCK_AREA_ID, Some(LAYOUT_VERSION), window, cx);
         // The skin's own collapse buttons sit in the center's title bar, which
         // the center panel replaces with its tab strip; the strip and the rail
         // carry the toggles instead.
         skin.set_toggle_button_visible(false, cx);
-        let center = cx.new(|cx| CenterPanel::new(state.clone(), &dock, cx));
-        let agents = cx.new(|cx| {
-            PlaceholderPanel::new(
-                AGENTS_PANEL,
-                "Agents",
-                "Your agents will be listed here.",
-                cx,
-            )
-        });
+        let center = cx.new(|cx| CenterPanel::new(state.clone(), cx));
         let settings = cx.new(|cx| {
             PlaceholderPanel::new(
                 SETTINGS_PANEL,
@@ -128,24 +171,19 @@ impl Shell {
                 cx,
             )
         });
-        let saved = layout.as_ref().and_then(LayoutStore::load);
-        let available = window.viewport_size().width - px(RAIL_WIDTH);
+        let left_pane = cx.new(|cx| LeftPanePlaceholder::new(state.clone(), cx));
         dock.update(cx, |area, cx| {
             let center = DockLayout::tabs().panel_view(panel_handle(center), cx);
-            let left = DockLayout::tabs().panel_view(panel_handle(agents), cx);
             let right = DockLayout::tabs().panel_view(panel_handle(settings), cx);
             area.set_center(center, window, cx);
-            area.set_dock(DockPlacement::Left, left, window, cx);
             area.set_dock(DockPlacement::Right, right, window, cx);
-            area.set_dock_size(DockPlacement::Left, DEFAULT_LEFT_DOCK, window, cx);
-            area.set_dock_size(DockPlacement::Right, DEFAULT_RIGHT_DOCK, window, cx);
-            // The panels stay where the shell puts them: docks resize and
-            // collapse, but tabs cannot be dragged between regions.
+            area.set_dock_size(DockPlacement::Right, right_size, window, cx);
+            // The panels stay where the shell puts them: the right dock
+            // resizes and hides, but tabs cannot be dragged between regions.
             area.set_locked(true, window, cx);
-            if let Some(saved) = &saved {
-                restore_docks(area, saved, window, cx);
+            if saved_right.is_some_and(|right| !right.open) {
+                area.toggle_dock(DockPlacement::Right, window, cx);
             }
-            fit_docks_to_window(area, available, window, cx);
         });
 
         let subscriptions = vec![
@@ -157,8 +195,14 @@ impl Shell {
                     cx.notify();
                 }
             }),
-            // Toggles made by the dock skin itself (a resize handle dragged
-            // past the edge); the shell's own entry points log theirs.
+            cx.subscribe(&state, |this, _, event: &ShellEvent, cx| match event {
+                ShellEvent::LeftPaneChanged => {
+                    this.schedule_layout_save(cx);
+                    cx.notify();
+                }
+            }),
+            // Toggles made by the dock skin itself; the shell's own entry
+            // points log theirs.
             cx.subscribe(&dock, |_, _, event: &DockToggleEvent, _| {
                 tracing::debug!(
                     source = "dock",
@@ -174,10 +218,10 @@ impl Shell {
                     this.schedule_layout_save(cx);
                 }
             }),
-            // A collapsed dock is no longer drawn, so if it held focus the
-            // window has none and keys dispatch from the Kit's `Root`, above
-            // the shell's key context: the shortcuts would stop working.
-            // Take focus back instead.
+            // A hidden right dock is no longer drawn (and a compact left pane
+            // may drop a focused child), so if it held focus the window has
+            // none and keys dispatch from the Kit's `Root`, above the shell's
+            // key context: the shortcuts would stop working. Take focus back.
             cx.on_focus_lost(window, |this, window, cx| {
                 tracing::debug!("focus lost; returning it to the shell");
                 this.focus.focus(window, cx);
@@ -196,6 +240,7 @@ impl Shell {
         Self {
             state,
             dock,
+            left_pane,
             layout,
             window_place: window_place(window, cx),
             last_saved_layout: None,
@@ -234,16 +279,41 @@ impl Shell {
         });
     }
 
-    fn on_toggle_agents(
+    fn on_toggle_agents(&mut self, _: &ToggleAgentsPane, _: &mut Window, cx: &mut Context<Self>) {
+        tracing::debug!(source = "shortcut", "left pane toggle");
+        self.state
+            .update(cx, |state, cx| state.toggle_left_pane(cx));
+    }
+
+    /// The width `left` is drawn at in `window`: fitted beside the right
+    /// dock so the center keeps its minimum, never zero.
+    fn fitted_left_width(&self, left: LeftPaneLayout, window: &Window, cx: &App) -> Pixels {
+        let dock = self.dock.read(cx);
+        let right_extent = if dock.is_dock_open(DockPlacement::Right) {
+            dock.dock_size(DockPlacement::Right).unwrap_or(px(0.))
+        } else {
+            px(0.)
+        };
+        let available = window.viewport_size().width - px(RAIL_WIDTH);
+        left_pane_extent(left, right_extent, available)
+    }
+
+    /// Follows a drag of the left pane's edge (expanded only).
+    fn on_left_pane_drag(
         &mut self,
-        _: &ToggleAgentsPane,
+        event: &DragMoveEvent<LeftPaneResize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        tracing::debug!(source = "shortcut", placement = ?DockPlacement::Left, "dock toggle");
-        self.dock.update(cx, |area, cx| {
-            area.toggle_dock(DockPlacement::Left, window, cx)
-        });
+        let mut layout = self.state.read(cx).left_pane_layout();
+        if layout.mode != LeftPaneMode::Expanded {
+            return;
+        }
+        layout.expanded_width = event.event.position.x - event.bounds.left();
+        // The same fit as drawing: the center keeps its minimum width.
+        let width = self.fitted_left_width(layout, window, cx);
+        self.state
+            .update(cx, |state, cx| state.set_left_expanded_width(width, cx));
     }
 
     fn on_toggle_settings(
@@ -273,7 +343,10 @@ impl Shell {
         let Some(store) = &self.layout else {
             return;
         };
-        let state = self.dock.read(cx).dump(cx);
+        let state = with_left_pane(
+            self.dock.read(cx).dump(cx),
+            self.state.read(cx).left_pane_layout(),
+        );
         if self.last_saved_layout.as_ref() != Some(&state) {
             match store.save(&state) {
                 Ok(()) => {
@@ -317,68 +390,48 @@ fn window_place(window: &Window, cx: &App) -> Option<SavedWindow> {
     saved_window(window.window_bounds(), window.viewport_size(), display)
 }
 
-/// Applies the saved size and open state of each side dock.
-fn restore_docks(
-    area: &mut DockArea,
-    saved: &DockAreaState,
-    window: &mut Window,
-    cx: &mut Context<DockArea>,
-) {
-    for placement in [DockPlacement::Left, DockPlacement::Right] {
-        let Some(dock) = saved_dock(saved, placement) else {
-            continue;
-        };
-        tracing::debug!(?placement, size = ?dock.size, open = dock.open, "restoring dock");
-        area.set_dock_size(placement, dock.size, window, cx);
-        if area.is_dock_open(placement) != dock.open {
-            area.toggle_dock(placement, window, cx);
-        }
-    }
-}
-
-/// Shrinks the side docks if, both open, they would leave the center less
-/// than its minimum of the dock area's `available` width.
-fn fit_docks_to_window(
-    area: &mut DockArea,
-    available: Pixels,
-    window: &mut Window,
-    cx: &mut Context<DockArea>,
-) {
-    let left = area
-        .dock_size(DockPlacement::Left)
-        .unwrap_or(DEFAULT_LEFT_DOCK);
-    let right = area
-        .dock_size(DockPlacement::Right)
-        .unwrap_or(DEFAULT_RIGHT_DOCK);
-    let (fit_left, fit_right) = fit_side_docks(left, right, available);
-    if (fit_left, fit_right) != (left, right) {
-        tracing::debug!(
-            ?available,
-            ?left,
-            ?right,
-            ?fit_left,
-            ?fit_right,
-            "fitting docks to the window"
-        );
-        area.set_dock_size(DockPlacement::Left, fit_left, window, cx);
-        area.set_dock_size(DockPlacement::Right, fit_right, window, cx);
-    }
-}
-
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let on_select = move |entry, window: &mut Window, cx: &mut App| {
             tracing::debug!(source = "rail", ?entry, "rail select");
             let _ = shell.update(cx, |this, cx| this.select_rail_entry(entry, window, cx));
         };
+        let expanded = self.state.read(cx).left_pane_mode() == LeftPaneMode::Expanded;
+        let left_width = self.fitted_left_width(self.state.read(cx).left_pane_layout(), window, cx);
+        let theme = cx.theme();
+        let left_pane = div()
+            .id(LEFT_PANE_ID)
+            .test_support()
+            .relative()
+            .flex_none()
+            .h_full()
+            .w(left_width)
+            .overflow_hidden()
+            .bg(theme.sidebar)
+            .border_r_1()
+            .border_color(theme.border)
+            .child(self.left_pane.clone())
+            // Only an expanded pane resizes; a compact one is a fixed strip.
+            .when(expanded, |this| {
+                this.child(
+                    resize_handle(LEFT_PANE_RESIZE_ID, Axis::Horizontal)
+                        .inside(HandleEdge::Trailing)
+                        .on_drag(LeftPaneResize, |drag, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| drag.clone())
+                        }),
+                )
+            });
         h_flex()
             .id("shell")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_toggle_agents))
             .on_action(cx.listener(Self::on_toggle_settings))
+            .on_drag_move(cx.listener(Self::on_left_pane_drag))
             .size_full()
+            .child(left_pane)
             .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
             .child(rail(self.rail_active(cx), on_select, cx))
     }

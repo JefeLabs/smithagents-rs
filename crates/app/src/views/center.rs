@@ -1,22 +1,19 @@
 //! The center dock panel: the connection banner, the tab strip, and the
 //! content area that reserves the web engine's rectangle.
 
-use gpui_kit::component::dock::{
-    BasePanel, DockArea, DockEvent, DockPlacement, Panel, PanelControl, PanelEvent,
-};
+use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
 use gpui_kit::component::{v_flex, ActiveTheme as _, ElementExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, WeakEntity,
-    Window,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _, Window,
 };
 
 use crate::model::Action;
 use crate::shell_state::{report_center_bounds, ShellState};
 use crate::theme_adapter::{agent_accent, srgb_to_hsla};
-use crate::view_models::{center_rect, tab_title};
+use crate::view_models::{center_rect, tab_title, LeftPaneMode};
 use crate::views::banner::banner;
 use crate::views::tabs::{tab_strip, TabItem, TabStripActions};
 
@@ -29,30 +26,20 @@ pub const EMPTY_HINT: &str = "No chat open";
 
 pub struct CenterPanel {
     state: Entity<ShellState>,
-    dock: WeakEntity<DockArea>,
     focus: FocusHandle,
-    _subscriptions: Vec<Subscription>,
+    _observe: Subscription,
 }
 
 impl CenterPanel {
     /// The persisted panel name. Never change it once shipped.
     pub const NAME: &'static str = "Center";
 
-    pub fn new(state: Entity<ShellState>, dock: &Entity<DockArea>, cx: &mut Context<Self>) -> Self {
-        let subscriptions = vec![
-            cx.observe(&state, |_, _, cx| cx.notify()),
-            // The left-dock toggle's icon follows the dock.
-            cx.subscribe(dock, |_, _, event: &DockEvent, cx| {
-                if matches!(event, DockEvent::LayoutChanged) {
-                    cx.notify();
-                }
-            }),
-        ];
+    pub fn new(state: Entity<ShellState>, cx: &mut Context<Self>) -> Self {
         Self {
+            // Also covers the left pane's mode, which the strip's toggle shows.
+            _observe: cx.observe(&state, |_, _, cx| cx.notify()),
             state,
-            dock: dock.downgrade(),
             focus: cx.focus_handle(),
-            _subscriptions: subscriptions,
         }
     }
 
@@ -76,7 +63,7 @@ impl CenterPanel {
 
     fn strip_actions(&self) -> TabStripActions {
         let (open, close) = (self.state.downgrade(), self.state.downgrade());
-        let dock = self.dock.clone();
+        let toggle = self.state.downgrade();
         TabStripActions {
             activate: Box::new(move |agent, _, cx| {
                 let _ = open.update(cx, |state, cx| state.dispatch(Action::OpenTab(agent), cx));
@@ -84,11 +71,9 @@ impl CenterPanel {
             close: Box::new(move |agent, _, cx| {
                 let _ = close.update(cx, |state, cx| state.dispatch(Action::CloseTab(agent), cx));
             }),
-            toggle_left_dock: Box::new(move |window, cx| {
-                tracing::debug!(source = "strip", placement = ?DockPlacement::Left, "dock toggle");
-                let _ = dock.update(cx, |area, cx| {
-                    area.toggle_dock(DockPlacement::Left, window, cx)
-                });
+            toggle_left_pane: Box::new(move |_, cx| {
+                tracing::debug!(source = "strip", "left pane toggle");
+                let _ = toggle.update(cx, |state, cx| state.toggle_left_pane(cx));
             }),
         }
     }
@@ -142,10 +127,7 @@ impl Render for CenterPanel {
         let state = self.state.read(cx);
         let banner_text = state.banner();
         let active = state.model().active_tab();
-        let left_open = self
-            .dock
-            .upgrade()
-            .is_some_and(|dock| dock.read(cx).is_dock_open(DockPlacement::Left));
+        let left_expanded = state.left_pane_mode() == LeftPaneMode::Expanded;
         let report = {
             let state = self.state.downgrade();
             move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
@@ -170,7 +152,7 @@ impl Render for CenterPanel {
             .child(tab_strip(
                 items,
                 active,
-                left_open,
+                left_expanded,
                 self.strip_actions(),
                 cx,
             ))

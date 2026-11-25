@@ -13,15 +13,21 @@ use gpui_kit::base::Root;
 use gpui_kit::component::dock::{DockAreaState, DockPlacement, DockState, PanelInfo, PanelState};
 use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
 use gpui_kit::{
-    point, px, size, AppContext as _, Bounds, Entity, MouseButton, Point, TestAppContext,
+    point, px, size, AppContext as _, Bounds, Entity, MouseButton, Pixels, Point, TestAppContext,
     WindowBounds, WindowHandle, WindowOptions,
 };
-use smithagents_app::layout_store::{saved_dock, LayoutStore, LAYOUT_VERSION, MIN_CENTER_WIDTH};
+use smithagents_app::layout_store::{
+    saved_dock, saved_left_pane, with_left_pane, LayoutStore, LeftPaneLayout,
+    COMPACT_LEFT_PANE_WIDTH, DEFAULT_LEFT_PANE_WIDTH, LAYOUT_VERSION, MIN_CENTER_WIDTH,
+};
 use smithagents_app::link::LinkConfig;
 use smithagents_app::model::{Action, Connection, Effect, ShellModel};
-use smithagents_app::shell::{Shell, ShellOptions};
+use smithagents_app::shell::{Shell, ShellOptions, LEFT_PANE_ID, LEFT_PANE_RESIZE_ID};
+use smithagents_app::shell_state::ShellState;
+use smithagents_app::view_models::LeftPaneMode;
 use smithagents_app::views::banner::BANNER_ID;
 use smithagents_app::views::center::EMPTY_HINT_ID;
+use smithagents_app::views::left_pane::{COMPACT_MARKER_ID, EXPANDED_TITLE_ID};
 use smithagents_app::views::rail::{RailEntry, RAIL_WIDTH};
 use smithagents_app::views::tabs::{close_button_id, TOGGLE_AGENTS_ID};
 use smithagents_center_host::PixelRect;
@@ -215,13 +221,13 @@ fn collapsing_either_dock_widens_the_reported_center(cx: &mut TestAppContext) {
         Some(both_open)
     );
 
-    // The strip's toggle collapses the left dock.
+    // The strip's toggle compacts the left pane.
     cx.update_window(window.into(), |_, window, cx| {
         window.click(TOGGLE_AGENTS_ID, cx);
         window.render_frame(cx);
     })
     .unwrap();
-    assert!(!dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Left)));
+    assert_eq!(mode(cx, &state), LeftPaneMode::Compact);
     let left_closed = *seen.borrow().last().unwrap();
     assert!(
         left_closed.w > both_open.w,
@@ -290,25 +296,98 @@ fn clicking_a_tab_activates_it(cx: &mut TestAppContext) {
     });
 }
 
-#[gpui_kit::test]
-fn cmd_b_toggles_the_agents_dock(cx: &mut TestAppContext) {
-    let (window, shell) = open_shell(cx, ShellModel::new());
-    let dock = shell.read_with(cx, |shell, _| shell.dock().clone());
-    let left_open = |cx: &mut TestAppContext| {
-        dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Left))
-    };
-    assert!(left_open(cx));
+fn mode(cx: &mut TestAppContext, state: &Entity<ShellState>) -> LeftPaneMode {
+    state.read_with(cx, |state, _| state.left_pane_mode())
+}
 
+/// Renders a frame and returns the left pane's drawn width, asserting it is
+/// there at all.
+fn left_pane_width(cx: &mut TestAppContext, window: WindowHandle<Root>) -> Pixels {
+    let mut width = px(0.);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.press("cmd-b", cx);
+        let pane = window.find(LEFT_PANE_ID);
+        assert!(pane.visible(), "the left pane is drawn");
+        width = pane.bounds().size.width;
     })
     .unwrap();
-    assert!(!left_open(cx));
+    assert!(width > px(0.), "the left pane has a width");
+    width
+}
+
+#[gpui_kit::test]
+fn cmd_b_switches_the_left_pane_between_expanded_and_compact(cx: &mut TestAppContext) {
+    let (window, shell) = open_shell(cx, ShellModel::new());
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    let seen: Rc<RefCell<Vec<PixelRect>>> = Rc::default();
+    state.update(cx, |state, cx| {
+        let seen = seen.clone();
+        state.set_center_bounds_listener(move |rect, _| seen.borrow_mut().push(rect), cx);
+    });
+    assert_eq!(mode(cx, &state), LeftPaneMode::Expanded);
+    assert_eq!(left_pane_width(cx, window), DEFAULT_LEFT_PANE_WIDTH);
+    let mut scale = 1.0;
+    cx.update_window(window.into(), |_, window, _| {
+        assert!(window.find(EXPANDED_TITLE_ID).visible());
+        assert!(window.try_find(COMPACT_MARKER_ID).is_none());
+        assert!(
+            window.find(LEFT_PANE_RESIZE_ID).visible(),
+            "expanded resizes"
+        );
+        scale = f64::from(window.scale_factor());
+    })
+    .unwrap();
+    let expanded = *seen.borrow().last().unwrap();
 
     cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
         .unwrap();
-    assert!(left_open(cx));
+    assert_eq!(mode(cx, &state), LeftPaneMode::Compact);
+    assert_eq!(left_pane_width(cx, window), COMPACT_LEFT_PANE_WIDTH);
+    cx.update_window(window.into(), |_, window, _| {
+        assert!(window.find(COMPACT_MARKER_ID).visible());
+        assert!(window.try_find(EXPANDED_TITLE_ID).is_none());
+        assert!(
+            window.try_find(LEFT_PANE_RESIZE_ID).is_none(),
+            "no resizing while compact"
+        );
+    })
+    .unwrap();
+    let compact = *seen.borrow().last().unwrap();
+    let grew = f64::from(f32::from(DEFAULT_LEFT_PANE_WIDTH - COMPACT_LEFT_PANE_WIDTH)) * scale;
+    assert!(
+        (compact.w - expanded.w - grew).abs() < 0.5,
+        "{compact:?} vs {expanded:?}"
+    );
+    assert!((expanded.x - compact.x - grew).abs() < 0.5);
+
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+        .unwrap();
+    assert_eq!(mode(cx, &state), LeftPaneMode::Expanded);
+    assert_eq!(
+        left_pane_width(cx, window),
+        DEFAULT_LEFT_PANE_WIDTH,
+        "back at the previous width"
+    );
+    assert_eq!(seen.borrow().last().unwrap().w, expanded.w);
+}
+
+#[gpui_kit::test]
+fn dragging_the_edge_resizes_the_expanded_left_pane(cx: &mut TestAppContext) {
+    let (window, shell) = open_shell(cx, ShellModel::new());
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    left_pane_width(cx, window);
+    let mut to = point(px(0.), px(0.));
+    cx.update_window(window.into(), |_, window, cx| {
+        let from = window.find(LEFT_PANE_RESIZE_ID).bounds().center();
+        to = point(from.x + px(60.), from.y);
+        window.drag(from, to, cx);
+    })
+    .unwrap();
+    // The pane's edge follows the pointer (the shell starts at x = 0).
+    let width = state.read_with(cx, |state, _| state.left_pane_layout().expanded_width);
+    assert!((width - to.x).abs() <= px(1.), "{width:?} vs {to:?}");
+    assert!(width > DEFAULT_LEFT_PANE_WIDTH + px(50.));
+    assert_eq!(left_pane_width(cx, window), width);
 }
 
 #[gpui_kit::test]
@@ -333,21 +412,132 @@ fn the_dock_layout_is_saved_after_a_change_and_restored_on_the_next_open(cx: &mu
 
     let saved = store.load().expect("the layout was written");
     assert_eq!(
-        saved_dock(&saved, DockPlacement::Left).map(|d| d.open),
-        Some(false)
+        saved_left_pane(&saved),
+        Some(LeftPaneLayout {
+            mode: LeftPaneMode::Compact,
+            expanded_width: DEFAULT_LEFT_PANE_WIDTH
+        })
     );
     assert_eq!(
         saved_dock(&saved, DockPlacement::Right).map(|d| d.open),
         Some(true)
     );
 
-    // A second window, as on the next launch, starts from the saved layout.
-    let (_, reopened) = open_shell_with(cx, ShellModel::new(), Some(store));
-    let dock = reopened.read_with(cx, |shell, _| shell.dock().clone());
-    dock.read_with(cx, |dock, _| {
-        assert!(!dock.is_dock_open(DockPlacement::Left));
-        assert!(dock.is_dock_open(DockPlacement::Right));
-    });
+    // A second window, as on the next launch, starts from the saved layout,
+    // remembering the expanded width for when the pane expands again.
+    let (reopened_window, reopened) = open_shell_with(cx, ShellModel::new(), Some(store));
+    let (state, dock) =
+        reopened.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+    assert_eq!(mode(cx, &state), LeftPaneMode::Compact);
+    assert_eq!(
+        left_pane_width(cx, reopened_window),
+        COMPACT_LEFT_PANE_WIDTH
+    );
+    assert!(dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Right)));
+    cx.update_window(reopened_window.into(), |_, window, cx| {
+        window.press("cmd-b", cx)
+    })
+    .unwrap();
+    assert_eq!(
+        left_pane_width(cx, reopened_window),
+        DEFAULT_LEFT_PANE_WIDTH
+    );
+}
+
+#[gpui_kit::test]
+fn every_saved_variant_restores_a_drawn_left_pane(cx: &mut TestAppContext) {
+    let panel = |name: &str| PanelState {
+        panel_name: name.into(),
+        children: vec![],
+        info: PanelInfo::panel(serde_json::Value::Null),
+    };
+    let area = |left: Option<DockState>| DockAreaState {
+        version: Some(LAYOUT_VERSION),
+        center: panel("Center"),
+        left_dock: left,
+        right_dock: Some(DockState::new(
+            panel("Settings"),
+            DockPlacement::Right,
+            px(300.),
+            true,
+        )),
+        bottom_dock: None,
+    };
+    let old = |size: f32, open| {
+        area(Some(DockState::new(
+            panel("Agents"),
+            DockPlacement::Left,
+            px(size),
+            open,
+        )))
+    };
+    let new = |mode, width: f32| {
+        with_left_pane(
+            area(None),
+            LeftPaneLayout {
+                mode,
+                expanded_width: px(width),
+            },
+        )
+    };
+    // (file contents, expected mode, expected drawn width)
+    let cases: Vec<(Option<String>, LeftPaneMode, Pixels)> = vec![
+        (None, LeftPaneMode::Expanded, DEFAULT_LEFT_PANE_WIDTH),
+        (
+            Some("{ corrupt".into()),
+            LeftPaneMode::Expanded,
+            DEFAULT_LEFT_PANE_WIDTH,
+        ),
+        (
+            Some(serde_json::to_string(&area(None)).unwrap()),
+            LeftPaneMode::Expanded,
+            DEFAULT_LEFT_PANE_WIDTH,
+        ),
+        (
+            Some(serde_json::to_string(&new(LeftPaneMode::Compact, 300.)).unwrap()),
+            LeftPaneMode::Compact,
+            COMPACT_LEFT_PANE_WIDTH,
+        ),
+        (
+            Some(serde_json::to_string(&new(LeftPaneMode::Expanded, 300.)).unwrap()),
+            LeftPaneMode::Expanded,
+            px(300.),
+        ),
+        (
+            Some(serde_json::to_string(&old(260., false)).unwrap()),
+            LeftPaneMode::Compact,
+            COMPACT_LEFT_PANE_WIDTH,
+        ),
+        (
+            Some(serde_json::to_string(&old(260., true)).unwrap()),
+            LeftPaneMode::Expanded,
+            px(260.),
+        ),
+        (
+            Some(serde_json::to_string(&old(1., true)).unwrap()),
+            LeftPaneMode::Expanded,
+            px(100.),
+        ),
+    ];
+    for (contents, want_mode, want_width) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let store = LayoutStore::new(home.path());
+        if let Some(contents) = &contents {
+            std::fs::write(store.path(), contents).unwrap();
+        }
+        let (window, shell) = open_shell_with(cx, ShellModel::new(), Some(store));
+        let state = shell.read_with(cx, |shell, _| shell.state().clone());
+        assert_eq!(mode(cx, &state), want_mode, "{contents:?}");
+        assert_eq!(left_pane_width(cx, window), want_width, "{contents:?}");
+        // And it stays drawn through a round of toggles.
+        for _ in 0..2 {
+            cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+                .unwrap();
+            left_pane_width(cx, window);
+        }
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+    }
 }
 
 /// Clicks the middle of a side dock, as a user would before using its
@@ -369,8 +559,8 @@ fn click_inside_dock(
             )
         };
         let x = match placement {
-            DockPlacement::Left => area.left() + width / 2.,
-            _ => area.right() - width / 2.,
+            DockPlacement::Right => area.right() - width / 2.,
+            _ => area.left() + width / 2.,
         };
         let at = point(x, area.top() + area.size.height / 2.);
         window.pointer_down(at, MouseButton::Left, cx);
@@ -380,27 +570,48 @@ fn click_inside_dock(
 }
 
 #[gpui_kit::test]
-fn shortcuts_still_work_after_the_focused_dock_collapses(cx: &mut TestAppContext) {
+fn shortcuts_still_work_after_the_focused_pane_changes(cx: &mut TestAppContext) {
     let (window, shell) = open_shell(cx, ShellModel::new());
-    let dock = shell.read_with(cx, |shell, _| shell.dock().clone());
-    for (placement, key) in [
-        (DockPlacement::Left, "cmd-b"),
-        (DockPlacement::Right, "cmd-alt-b"),
-    ] {
-        let open =
-            |cx: &mut TestAppContext| dock.read_with(cx, |dock, _| dock.is_dock_open(placement));
-        click_inside_dock(cx, window, &shell, placement);
-        cx.update_window(window.into(), |_, window, cx| window.press(key, cx))
-            .unwrap();
-        assert!(!open(cx), "{key} closed the {placement:?} dock");
-        cx.run_until_parked();
-        cx.update_window(window.into(), |_, window, cx| {
-            window.render_frame(cx);
-            window.press(key, cx);
-        })
+    let (state, dock) =
+        shell.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+
+    // The left pane: focus inside it, compact it, expand it again.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let at = window.find(LEFT_PANE_ID).bounds().center();
+        window.pointer_down(at, MouseButton::Left, cx);
+        window.pointer_up(at, MouseButton::Left, cx);
+        window.press("cmd-b", cx);
+    })
+    .unwrap();
+    assert_eq!(mode(cx, &state), LeftPaneMode::Compact);
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("cmd-b", cx);
+    })
+    .unwrap();
+    assert_eq!(
+        mode(cx, &state),
+        LeftPaneMode::Expanded,
+        "a second cmd-b expands it"
+    );
+
+    // The right dock still hides and shows.
+    let open = |cx: &mut TestAppContext| {
+        dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Right))
+    };
+    click_inside_dock(cx, window, &shell, DockPlacement::Right);
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-alt-b", cx))
         .unwrap();
-        assert!(open(cx), "a second {key} reopened the {placement:?} dock");
-    }
+    assert!(!open(cx), "cmd-alt-b closed the right dock");
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("cmd-alt-b", cx);
+    })
+    .unwrap();
+    assert!(open(cx), "a second cmd-alt-b reopened the right dock");
 }
 
 #[gpui_kit::test]
@@ -418,8 +629,9 @@ fn closing_the_window_saves_the_layout(cx: &mut TestAppContext) {
 
     let saved = store.load().expect("the layout was written on close");
     assert_eq!(
-        saved_dock(&saved, DockPlacement::Left).map(|d| d.open),
-        Some(true)
+        saved_left_pane(&saved),
+        Some(LeftPaneLayout::default()),
+        "an expanded left pane at the default width"
     );
     let saved_window = store.load_window().expect("the window bounds were written");
     assert_eq!(saved_window.bounds.size, size(px(1200.), px(800.)));
@@ -499,16 +711,14 @@ fn a_narrow_window_keeps_the_center_wide_enough(cx: &mut TestAppContext) {
         })
         .unwrap();
 
-    // Reopened in a 900 px window, both docks shrink so the center keeps its
+    // Reopened in a 900 px window, both shrink so the center keeps its
     // minimum.
     let (window, shell) = open_shell_full(cx, ShellModel::new(), Some(store), None, (900., 700.));
-    let dock = shell.read_with(cx, |shell, _| shell.dock().clone());
-    let (left, right) = dock.read_with(cx, |area, _| {
-        (
-            area.dock_size(DockPlacement::Left).unwrap(),
-            area.dock_size(DockPlacement::Right).unwrap(),
-        )
-    });
+    let (dock, state) =
+        shell.read_with(cx, |shell, _| (shell.dock().clone(), shell.state().clone()));
+    let left = state.read_with(cx, |state, _| state.left_pane_layout().expanded_width);
+    let right = dock.read_with(cx, |area, _| area.dock_size(DockPlacement::Right).unwrap());
+    assert_eq!(left_pane_width(cx, window), left);
     assert_eq!(left, right, "both shrink in proportion");
     assert!(left < px(600.));
     assert!(
@@ -516,7 +726,62 @@ fn a_narrow_window_keeps_the_center_wide_enough(cx: &mut TestAppContext) {
         "{left:?} + {right:?}"
     );
 
-    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    let mut scale = 1.0;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        scale = f64::from(window.scale_factor());
+    })
+    .unwrap();
+    let rect = state.read_with(cx, |state, _| state.center_rect()).unwrap();
+    assert!(
+        rect.w / scale >= f64::from(f32::from(MIN_CENTER_WIDTH)) - 1.0,
+        "{rect:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_compact_left_pane_and_a_wide_right_dock_keep_the_center_wide_enough(cx: &mut TestAppContext) {
+    let home = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(home.path());
+    let panel = |name: &str| PanelState {
+        panel_name: name.into(),
+        children: vec![],
+        info: PanelInfo::panel(serde_json::Value::Null),
+    };
+    store
+        .save(&with_left_pane(
+            DockAreaState {
+                version: Some(LAYOUT_VERSION),
+                center: panel("Center"),
+                left_dock: None,
+                right_dock: Some(DockState::new(
+                    panel("Settings"),
+                    DockPlacement::Right,
+                    px(900.),
+                    true,
+                )),
+                bottom_dock: None,
+            },
+            LeftPaneLayout {
+                mode: LeftPaneMode::Compact,
+                expanded_width: px(300.),
+            },
+        ))
+        .unwrap();
+    let (window, shell) = open_shell_full(cx, ShellModel::new(), Some(store), None, (1000., 700.));
+    let (dock, state) =
+        shell.read_with(cx, |shell, _| (shell.dock().clone(), shell.state().clone()));
+    assert_eq!(left_pane_width(cx, window), COMPACT_LEFT_PANE_WIDTH);
+    let right = dock.read_with(cx, |area, _| area.dock_size(DockPlacement::Right).unwrap());
+    assert!(
+        px(1000. - RAIL_WIDTH) - COMPACT_LEFT_PANE_WIDTH - right >= MIN_CENTER_WIDTH,
+        "{right:?}"
+    );
+    assert_eq!(
+        state.read_with(cx, |state, _| state.left_pane_layout().expanded_width),
+        px(300.),
+        "the expanded width is remembered"
+    );
     let mut scale = 1.0;
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
