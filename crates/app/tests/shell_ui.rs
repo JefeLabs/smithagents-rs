@@ -43,6 +43,7 @@ use smithagents_app::views::tabs::{close_button_id, TOGGLE_AGENTS_ID};
 use smithagents_app::views::title_bar::TITLE_BAR_ID;
 use smithagents_center_host::PixelRect;
 use smithagents_core::agent::Agent;
+use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
 
 /// A connected model with `agent` open in a tab.
@@ -1377,8 +1378,15 @@ fn switching_the_theme_repaints_the_regions(cx: &mut TestAppContext) {
     let dark = painted_regions(cx, window);
 
     let light_state = theme_state(Appearance::Light);
-    cx.update(|cx| {
-        smithagents_app::theme_adapter::apply_theme(set, &light_state, Some(&state), cx);
+    // The user's choice, through the state's ThemeController.
+    state.update(cx, |state, cx| {
+        state.set_appearance(
+            AppearanceSettings {
+                theme: ThemeChoice::Id(light_state.theme.clone()),
+                ..AppearanceSettings::default()
+            },
+            cx,
+        )
     });
     let light = painted_regions(cx, window);
 
@@ -1433,15 +1441,24 @@ fn the_title_bar_spans_the_window_and_the_center_sits_below_it(cx: &mut TestAppC
 #[gpui_kit::test]
 fn the_center_pane_paints_its_own_token_not_the_background(cx: &mut TestAppContext) {
     let mercury = agent("Mercury");
-    let (window, shell) = open_shell(cx, connected_with_tab(&mercury));
-    let state = shell.read_with(cx, |shell, _| shell.state().clone());
-    let mut native = ThemeSet::embedded()
-        .native(&theme_state(Appearance::Dark).theme)
-        .unwrap();
-    // Give the center a color no other surface has.
-    let distinct = native.colors["selection"];
-    native.colors.insert("center-pane".into(), distinct);
-    state.update(cx, |state, cx| state.set_native_theme(native.clone(), cx));
+    // Tokens where the center has a color no other surface has (in the
+    // shipped themes it equals the background).
+    let mut set = ThemeSet::embedded().clone();
+    for theme in &mut set.themes {
+        let distinct = theme.colors["selection"];
+        theme.colors.insert("center-pane".into(), distinct);
+    }
+    let set: &'static ThemeSet = Box::leak(Box::new(set));
+    let (window, _) = open_shell_options(
+        cx,
+        ShellOptions {
+            model: connected_with_tab(&mercury),
+            theme_set: Some(set),
+            ..Default::default()
+        },
+        (1200., 800.),
+    );
+    let native = set.native(&theme_state(Appearance::Dark).theme).unwrap();
     let painted = painted_regions(cx, window);
     assert_eq!(painted.center, token_background(&native, "selection"));
     assert_ne!(painted.center, token_background(&native, "background"));

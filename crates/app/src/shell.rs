@@ -83,7 +83,8 @@ const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 /// Registers the shell's key bindings: `cmd-b` switches the agents pane
 /// between expanded and compact, `cmd-alt-b` hides or shows the settings
-/// dock, plus the agents pane's own ([`crate::views::agents::init`]). (v1 is
+/// dock, plus the agents pane's and the settings view's own
+/// ([`crate::views::agents::init`], [`crate::views::settings::init`]). (v1 is
 /// macOS only. `KeyBinding::new` does not resolve the portable `secondary-`
 /// modifier and panics on it.)
 pub fn init(cx: &mut App) {
@@ -92,6 +93,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-b", ToggleSettingsPane, Some(KEY_CONTEXT)),
     ]);
     crate::views::agents::init(cx);
+    crate::views::settings::init(cx);
 }
 
 /// How to build a [`Shell`]. The default is an empty, offline shell.
@@ -110,6 +112,9 @@ pub struct ShellOptions {
     /// Where the OS light/dark appearance comes from; `None` is the real one
     /// ([`OsAppearance`]). Headless tests inject a fake they can flip.
     pub system_appearance: Option<Rc<dyn SystemAppearanceSource>>,
+    /// The design tokens the themes come from; `None` is the embedded set
+    /// ([`ThemeSet::embedded`]). Tests pass a set with distinct tokens.
+    pub theme_set: Option<&'static ThemeSet>,
     /// Replaces the daemon link for the views' commands (create and close an
     /// agent, add a repository), so headless tests need no daemon; `None`
     /// sends them through the link.
@@ -172,6 +177,7 @@ impl Shell {
             layout,
             settings,
             system_appearance,
+            theme_set,
             commands,
             app_state,
             command_timeout,
@@ -204,7 +210,7 @@ impl Shell {
         // from here on.
         let system_appearance = system_appearance.unwrap_or_else(|| Rc::new(OsAppearance));
         let appearance = AppearanceRuntime::new(
-            ThemeSet::embedded(),
+            theme_set.unwrap_or_else(ThemeSet::embedded),
             settings,
             system_appearance.current(cx),
         );

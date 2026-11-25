@@ -2,14 +2,23 @@
 //! new `AppearanceSettings` and hands them to the shell state
 //! ([`ShellState::set_appearance`](crate::shell_state::ShellState::set_appearance)),
 //! which resolves, saves and applies them live.
+//!
+//! The theme and font choices are radio groups drawn here on gpui-base's
+//! unstyled `Radio` with focus handles the pane owns, because gpui-component's
+//! `RadioGroup` keeps its radios' focus to itself and has no arrow keys. Each
+//! option is a Tab stop; Space or Enter selects the focused one; Up/Left and
+//! Down/Right move the focus to the adjacent option and select it, wrapping
+//! at the ends, as radio groups conventionally do.
 
+use gpui_kit::base::Radio;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::label::Label;
-use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::{h_flex, v_flex, Disableable as _, Icon, IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, Context, InteractiveElement as _, IntoElement, ParentElement as _, Role,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
+    div, rems, App, Context, FocusHandle, InteractiveElement as _, IntoElement, KeyBinding,
+    ParentElement as _, Role, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
+    Window,
 };
 use smithagents_theme::state::AppearanceSettings;
 
@@ -18,7 +27,23 @@ use crate::view_models::{
     font_options, stepped_text_scale, text_scale_label, text_scale_steps, theme_options,
 };
 
-/// Element id of the theme choice (a radio group; its radios are `0..`).
+gpui_kit::actions!(
+    smithagents_settings,
+    [
+        /// Move to the option before the focused one in a settings radio
+        /// group (the last after the first) and select it.
+        SelectPreviousOption,
+        /// Move to the option after the focused one in a settings radio group
+        /// (the first after the last) and select it.
+        SelectNextOption,
+    ]
+);
+
+/// Key context of a settings radio group, for its arrow keys.
+pub const RADIO_KEY_CONTEXT: &str = "SettingsRadioGroup";
+
+/// Element id of the theme choice (a radio group named "Theme"; its radios
+/// are `0..`).
 pub const THEME_OPTIONS_ID: &str = "theme-options";
 /// Element id of the text size stepper (a labeled group).
 pub const TEXT_SIZE_ID: &str = "text-size";
@@ -28,19 +53,81 @@ pub const TEXT_SIZE_DOWN_ID: &str = "text-size-down";
 pub const TEXT_SIZE_UP_ID: &str = "text-size-up";
 /// Element id of the stepper's value ("100%").
 pub const TEXT_SIZE_VALUE_ID: &str = "text-size-value";
-/// Element id of the font choice (a radio group; its radios are `0..`).
+/// Element id of the font choice (a radio group named "Font"; its radios are
+/// `0..`).
 pub const FONT_OPTIONS_ID: &str = "font-options";
 
 pub const THEME_LABEL: &str = "Theme";
 pub const TEXT_SIZE_LABEL: &str = "Text size";
 pub const FONT_LABEL: &str = "Font";
 
-/// Element id of the theme field (a group named "Theme").
-pub const THEME_FIELD_ID: &str = "theme-field";
-/// Element id of the font field (a group named "Font").
-pub const FONT_FIELD_ID: &str = "font-field";
+/// The width of the stepper's value, in rems so it grows with the text: it
+/// holds "150%" at the largest scale.
+const VALUE_WIDTH_REMS: f32 = 3.5;
+
+/// Registers the radio groups' arrow keys.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPreviousOption, Some(RADIO_KEY_CONTEXT)),
+        KeyBinding::new("left", SelectPreviousOption, Some(RADIO_KEY_CONTEXT)),
+        KeyBinding::new("down", SelectNextOption, Some(RADIO_KEY_CONTEXT)),
+        KeyBinding::new("right", SelectNextOption, Some(RADIO_KEY_CONTEXT)),
+    ]);
+}
+
+/// The section's two radio groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Theme,
+    Font,
+}
+
+impl Choice {
+    fn id(self) -> &'static str {
+        match self {
+            Choice::Theme => THEME_OPTIONS_ID,
+            Choice::Font => FONT_OPTIONS_ID,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Choice::Theme => THEME_LABEL,
+            Choice::Font => FONT_LABEL,
+        }
+    }
+}
+
+/// One option of a radio group: its label and whether it is selected.
+struct OptionVm {
+    label: String,
+    selected: bool,
+}
 
 impl SettingsPane {
+    /// Keeps one focus handle per option of each radio group (the option
+    /// lists come from the token set, so they only grow with it).
+    pub(super) fn sync_radio_focus(&mut self, cx: &mut Context<Self>) {
+        let set = self.state.read(cx).theme_set();
+        let (themes, fonts) = (set.themes.len() + 1, set.base.fonts.len());
+        for (handles, count) in [
+            (&mut self.theme_focus, themes),
+            (&mut self.font_focus, fonts),
+        ] {
+            handles.truncate(count);
+            while handles.len() < count {
+                handles.push(cx.focus_handle().tab_stop(true));
+            }
+        }
+    }
+
+    fn focus_handles(&self, choice: Choice) -> &[FocusHandle] {
+        match choice {
+            Choice::Theme => &self.theme_focus,
+            Choice::Font => &self.font_focus,
+        }
+    }
+
     /// The settings now, changed by `change`, handed to the shell state.
     fn change_appearance(
         &mut self,
@@ -51,6 +138,13 @@ impl SettingsPane {
         change(&mut settings);
         self.state
             .update(cx, |state, cx| state.set_appearance(settings, cx));
+    }
+
+    fn choose(&mut self, choice: Choice, ix: usize, cx: &mut Context<Self>) {
+        match choice {
+            Choice::Theme => self.choose_theme(ix, cx),
+            Choice::Font => self.choose_font(ix, cx),
+        }
     }
 
     fn choose_theme(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -68,20 +162,6 @@ impl SettingsPane {
         self.change_appearance(|settings| settings.theme = choice, cx);
     }
 
-    /// One step larger (`up`) or smaller, from the scale in effect.
-    fn step_text_size(&mut self, up: bool, cx: &mut Context<Self>) {
-        let next = {
-            let state = self.state.read(cx);
-            let steps = text_scale_steps(&state.theme_set().base.text_scale);
-            stepped_text_scale(&steps, state.theme_state().text_scale, up)
-        };
-        let Some(next) = next else {
-            return;
-        };
-        tracing::debug!(next, "text size stepped");
-        self.change_appearance(|settings| settings.text_scale = next, cx);
-    }
-
     fn choose_font(&mut self, ix: usize, cx: &mut Context<Self>) {
         let font = {
             let state = self.state.read(cx);
@@ -97,39 +177,139 @@ impl SettingsPane {
         self.change_appearance(|settings| settings.font = font, cx);
     }
 
+    /// An arrow key in a radio group: the option after (`forward`) or before
+    /// the focused one, wrapping, takes the focus and is selected.
+    fn step_choice(
+        &mut self,
+        choice: Choice,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handles = self.focus_handles(choice);
+        let count = handles.len();
+        let Some(current) = handles.iter().position(|handle| handle.is_focused(window)) else {
+            return;
+        };
+        let next = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        tracing::debug!(?choice, next, "radio group arrow key");
+        handles[next].focus(window, cx);
+        self.choose(choice, next, cx);
+    }
+
+    /// One step larger (`up`) or smaller, from the scale in effect.
+    fn step_text_size(&mut self, up: bool, cx: &mut Context<Self>) {
+        let next = {
+            let state = self.state.read(cx);
+            let steps = text_scale_steps(&state.theme_set().base.text_scale);
+            stepped_text_scale(&steps, state.theme_state().text_scale, up)
+        };
+        let Some(next) = next else {
+            return;
+        };
+        tracing::debug!(next, "text size stepped");
+        self.change_appearance(|settings| settings.text_scale = next, cx);
+    }
+
+    /// A radio group named after `choice`: one Tab stop per option, arrow
+    /// keys between them.
+    fn radio_group(
+        &self,
+        choice: Choice,
+        options: Vec<OptionVm>,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let handles = self.focus_handles(choice);
+        let count = options.len();
+        let pane = cx.entity().downgrade();
+        v_flex()
+            .id(choice.id())
+            .role(Role::RadioGroup)
+            .test_support()
+            .aria_label(choice.label())
+            .key_context(RADIO_KEY_CONTEXT)
+            .on_action(
+                cx.listener(move |this, _: &SelectPreviousOption, window, cx| {
+                    this.step_choice(choice, false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(move |this, _: &SelectNextOption, window, cx| {
+                this.step_choice(choice, true, window, cx)
+            }))
+            .gap_0p5()
+            .children(
+                options
+                    .into_iter()
+                    .zip(handles)
+                    .enumerate()
+                    .map(|(ix, (option, handle))| {
+                        let pane = pane.clone();
+                        let ring = paint.ring;
+                        Radio::new(ix)
+                            .track_focus(handle)
+                            .checked(option.selected)
+                            .accessibility_label(option.label.clone())
+                            .set_position(ix + 1, count)
+                            .on_change(move |_, _, _, cx| {
+                                let _ = pane.update(cx, |this, cx| this.choose(choice, ix, cx));
+                            })
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_1()
+                            .py_0p5()
+                            .rounded(paint.radius)
+                            .border_1()
+                            .border_color(paint.surface)
+                            .focus_visible(move |style| style.border_color(ring))
+                            .child(radio_indicator(option.selected, paint))
+                            .child(
+                                Label::new(option.label)
+                                    .text_sm()
+                                    .text_color(paint.foreground),
+                            )
+                    }),
+            )
+    }
+
     pub(super) fn appearance_content(&self, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let set = state.theme_set();
         let settings = state.appearance_settings();
-        let themes = theme_options(set, &settings.theme);
-        let fonts = font_options(set, &settings.font);
+        let themes = theme_options(set, &settings.theme)
+            .into_iter()
+            .map(|option| OptionVm {
+                label: option.label,
+                selected: option.selected,
+            })
+            .collect();
+        let fonts = font_options(set, &settings.font)
+            .into_iter()
+            .map(|option| OptionVm {
+                label: option.label,
+                selected: option.selected,
+            })
+            .collect();
         let scale = state.theme_state().text_scale;
         let steps = text_scale_steps(&set.base.text_scale);
         let smaller = stepped_text_scale(&steps, scale, false);
         let larger = stepped_text_scale(&steps, scale, true);
         let scale_text = text_scale_label(scale);
 
-        let theme_group = RadioGroup::vertical(THEME_OPTIONS_ID)
-            .selected_index(themes.iter().position(|option| option.selected))
-            .children(themes.iter().map(|option| {
-                Radio::new(option.label.clone())
-                    .label(option.label.clone())
-                    .small()
-            }))
-            .on_change(cx.listener(|this, ix: &usize, _, cx| this.choose_theme(*ix, cx)));
-        let font_group = RadioGroup::vertical(FONT_OPTIONS_ID)
-            .selected_index(fonts.iter().position(|option| option.selected))
-            .children(fonts.iter().map(|option| {
-                Radio::new(option.id.clone())
-                    .label(option.label.clone())
-                    .small()
-            }))
-            .on_change(cx.listener(|this, ix: &usize, _, cx| this.choose_font(*ix, cx)));
-
         v_flex()
             .w_full()
             .gap_3()
-            .child(field(THEME_FIELD_ID, THEME_LABEL, theme_group, paint))
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(caption(THEME_LABEL, paint))
+                    .child(self.radio_group(Choice::Theme, themes, paint, cx)),
+            )
             .child(
                 v_flex()
                     .gap_1p5()
@@ -159,7 +339,8 @@ impl SettingsPane {
                             .child(
                                 Label::new(scale_text)
                                     .id(TEXT_SIZE_VALUE_ID)
-                                    .w(px(48.))
+                                    .flex_none()
+                                    .w(rems(VALUE_WIDTH_REMS))
                                     .text_center()
                                     .text_sm()
                                     .text_color(paint.foreground),
@@ -178,24 +359,33 @@ impl SettingsPane {
                             ),
                     ),
             )
-            .child(field(FONT_FIELD_ID, FONT_LABEL, font_group, paint))
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(caption(FONT_LABEL, paint))
+                    .child(self.radio_group(Choice::Font, fonts, paint, cx)),
+            )
     }
 }
 
-/// A caption over `control`, inside a group named `label` (the radio group
-/// itself cannot carry a name in this gpui-component).
-fn field(
-    id: &'static str,
-    label: &'static str,
-    control: impl IntoElement,
-    paint: &Paint,
-) -> impl IntoElement {
-    v_flex()
-        .id(id)
-        .role(Role::Group)
-        .test_support()
-        .aria_label(label)
-        .gap_1p5()
-        .child(caption(label, paint))
-        .child(div().child(control))
+/// A radio's circle: a `primary` disc with a `primary-foreground` dot when
+/// checked, an `input` ring when not.
+fn radio_indicator(checked: bool, paint: &Paint) -> impl IntoElement {
+    div()
+        .flex_none()
+        .size(rems(1.))
+        .rounded_full()
+        .border_1()
+        .border_color(if checked { paint.primary } else { paint.input })
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(checked, |this| {
+            this.bg(paint.primary).child(
+                div()
+                    .size(rems(0.375))
+                    .rounded_full()
+                    .bg(paint.primary_foreground),
+            )
+        })
 }

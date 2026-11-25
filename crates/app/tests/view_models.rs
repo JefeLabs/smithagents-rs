@@ -652,11 +652,11 @@ mod settings_pane {
     use chrono::{DateTime, Utc};
     use smithagents_app::link::LinkError;
     use smithagents_app::view_models::{
-        font_options, nearest_step, repo_error_text, repo_rows, stepped_text_scale,
-        text_scale_label, text_scale_steps, theme_options, validate_repo_path_input_in,
-        FontOptionVm, RepoRowVm, SettingsSection, ThemeOptionVm, ABSOLUTE_PATH_TEXT,
-        CLONE_UNSUPPORTED_TEXT, DAEMON_UNREACHABLE_TEXT, ENTER_A_PATH_TEXT, NOT_CONNECTED_TEXT,
-        SYSTEM_THEME_LABEL,
+        font_options, nearest_step, repo_error_text, repo_matches_sent_path, repo_rows,
+        stepped_text_scale, text_scale_label, text_scale_steps, theme_options,
+        validate_repo_path_input_in, FontOptionVm, RepoRowVm, SettingsSection, ThemeOptionVm,
+        ABSOLUTE_PATH_TEXT, CLONE_UNSUPPORTED_TEXT, DAEMON_UNREACHABLE_TEXT, ENTER_A_PATH_TEXT,
+        NOT_CONNECTED_TEXT, REPO_ADD_FAILED_TEXT, SYSTEM_THEME_LABEL,
     };
     use smithagents_client::ClientError;
     use smithagents_core::agent::Repo;
@@ -879,56 +879,130 @@ mod settings_pane {
         })
     }
 
+    /// The daemon's real answers to an add: its codes (`api.rs`) and its
+    /// messages, which carry the `ServiceError` prefix (`service.rs`:
+    /// `"git: {0}"`, `"store: {0}"`) before the `GitError` / `StoreError`
+    /// text (`git.rs`, `store.rs`).
+    const DAEMON_ANSWERS: [(u16, &str, &str, &str); 5] = [
+        (
+            400,
+            "path_not_found",
+            "git: no directory at /tmp/missing dir",
+            "No directory at that path.",
+        ),
+        (
+            400,
+            "not_a_git_repo",
+            "git: not a git repository",
+            "That directory is not a git repository.",
+        ),
+        (
+            400,
+            "bare_repo",
+            "git: bare repositories are not supported",
+            "Bare repositories are not supported.",
+        ),
+        (
+            400,
+            "no_default_branch",
+            "git: could not determine the default branch",
+            "Could not determine the repository's default branch.",
+        ),
+        (
+            409,
+            "repo_exists",
+            "store: a repo with this path already exists",
+            "That repository is already added.",
+        ),
+    ];
+
     #[test]
-    fn a_daemon_error_reads_as_the_daemons_message() {
-        // The real codes and messages from `crates/server/src/api.rs`.
-        for (code, message, want) in [
-            (
-                "path_not_found",
-                "no directory at /tmp/missing dir",
-                "No directory at /tmp/missing dir",
-            ),
-            (
-                "not_a_git_repo",
-                "not a git repository",
-                "Not a git repository",
-            ),
-            (
-                "bare_repo",
-                "bare repositories are not supported",
-                "Bare repositories are not supported",
-            ),
-            (
-                "repo_exists",
-                "a repo with this path already exists",
-                "A repo with this path already exists",
-            ),
-            (
-                "no_default_branch",
-                "could not determine the default branch",
-                "Could not determine the default branch",
-            ),
-        ] {
-            assert_eq!(repo_error_text(&api(400, code, message)), want, "{code}");
+    fn a_known_daemon_code_reads_as_our_own_sentence() {
+        for (status, code, message, want) in DAEMON_ANSWERS {
+            let text = repo_error_text(&api(status, code, message));
+            assert_eq!(text, want, "{code}");
+            assert!(!text.contains("git:") && !text.contains("store:"), "{text}");
         }
-        // Surrounding and inner whitespace never makes a second line.
+        // The sentence does not depend on the message.
         assert_eq!(
-            repo_error_text(&api(400, "not_a_git_repo", "  not a\ngit repository \n")),
-            "Not a git repository"
+            repo_error_text(&api(400, "not_a_git_repo", " ")),
+            "That directory is not a git repository."
         );
     }
 
     #[test]
-    fn a_blank_daemon_message_falls_back_to_a_line_for_its_code() {
-        for (code, want) in [
-            ("path_not_found", "No directory at that path"),
-            ("not_a_git_repo", "Not a git repository"),
-            ("bare_repo", "Bare repositories are not supported"),
-            ("repo_exists", "This repository is already added"),
-            ("http_502", "The daemon could not add the repository"),
+    fn another_daemon_error_shows_its_message_without_the_internal_prefix() {
+        for (code, message, want) in [
+            (
+                "git_error",
+                "git: git command failed: fatal: bad object HEAD",
+                "Git command failed: fatal: bad object HEAD",
+            ),
+            (
+                "store_error",
+                "store: database error: disk I/O error",
+                "Database error: disk I/O error",
+            ),
+            (
+                "invalid",
+                "invalid JSON: EOF while parsing",
+                "Invalid JSON: EOF while parsing",
+            ),
+            ("internal", "internal error", "Internal error"),
+            // Whitespace never makes a second line.
+            (
+                "git_error",
+                "  git:  git command\nfailed \n",
+                "Git command failed",
+            ),
         ] {
-            assert_eq!(repo_error_text(&api(400, code, " ")), want, "{code}");
+            assert_eq!(
+                repo_error_text(&api(500, code, message)),
+                want,
+                "{message:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_blank_daemon_message_without_a_sentence_reads_as_a_generic_line() {
+        assert_eq!(
+            REPO_ADD_FAILED_TEXT,
+            "The daemon could not add the repository."
+        );
+        for message in ["", "  ", "git: ", "store:"] {
+            assert_eq!(
+                repo_error_text(&api(500, "http_502", message)),
+                REPO_ADD_FAILED_TEXT,
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_added_repo_matches_the_path_sent() {
+        let sent = Path::new("/tmp/My Repo/sub");
+        let canonical = Path::new("/private/tmp/My Repo/sub");
+        // The same path.
+        assert!(repo_matches_sent_path(sent, None, sent));
+        // The daemon records the git top level of the canonical path.
+        assert!(repo_matches_sent_path(
+            sent,
+            Some(canonical),
+            Path::new("/private/tmp/My Repo")
+        ));
+        assert!(repo_matches_sent_path(sent, Some(canonical), canonical));
+        // Another repository does not match.
+        assert!(!repo_matches_sent_path(
+            sent,
+            Some(canonical),
+            Path::new("/private/tmp/My Repo 2")
+        ));
+        assert!(!repo_matches_sent_path(
+            sent,
+            None,
+            Path::new("/tmp/My Repo")
+        ));
     }
 
     #[test]
@@ -1032,5 +1106,9 @@ mod settings_pane {
         assert_eq!(SettingsSection::Appearance.title(), "Appearance");
         assert_eq!(SettingsSection::Repositories.title(), "Source repositories");
         assert_eq!(SettingsSection::parse("agent-defaults"), None);
+        // The scroll index is the position in `ALL`, the pane's order.
+        for (ix, section) in SettingsSection::ALL.into_iter().enumerate() {
+            assert_eq!(section.index(), ix);
+        }
     }
 }

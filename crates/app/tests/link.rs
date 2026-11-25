@@ -8,6 +8,7 @@ use std::time::Duration;
 use common::{daemon_bin, fake_claude, init_repo, TestHome};
 use smithagents_app::link::{DaemonLink, LinkConfig, LinkError, LinkErrorKind};
 use smithagents_app::model::{Action, Connection};
+use smithagents_app::view_models::repo_error_text;
 use smithagents_client::{Client, ClientError, SpawnOptions};
 use smithagents_core::agent::AgentState;
 use smithagents_core::daemon::read_lockfile;
@@ -164,19 +165,54 @@ async fn killed_daemon_reconnects_with_a_fresh_snapshot() {
     assert_eq!(link.connection_info(), Some((new.port, new.token)));
 }
 
+/// Adds `path` expecting the daemon to refuse it with `code`; returns the
+/// error and checks the daemon's raw message carries `prefix` (its internal
+/// `ServiceError` prefix, which the Settings pane must never show).
+async fn refused_add(
+    link: &DaemonLink,
+    path: &std::path::Path,
+    code: &str,
+    prefix: &str,
+) -> LinkError {
+    let err = link
+        .add_repo(path)
+        .await
+        .expect_err("the daemon refuses the add");
+    match &err {
+        LinkError::Client(ClientError::Api {
+            code: got, message, ..
+        }) => {
+            assert_eq!(got, code, "{message}");
+            assert!(message.starts_with(prefix), "{message}");
+        }
+        other => panic!("expected {code}, got {other:?}"),
+    }
+    err
+}
+
 #[tokio::test]
 async fn add_repo_with_a_missing_path_returns_the_typed_error() {
     let home = TestHome::new();
     let (link, mut rx) = connected(&home).await;
     let missing = home.scratch().join("nope");
-    match link.add_repo(&missing).await {
-        Err(LinkError::Client(ClientError::Api { code, .. })) => {
-            assert_eq!(code, "path_not_found");
-        }
-        other => panic!("expected path_not_found, got {other:?}"),
-    }
+    let err = refused_add(&link, &missing, "path_not_found", "git: no directory at ").await;
+    assert_eq!(repo_error_text(&err), "No directory at that path.");
+    // A file is not a directory either.
+    let file = home.scratch().join("a file.txt");
+    std::fs::write(&file, "not a repository").unwrap();
+    let err = refused_add(&link, &file, "path_not_found", "git: no directory at ").await;
+    assert_eq!(repo_error_text(&err), "No directory at that path.");
+    // A plain directory is not a git repository.
+    let plain = home.scratch().join("plain dir ünï");
+    std::fs::create_dir(&plain).unwrap();
+    let err = refused_add(&link, &plain, "not_a_git_repo", "git: not a git repository").await;
+    assert_eq!(
+        repo_error_text(&err),
+        "That directory is not a git repository."
+    );
+
     // A good one succeeds and also reaches the model, since repos have no event.
-    let repo_dir = home.scratch().join("repo");
+    let repo_dir = home.scratch().join("My Repo ünïcode");
     init_repo(&repo_dir);
     let repo = link.add_repo(&repo_dir).await.unwrap();
     let added = until(&mut rx, "RepoAdded", |a| match a {
@@ -185,6 +221,15 @@ async fn add_repo_with_a_missing_path_returns_the_typed_error() {
     })
     .await;
     assert_eq!(added, repo.id);
+    // Adding it again is refused.
+    let err = refused_add(
+        &link,
+        &repo_dir,
+        "repo_exists",
+        "store: a repo with this path",
+    )
+    .await;
+    assert_eq!(repo_error_text(&err), "That repository is already added.");
 }
 
 #[tokio::test]

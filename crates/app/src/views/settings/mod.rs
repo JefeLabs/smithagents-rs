@@ -3,15 +3,20 @@
 //! `app-state.json`):
 //!
 //! - **Appearance** (app scope, [`appearance`]): the theme ("System" or a
-//!   theme), the text size (a stepper over the token set's scale) and the
-//!   font. A change applies live and is saved to `app-settings.json`.
+//!   theme) and the font as radio groups (Up/Down or Left/Right move to and
+//!   select the adjacent option, wrapping), and the text size as a stepper
+//!   over the token set's scale. A change applies live and is saved to
+//!   `app-settings.json`.
 //! - **Source repositories** (Space scope, [`repositories`]): the daemon's
 //!   repositories and an "Add repository" field for a local path.
 //!
 //! Each section is a labeled group; its header is a button that exposes
 //! whether it is expanded. The New agent button, when there is no repository,
 //! asks for Source repositories ([`ShellEvent::FocusSettings`]): the section
-//! is expanded, scrolled to the top and its path field focused.
+//! is expanded and scrolled toward the top of the pane, as far as the content
+//! below it allows (it is the last section, so in a short pane it ends at the
+//! bottom, fully in view), and its path field takes the focus. No other
+//! section is ever asked for.
 //!
 //! The pane paints its whole area from `Region::RightPane` (`card`,
 //! `card-foreground`); muted text, errors and borders come from tokens.
@@ -20,6 +25,9 @@
 
 mod appearance;
 mod repositories;
+
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
@@ -32,16 +40,18 @@ use gpui_kit::{
     Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
     Task, TestSupportExt as _, Window,
 };
+use smithagents_core::ids::RepoId;
 
 use crate::model::Connection;
 use crate::shell::SETTINGS_PANEL;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, token_paint, Region};
-use crate::view_models::{SettingsSection, DAEMON_SILENT_TEXT};
+use crate::view_models::SettingsSection;
 
 pub use appearance::{
-    FONT_FIELD_ID, FONT_LABEL, FONT_OPTIONS_ID, TEXT_SIZE_DOWN_ID, TEXT_SIZE_ID, TEXT_SIZE_LABEL,
-    TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID, THEME_FIELD_ID, THEME_LABEL, THEME_OPTIONS_ID,
+    init, SelectNextOption, SelectPreviousOption, FONT_LABEL, FONT_OPTIONS_ID, RADIO_KEY_CONTEXT,
+    TEXT_SIZE_DOWN_ID, TEXT_SIZE_ID, TEXT_SIZE_LABEL, TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID,
+    THEME_LABEL, THEME_OPTIONS_ID,
 };
 pub use repositories::{
     repo_row_id, ADD_REPO_ID, BROWSE_REPO_ID, REPOS_EMPTY_ID, REPO_LIST_ID, REPO_PATH_ERROR_ID,
@@ -76,11 +86,32 @@ pub struct SettingsPane {
     /// The add in flight, if any; the field and its buttons are disabled
     /// while it runs. Dropping it gives the add up.
     adding: Option<Task<()>>,
+    /// What the add in flight was sent for.
+    sent: Option<SentAdd>,
+    /// An add given up on (timeout, connection drop) that the daemon may
+    /// still finish: when its repository appears, the stale "did not
+    /// answer" line and the field are cleared.
+    given_up: Option<SentAdd>,
     /// The folder picker, while it is open.
     browsing: Option<Task<()>>,
     /// The connection as last seen, to notice it dropping.
     connection: Connection,
+    /// One focus handle per theme option, and per font option (their radio
+    /// groups move the focus with the arrow keys).
+    theme_focus: Vec<FocusHandle>,
+    font_focus: Vec<FocusHandle>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// An add as it was sent.
+struct SentAdd {
+    path: PathBuf,
+    /// The path resolved on disk, filled in when the add is given up (the
+    /// daemon records the git top level of the real path).
+    canonical: Option<PathBuf>,
+    /// The repositories the model had when it was sent: a repository that
+    /// appears later and matches the path is this add's.
+    known: HashSet<RepoId>,
 }
 
 impl SettingsPane {
@@ -88,7 +119,9 @@ impl SettingsPane {
         let path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(repositories::PATH_PLACEHOLDER));
         let subscriptions = vec![
-            cx.observe(&state, |this, _, cx| this.on_state_changed(cx)),
+            cx.observe_in(&state, window, |this, _, window, cx| {
+                this.on_state_changed(window, cx)
+            }),
             cx.subscribe_in(&state, window, |this, _, event: &ShellEvent, window, cx| {
                 if let ShellEvent::FocusSettings(section) = event {
                     this.focus_section(*section, window, cx);
@@ -116,28 +149,33 @@ impl SettingsPane {
             path_input,
             path_error: None,
             adding: None,
+            sent: None,
+            given_up: None,
             browsing: None,
+            theme_focus: Vec::new(),
+            font_focus: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
 
-    fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+    fn on_state_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let connection = self.state.read(cx).model().connection();
         let dropped =
             self.connection == Connection::Connected && connection != Connection::Connected;
         self.connection = connection;
         // The answer may never come; the repository, if the daemon added it,
         // arrives with the next snapshot.
-        if dropped && self.adding.take().is_some() {
+        if dropped && self.adding.is_some() {
             tracing::warn!("the connection dropped while an add waited");
-            self.path_error = Some(DAEMON_SILENT_TEXT.to_owned());
+            self.give_up_add();
         }
+        self.notice_late_add(window, cx);
         cx.notify();
     }
 
-    /// Scrolls `section` (expanded by the request) toward the top of the
-    /// pane, as far as the content below it allows, and focuses its first
-    /// field.
+    /// Scrolls toward `section` (expanded by the request), as far as the
+    /// content below it allows, and, for Source repositories, focuses the
+    /// path field.
     fn focus_section(
         &mut self,
         section: SettingsSection,
@@ -259,9 +297,24 @@ impl Focusable for SettingsPane {
 
 impl Render for SettingsPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_radio_focus(cx);
         let paint = Paint::new(self.state.read(cx), cx);
-        let appearance = self.appearance_content(&paint, cx).into_any_element();
-        let repositories = self.repositories_content(&paint, cx).into_any_element();
+        // One child per section, in `SettingsSection::ALL` order, which is
+        // what `SettingsSection::index` (the scroll target) counts.
+        let sections: Vec<_> = SettingsSection::ALL
+            .into_iter()
+            .map(|section| {
+                let content = match section {
+                    SettingsSection::Appearance => {
+                        self.appearance_content(&paint, cx).into_any_element()
+                    }
+                    SettingsSection::Repositories => {
+                        self.repositories_content(&paint, cx).into_any_element()
+                    }
+                };
+                self.section(section, content, &paint, cx)
+            })
+            .collect();
         v_flex()
             .id(SETTINGS_PANEL)
             .test_support()
@@ -295,9 +348,7 @@ impl Render for SettingsPane {
                     .w_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    // One child per section, in `SettingsSection::index` order.
-                    .child(self.section(SettingsSection::Appearance, appearance, &paint, cx))
-                    .child(self.section(SettingsSection::Repositories, repositories, &paint, cx)),
+                    .children(sections),
             )
     }
 }
@@ -310,6 +361,14 @@ struct Paint {
     /// Inline errors.
     destructive: Hsla,
     border: Hsla,
+    /// A checked radio's ring and fill, and its dot.
+    primary: Hsla,
+    primary_foreground: Hsla,
+    /// An unchecked radio's ring.
+    input: Hsla,
+    /// The keyboard focus ring.
+    ring: Hsla,
+    radius: gpui_kit::Pixels,
 }
 
 impl Paint {
@@ -321,7 +380,12 @@ impl Paint {
             foreground,
             muted_foreground: token_paint(native, "muted-foreground", cx),
             destructive: token_paint(native, "destructive", cx),
-            border: cx.theme().border,
+            border: token_paint(native, "border", cx),
+            primary: token_paint(native, "primary", cx),
+            primary_foreground: token_paint(native, "primary-foreground", cx),
+            input: token_paint(native, "input", cx),
+            ring: token_paint(native, "ring", cx),
+            radius: cx.theme().radius,
         }
     }
 }

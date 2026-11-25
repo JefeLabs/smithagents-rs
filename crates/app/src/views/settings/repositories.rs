@@ -7,7 +7,9 @@
 //! then `add_repo` through the commands seam. While it runs, the field and
 //! its buttons are disabled, so a second Enter or click sends nothing; it is
 //! given up after the shell's command timeout, or when the connection drops,
-//! with "The daemon did not answer". On success the field clears; the
+//! with "The daemon did not answer". The daemon may still finish it: when a
+//! repository matching the path appears in the model afterwards, that line
+//! and the field clear as on success. On success the field clears; the
 //! repository itself arrives through the model (`Action::RepoAdded`, which
 //! also sets the "Repository added" status). On failure the daemon's message
 //! shows under the field and the typed text stays.
@@ -27,11 +29,11 @@ use gpui_kit::{
 use smithagents_core::agent::Repo;
 use smithagents_core::ids::RepoId;
 
-use super::{caption, Paint, SettingsPane};
+use super::{caption, Paint, SentAdd, SettingsPane};
 use crate::link::LinkError;
 use crate::view_models::{
-    repo_error_text, repo_rows, validate_repo_path_input, RepoRowVm, DAEMON_SILENT_TEXT,
-    NOT_CONNECTED_TEXT, NO_REPOS_TEXT,
+    repo_error_text, repo_matches_sent_path, repo_rows, validate_repo_path_input, RepoRowVm,
+    DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT, NO_REPOS_TEXT,
 };
 use crate::views::answered;
 
@@ -90,6 +92,19 @@ impl SettingsPane {
         };
         tracing::debug!(path = %path.display(), "adding a repository");
         self.path_error = None;
+        self.given_up = None;
+        self.sent = Some(SentAdd {
+            known: self
+                .state
+                .read(cx)
+                .model()
+                .repos()
+                .iter()
+                .map(|repo| repo.id)
+                .collect(),
+            path,
+            canonical: None,
+        });
         let timer = cx.background_executor().timer(timeout);
         self.adding = Some(cx.spawn_in(window, async move |this, cx| {
             let answer = answered(add, timer).await;
@@ -105,23 +120,65 @@ impl SettingsPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.adding = None;
         match answer {
             None => {
                 tracing::warn!("the daemon did not answer an add in time");
-                self.path_error = Some(DAEMON_SILENT_TEXT.to_owned());
+                self.give_up_add();
             }
             Some(Ok(repo)) => {
+                self.adding = None;
+                self.sent = None;
                 tracing::debug!(repo = %repo.id, path = %repo.path.display(), "repository added");
                 self.path_error = None;
                 self.path_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
             }
             Some(Err(e)) => {
+                self.adding = None;
+                self.sent = None;
                 tracing::warn!("cannot add the repository: {e}");
                 self.path_error = Some(repo_error_text(&e));
             }
         }
+        cx.notify();
+    }
+
+    /// Stops waiting for the add in flight (timeout, connection drop) and
+    /// says so; its repository may still appear later
+    /// ([`SettingsPane::notice_late_add`]).
+    pub(super) fn give_up_add(&mut self) {
+        self.adding = None;
+        self.given_up = self.sent.take().map(|mut sent| {
+            sent.canonical = std::fs::canonicalize(&sent.path).ok();
+            sent
+        });
+        self.path_error = Some(DAEMON_SILENT_TEXT.to_owned());
+    }
+
+    /// A given-up add whose repository has now appeared (the daemon finished
+    /// it after all): the "did not answer" line goes, and the field clears if
+    /// it still holds that path.
+    pub(super) fn notice_late_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(given_up) = &self.given_up else {
+            return;
+        };
+        let arrived = self.state.read(cx).model().repos().iter().any(|repo| {
+            !given_up.known.contains(&repo.id)
+                && repo_matches_sent_path(&given_up.path, given_up.canonical.as_deref(), &repo.path)
+        });
+        if !arrived {
+            return;
+        }
+        tracing::debug!(path = %given_up.path.display(), "a given-up add arrived after all");
+        if self.path_error.as_deref() == Some(DAEMON_SILENT_TEXT) {
+            self.path_error = None;
+        }
+        let typed = self.path_input.read(cx).value();
+        if validate_repo_path_input(&typed).ok().as_ref() == Some(&given_up.path) {
+            self.path_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.given_up = None;
         cx.notify();
     }
 

@@ -60,7 +60,9 @@ pub enum ShellEvent {
     /// Show the Settings view in the right dock.
     RevealSettings,
     /// Bring a Settings section into view (it is already expanded): the
-    /// Settings view scrolls to it and focuses its first field. Emitted after
+    /// Settings view scrolls toward it, as far as the content below it
+    /// allows, and, for Source repositories, focuses the path field (the
+    /// only section that asks for this). Emitted after
     /// [`ShellEvent::RevealSettings`].
     FocusSettings(SettingsSection),
     /// The theme in effect changed: [`ShellState::theme_state`] and
@@ -495,13 +497,6 @@ impl ShellState {
         self.native_theme.as_ref()
     }
 
-    /// Replaces the native panes' theme only (a test hook: it leaves the
-    /// theme state and gpui-component's theme alone, and emits nothing).
-    pub fn set_native_theme(&mut self, theme: NativeTheme, cx: &mut Context<Self>) {
-        self.native_theme = Some(theme);
-        cx.notify();
-    }
-
     /// The theme in effect: what the native panes and gpui-component paint
     /// with, and what web tabs must get (Task 15). [`ShellEvent::ThemeChanged`]
     /// says when it changes.
@@ -557,10 +552,9 @@ impl ShellState {
         self.record_theme(state, native, cx);
     }
 
-    /// Records a theme already applied to gpui-component's theme (by
-    /// [`ShellState::apply_theme_state`] or
-    /// [`crate::theme_adapter::apply_theme`]) as the one in effect, and says so.
-    pub(crate) fn record_theme(
+    /// Records a theme just applied to gpui-component's theme as the one in
+    /// effect, and says so.
+    fn record_theme(
         &mut self,
         state: ThemeState,
         native: Option<NativeTheme>,

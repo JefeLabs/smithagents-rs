@@ -44,11 +44,10 @@ use smithagents_app::view_models::{
 use smithagents_app::views::agents::NEW_AGENT_ID;
 use smithagents_app::views::rail::{RailEntry, RAIL_ID};
 use smithagents_app::views::settings::{
-    repo_row_id, section_header_id, section_id, ADD_REPO_ID, BROWSE_REPO_ID, FONT_FIELD_ID,
-    FONT_LABEL, FONT_OPTIONS_ID, REPOS_EMPTY_ID, REPO_LIST_ID, REPO_PATH_ERROR_ID,
-    REPO_PATH_INPUT_ID, REPO_PATH_LABEL, SETTINGS_SCROLL_ID, TEXT_SIZE_DOWN_ID, TEXT_SIZE_ID,
-    TEXT_SIZE_LABEL, TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID, THEME_FIELD_ID, THEME_LABEL,
-    THEME_OPTIONS_ID,
+    repo_row_id, section_header_id, section_id, ADD_REPO_ID, BROWSE_REPO_ID, FONT_LABEL,
+    FONT_OPTIONS_ID, REPOS_EMPTY_ID, REPO_LIST_ID, REPO_PATH_ERROR_ID, REPO_PATH_INPUT_ID,
+    REPO_PATH_LABEL, SETTINGS_SCROLL_ID, TEXT_SIZE_DOWN_ID, TEXT_SIZE_ID, TEXT_SIZE_LABEL,
+    TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID, THEME_LABEL, THEME_OPTIONS_ID,
 };
 use smithagents_client::ClientError;
 use smithagents_core::agent::{Agent, Repo};
@@ -294,14 +293,14 @@ fn the_pane_paints_card_and_shows_both_sections_expanded_with_labeled_controls(
         for label in [THEME_LABEL, TEXT_SIZE_LABEL, FONT_LABEL, REPO_PATH_LABEL] {
             assert!(window.try_find_by_label(label).is_some(), "{label}");
         }
-        for (field, label, options, count) in [
-            (THEME_FIELD_ID, THEME_LABEL, THEME_OPTIONS_ID, 3),
-            (FONT_FIELD_ID, FONT_LABEL, FONT_OPTIONS_ID, 2),
+        for (group, label, count) in [
+            (THEME_OPTIONS_ID, THEME_LABEL, 3),
+            (FONT_OPTIONS_ID, FONT_LABEL, 2),
         ] {
-            let group = window.find(field);
-            assert_eq!(group.role(), Some(Role::Group));
-            assert_eq!(group.label(), Some(label));
-            let radios = window.within(options).find_all_by_role(Role::RadioButton);
+            let radio_group = window.find(group);
+            assert_eq!(radio_group.role(), Some(Role::RadioGroup));
+            assert_eq!(radio_group.label(), Some(label));
+            let radios = window.within(group).find_all_by_role(Role::RadioButton);
             assert_eq!(radios.len(), count, "{label}");
         }
         assert_eq!(window.find(TEXT_SIZE_VALUE_ID).value(), Some("100%"));
@@ -736,14 +735,15 @@ fn a_daemon_error_shows_its_message_under_the_field_and_keeps_the_text(cx: &mut 
         .push_back(Err(LinkError::Client(ClientError::Api {
             status: 400,
             code: "not_a_git_repo".into(),
-            message: "not a git repository".into(),
+            // The daemon's real message (`ServiceError` prefix included).
+            message: "git: not a git repository".into(),
         })));
     let (window, _, state) = setup.open(cx);
     type_path(cx, window, "/tmp/plain dir");
     press(cx, window, "enter");
     assert_eq!(
         path_error(cx, window).as_deref(),
-        Some("Not a git repository")
+        Some("That directory is not a git repository.")
     );
     assert_eq!(path_value(cx, window), "/tmp/plain dir", "the text stays");
     assert!(!add_disabled(cx, window));
@@ -892,7 +892,10 @@ fn a_collapsed_section_stays_collapsed_after_a_reopen(cx: &mut TestAppContext) {
     frame(cx, window);
     with_window(cx, window, |window, _| {
         assert_eq!(window.find(header.clone()).expanded(), Some(false));
-        assert!(window.try_find(THEME_FIELD_ID).is_none(), "content hidden");
+        assert!(
+            window.try_find(THEME_OPTIONS_ID).is_none(),
+            "content hidden"
+        );
         assert!(
             window.try_find(REPO_PATH_INPUT_ID).is_some(),
             "the other stays"
@@ -908,14 +911,14 @@ fn a_collapsed_section_stays_collapsed_after_a_reopen(cx: &mut TestAppContext) {
     let (reopened, _, _) = setup.open(cx);
     with_window(cx, reopened, |window, _| {
         assert_eq!(window.find(header.clone()).expanded(), Some(false));
-        assert!(window.try_find(THEME_FIELD_ID).is_none());
+        assert!(window.try_find(THEME_OPTIONS_ID).is_none());
     });
     // Expanding again is remembered too.
     with_window(cx, reopened, |window, cx| window.click(header.clone(), cx));
     frame(cx, reopened);
     with_window(cx, reopened, |window, _| {
         assert_eq!(window.find(header.clone()).expanded(), Some(true));
-        assert!(window.try_find(THEME_FIELD_ID).is_some());
+        assert!(window.try_find(THEME_OPTIONS_ID).is_some());
     });
     assert!(AppStateStore::new(home.path())
         .load()
@@ -988,16 +991,214 @@ fn new_agent_without_a_repository_opens_settings_on_the_path_field(cx: &mut Test
     assert_eq!(path_value(cx, window), "/src/app");
 }
 
+// ---- Keyboard ------------------------------------------------------------------
+
+/// Whether the radio labeled `label` in `group` has the keyboard focus.
+fn radio_focused(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Root>,
+    group: &'static str,
+    label: &str,
+) -> bool {
+    with_window(cx, window, |window, _| {
+        window.within(group).find_by_label(label).focused() == Some(true)
+    })
+}
+
+/// Clicks the radio labeled `label` (it takes the focus; a checked one stays
+/// as it is).
+fn focus_radio(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Root>,
+    group: &'static str,
+    label: &str,
+) {
+    choose(cx, window, group, label);
+    assert!(radio_focused(cx, window, group, label), "{label} focused");
+}
+
 #[gpui_kit::test]
-fn a_theme_applied_from_outside_is_recorded_and_announced_once(cx: &mut TestAppContext) {
+fn tab_and_space_or_enter_choose_a_theme_and_step_the_text_size(cx: &mut TestAppContext) {
     let (window, _, state) = Setup::new().open(cx);
-    let (changes, _subscription) = count_theme_changes(cx, &state);
-    let light = theme_state(Appearance::Light);
-    cx.update(|cx| {
-        smithagents_app::theme_adapter::apply_theme(ThemeSet::embedded(), &light, Some(&state), cx)
+    let scale = |cx: &mut TestAppContext| state.read_with(cx, |s, _| s.theme_state().text_scale);
+    focus_radio(cx, window, THEME_OPTIONS_ID, "System");
+
+    press(cx, window, "tab");
+    assert!(radio_focused(cx, window, THEME_OPTIONS_ID, "Smith Dark"));
+    press(cx, window, "tab");
+    assert!(radio_focused(cx, window, THEME_OPTIONS_ID, "Smith Light"));
+    assert_eq!(theme(cx, &state), "smith-dark", "Tab only moves the focus");
+    press(cx, window, "space");
+    assert_eq!(theme(cx, &state), "smith-light");
+    assert!(checked(cx, window, THEME_OPTIONS_ID, "Smith Light"));
+
+    // On to the stepper: smaller with Space, larger with Enter.
+    press(cx, window, "tab");
+    with_window(cx, window, |window, _| {
+        assert_eq!(window.find(TEXT_SIZE_DOWN_ID).focused(), Some(true));
     });
-    cx.run_until_parked();
-    assert_eq!(changes.get(), 1);
-    assert_eq!(state.read_with(cx, |s, _| s.theme_state().clone()), light);
-    assert_eq!(painted(cx, window), expected(&light_native()));
+    press(cx, window, "space");
+    assert_eq!(scale(cx), 0.95);
+    press(cx, window, "tab");
+    with_window(cx, window, |window, _| {
+        assert_eq!(window.find(TEXT_SIZE_UP_ID).focused(), Some(true));
+    });
+    press(cx, window, "enter");
+    press(cx, window, "enter");
+    assert_eq!(scale(cx), 1.05);
+}
+
+#[gpui_kit::test]
+fn arrow_keys_move_to_and_select_the_adjacent_option_wrapping(cx: &mut TestAppContext) {
+    let (window, _, state) = Setup::new().open(cx);
+    focus_radio(cx, window, THEME_OPTIONS_ID, "System");
+    for (key, label, id) in [
+        ("down", "Smith Dark", "smith-dark"),
+        ("down", "Smith Light", "smith-light"),
+        ("down", "System", "smith-dark"),
+        ("up", "Smith Light", "smith-light"),
+        ("left", "Smith Dark", "smith-dark"),
+        ("right", "Smith Light", "smith-light"),
+    ] {
+        press(cx, window, key);
+        assert!(
+            radio_focused(cx, window, THEME_OPTIONS_ID, label),
+            "{key}: {label} focused"
+        );
+        assert!(
+            checked(cx, window, THEME_OPTIONS_ID, label),
+            "{key}: {label} checked"
+        );
+        assert_eq!(theme(cx, &state), id, "{key}");
+    }
+    assert_eq!(
+        state.read_with(cx, |s, _| s.appearance_settings().theme.clone()),
+        ThemeChoice::Id("smith-light".into())
+    );
+
+    let font = |cx: &mut TestAppContext| state.read_with(cx, |s, _| s.theme_state().font.clone());
+    focus_radio(cx, window, FONT_OPTIONS_ID, "System");
+    press(cx, window, "down");
+    assert!(radio_focused(cx, window, FONT_OPTIONS_ID, "Monospace"));
+    assert_eq!(font(cx), "mono");
+    press(cx, window, "down");
+    assert!(
+        radio_focused(cx, window, FONT_OPTIONS_ID, "System"),
+        "wraps"
+    );
+    assert_eq!(font(cx), "system");
+    // The arrows stay inside their group: the theme did not move.
+    assert_eq!(theme(cx, &state), "smith-light");
+}
+
+#[gpui_kit::test]
+fn cmd_alt_b_still_toggles_the_dock_while_the_path_field_has_focus(cx: &mut TestAppContext) {
+    let (window, shell, _) = Setup::new().open(cx);
+    let dock = shell.read_with(cx, |shell, _| shell.dock().clone());
+    let open = |cx: &mut TestAppContext| {
+        dock.read_with(cx, |dock, _| dock.is_dock_open(DockPlacement::Right))
+    };
+    with_window(cx, window, |window, cx| {
+        window.click(REPO_PATH_INPUT_ID, cx)
+    });
+    with_window(cx, window, |window, _| {
+        assert_eq!(window.find(REPO_PATH_INPUT_ID).focused(), Some(true));
+    });
+    press(cx, window, "cmd-alt-b");
+    assert!(!open(cx), "hidden from inside the path field");
+    press(cx, window, "cmd-alt-b");
+    assert!(open(cx), "and shown again");
+}
+
+#[gpui_kit::test]
+fn the_text_size_value_fits_its_box_at_the_largest_scale(cx: &mut TestAppContext) {
+    let (window, _, state) = Setup::new().open(cx);
+    state.update(cx, |state, cx| {
+        let settings = AppearanceSettings {
+            text_scale: 1.5,
+            ..state.appearance_settings().clone()
+        };
+        state.set_appearance(settings, cx)
+    });
+    frame(cx, window);
+    with_window(cx, window, |window, cx| {
+        let value = window.find(TEXT_SIZE_VALUE_ID);
+        assert_eq!(value.value(), Some("150%"));
+        // The recorded text bounds are the label's own box, so shape the line
+        // the label draws: `text_sm` (0.875 rem) at the window's rem size.
+        let font_size = window.rem_size() * 0.875;
+        let font = cx.theme().font_family.clone();
+        let mut style = window.text_style();
+        style.font_family = font;
+        let line = window.text_system().shape_line(
+            "150%".into(),
+            font_size,
+            &[style.to_run("150%".len())],
+            None,
+        );
+        let frame = value.bounds();
+        assert!(
+            line.width <= frame.size.width,
+            "\"150%\" is {:?} wide, its box {:?}",
+            line.width,
+            frame.size.width
+        );
+    });
+}
+
+// ---- A late add ------------------------------------------------------------------
+
+#[gpui_kit::test]
+fn an_add_given_up_on_that_arrives_later_clears_the_stale_line_and_the_field(
+    cx: &mut TestAppContext,
+) {
+    let setup = Setup {
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Setup::new()
+    };
+    let (window, _, state) = setup.open(cx);
+    type_path(cx, window, "/src/late repo");
+    press(cx, window, "enter");
+    cx.executor().advance_clock(Duration::from_secs(6));
+    frame(cx, window);
+    assert_eq!(path_error(cx, window).as_deref(), Some(DAEMON_SILENT_TEXT));
+
+    // Another client's repository changes nothing.
+    let other = repo("/src/other");
+    state.update(cx, |state, cx| state.dispatch(Action::RepoAdded(other), cx));
+    frame(cx, window);
+    assert_eq!(path_error(cx, window).as_deref(), Some(DAEMON_SILENT_TEXT));
+    assert_eq!(path_value(cx, window), "/src/late repo");
+
+    // The daemon finished the add after all.
+    let late = repo("/src/late repo");
+    state.update(cx, |state, cx| {
+        state.dispatch(Action::RepoAdded(late.clone()), cx)
+    });
+    frame(cx, window);
+    assert_eq!(path_error(cx, window), None, "the stale line is gone");
+    assert_eq!(path_value(cx, window), "", "the field clears");
+    with_window(cx, window, |window, _| {
+        assert!(window.find(repo_row_id(late.id)).visible());
+    });
+}
+
+#[gpui_kit::test]
+fn a_late_add_leaves_a_path_typed_since_alone(cx: &mut TestAppContext) {
+    let setup = Setup {
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Setup::new()
+    };
+    let (window, _, state) = setup.open(cx);
+    type_path(cx, window, "/src/late repo");
+    press(cx, window, "enter");
+    cx.executor().advance_clock(Duration::from_secs(6));
+    frame(cx, window);
+    type_path(cx, window, "/src/next one");
+    state.update(cx, |state, cx| {
+        state.dispatch(Action::RepoAdded(repo("/src/late repo")), cx)
+    });
+    frame(cx, window);
+    assert_eq!(path_value(cx, window), "/src/next one");
+    assert_eq!(path_error(cx, window), None);
 }

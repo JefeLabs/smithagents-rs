@@ -107,6 +107,7 @@ fn open_main_window(link: LinkConfig, cx: &mut App) -> gpui_kit::Result<()> {
                     layout: Some(layout),
                     settings: Some(settings),
                     system_appearance: None,
+                    theme_set: None,
                     commands: None,
                     app_state: Some(app_state),
                     command_timeout: None,

@@ -480,10 +480,10 @@ impl SettingsSection {
 
     /// The section's position in the pane.
     pub fn index(self) -> usize {
-        match self {
-            SettingsSection::Appearance => 0,
-            SettingsSection::Repositories => 1,
-        }
+        Self::ALL
+            .iter()
+            .position(|section| *section == self)
+            .expect("every section is in SettingsSection::ALL")
     }
 }
 
@@ -649,39 +649,74 @@ pub fn repo_rows(repos: &[Repo]) -> Vec<RepoRowVm> {
 /// transport detail.
 pub const DAEMON_UNREACHABLE_TEXT: &str = "Could not reach the daemon";
 
-/// A failed add as one line under the path field: the daemon's own message
-/// (first letter capitalized) for an answer it gave, a line for the code when
-/// that message is blank, or a generic line for a connection or transport
-/// failure. Nothing here prints a request (so never a token).
+/// A failed add as one line under the path field.
+///
+/// A daemon answer with a known code reads as our own sentence (the daemon's
+/// messages carry its internal `git: ` / `store: ` prefixes, see
+/// [`repo_code_text`]). Any other answer shows the daemon's message without
+/// that prefix, first letter capitalized, on one line. A connection or
+/// transport failure reads as a generic line. Nothing here prints a request
+/// (so never a token).
 pub fn repo_error_text(error: &LinkError) -> String {
     match error {
         LinkError::NotConnected => NOT_CONNECTED_TEXT.to_owned(),
         LinkError::Stopped => "The daemon link has stopped".to_owned(),
-        LinkError::Client(ClientError::Api { code, message, .. }) => {
-            let message = one_line(message);
-            if message.is_empty() {
-                repo_code_text(code).to_owned()
-            } else {
-                capitalized(&message)
-            }
-        }
+        LinkError::Client(ClientError::Api { code, message, .. }) => match repo_code_text(code) {
+            Some(text) => text.to_owned(),
+            None => daemon_message_text(message),
+        },
         LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }
     }
 }
 
-/// A line for a daemon error code whose message was blank. The codes are the
-/// daemon's (`crates/server/src/api.rs`).
-fn repo_code_text(code: &str) -> &'static str {
-    match code {
-        "path_not_found" => "No directory at that path",
-        "not_a_git_repo" => "Not a git repository",
-        "bare_repo" => "Bare repositories are not supported",
-        "no_default_branch" => "Could not determine the default branch",
-        "repo_exists" => "This repository is already added",
-        _ => "The daemon could not add the repository",
+/// Our sentence for a daemon error code an add can answer with. The codes
+/// and the messages they replace are the daemon's
+/// (`crates/server/src/api.rs`, `service.rs`, `git.rs`, `store.rs`):
+///
+/// | code | daemon message |
+/// |---|---|
+/// | `path_not_found` | `git: no directory at <path>` |
+/// | `not_a_git_repo` | `git: not a git repository` |
+/// | `bare_repo` | `git: bare repositories are not supported` |
+/// | `no_default_branch` | `git: could not determine the default branch` |
+/// | `repo_exists` | `store: a repo with this path already exists` |
+fn repo_code_text(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "path_not_found" => "No directory at that path.",
+        "not_a_git_repo" => "That directory is not a git repository.",
+        "bare_repo" => "Bare repositories are not supported.",
+        "no_default_branch" => "Could not determine the repository's default branch.",
+        "repo_exists" => "That repository is already added.",
+        _ => return None,
+    })
+}
+
+/// What an add without its own sentence says when the daemon's message is
+/// blank (or only a prefix).
+pub const REPO_ADD_FAILED_TEXT: &str = "The daemon could not add the repository.";
+
+/// The daemon's message for display: one line, without the daemon's
+/// internal `git: ` or `store: ` prefix, first letter capitalized.
+fn daemon_message_text(message: &str) -> String {
+    let message = one_line(message);
+    let message = ["git:", "store:"]
+        .iter()
+        .find_map(|prefix| message.strip_prefix(prefix))
+        .map_or(message.as_str(), str::trim_start);
+    if message.is_empty() {
+        REPO_ADD_FAILED_TEXT.to_owned()
+    } else {
+        capitalized(message)
     }
+}
+
+/// Whether `repo` (a path the daemon reports for a newly added repository) is
+/// the one an add was sent for: the same path, or, as the daemon records the
+/// git top level of the canonical path, `sent_canonical` inside it.
+pub fn repo_matches_sent_path(sent: &Path, sent_canonical: Option<&Path>, repo: &Path) -> bool {
+    sent == repo || sent_canonical.is_some_and(|canonical| canonical.starts_with(repo))
 }
 
 fn one_line(text: &str) -> String {

@@ -49,6 +49,7 @@ use smithagents_core::agent::{Agent, AgentState, Repo};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
+use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
 
 /// Agent commands that record each call. A create answers with the next
@@ -1319,8 +1320,15 @@ fn a_theme_switch_recolors_the_row_accents(cx: &mut TestAppContext) {
     let dark = accent_and_dot(cx);
     let set = ThemeSet::embedded();
     let light_state = theme_state(Appearance::Light);
-    cx.update(|cx| {
-        smithagents_app::theme_adapter::apply_theme(set, &light_state, Some(&state), cx);
+    // The user's choice, through the state's ThemeController.
+    state.update(cx, |state, cx| {
+        state.set_appearance(
+            AppearanceSettings {
+                theme: ThemeChoice::Id(light_state.theme.clone()),
+                ..AppearanceSettings::default()
+            },
+            cx,
+        )
     });
     let light = accent_and_dot(cx);
     let native = set.native(&light_state.theme).unwrap();
