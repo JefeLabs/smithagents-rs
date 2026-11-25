@@ -6,9 +6,10 @@ use std::future::Future;
 use std::time::Duration;
 
 use common::{daemon_bin, fake_claude, init_repo, TestHome};
-use smithagents_app::link::{DaemonLink, LinkConfig, LinkError};
+use smithagents_app::link::{DaemonLink, LinkConfig, LinkError, LinkErrorKind};
 use smithagents_app::model::{Action, Connection};
 use smithagents_client::{Client, ClientError, SpawnOptions};
+use smithagents_core::agent::AgentState;
 use smithagents_core::daemon::read_lockfile;
 use smithagents_core::event::EventKind;
 use tokio::sync::mpsc::Receiver;
@@ -212,12 +213,10 @@ async fn an_unstartable_daemon_stays_reconnecting_with_an_error_and_drop_is_prom
         next(&mut rx, "reconnecting").await,
         Action::ConnectionChanged(Connection::Reconnecting)
     );
-    within("an error text", async {
-        while link.last_error().is_none() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await;
+    // The error is recorded before `Reconnecting` is sent.
+    let error = link.last_error().expect("an error text");
+    assert!(error.contains("could not start"), "{error}");
+    assert_eq!(link.last_error_kind(), Some(LinkErrorKind::StartFailed));
     assert!(link.connection_info().is_none());
     assert!(matches!(
         link.create_agent(Default::default()).await,
@@ -245,4 +244,153 @@ async fn drop_promptly(link: DaemonLink) {
         .await
         .unwrap()
         .expect("dropping the link hung");
+}
+
+/// Kills the process (and its group) whose pid `file` holds, on drop.
+struct KillPidFile(std::path::PathBuf);
+
+impl Drop for KillPidFile {
+    fn drop(&mut self) {
+        use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+        let Some(pid) = std::fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|t| t.trim().parse::<i32>().ok())
+            .and_then(Pid::from_raw)
+        else {
+            return;
+        };
+        // The script's `sleep` child would outlive it: kill children first.
+        let _ = std::process::Command::new("pkill")
+            .args(["-KILL", "-P", &pid.as_raw_nonzero().get().to_string()])
+            .status();
+        let _ = kill_process_group(pid, Signal::KILL);
+        let _ = kill_process(pid, Signal::KILL);
+    }
+}
+
+#[tokio::test]
+async fn a_working_agent_is_dead_in_the_snapshot_after_the_daemon_is_killed() {
+    use rustix::process::{kill_process, Pid, Signal};
+
+    let home = TestHome::new();
+    let repo_dir = home.scratch().join("repo");
+    init_repo(&repo_dir);
+    let pid_file = home.scratch().join("claude.pid");
+    let _cleanup = KillPidFile(pid_file.clone());
+    let mut cfg = config(&home);
+    cfg.spawn.env = vec![
+        ("FAKE_CLAUDE_SLEEP".into(), "30".into()),
+        ("FAKE_CLAUDE_PID_FILE".into(), pid_file.clone().into()),
+    ];
+    let (_link, mut rx) = DaemonLink::start(cfg);
+    until(&mut rx, "connected", |a| {
+        (*a == Action::ConnectionChanged(Connection::Connected)).then_some(())
+    })
+    .await;
+
+    let other = client_for(&home);
+    let repo = other.add_repo(&repo_dir).await.unwrap();
+    let agent = other.create_agent(repo.id).await.unwrap();
+    other.send_message(agent.id, "hello").await.unwrap();
+    until(&mut rx, "Working", |a| match a {
+        Action::Event(e) => match &e.kind {
+            EventKind::AgentUpdated(u) if u.id == agent.id && u.state == AgentState::Working => {
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+
+    let old = read_lockfile(home.path()).unwrap().unwrap();
+    kill_process(
+        Pid::from_raw(i32::try_from(old.pid).unwrap()).unwrap(),
+        Signal::KILL,
+    )
+    .unwrap();
+
+    until(&mut rx, "Reconnecting", |a| {
+        (*a == Action::ConnectionChanged(Connection::Reconnecting)).then_some(())
+    })
+    .await;
+    let agents = until(&mut rx, "fresh snapshot", |a| match a {
+        Action::Snapshot { agents, .. } => Some(agents.clone()),
+        _ => None,
+    })
+    .await;
+    let after = agents
+        .iter()
+        .find(|a| a.id == agent.id)
+        .expect("agent listed");
+    assert_eq!(after.state, AgentState::Dead, "{after:?}");
+    assert_eq!(
+        next(&mut rx, "connected").await,
+        Action::ConnectionChanged(Connection::Connected)
+    );
+}
+
+#[tokio::test]
+async fn a_version_mismatch_is_reported_and_no_second_daemon_starts() {
+    let home = TestHome::new();
+    let (link, _rx) = connected(&home).await;
+    let pid = read_lockfile(home.path()).unwrap().unwrap().pid;
+    drop(link);
+
+    let mut cfg = config(&home);
+    cfg.version = "0.0.0-other".into();
+    let (link, mut rx2) = DaemonLink::start(cfg);
+    assert_eq!(
+        next(&mut rx2, "reconnecting").await,
+        Action::ConnectionChanged(Connection::Reconnecting)
+    );
+    assert_eq!(link.last_error_kind(), Some(LinkErrorKind::VersionMismatch));
+    assert!(link.last_error().unwrap().contains("0.0.0-other"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(read_lockfile(home.path()).unwrap().unwrap().pid, pid);
+}
+
+#[tokio::test]
+async fn dropping_the_receiver_stops_the_link() {
+    let home = TestHome::new();
+    let mut cfg = config(&home);
+    cfg.daemon_bin = home.scratch().join("no-such-daemon");
+    let (link, mut rx) = DaemonLink::start(cfg);
+    next(&mut rx, "reconnecting").await;
+    drop(rx);
+    within("the link thread to end", async {
+        while !link.is_finished() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropping_the_link_while_the_daemon_never_becomes_ready_is_prompt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TestHome::new();
+    let pid_file = home.scratch().join("sleeper.pid");
+    let _cleanup = KillPidFile(pid_file.clone());
+    let script = home.scratch().join("sleeper");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 60\n",
+            pid_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = config(&home);
+    cfg.daemon_bin = script;
+    let (link, _rx) = DaemonLink::start(cfg);
+    within("the sleeper to start", async {
+        while std::fs::read_to_string(&pid_file).map_or(true, |t| t.trim().is_empty()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    drop_promptly(link).await;
 }
