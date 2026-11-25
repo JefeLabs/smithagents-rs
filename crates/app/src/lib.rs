@@ -1,51 +1,53 @@
 //! SmithAgents native app shell, built on GPUI through `gpui-kit`.
 //!
-//! For now this is the spike window: one window titled "SmithAgents" with a
-//! label, mounted under the Kit's `Root`. Later tasks grow it into the
-//! docked shell; `host-desktop` stays a thin `main` that calls [`run`].
+//! [`run`] opens the main window: the docked [`shell::Shell`] under the Kit's
+//! `Root`, connected to the local daemon through a [`link::DaemonLink`].
+//! `host-desktop` stays a thin `main` that builds the [`link::LinkConfig`]
+//! and calls [`run`].
 
+mod atomic_file;
+pub mod layout_store;
 pub mod link;
 pub mod model;
 pub mod settings;
+pub mod shell;
 pub mod theme_adapter;
+pub mod view_models;
+pub mod views;
 
-use gpui_kit::component::label::Label;
 use gpui_kit::{
-    div, px, size, App, AppContext as _, Bounds, Context, IntoElement, ParentElement as _,
-    QuitMode, Render, Styled as _, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    px, size, App, AppContext as _, Bounds, QuitMode, TitlebarOptions, WindowBounds, WindowOptions,
 };
+use smithagents_theme::native::NativeTheme;
+
+use crate::layout_store::LayoutStore;
+use crate::link::LinkConfig;
+use crate::model::ShellModel;
+use crate::shell::{Shell, ShellOptions};
 
 /// The main window's title.
 pub const WINDOW_TITLE: &str = "SmithAgents";
 
-/// Placeholder content for the main window. The Kit's `Root` paints the
-/// theme background, foreground and font around it, so it needs no colors.
-struct SpikeView;
-
-impl Render for SpikeView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(Label::new("SmithAgents"))
-    }
-}
-
 /// Runs the app until it quits; never returns.
 ///
+/// `link` says where the daemon's home is (the app keeps its own files,
+/// such as `app-layout.json`, there too) and how to start the daemon.
+///
 /// The app quits when its last window closes (not the macOS default, which
-/// keeps the app alive) and, on Unix, on the first SIGTERM or SIGINT.
-pub fn run() -> ! {
+/// keeps the app alive) and, on Unix, on the first SIGTERM or SIGINT. The
+/// daemon keeps running either way.
+pub fn run(link: LinkConfig) -> ! {
     gpui_kit::application()
+        // The Kit's bundled icons; without them every icon draws blank.
+        .with_assets(gpui_kit::assets::Assets)
         .with_quit_mode(QuitMode::LastWindowClosed)
-        .run(|cx| {
+        .run(move |cx| {
             gpui_kit::init(cx);
-            apply_startup_theme(cx);
+            shell::init(cx);
+            let native_theme = apply_startup_theme(cx);
             #[cfg(unix)]
             quit_on_termination_signals(cx);
-            if let Err(e) = open_main_window(cx) {
+            if let Err(e) = open_main_window(link, native_theme, cx) {
                 eprintln!("smithagents: cannot open the main window: {e:#}");
                 std::process::exit(1);
             }
@@ -58,22 +60,29 @@ pub fn run() -> ! {
 }
 
 /// Applies the Smith theme before the first window opens, replacing the
-/// Kit's forced light default. Persisted settings arrive in a later task.
-fn apply_startup_theme(cx: &mut App) {
+/// Kit's forced light default, and returns it for agent accents. Persisted
+/// settings arrive in a later task.
+fn apply_startup_theme(cx: &mut App) -> Option<NativeTheme> {
     use smithagents_theme::state::{AppearanceSettings, ThemeController};
     use smithagents_theme::tokens::{Appearance, ThemeSet};
 
     let set = ThemeSet::embedded();
     let controller =
         ThemeController::new(set.clone(), AppearanceSettings::default(), Appearance::Dark);
-    theme_adapter::apply_theme_state(set, &controller.state(), cx);
+    let state = controller.state();
+    theme_adapter::apply_theme_state(set, &state, cx);
+    set.native(&state.theme)
 }
 
-fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
+fn open_main_window(
+    link: LinkConfig,
+    native_theme: Option<NativeTheme>,
+    cx: &mut App,
+) -> gpui_kit::Result<()> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(960.), px(640.)),
+            size(px(1200.), px(760.)),
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
@@ -82,7 +91,21 @@ fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
         }),
         ..Default::default()
     };
-    gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| SpikeView))?;
+    let layout = LayoutStore::new(&link.home);
+    gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| {
+            Shell::new(
+                ShellOptions {
+                    model: ShellModel::new(),
+                    link: Some(link),
+                    layout: Some(layout),
+                    native_theme,
+                },
+                window,
+                cx,
+            )
+        })
+    })?;
     Ok(())
 }
 

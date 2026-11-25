@@ -4,9 +4,9 @@ use gpui_kit::component::theme::{ThemeMode, ThemeSet as GpuiThemeSet};
 use gpui_kit::WindowAppearance;
 use serde_json::Value;
 use smithagents_app::theme_adapter::{
-    agent_accent, appearance_from_window, theme_set_json, COLOR_KEY_MAP,
+    agent_accent, appearance_from_window, srgb_to_hsla, theme_set_json, COLOR_KEY_MAP,
 };
-use smithagents_theme::color::Oklch;
+use smithagents_theme::color::{Oklch, Srgb};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
 
 fn parse(set: &ThemeSet) -> Value {
@@ -226,5 +226,29 @@ fn each_config_carries_a_highlight_theme_for_its_mode() {
         let bg = gpui_kit::component::theme::try_parse_color(&native.colors["background"].hex())
             .unwrap();
         assert_eq!(h.editor_background, Some(bg), "{}", theme.name);
+    }
+}
+
+#[test]
+fn srgb_to_hsla_keeps_the_color() {
+    let red = srgb_to_hsla(Srgb { r: 255, g: 0, b: 0 });
+    assert!(red.h.abs() < 1e-6 && (red.s - 1.0).abs() < 1e-6 && (red.l - 0.5).abs() < 1e-6);
+    assert_eq!(red.a, 1.0);
+
+    // Every theme's accent for a few hues survives the trip back to 8-bit RGB.
+    let set = ThemeSet::embedded();
+    for theme in &set.themes {
+        let native = set.native(&theme.id).unwrap();
+        for hue in [0.0, 95.0, 210.0, 300.0] {
+            let srgb = agent_accent(&native, hue);
+            let back = srgb_to_hsla(srgb).to_rgb();
+            let byte = |v: f32| (v * 255.0).round() as u8;
+            assert_eq!(
+                (byte(back.r), byte(back.g), byte(back.b)),
+                (srgb.r, srgb.g, srgb.b),
+                "{} hue {hue}",
+                theme.id
+            );
+        }
     }
 }

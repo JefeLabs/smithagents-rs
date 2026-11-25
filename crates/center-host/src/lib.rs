@@ -21,6 +21,12 @@ pub struct TabSpec {
     pub title: String,
 }
 
+/// Where the center content area is, for the engine's view.
+///
+/// `x`, `y`, `w`, `h` are **device pixels** relative to the top-left of the
+/// window's content area: the shell's logical pixels times `scale`, the
+/// window's scale factor (see `smithagents_app::view_models::center_rect`).
+/// Divide by `scale` for points (macOS view frames).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PixelRect {
     pub x: f64,

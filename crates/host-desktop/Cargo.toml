@@ -14,3 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 smithagents-app = { path = "../app" }
+smithagents-core = { path = "../core" }
+tracing.workspace = true
+tracing-subscriber.workspace = true

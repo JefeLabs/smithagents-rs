@@ -1,5 +1,6 @@
 //! Daemon discovery: the lockfile that tells clients how to reach it.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,23 @@ impl fmt::Debug for DaemonInfo {
             .field("token", &"<redacted>")
             .field("version", &self.version)
             .finish()
+    }
+}
+
+/// The SmithAgents home (the daemon's state root) from the environment:
+/// `SMITHAGENTS_HOME` when set and non-empty, else `~/.smithagents`. The one
+/// rule shared by the daemon and its clients.
+pub fn home_from_env() -> PathBuf {
+    resolve_home(std::env::var_os("SMITHAGENTS_HOME"), std::env::home_dir())
+}
+
+/// [`home_from_env`] with its inputs given: `override_home` when non-empty,
+/// else `user_home/.smithagents` (a relative `.smithagents` when no user home
+/// is known).
+pub fn resolve_home(override_home: Option<OsString>, user_home: Option<PathBuf>) -> PathBuf {
+    match override_home {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => user_home.unwrap_or_default().join(".smithagents"),
     }
 }
 
@@ -65,6 +83,25 @@ mod tests {
         assert!(shown.contains(r#"version: "0.1.0""#), "{shown}");
         let pretty = format!("{info:#?}");
         assert!(!pretty.contains("s3cr3t-t0ken-value"), "{pretty}");
+    }
+
+    #[test]
+    fn home_resolution() {
+        let user = Some(PathBuf::from("/users/me"));
+        assert_eq!(
+            resolve_home(None, user.clone()),
+            PathBuf::from("/users/me/.smithagents")
+        );
+        assert_eq!(
+            resolve_home(Some("".into()), user.clone()),
+            PathBuf::from("/users/me/.smithagents"),
+            "an empty override is ignored"
+        );
+        assert_eq!(
+            resolve_home(Some("/state".into()), user),
+            PathBuf::from("/state")
+        );
+        assert_eq!(resolve_home(None, None), PathBuf::from(".smithagents"));
     }
 
     #[test]

@@ -1,6 +1,5 @@
 //! On-disk layout of the daemon's state root.
 
-use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -13,17 +12,19 @@ pub struct Paths {
 
 impl Paths {
     /// `SMITHAGENTS_HOME` when set and non-empty, else `~/.smithagents`
-    /// (relative `.smithagents` if no home directory can be found).
+    /// (relative `.smithagents` if no home directory can be found). The rule
+    /// lives in `smithagents_core::daemon` so clients resolve the same home.
     pub fn from_env() -> Paths {
-        Self::from_parts(std::env::var_os("SMITHAGENTS_HOME"), std::env::home_dir())
+        Paths {
+            home: smithagents_core::daemon::home_from_env(),
+        }
     }
 
-    fn from_parts(override_home: Option<OsString>, user_home: Option<PathBuf>) -> Paths {
-        let home = match override_home {
-            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => user_home.unwrap_or_default().join(".smithagents"),
-        };
-        Paths { home }
+    #[cfg(test)]
+    fn from_parts(override_home: Option<std::ffi::OsString>, user_home: Option<PathBuf>) -> Paths {
+        Paths {
+            home: smithagents_core::daemon::resolve_home(override_home, user_home),
+        }
     }
 
     /// Holds the lockfile and instance lock; created with mode 0700 by the daemon.

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::theme::{try_parse_color, Theme, ThemeRegistry};
-use gpui_kit::{px, App, Global, Subscription, Window, WindowAppearance};
+use gpui_kit::{px, App, Global, Hsla, Rgba, Subscription, Window, WindowAppearance};
 use serde::Serialize;
 use smithagents_theme::color::Srgb;
 use smithagents_theme::native::NativeTheme;
@@ -136,6 +136,19 @@ fn highlight_json(native: &NativeTheme) -> serde_json::Value {
 /// The agent accent color for `hue` (degrees) in `native`.
 pub fn agent_accent(native: &NativeTheme, hue: f32) -> Srgb {
     native.agent_color(f64::from(hue))
+}
+
+/// A token color as a GPUI color. The one place an [`Srgb`] becomes an
+/// [`Hsla`], so views never build colors themselves.
+pub fn srgb_to_hsla(color: Srgb) -> Hsla {
+    let channel = |v: u8| f32::from(v) / 255.0;
+    Rgba {
+        r: channel(color.r),
+        g: channel(color.g),
+        b: channel(color.b),
+        a: 1.0,
+    }
+    .into()
 }
 
 pub fn appearance_from_window(appearance: WindowAppearance) -> Appearance {
