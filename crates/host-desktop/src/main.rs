@@ -35,6 +35,12 @@ fn daemon_bin() -> PathBuf {
 
 /// Logs go to stderr. `SMITHAGENTS_LOG` sets the level (`error`, `warn`,
 /// `info`, `debug`, `trace`); the default is `info`.
+///
+/// Only `tracing` events are printed. The `log` crate is deliberately not
+/// bridged (no `tracing-log`/`LogTracer`): tungstenite, under the daemon
+/// client's event stream, logs the raw WebSocket handshake, including the
+/// `Authorization` header with the daemon token, at `log::trace!`. If `log`
+/// is ever bridged, cap it at `debug`.
 fn init_logging() {
     let level = std::env::var("SMITHAGENTS_LOG")
         .ok()

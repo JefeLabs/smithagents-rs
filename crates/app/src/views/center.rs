@@ -14,7 +14,7 @@ use gpui_kit::{
 };
 
 use crate::model::Action;
-use crate::shell::{report_center_bounds, ShellState};
+use crate::shell_state::{report_center_bounds, ShellState};
 use crate::theme_adapter::{agent_accent, srgb_to_hsla};
 use crate::view_models::{center_rect, tab_title};
 use crate::views::banner::banner;
@@ -85,6 +85,7 @@ impl CenterPanel {
                 let _ = close.update(cx, |state, cx| state.dispatch(Action::CloseTab(agent), cx));
             }),
             toggle_left_dock: Box::new(move |window, cx| {
+                tracing::debug!(source = "strip", placement = ?DockPlacement::Left, "dock toggle");
                 let _ = dock.update(cx, |area, cx| {
                     area.toggle_dock(DockPlacement::Left, window, cx)
                 });

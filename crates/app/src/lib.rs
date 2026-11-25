@@ -11,6 +11,7 @@ pub mod link;
 pub mod model;
 pub mod settings;
 pub mod shell;
+pub mod shell_state;
 pub mod theme_adapter;
 pub mod view_models;
 pub mod views;
@@ -20,7 +21,7 @@ use gpui_kit::{
 };
 use smithagents_theme::native::NativeTheme;
 
-use crate::layout_store::LayoutStore;
+use crate::layout_store::{restored_window_bounds, LayoutStore};
 use crate::link::LinkConfig;
 use crate::model::ShellModel;
 use crate::shell::{Shell, ShellOptions};
@@ -79,19 +80,32 @@ fn open_main_window(
     native_theme: Option<NativeTheme>,
     cx: &mut App,
 ) -> gpui_kit::Result<()> {
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+    let layout = LayoutStore::new(&link.home);
+    // The saved place, on its display if that display is still attached.
+    let placed = layout.load_window().and_then(|saved| {
+        let display = cx
+            .displays()
+            .into_iter()
+            .find(|display| display.uuid().ok().map(|uuid| uuid.to_string()) == saved.display)?;
+        let bounds = restored_window_bounds(&saved, Some(display.bounds()))?;
+        Some((bounds, display.id()))
+    });
+    let (window_bounds, display_id) = match placed {
+        Some((bounds, display)) => (bounds, Some(display)),
+        None => (
+            WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(760.)), cx)),
             None,
-            size(px(1200.), px(760.)),
-            cx,
-        ))),
+        ),
+    };
+    let options = WindowOptions {
+        window_bounds: Some(window_bounds),
+        display_id,
         titlebar: Some(TitlebarOptions {
             title: Some(WINDOW_TITLE.into()),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let layout = LayoutStore::new(&link.home);
     gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| {
             Shell::new(

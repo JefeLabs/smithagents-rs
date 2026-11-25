@@ -6,34 +6,32 @@
 //! two docks; the center panel ([`CenterPanel`]) stacks the connection
 //! banner, the tab strip and the content area the web engine will cover.
 //!
-//! State lives in a separate [`ShellState`] entity (the [`ShellModel`], the
-//! [`DaemonLink`], the queue of [`Effect`]s), which the center panel observes,
-//! so no view holds a handle back to its owner.
+//! State lives in a separate [`ShellState`] entity, which the center panel
+//! observes, so no view holds a handle back to its owner.
 
-use std::collections::VecDeque;
-use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSkin,
+    DockToggleEvent,
 };
 use gpui_kit::component::h_flex;
 use gpui_kit::{
     div, px, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
     IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled as _, Subscription, Task,
-    WeakEntity, Window,
+    Window,
 };
-use smithagents_center_host::PixelRect;
 use smithagents_theme::native::NativeTheme;
-use tokio::sync::mpsc;
 
-use crate::layout_store::{saved_dock, LayoutStore, LAYOUT_VERSION};
+use crate::layout_store::{
+    fit_side_docks, saved_dock, saved_window, LayoutStore, SavedWindow, LAYOUT_VERSION,
+};
 use crate::link::{DaemonLink, LinkConfig};
-use crate::model::{Action, Effect, ShellModel};
-use crate::view_models::banner_text;
+use crate::model::ShellModel;
+use crate::shell_state::ShellState;
 use crate::views::center::CenterPanel;
 use crate::views::placeholder::PlaceholderPanel;
-use crate::views::rail::{rail, RailEntry};
+use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 
 gpui_kit::actions!(
     smithagents_shell,
@@ -57,9 +55,6 @@ const DEFAULT_RIGHT_DOCK: Pixels = px(300.);
 /// Layout changes (a resize drag fires many) are written this long after the
 /// last one.
 const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
-/// How often the link's last error is re-read while it retries; the link
-/// changes it without sending an action.
-const LINK_ERROR_POLL: Duration = Duration::from_secs(1);
 
 /// Registers the shell's key bindings: `cmd-b` toggles the agents dock,
 /// `cmd-alt-b` the settings dock. (v1 is macOS only. `KeyBinding::new` does
@@ -71,212 +66,14 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Receives the center content area's rectangle whenever it changes. Called
-/// outside any `ShellState` update, so it may update other entities.
-pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
-
-/// The shell's state: the model, the link, and the effects for the tab
-/// lifecycle (Task 15) to carry out.
-pub struct ShellState {
-    model: ShellModel,
-    /// Effects not yet consumed, oldest first. Task 15 drains them with
-    /// [`ShellState::take_effects`]; until then they are only logged.
-    effects: VecDeque<Effect>,
-    link: Option<DaemonLink>,
-    /// The link's last connect error as last read, for the banner.
-    link_error: Option<String>,
-    native_theme: Option<NativeTheme>,
-    center_rect: Option<PixelRect>,
-    center_listener: Option<CenterBoundsListener>,
-    _tasks: Vec<Task<()>>,
-}
-
-impl ShellState {
-    fn new(
-        model: ShellModel,
-        native_theme: Option<NativeTheme>,
-        link: Option<(DaemonLink, mpsc::Receiver<Action>)>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let mut tasks = Vec::new();
-        let link = link.map(|(link, actions)| {
-            tasks.push(pump_actions(actions, cx));
-            tasks.push(watch_link_error(cx));
-            link
-        });
-        let mut state = Self {
-            model,
-            effects: VecDeque::new(),
-            link,
-            link_error: None,
-            native_theme,
-            center_rect: None,
-            center_listener: None,
-            _tasks: tasks,
-        };
-        state.link_error = state.current_link_error();
-        state
-    }
-
-    pub fn model(&self) -> &ShellModel {
-        &self.model
-    }
-
-    /// The daemon link, when the shell runs one.
-    pub fn link(&self) -> Option<&DaemonLink> {
-        self.link.as_ref()
-    }
-
-    /// Applies one action (from the user or the link), queues its effects and
-    /// redraws.
-    pub fn dispatch(&mut self, action: Action, cx: &mut Context<Self>) {
-        self.apply(action);
-        self.link_error = self.current_link_error();
-        cx.notify();
-    }
-
-    /// Applies a burst of actions with one redraw.
-    fn dispatch_all(&mut self, actions: Vec<Action>, cx: &mut Context<Self>) {
-        for action in actions {
-            self.apply(action);
-        }
-        self.link_error = self.current_link_error();
-        cx.notify();
-    }
-
-    fn apply(&mut self, action: Action) {
-        if let Action::ConnectionChanged(connection) = &action {
-            tracing::debug!(?connection, "daemon connection changed");
-        }
-        let effects = self.model.apply(action);
-        for effect in &effects {
-            tracing::debug!(?effect, "shell effect queued");
-        }
-        self.effects.extend(effects);
-    }
-
-    /// Effects not yet taken, oldest first.
-    pub fn pending_effects(&self) -> &VecDeque<Effect> {
-        &self.effects
-    }
-
-    /// Takes every pending effect, oldest first.
-    pub fn take_effects(&mut self) -> Vec<Effect> {
-        self.effects.drain(..).collect()
-    }
-
-    /// The banner line(s), or `None` while connected.
-    pub fn banner(&self) -> Option<String> {
-        banner_text(&self.model.connection(), self.link_error.as_deref())
-    }
-
-    /// The theme agent accents are drawn in.
-    pub fn native_theme(&self) -> Option<&NativeTheme> {
-        self.native_theme.as_ref()
-    }
-
-    pub fn set_native_theme(&mut self, theme: NativeTheme, cx: &mut Context<Self>) {
-        self.native_theme = Some(theme);
-        cx.notify();
-    }
-
-    /// The center content area's last reported rectangle.
-    pub fn center_rect(&self) -> Option<PixelRect> {
-        self.center_rect
-    }
-
-    /// Sets the one center-bounds listener (replacing any earlier one). If the
-    /// rectangle is already known, the listener receives it right after this
-    /// update ends.
-    pub fn set_center_bounds_listener(
-        &mut self,
-        listener: impl Fn(PixelRect, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        let listener: CenterBoundsListener = Rc::new(listener);
-        if let Some(rect) = self.center_rect {
-            let first = listener.clone();
-            cx.defer(move |cx| first(rect, cx));
-        }
-        self.center_listener = Some(listener);
-    }
-
-    /// Records `rect`; returns the listener to call when it changed.
-    fn record_center_rect(&mut self, rect: PixelRect) -> Option<CenterBoundsListener> {
-        if self.center_rect == Some(rect) {
-            return None;
-        }
-        tracing::trace!(?rect, "center bounds changed");
-        self.center_rect = Some(rect);
-        self.center_listener.clone()
-    }
-
-    fn current_link_error(&self) -> Option<String> {
-        self.link.as_ref().and_then(DaemonLink::last_error)
-    }
-
-    fn refresh_link_error(&mut self, cx: &mut Context<Self>) {
-        let latest = self.current_link_error();
-        if latest != self.link_error {
-            self.link_error = latest;
-            cx.notify();
-        }
-    }
-}
-
-/// Feeds the link's actions into the state on GPUI's foreground executor.
-/// tokio's receiver needs no tokio runtime to be awaited. Each wake-up
-/// drains what is already queued and applies it as one batch. Ends when the
-/// link closes the channel or the state is gone; dropping the task drops the
-/// receiver, which stops the link.
-fn pump_actions(mut actions: mpsc::Receiver<Action>, cx: &mut Context<ShellState>) -> Task<()> {
-    cx.spawn(async move |state, cx| {
-        while let Some(first) = actions.recv().await {
-            let mut batch = vec![first];
-            while let Ok(next) = actions.try_recv() {
-                batch.push(next);
-            }
-            if state
-                .update(cx, |state, cx| state.dispatch_all(batch, cx))
-                .is_err()
-            {
-                break;
-            }
-        }
-        tracing::debug!("daemon link channel closed");
-    })
-}
-
-fn watch_link_error(cx: &mut Context<ShellState>) -> Task<()> {
-    cx.spawn(async move |state, cx| loop {
-        cx.background_executor().timer(LINK_ERROR_POLL).await;
-        if state
-            .update(cx, |state, cx| state.refresh_link_error(cx))
-            .is_err()
-        {
-            break;
-        }
-    })
-}
-
-/// Called from the center content area's prepaint with its rectangle.
-pub(crate) fn report_center_bounds(state: &WeakEntity<ShellState>, rect: PixelRect, cx: &mut App) {
-    let listener = state
-        .update(cx, |state, _| state.record_center_rect(rect))
-        .ok()
-        .flatten();
-    if let Some(listener) = listener {
-        listener(rect, cx);
-    }
-}
-
 /// How to build a [`Shell`].
 pub struct ShellOptions {
     /// The starting model (empty in the app; tests pre-fill it).
     pub model: ShellModel,
     /// Starts a [`DaemonLink`] with this configuration; `None` runs offline.
     pub link: Option<LinkConfig>,
-    /// Where the dock layout persists; `None` keeps it in memory only.
+    /// Where the dock layout and window bounds persist; `None` keeps them
+    /// in memory only.
     pub layout: Option<LayoutStore>,
     /// The current theme, for agent accents.
     pub native_theme: Option<NativeTheme>,
@@ -287,8 +84,12 @@ pub struct Shell {
     state: Entity<ShellState>,
     dock: Entity<DockArea>,
     layout: Option<LayoutStore>,
+    /// The window's place and size as last observed (not updated while
+    /// fullscreen).
+    window_place: Option<SavedWindow>,
     /// What this shell last wrote, so an unchanged layout is not rewritten.
     last_saved_layout: Option<DockAreaState>,
+    last_saved_window: Option<SavedWindow>,
     pending_save: Option<Task<()>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -328,6 +129,7 @@ impl Shell {
             )
         });
         let saved = layout.as_ref().and_then(LayoutStore::load);
+        let available = window.viewport_size().width - px(RAIL_WIDTH);
         dock.update(cx, |area, cx| {
             let center = DockLayout::tabs().panel_view(panel_handle(center), cx);
             let left = DockLayout::tabs().panel_view(panel_handle(agents), cx);
@@ -343,15 +145,42 @@ impl Shell {
             if let Some(saved) = &saved {
                 restore_docks(area, saved, window, cx);
             }
+            fit_docks_to_window(area, available, window, cx);
         });
 
         let subscriptions = vec![
             cx.subscribe(&dock, |this, _, event: &DockEvent, cx| {
                 if matches!(event, DockEvent::LayoutChanged) {
+                    tracing::trace!("dock layout changed");
                     this.schedule_layout_save(cx);
                     // The rail's selection follows the right dock.
                     cx.notify();
                 }
+            }),
+            // Toggles made by the dock skin itself (a resize handle dragged
+            // past the edge); the shell's own entry points log theirs.
+            cx.subscribe(&dock, |_, _, event: &DockToggleEvent, _| {
+                tracing::debug!(
+                    source = "dock",
+                    placement = ?event.placement(),
+                    open = event.is_open(),
+                    "dock toggled"
+                );
+            }),
+            cx.observe_window_bounds(window, |this, window, cx| {
+                let place = window_place(window, cx);
+                if place.is_some() && place != this.window_place {
+                    this.window_place = place;
+                    this.schedule_layout_save(cx);
+                }
+            }),
+            // A collapsed dock is no longer drawn, so if it held focus the
+            // window has none and keys dispatch from the Kit's `Root`, above
+            // the shell's key context: the shortcuts would stop working.
+            // Take focus back instead.
+            cx.on_focus_lost(window, |this, window, cx| {
+                tracing::debug!("focus lost; returning it to the shell");
+                this.focus.focus(window, cx);
             }),
             cx.on_app_quit(|this, cx| {
                 this.pending_save = None;
@@ -368,7 +197,9 @@ impl Shell {
             state,
             dock,
             layout,
+            window_place: window_place(window, cx),
             last_saved_layout: None,
+            last_saved_window: None,
             pending_save: None,
             focus,
             _subscriptions: subscriptions,
@@ -403,18 +234,16 @@ impl Shell {
         });
     }
 
-    fn toggle_dock(&mut self, placement: DockPlacement, window: &mut Window, cx: &mut App) {
-        self.dock
-            .update(cx, |area, cx| area.toggle_dock(placement, window, cx));
-    }
-
     fn on_toggle_agents(
         &mut self,
         _: &ToggleAgentsPane,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_dock(DockPlacement::Left, window, cx);
+        tracing::debug!(source = "shortcut", placement = ?DockPlacement::Left, "dock toggle");
+        self.dock.update(cx, |area, cx| {
+            area.toggle_dock(DockPlacement::Left, window, cx)
+        });
     }
 
     fn on_toggle_settings(
@@ -423,6 +252,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        tracing::debug!(source = "shortcut", entry = ?RailEntry::Settings, "rail select");
         self.select_rail_entry(RailEntry::Settings, window, cx);
     }
 
@@ -437,26 +267,54 @@ impl Shell {
         }));
     }
 
-    /// Writes the dock layout unless it equals what was last written.
+    /// Writes the dock layout and the window bounds, each unless it equals
+    /// what was last written.
     fn save_layout(&mut self, cx: &App) {
         let Some(store) = &self.layout else {
             return;
         };
         let state = self.dock.read(cx).dump(cx);
-        if self.last_saved_layout.as_ref() == Some(&state) {
-            return;
-        }
-        match store.save(&state) {
-            Ok(()) => {
-                tracing::debug!("saved the dock layout to {}", store.path().display());
-                self.last_saved_layout = Some(state);
+        if self.last_saved_layout.as_ref() != Some(&state) {
+            match store.save(&state) {
+                Ok(()) => {
+                    tracing::debug!("saved the dock layout to {}", store.path().display());
+                    self.last_saved_layout = Some(state);
+                }
+                Err(e) => tracing::warn!(
+                    "cannot save the dock layout to {}: {e}",
+                    store.path().display()
+                ),
             }
-            Err(e) => tracing::warn!(
-                "cannot save the dock layout to {}: {e}",
-                store.path().display()
-            ),
+        }
+        let Some(place) = &self.window_place else {
+            return;
+        };
+        if self.last_saved_window.as_ref() != Some(place) {
+            match store.save_window(place) {
+                Ok(()) => {
+                    tracing::debug!(
+                        "saved the window bounds to {}",
+                        store.window_path().display()
+                    );
+                    self.last_saved_window = Some(place.clone());
+                }
+                Err(e) => tracing::warn!(
+                    "cannot save the window bounds to {}: {e}",
+                    store.window_path().display()
+                ),
+            }
         }
     }
+}
+
+/// The window's place and content size on its display, as saved (`None`
+/// while fullscreen).
+fn window_place(window: &Window, cx: &App) -> Option<SavedWindow> {
+    let display = window
+        .display(cx)
+        .and_then(|display| display.uuid().ok())
+        .map(|uuid| uuid.to_string());
+    saved_window(window.window_bounds(), window.viewport_size(), display)
 }
 
 /// Applies the saved size and open state of each side dock.
@@ -478,10 +336,40 @@ fn restore_docks(
     }
 }
 
+/// Shrinks the side docks if, both open, they would leave the center less
+/// than its minimum of the dock area's `available` width.
+fn fit_docks_to_window(
+    area: &mut DockArea,
+    available: Pixels,
+    window: &mut Window,
+    cx: &mut Context<DockArea>,
+) {
+    let left = area
+        .dock_size(DockPlacement::Left)
+        .unwrap_or(DEFAULT_LEFT_DOCK);
+    let right = area
+        .dock_size(DockPlacement::Right)
+        .unwrap_or(DEFAULT_RIGHT_DOCK);
+    let (fit_left, fit_right) = fit_side_docks(left, right, available);
+    if (fit_left, fit_right) != (left, right) {
+        tracing::debug!(
+            ?available,
+            ?left,
+            ?right,
+            ?fit_left,
+            ?fit_right,
+            "fitting docks to the window"
+        );
+        area.set_dock_size(DockPlacement::Left, fit_left, window, cx);
+        area.set_dock_size(DockPlacement::Right, fit_right, window, cx);
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let shell = cx.entity().downgrade();
         let on_select = move |entry, window: &mut Window, cx: &mut App| {
+            tracing::debug!(source = "rail", ?entry, "rail select");
             let _ = shell.update(cx, |this, cx| this.select_rail_entry(entry, window, cx));
         };
         h_flex()

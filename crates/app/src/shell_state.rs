@@ -1,0 +1,252 @@
+//! The shell's state entity: the [`ShellModel`], the [`DaemonLink`] and the
+//! [`Effect`]s for the tab lifecycle (Task 15) to carry out, plus the tasks
+//! that feed the link's actions in.
+
+use std::collections::VecDeque;
+use std::rc::Rc;
+use std::time::Duration;
+
+use gpui_kit::{App, Context, Task, WeakEntity};
+use smithagents_center_host::PixelRect;
+use smithagents_theme::native::NativeTheme;
+use tokio::sync::mpsc;
+
+use crate::link::DaemonLink;
+use crate::model::{Action, Connection, Effect, ShellModel};
+use crate::view_models::banner_text;
+
+/// How often the link's last error is re-read while the link is not
+/// connected: it changes the error between retries without sending an action.
+const LINK_ERROR_POLL: Duration = Duration::from_secs(1);
+
+/// Receives the center content area's rectangle.
+///
+/// The contract:
+/// - It is called with each new rectangle after the frame that laid it out,
+///   through `App::defer`, so never during a draw and never inside an entity
+///   update. It may update any entity, `ShellState` included, and a
+///   `cx.notify()` in it schedules the next frame normally.
+/// - It is called only when the rectangle changed, in order, so the last call
+///   carries the current rectangle.
+/// - Setting a listener calls it once with the current rectangle, if one is
+///   known yet (also deferred).
+pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
+
+pub struct ShellState {
+    model: ShellModel,
+    /// Effects not yet consumed, oldest first. Task 15 drains them with
+    /// [`ShellState::take_effects`]; until then they are only logged.
+    effects: VecDeque<Effect>,
+    link: Option<DaemonLink>,
+    /// The link's last connect error as last read, for the banner.
+    link_error: Option<String>,
+    native_theme: Option<NativeTheme>,
+    center_rect: Option<PixelRect>,
+    center_listener: Option<CenterBoundsListener>,
+    /// Feeds the link's actions in; `None` without a link.
+    _pump: Option<Task<()>>,
+    /// Polls the link's error; runs only while a link is not connected.
+    error_watch: Option<Task<()>>,
+}
+
+impl ShellState {
+    pub(crate) fn new(
+        model: ShellModel,
+        native_theme: Option<NativeTheme>,
+        link: Option<(DaemonLink, mpsc::Receiver<Action>)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (link, pump) = match link {
+            Some((link, actions)) => (Some(link), Some(pump_actions(actions, cx))),
+            None => (None, None),
+        };
+        let mut state = Self {
+            model,
+            effects: VecDeque::new(),
+            link,
+            link_error: None,
+            native_theme,
+            center_rect: None,
+            center_listener: None,
+            _pump: pump,
+            error_watch: None,
+        };
+        state.link_error = state.current_link_error();
+        state.sync_error_watch(cx);
+        state
+    }
+
+    pub fn model(&self) -> &ShellModel {
+        &self.model
+    }
+
+    /// The daemon link, when the shell runs one.
+    pub fn link(&self) -> Option<&DaemonLink> {
+        self.link.as_ref()
+    }
+
+    /// Applies one action (from the user or the link), queues its effects and
+    /// redraws.
+    pub fn dispatch(&mut self, action: Action, cx: &mut Context<Self>) {
+        self.dispatch_all(vec![action], cx);
+    }
+
+    /// Applies a burst of actions with one redraw.
+    fn dispatch_all(&mut self, actions: Vec<Action>, cx: &mut Context<Self>) {
+        for action in actions {
+            self.apply(action);
+        }
+        self.link_error = self.current_link_error();
+        self.sync_error_watch(cx);
+        cx.notify();
+    }
+
+    fn apply(&mut self, action: Action) {
+        if let Action::ConnectionChanged(connection) = &action {
+            tracing::debug!(?connection, "daemon connection changed");
+        }
+        let effects = self.model.apply(action);
+        for effect in &effects {
+            tracing::debug!(?effect, "shell effect queued");
+        }
+        self.effects.extend(effects);
+    }
+
+    /// Effects not yet taken, oldest first.
+    pub fn pending_effects(&self) -> &VecDeque<Effect> {
+        &self.effects
+    }
+
+    /// Takes every pending effect, oldest first.
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        self.effects.drain(..).collect()
+    }
+
+    /// The banner line(s), or `None` while connected.
+    pub fn banner(&self) -> Option<String> {
+        banner_text(&self.model.connection(), self.link_error.as_deref())
+    }
+
+    /// The theme agent accents are drawn in.
+    pub fn native_theme(&self) -> Option<&NativeTheme> {
+        self.native_theme.as_ref()
+    }
+
+    pub fn set_native_theme(&mut self, theme: NativeTheme, cx: &mut Context<Self>) {
+        self.native_theme = Some(theme);
+        cx.notify();
+    }
+
+    /// The center content area's last reported rectangle.
+    pub fn center_rect(&self) -> Option<PixelRect> {
+        self.center_rect
+    }
+
+    /// Sets the one center-bounds listener, replacing any earlier one. See
+    /// [`CenterBoundsListener`] for when it is called.
+    pub fn set_center_bounds_listener(
+        &mut self,
+        listener: impl Fn(PixelRect, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let listener: CenterBoundsListener = Rc::new(listener);
+        if let Some(rect) = self.center_rect {
+            let first = listener.clone();
+            cx.defer(move |cx| first(rect, cx));
+        }
+        self.center_listener = Some(listener);
+    }
+
+    /// Whether the link's error is being polled (only while not connected).
+    pub fn is_polling_link_error(&self) -> bool {
+        self.error_watch.is_some()
+    }
+
+    /// Records `rect`; returns the listener to call when it changed.
+    fn record_center_rect(&mut self, rect: PixelRect) -> Option<CenterBoundsListener> {
+        if self.center_rect == Some(rect) {
+            return None;
+        }
+        tracing::trace!(?rect, "center bounds changed");
+        self.center_rect = Some(rect);
+        self.center_listener.clone()
+    }
+
+    fn current_link_error(&self) -> Option<String> {
+        self.link.as_ref().and_then(DaemonLink::last_error)
+    }
+
+    fn refresh_link_error(&mut self, cx: &mut Context<Self>) {
+        let latest = self.current_link_error();
+        if latest != self.link_error {
+            self.link_error = latest;
+            cx.notify();
+        }
+    }
+
+    /// Polls the link's error only while a link exists and is not connected;
+    /// a connected shell never wakes for it.
+    fn sync_error_watch(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.link.is_some() && self.model.connection() != Connection::Connected;
+        match (wanted, self.error_watch.is_some()) {
+            (true, false) => {
+                tracing::debug!("polling the daemon link's error while disconnected");
+                self.error_watch = Some(watch_link_error(cx));
+            }
+            (false, true) => {
+                tracing::debug!("stopped polling the daemon link's error");
+                // Dropping the task cancels it.
+                self.error_watch = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Feeds the link's actions into the state on GPUI's foreground executor.
+/// tokio's receiver needs no tokio runtime to be awaited. Each wake-up
+/// drains what is already queued and applies it as one batch. Ends when the
+/// link closes the channel or the state is gone; dropping the task drops the
+/// receiver, which stops the link.
+fn pump_actions(mut actions: mpsc::Receiver<Action>, cx: &mut Context<ShellState>) -> Task<()> {
+    cx.spawn(async move |state, cx| {
+        while let Some(first) = actions.recv().await {
+            let mut batch = vec![first];
+            while let Ok(next) = actions.try_recv() {
+                batch.push(next);
+            }
+            if state
+                .update(cx, |state, cx| state.dispatch_all(batch, cx))
+                .is_err()
+            {
+                break;
+            }
+        }
+        tracing::debug!("daemon link channel closed");
+    })
+}
+
+fn watch_link_error(cx: &mut Context<ShellState>) -> Task<()> {
+    cx.spawn(async move |state, cx| loop {
+        cx.background_executor().timer(LINK_ERROR_POLL).await;
+        if state
+            .update(cx, |state, cx| state.refresh_link_error(cx))
+            .is_err()
+        {
+            break;
+        }
+    })
+}
+
+/// Called from the center content area's prepaint with its rectangle.
+/// Records it and, when it changed, calls the listener after the current
+/// update (see [`CenterBoundsListener`]).
+pub(crate) fn report_center_bounds(state: &WeakEntity<ShellState>, rect: PixelRect, cx: &mut App) {
+    let listener = state
+        .update(cx, |state, _| state.record_center_rect(rect))
+        .ok()
+        .flatten();
+    if let Some(listener) = listener {
+        cx.defer(move |cx| listener(rect, cx));
+    }
+}

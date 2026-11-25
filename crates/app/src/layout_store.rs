@@ -1,20 +1,27 @@
-//! The persisted dock layout: `<home>/app-layout.json`, a gpui-component
-//! [`DockAreaState`] as written by `DockArea::dump`.
+//! The persisted window layout:
+//!
+//! - `<home>/app-layout.json`, a gpui-component [`DockAreaState`] as written
+//!   by `DockArea::dump`. The shell's panel tree is fixed (the dock is
+//!   locked), so what it restores is each side dock's size and open state;
+//!   see [`saved_dock`] and [`fit_side_docks`].
+//! - `<home>/app-window.json`, the main window's place and size
+//!   ([`SavedWindow`]), reused only where it can be seen
+//!   ([`restored_window_bounds`]).
 //!
 //! Loading is lenient like the settings file: a missing, empty, corrupt or
-//! other-version file gives `None` (the default layout), never an error.
-//! The shell's panel tree is fixed (the dock is locked), so what a saved
-//! layout restores is each side dock's size and open state; see
-//! [`saved_dock`].
+//! other-version file gives `None` (the default), never an error.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::dock::{DockAreaState, DockPlacement};
-use gpui_kit::{px, Pixels};
+use gpui_kit::{px, size, Bounds, Pixels, Size, WindowBounds};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 pub const LAYOUT_FILE_NAME: &str = "app-layout.json";
+pub const WINDOW_FILE_NAME: &str = "app-window.json";
 
 /// The layout schema version written into the file. Bump it when the
 /// shell's dock structure changes; files of another version are ignored.
@@ -25,6 +32,18 @@ pub const LAYOUT_VERSION: usize = 1;
 /// out of a normal window. The lower bound is the dock's own minimum.
 pub const MIN_DOCK_SIZE: Pixels = px(100.);
 pub const MAX_DOCK_SIZE: Pixels = px(1000.);
+
+/// The width the center keeps when the side docks are fitted to a window.
+pub const MIN_CENTER_WIDTH: Pixels = px(320.);
+
+/// A saved window smaller than this is not reused.
+const MIN_WINDOW_WIDTH: f32 = 640.;
+const MIN_WINDOW_HEIGHT: f32 = 400.;
+/// A saved window is reused only if this much of its top strip (where the
+/// title bar is) lies on one display, so it can be seen and dragged.
+const TITLE_STRIP_HEIGHT: f32 = 30.;
+const MIN_VISIBLE_TITLE_WIDTH: f32 = 100.;
+const MIN_VISIBLE_TITLE_HEIGHT: f32 = 15.;
 
 /// Loads and saves the dock layout under a home directory.
 #[derive(Debug, Clone)]
@@ -43,31 +62,14 @@ impl LayoutStore {
         self.home.join(LAYOUT_FILE_NAME)
     }
 
-    /// The saved layout, or `None` when there is none this build can use.
+    /// The saved dock layout, or `None` when there is none this build can
+    /// use.
     pub fn load(&self) -> Option<DockAreaState> {
-        let path = self.path();
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) => {
-                tracing::debug!("no dock layout at {}: {e}", path.display());
-                return None;
-            }
-        };
-        let state: DockAreaState = match serde_json::from_str(&text) {
-            Ok(state) => state,
-            Err(e) => {
-                if text.trim().is_empty() {
-                    tracing::debug!("empty dock layout {}", path.display());
-                } else {
-                    tracing::warn!("ignoring corrupt dock layout {}: {e}", path.display());
-                }
-                return None;
-            }
-        };
+        let state: DockAreaState = read_json(&self.path(), "dock layout")?;
         if state.version != Some(LAYOUT_VERSION) {
             tracing::info!(
                 "ignoring dock layout {} of version {:?} (expected {LAYOUT_VERSION})",
-                path.display(),
+                self.path().display(),
                 state.version
             );
             return None;
@@ -80,6 +82,158 @@ impl LayoutStore {
         let json = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
         crate::atomic_file::write_private(&self.home, LAYOUT_FILE_NAME, &json)
     }
+
+    pub fn window_path(&self) -> PathBuf {
+        self.home.join(WINDOW_FILE_NAME)
+    }
+
+    /// The saved window, or `None` when there is none this build can use.
+    /// Whether it still fits the displays is [`restored_window_bounds`]'s
+    /// question.
+    pub fn load_window(&self) -> Option<SavedWindow> {
+        let saved: SavedWindow = read_json(&self.window_path(), "window bounds")?;
+        if saved.version != LAYOUT_VERSION {
+            tracing::info!(
+                "ignoring window bounds {} of version {} (expected {LAYOUT_VERSION})",
+                self.window_path().display(),
+                saved.version
+            );
+            return None;
+        }
+        Some(saved)
+    }
+
+    /// Writes the window bounds atomically, mode 0600.
+    pub fn save_window(&self, saved: &SavedWindow) -> io::Result<()> {
+        let json = serde_json::to_vec_pretty(saved).map_err(io::Error::other)?;
+        crate::atomic_file::write_private(&self.home, WINDOW_FILE_NAME, &json)
+    }
+}
+
+/// Reads a JSON file leniently: `None` (logged) when missing, empty or
+/// corrupt.
+fn read_json<T: DeserializeOwned>(path: &Path, what: &str) -> Option<T> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::debug!("no {what} at {}: {e}", path.display());
+            return None;
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            if text.trim().is_empty() {
+                tracing::debug!("empty {what} file {}", path.display());
+            } else {
+                tracing::warn!("ignoring corrupt {what} file {}: {e}", path.display());
+            }
+            None
+        }
+    }
+}
+
+/// The main window as saved, in GPUI's macOS terms: `bounds.origin` is the
+/// window frame's top-left and `bounds.size` the **content** size, both
+/// relative to the top-left of the display it was on (`display`, that
+/// display's UUID). That is what `WindowOptions` takes back (with the
+/// display's id): the platform reports the frame size (title bar included)
+/// but opens windows from a content size, so saving the frame size would
+/// grow the window by its title bar on every launch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedWindow {
+    pub version: usize,
+    pub display: Option<String>,
+    pub bounds: Bounds<Pixels>,
+    pub maximized: bool,
+}
+
+/// What to save for a window whose platform bounds are `bounds`, whose
+/// content is `content` large, on the display with UUID `display`. `None`
+/// for a fullscreen window: the last windowed save stays.
+pub fn saved_window(
+    bounds: WindowBounds,
+    content: Size<Pixels>,
+    display: Option<String>,
+) -> Option<SavedWindow> {
+    let (origin, maximized) = match bounds {
+        WindowBounds::Windowed(frame) => (frame.origin, false),
+        WindowBounds::Maximized(frame) => (frame.origin, true),
+        WindowBounds::Fullscreen(_) => return None,
+    };
+    Some(SavedWindow {
+        version: LAYOUT_VERSION,
+        display,
+        bounds: Bounds {
+            origin,
+            size: content,
+        },
+        maximized,
+    })
+}
+
+/// How to reopen a saved window on its display, whose bounds are `display`
+/// (`None` when that display is gone), or `None` to use the default
+/// placement: when its numbers are not finite, it is smaller than 640x400,
+/// or its top strip (where the title bar is) is not at least 100x15 px on
+/// the display (a smaller display, a window dragged almost off screen).
+pub fn restored_window_bounds(
+    saved: &SavedWindow,
+    display: Option<Bounds<Pixels>>,
+) -> Option<WindowBounds> {
+    let display = display?;
+    let b = saved.bounds;
+    let numbers = [b.origin.x, b.origin.y, b.size.width, b.size.height];
+    if numbers.iter().any(|v| !f32::from(*v).is_finite())
+        || f32::from(b.size.width) < MIN_WINDOW_WIDTH
+        || f32::from(b.size.height) < MIN_WINDOW_HEIGHT
+    {
+        return None;
+    }
+    let title_strip = Bounds {
+        origin: b.origin,
+        size: size(b.size.width, px(TITLE_STRIP_HEIGHT)),
+    };
+    if !display.intersects(&title_strip) {
+        return None;
+    }
+    let seen = display.intersect(&title_strip).size;
+    if f32::from(seen.width) < MIN_VISIBLE_TITLE_WIDTH
+        || f32::from(seen.height) < MIN_VISIBLE_TITLE_HEIGHT
+    {
+        return None;
+    }
+    Some(if saved.maximized {
+        WindowBounds::Maximized(b)
+    } else {
+        WindowBounds::Windowed(b)
+    })
+}
+
+/// Side dock widths that leave the center at least [`MIN_CENTER_WIDTH`] of
+/// `available` (the width the dock area gets) with both docks open. Docks
+/// that fit are returned unchanged; otherwise both shrink in proportion, and
+/// one that would drop below [`MIN_DOCK_SIZE`] stays at it while the other
+/// takes the rest. In a window too narrow for that, both get the minimum.
+/// A non-finite `available` changes nothing.
+pub fn fit_side_docks(left: Pixels, right: Pixels, available: Pixels) -> (Pixels, Pixels) {
+    let (l, r, avail) = (f32::from(left), f32::from(right), f32::from(available));
+    let min = f32::from(MIN_DOCK_SIZE);
+    let total = l + r;
+    let budget = (avail - f32::from(MIN_CENTER_WIDTH)).max(2.0 * min);
+    if !avail.is_finite() || !total.is_finite() || total <= budget {
+        return (left, right);
+    }
+    let mut fitted_l = (l * budget / total).floor();
+    let mut fitted_r = (r * budget / total).floor();
+    if fitted_l < min {
+        fitted_l = min;
+        fitted_r = (budget - min).floor().clamp(min, r.max(min));
+    } else if fitted_r < min {
+        fitted_r = min;
+        fitted_l = (budget - min).floor().clamp(min, l.max(min));
+    }
+    (px(fitted_l), px(fitted_r))
 }
 
 /// What a saved layout restores for one side dock.
