@@ -3,6 +3,9 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::DockPlacement;
+use smithagents_theme::native::NativeTheme;
+
+use crate::theme_adapter::{region_paint, Region};
 use gpui_kit::component::{v_flex, ActiveTheme as _, IconName, Selectable as _, Sizable as _};
 use gpui_kit::{
     px, App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
@@ -55,9 +58,11 @@ impl RailEntry {
 pub fn rail(
     active: Option<RailEntry>,
     on_select: impl Fn(RailEntry, &mut Window, &mut App) + Clone + 'static,
+    native: Option<&NativeTheme>,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
+    let (surface, foreground) = region_paint(native, Region::Rail, cx);
     v_flex()
         .id("icon-rail")
         .flex_none()
@@ -66,7 +71,8 @@ pub fn rail(
         .items_center()
         .gap_1()
         .py_2()
-        .bg(theme.tab_bar)
+        .bg(surface)
+        .text_color(foreground)
         .border_l_1()
         .border_color(theme.border)
         .children(RailEntry::ALL.iter().map(|&entry| {

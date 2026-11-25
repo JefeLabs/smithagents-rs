@@ -11,6 +11,7 @@ use gpui_kit::{
 };
 
 use crate::shell_state::ShellState;
+use crate::theme_adapter::{region_paint, Region};
 use crate::view_models::LeftPaneMode;
 
 /// Element id of the pane's root, which holds the pane's focus.
@@ -46,6 +47,8 @@ impl Render for LeftPanePlaceholder {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.state.read(cx).left_pane_mode();
         let theme = cx.theme();
+        let (surface, foreground) =
+            region_paint(self.state.read(cx).native_theme(), Region::LeftPane, cx);
         // The focus is tracked on the root in both modes, so switching modes
         // never drops a focused pane out of the tree.
         v_flex()
@@ -54,6 +57,8 @@ impl Render for LeftPanePlaceholder {
             .test_support()
             .track_focus(&self.focus)
             .size_full()
+            .bg(surface)
+            .text_color(foreground)
             .map(|this| match mode {
                 LeftPaneMode::Expanded => this
                     .gap_2()
@@ -65,7 +70,7 @@ impl Render for LeftPanePlaceholder {
                             .aria_label("Agents")
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
+                            .text_color(foreground)
                             .child("Agents"),
                     )
                     .child(

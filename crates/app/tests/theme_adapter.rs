@@ -4,7 +4,8 @@ use gpui_kit::component::theme::{ThemeMode, ThemeSet as GpuiThemeSet};
 use gpui_kit::WindowAppearance;
 use serde_json::Value;
 use smithagents_app::theme_adapter::{
-    agent_accent, appearance_from_window, srgb_to_hsla, theme_set_json, COLOR_KEY_MAP,
+    agent_accent, appearance_from_window, region_colors, region_tokens, srgb_to_hsla,
+    theme_set_json, Region, COLOR_KEY_MAP,
 };
 use smithagents_theme::color::{Oklch, Srgb};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
@@ -173,14 +174,14 @@ const PINNED: &[(&str, &str)] = &[
     ("list.active.background", "selection"),
     ("list.active.border", "ring"),
     ("list.highlight.foreground", "ring"),
-    ("tab_bar.background", "card"),
+    ("tab_bar.background", "card-2"),
     ("tab.foreground", "muted-foreground"),
-    ("tab.active.background", "background"),
-    ("tab.active.foreground", "foreground"),
+    ("tab.active.background", "center"),
+    ("tab.active.foreground", "center-foreground"),
     ("sidebar.background", "card"),
     ("sidebar.foreground", "card-foreground"),
-    ("title_bar.background", "card"),
-    ("status_bar.background", "card"),
+    ("title_bar.background", "card-2"),
+    ("status_bar.background", "card-2"),
     ("base.red", "status-error"),
     ("base.green", "status-ok"),
     ("base.yellow", "status-warn"),
@@ -251,4 +252,54 @@ fn srgb_to_hsla_keeps_the_color() {
             );
         }
     }
+}
+
+#[test]
+fn region_mapping_is_pinned() {
+    let want = [
+        (Region::Center, ("center", "center-foreground")),
+        (Region::LeftPane, ("card", "card-foreground")),
+        (Region::RightPane, ("card", "card-foreground")),
+        (Region::TitleBar, ("card-2", "card-2-foreground")),
+        (Region::Rail, ("card-2", "card-2-foreground")),
+        (Region::TabStrip, ("card-2", "card-2-foreground")),
+        (Region::BottomBar, ("card-2", "card-2-foreground")),
+    ];
+    for (region, tokens) in want {
+        assert_eq!(region_tokens(region), tokens, "{region:?}");
+    }
+}
+
+#[test]
+fn region_colors_come_from_the_theme_tokens() {
+    let set = ThemeSet::embedded();
+    for theme in &set.themes {
+        let native = set.native(&theme.id).unwrap();
+        let (surface, fg) = region_colors(&native, Region::Rail).unwrap();
+        assert_eq!(surface, srgb_to_hsla(native.colors["card-2"]));
+        assert_eq!(fg, srgb_to_hsla(native.colors["card-2-foreground"]));
+    }
+}
+
+#[test]
+fn gpui_rows_agree_with_the_region_mapping() {
+    let get = |key: &str| COLOR_KEY_MAP.iter().find(|(k, _)| *k == key).unwrap().1;
+    assert_eq!(
+        get("title_bar.background"),
+        region_tokens(Region::TitleBar).0
+    );
+    assert_eq!(get("tab_bar.background"), region_tokens(Region::TabStrip).0);
+    assert_eq!(
+        get("status_bar.background"),
+        region_tokens(Region::BottomBar).0
+    );
+    assert_eq!(get("sidebar.background"), region_tokens(Region::LeftPane).0);
+    assert_eq!(
+        get("tab.active.background"),
+        region_tokens(Region::Center).0
+    );
+    assert_eq!(
+        get("tab.active.foreground"),
+        region_tokens(Region::Center).1
+    );
 }

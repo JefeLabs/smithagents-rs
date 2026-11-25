@@ -12,7 +12,7 @@ use gpui_kit::{
 
 use crate::model::Action;
 use crate::shell_state::{report_center_bounds, ShellState};
-use crate::theme_adapter::{agent_accent, srgb_to_hsla};
+use crate::theme_adapter::{agent_accent, region_paint, srgb_to_hsla, Region};
 use crate::view_models::{center_rect, tab_title, LeftPaneMode};
 use crate::views::banner::banner;
 use crate::views::tabs::{tab_strip, TabItem, TabStripActions};
@@ -141,13 +141,16 @@ impl Render for CenterPanel {
                 report_center_bounds(&state, rect, cx);
             }
         };
+        let (surface, foreground) =
+            region_paint(self.state.read(cx).native_theme(), Region::Center, cx);
         let theme = cx.theme();
 
         v_flex()
             .id("center-panel")
             .track_focus(&self.focus)
             .size_full()
-            .bg(theme.background)
+            .bg(surface)
+            .text_color(foreground)
             .when_some(banner_text, |this, text| this.child(banner(&text, cx)))
             .child(tab_strip(
                 items,

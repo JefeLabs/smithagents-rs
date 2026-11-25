@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use gpui_kit::component::highlighter::HighlightTheme;
 use gpui_kit::component::theme::{try_parse_color, Theme, ThemeRegistry};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{px, App, Global, Hsla, Rgba, Subscription, Window, WindowAppearance};
 use serde::Serialize;
 use smithagents_theme::color::Srgb;
@@ -45,14 +46,14 @@ pub const COLOR_KEY_MAP: &[(&str, &str)] = &[
     ("list.active.background", "selection"),
     ("list.active.border", "ring"),
     ("list.highlight.foreground", "ring"),
-    ("tab_bar.background", "card"),
+    ("tab_bar.background", "card-2"),
     ("tab.foreground", "muted-foreground"),
-    ("tab.active.background", "background"),
-    ("tab.active.foreground", "foreground"),
+    ("tab.active.background", "center"),
+    ("tab.active.foreground", "center-foreground"),
     ("sidebar.background", "card"),
     ("sidebar.foreground", "card-foreground"),
-    ("title_bar.background", "card"),
-    ("status_bar.background", "card"),
+    ("title_bar.background", "card-2"),
+    ("status_bar.background", "card-2"),
     ("base.red", "status-error"),
     ("base.green", "status-ok"),
     ("base.yellow", "status-warn"),
@@ -62,6 +63,56 @@ pub const COLOR_KEY_MAP: &[(&str, &str)] = &[
     ("warning.background", "status-warn"),
     ("info.background", "status-info"),
 ];
+
+/// A shell surface that paints from one of the theme's surface tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Region {
+    /// The center pane: the active chat tab and its content.
+    Center,
+    LeftPane,
+    /// The right activity pane.
+    RightPane,
+    TitleBar,
+    /// The right activity toolbar (the icon rail).
+    Rail,
+    TabStrip,
+    BottomBar,
+}
+
+/// The `(surface token, foreground token)` a region paints with. This is the
+/// one place the region-to-surface mapping lives; change a row to restyle a
+/// region (the gpui-component rows in [`COLOR_KEY_MAP`] for the title bar,
+/// tab bar, status bar and active tab must follow).
+pub fn region_tokens(region: Region) -> (&'static str, &'static str) {
+    match region {
+        Region::Center => ("center", "center-foreground"),
+        Region::LeftPane | Region::RightPane => ("card", "card-foreground"),
+        Region::TitleBar | Region::Rail | Region::TabStrip | Region::BottomBar => {
+            ("card-2", "card-2-foreground")
+        }
+    }
+}
+
+/// A region's `(surface, foreground)` colors in `native`, or `None` if the
+/// theme lacks a token (a validated set never does).
+pub fn region_colors(native: &NativeTheme, region: Region) -> Option<(Hsla, Hsla)> {
+    let (surface, foreground) = region_tokens(region);
+    Some((
+        srgb_to_hsla(*native.colors.get(surface)?),
+        srgb_to_hsla(*native.colors.get(foreground)?),
+    ))
+}
+
+/// A region's `(surface, foreground)` for painting. Without a native theme
+/// (offline tests) it falls back to the framework theme's base colors.
+pub fn region_paint(native: Option<&NativeTheme>, region: Region, cx: &App) -> (Hsla, Hsla) {
+    native
+        .and_then(|native| region_colors(native, region))
+        .unwrap_or_else(|| {
+            let theme = cx.theme();
+            (theme.background, theme.foreground)
+        })
+}
 
 /// The base font size gpui-component uses at text scale 1.0, in pixels. The
 /// window's rem size follows `Theme::font_size`, so scaling it scales text.

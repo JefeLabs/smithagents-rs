@@ -521,6 +521,11 @@ impl Render for Shell {
             .size_full()
             .child(left_pane)
             .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
-            .child(rail(self.rail_active(cx), on_select, cx))
+            .child(rail(
+                self.rail_active(cx),
+                on_select,
+                self.state.read(cx).native_theme(),
+                cx,
+            ))
     }
 }
