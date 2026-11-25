@@ -131,9 +131,8 @@ Anti-goals (failure even if it "works")
 - Sign-ins: the Space card shows "n signed out"; a popover lists Coder,
   Keeper, Jira and Browser with Signed in/out, Sign in, Check now, Sign out
   and "checked Ns ago". [from screenshot]
-- All panes collapsible. [decided] The left pane collapses to a compact
-  strip (markers only) and is never hidden; the right pane hides. [owner
-  decision 2026-11-24]
+- Right (and later bottom) panes hide; the left pane is never hidden: it
+  switches between expanded and a compact strip. [owner decision 2026-11-24]
 - gpui-component's dock may need adjustment to get "left full height, bottom
   under center + right"; verify in the first spike. [my call]
 
@@ -370,7 +369,10 @@ example "open this issue in a center tab").
     surfaces (`card`, `card-2`, each with a `-foreground`), a dedicated
     `center-pane` surface (center pane content and the active tab) and
     `popover`. Default regions: center = `center-pane`; left and right panes =
-    `card`; title bar, icon rail, tab strip, bottom bar = `card-2`.
+    `card`; title bar, icon rail, tab strip, status bar = `card-2`. Inactive
+    tabs sit on the tab strip's `card-2`; the active tab is on
+    `center-pane`, part of the content below it. The update chip is in the
+    title bar (a `primary` pill).
   - Tailwind side: utilities consume CSS variables, so a new theme is a new
     token file with no component changes. Variable names follow the shadcn
     contract (`--background`, `--foreground`, `--card`, `--primary`,

@@ -19,9 +19,9 @@ use crate::view_models::{center_rect, tab_title, LeftPaneMode, OPEN_CHAT_FAILED}
 use crate::views::banner::banner;
 use crate::views::tabs::{tab_strip, TabItem, TabStripActions};
 
-/// Element id of the content area whose bounds go to the web engine.
 /// Element id of the center panel's root.
 pub const CENTER_PANEL_ID: &str = "center-panel";
+/// Element id of the content area whose bounds go to the web engine.
 pub const CONTENT_ID: &str = "center-content";
 /// Element id of the hint shown when no tab is open.
 pub const EMPTY_HINT_ID: &str = "no-chat-hint";

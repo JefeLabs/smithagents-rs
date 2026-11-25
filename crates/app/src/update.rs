@@ -1,4 +1,4 @@
-//! The update seam: what the status bar's update button talks to.
+//! The update seam: what the update chip in the title bar talks to.
 //!
 //! [`Updater`] is the app's only view of updating itself, mirroring the
 //! [`AgentCommands`](crate::link::AgentCommands) seam: object-safe, futures

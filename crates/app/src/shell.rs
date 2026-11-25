@@ -738,7 +738,7 @@ impl Render for Shell {
         };
         let state = self.state.downgrade();
         let on_update = move |_: &mut Window, cx: &mut App| {
-            tracing::debug!(source = "status bar", "update button");
+            tracing::debug!(source = "title bar", "update chip");
             let _ = state.update(cx, |state, cx| state.install_update(cx));
         };
         let expanded = self.state.read(cx).left_pane_mode() == LeftPaneMode::Expanded;

@@ -21,6 +21,6 @@ Default region mapping (one place: `region_tokens` in `crates/app/src/theme_adap
 |---|---|
 | center pane, active center tab | `center-pane` |
 | left pane, right activity pane | `card` |
-| title bar (app-drawn), icon rail, tab strip, bottom bar | `card-2` |
+| title bar (app-drawn), icon rail, tab strip, status bar | `card-2` |
 
-The bottom bar does not exist yet; its row is a mapping only. The tab strip bar and inactive tabs use `card-2`; the active tab uses `center-pane`.
+The status bar runs the full width of the window's bottom (`Region::BottomBar`). The tab strip bar and inactive tabs use `card-2`; the active tab uses `center-pane`. The update chip in the title bar is a `primary` pill (`primary`/`primary-foreground`); the validator requires `primary` at 3:1 against `card-2`.
