@@ -23,9 +23,9 @@ use gpui_kit::{
     TestAppContext, WindowHandle,
 };
 use smithagents_app::layout_store::{
-    saved_dock, saved_left_pane, with_left_pane, LayoutStore, LeftPaneLayout,
+    saved_dock, saved_left_pane, status_bar_height, with_left_pane, LayoutStore, LeftPaneLayout,
     COMPACT_LEFT_PANE_WIDTH, DEFAULT_LEFT_PANE_WIDTH, LAYOUT_VERSION, MIN_CENTER_WIDTH,
-    MIN_LEFT_PANE_WIDTH, STATUS_BAR_HEIGHT,
+    MIN_LEFT_PANE_WIDTH,
 };
 use smithagents_app::link::LinkConfig;
 use smithagents_app::model::{Action, Connection, ShellModel};
@@ -1021,7 +1021,7 @@ fn the_left_pane_spans_the_height_below_the_title_bar_and_the_rail_sits_at_the_f
         assert_eq!(left.origin, point(px(0.), title.bottom()), "{left:?}");
         assert_eq!(
             left.bottom(),
-            content.height - STATUS_BAR_HEIGHT,
+            content.height - status_bar_height(window.rem_size()),
             "to the top of the status bar"
         );
 
@@ -1389,6 +1389,7 @@ fn switching_the_theme_repaints_the_regions(cx: &mut TestAppContext) {
         (Region::RightPane, light.right_pane),
         (Region::TitleBar, light.title_bar),
         (Region::Center, light.center),
+        (Region::TabStrip, light.tab_strip),
     ] {
         assert_eq!(
             got,
@@ -1396,8 +1397,16 @@ fn switching_the_theme_repaints_the_regions(cx: &mut TestAppContext) {
             "{region:?}"
         );
     }
+    // The active tab is part of the content: the center surface.
+    assert_eq!(
+        light.active_tab,
+        token_background(&native, region_tokens(Region::Center).0),
+        "active tab"
+    );
     assert_ne!(dark.left_pane, light.left_pane);
     assert_ne!(dark.rail, light.rail);
+    assert_ne!(dark.tab_strip, light.tab_strip);
+    assert_ne!(dark.active_tab, light.active_tab);
 }
 
 #[gpui_kit::test]

@@ -7,14 +7,16 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use common::ui::{agent, dark_native, open_shell_options, painted_at, token_background};
+use common::ui::{
+    agent, dark_native, open_shell_options, painted_at, theme_state, token_background,
+};
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
 use gpui_kit::base::{test_support, Root};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{point, px, AppContext as _, Entity, Role, TestAppContext, WindowHandle};
-use smithagents_app::layout_store::STATUS_BAR_HEIGHT;
+use smithagents_app::layout_store::{status_bar_height, MIN_WINDOW_SIZE};
 use smithagents_app::link::{AgentCommands, LinkError};
 use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::shell::{Shell, ShellOptions, LEFT_PANE_ID};
@@ -33,6 +35,8 @@ use smithagents_app::views::title_bar::{
 use smithagents_center_host::PixelRect;
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
+use smithagents_theme::tokens::{Appearance, ThemeSet};
 
 const INFO_FOR: Duration = Duration::from_millis(300);
 
@@ -172,8 +176,8 @@ fn the_bar_spans_the_window_bottom_and_the_regions_end_at_its_top(cx: &mut TestA
         assert_eq!(bounds.origin.x, px(0.));
         assert_eq!(bounds.size.width, view.width);
         assert_eq!(bounds.bottom(), view.height);
-        assert_eq!(bounds.size.height, STATUS_BAR_HEIGHT);
-        assert_eq!(bounds.size.height, px(24.));
+        assert_eq!(bounds.size.height, status_bar_height(window.rem_size()));
+        assert_eq!(bounds.size.height, px(24.), "at 100% text");
         assert_eq!(window.find(LEFT_PANE_ID).bounds().bottom(), bounds.top());
         assert_eq!(window.find(RAIL_ID).bounds().bottom(), bounds.top());
 
@@ -523,7 +527,7 @@ fn a_very_long_message_is_contained_left_of_the_right_zone(cx: &mut TestAppConte
             "the version is not squeezed"
         );
         assert!(message.left() >= px(0.));
-        assert!(message.size.height <= STATUS_BAR_HEIGHT);
+        assert!(message.size.height <= status_bar_height(window.rem_size()));
     })
     .unwrap();
 }
@@ -621,4 +625,97 @@ fn a_multi_line_error_shows_on_one_line(cx: &mut TestAppContext) {
         message(cx, window).as_deref(),
         Some("line one line two three")
     );
+}
+
+/// The painted fill of the status bar and of the update chip.
+fn bar_and_chip_colors(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Root>,
+) -> (gpui_kit::Background, gpui_kit::Background) {
+    let mut colors = None;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let bar = window.find(STATUS_BAR_ID).bounds();
+        let chip = window.find(UPDATE_CHIP_ID).bounds();
+        colors = Some((
+            painted_at(window, point(px(300.), bar.center().y)),
+            painted_at(window, point(chip.left() + px(6.), chip.center().y)),
+        ));
+    })
+    .unwrap();
+    colors.unwrap()
+}
+
+#[gpui_kit::test]
+fn the_status_bar_and_the_update_chip_paint_their_tokens_in_both_themes(cx: &mut TestAppContext) {
+    let fake = FakeUpdater::available("9.9.9");
+    let (window, _shell, state) = open(cx, connected(), Some(fake));
+    let set = ThemeSet::embedded();
+    for appearance in [Appearance::Dark, Appearance::Light] {
+        let theme = theme_state(appearance).theme;
+        state.update(cx, |state, cx| {
+            state.set_appearance(
+                AppearanceSettings {
+                    theme: ThemeChoice::Id(theme.clone()),
+                    ..AppearanceSettings::default()
+                },
+                cx,
+            )
+        });
+        let native = set.native(&theme).unwrap();
+        let (bar, chip) = bar_and_chip_colors(cx, window);
+        assert_eq!(bar, token_background(&native, "card-2"), "{theme}: bar");
+        // A primary pill, so it reads as a control on the card-2 bar.
+        assert_eq!(chip, token_background(&native, "primary"), "{theme}: chip");
+        assert_ne!(chip, bar, "{theme}");
+    }
+}
+
+#[gpui_kit::test]
+fn at_the_minimum_window_size_the_title_and_the_widest_chip_do_not_collide(
+    cx: &mut TestAppContext,
+) {
+    // The main window cannot be made smaller than this.
+    let min = smithagents_app::main_window_options(None, None)
+        .window_min_size
+        .expect("the main window has a minimum size");
+    assert_eq!(min, MIN_WINDOW_SIZE);
+    assert_eq!((min.width, min.height), (px(640.), px(400.)));
+
+    // The longest chip label, at the largest text size.
+    let fake = FakeUpdater::new(UpdateState::Failed {
+        version: "10.20.30".into(),
+        message: "no".into(),
+    });
+    let options = ShellOptions {
+        model: connected(),
+        updater: Some(fake as Rc<dyn Updater>),
+        ..Default::default()
+    };
+    let (window, shell) = open_shell_options(cx, options, (640., 400.));
+    cx.run_until_parked();
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    for scale in [1.0, 1.5] {
+        state.update(cx, |state, cx| {
+            let mut settings = state.appearance_settings().clone();
+            settings.text_scale = scale;
+            state.set_appearance(settings, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let bar = window.find(TITLE_BAR_ID).bounds();
+            let title = window.find(TITLE_TEXT_ID).bounds();
+            let chip = window.find(UPDATE_CHIP_ID).bounds();
+            assert_eq!(bar.size.width, px(640.));
+            assert!(
+                title.right() < chip.left(),
+                "at {scale}: title {title:?} meets chip {chip:?}"
+            );
+            assert!(chip.right() <= bar.right(), "{chip:?} in {bar:?}");
+            assert_eq!(chip_text(window), ["Update failed, retry"]);
+        })
+        .unwrap();
+    }
 }

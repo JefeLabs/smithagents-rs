@@ -47,9 +47,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, px, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight,
-    Hsla, InteractiveElement as _, IntoElement, KeyBinding, KeyboardButton, KeyboardClickEvent,
-    ParentElement as _, Pixels, Render, Role, ScrollHandle, SharedString,
+    div, px, rems, App, ClickEvent, Context, Div, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyBinding, KeyboardButton,
+    KeyboardClickEvent, ParentElement as _, Pixels, Render, Role, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _, Window,
 };
 use smithagents_core::ids::AgentId;
@@ -113,8 +113,10 @@ pub const CONFIRM_CLOSE_ID: &str = "confirm-close-agent";
 /// What the expanded pane says when there is no agent.
 pub const NO_AGENTS_TEXT: &str = "No agents yet";
 
-/// Height of an expanded row.
-const ROW_HEIGHT: f32 = 40.;
+/// The least height of an expanded row, in rems: its two lines of text (a
+/// `Label` line is 1.25 rem), 40 px at 100%. The row grows with its content,
+/// so the text scale never makes rows overlap.
+const ROW_MIN_HEIGHT_REMS: f32 = 2.5;
 const ACCENT_BAR_WIDTH: f32 = 3.;
 const ROW_DOT: f32 = 8.;
 /// A compact marker's box: a 2 px selection ring, 2 px of space, then the
@@ -334,7 +336,7 @@ impl AgentsPane {
             .when(row.has_open_tab, |this| this.aria_description("Chat open"))
             .flex_none()
             .w_full()
-            .h(px(ROW_HEIGHT))
+            .min_h(rems(ROW_MIN_HEIGHT_REMS))
             .items_center()
             .gap_2()
             .pr_2()
@@ -350,7 +352,8 @@ impl AgentsPane {
                     .test_support()
                     .flex_none()
                     .w(px(ACCENT_BAR_WIDTH))
-                    .h_full()
+                    // The row's height comes from its text, so stretch.
+                    .self_stretch()
                     .when_some(paint.accent(row.accent_hue), |this, accent| this.bg(accent)),
             )
             .child(

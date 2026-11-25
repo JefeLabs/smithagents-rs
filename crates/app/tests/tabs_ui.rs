@@ -15,6 +15,7 @@ use chrono::Utc;
 use common::ui::{agent, open_shell_options, FakeAppearance};
 use gpui_kit::base::Root;
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::test::TestQueryExt as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext, WindowHandle};
 use raw_window_handle::HasWindowHandle;
@@ -24,9 +25,12 @@ use smithagents_app::shell_state::{ConnectionInfoSource, ShellState};
 use smithagents_app::tabs::SharedHost;
 use smithagents_app::view_models::{StatusKind, NOT_CONNECTED_TEXT, OPEN_CHAT_FAILED};
 use smithagents_app::views::agents::agent_row_id;
+use smithagents_app::views::center::CENTER_PANEL_ID;
 use smithagents_app::views::center::{CHAT_NOTICE_ID, EMPTY_HINT_ID};
 use smithagents_app::views::settings::THEME_OPTIONS_ID;
-use smithagents_app::views::tabs::{close_button_id, TOGGLE_AGENTS_ID};
+use smithagents_app::views::tabs::{
+    close_button_id, tab_title_id, TAB_MAX_WIDTH, TOGGLE_AGENTS_ID,
+};
 use smithagents_center_host::{
     CenterTabHost, ExternalUrl, HostCall, HostError, PageBoot, PixelRect, RecordingHost, TabId,
     TabKind, TabSpec,
@@ -739,4 +743,50 @@ fn the_default_placeholder_host_opens_tabs(cx: &mut TestAppContext) {
         [mercury.id]
     );
     assert_eq!(state.read_with(cx, |state, _| state.status_message()), None);
+}
+
+#[gpui_kit::test]
+fn a_long_name_is_cut_short_and_never_pushes_the_other_tabs_off(cx: &mut TestAppContext) {
+    let long = agent(&"Saturn".repeat(34)[..200]);
+    assert_eq!(long.name.chars().count(), 200);
+    let venus = agent("Venus");
+    let h = open(cx, connected(vec![long.clone(), venus.clone()]));
+    dispatch(cx, &h, Action::OpenTab(long.id));
+    dispatch(cx, &h, Action::OpenTab(venus.id));
+    cx.update_window(h.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let center = window.find(CENTER_PANEL_ID).bounds();
+        let tab = |ix: usize, window: &mut gpui_kit::Window| {
+            window.within("center-tabs").find(ix).bounds()
+        };
+        let (first, second) = (tab(0, window), tab(1, window));
+        assert!(first.size.width <= TAB_MAX_WIDTH, "{first:?}");
+        let title = window.find(tab_title_id(0)).bounds();
+        assert!(title.right() <= first.right(), "{title:?} in {first:?}");
+        assert!(second.left() >= first.right(), "{first:?} then {second:?}");
+        assert!(second.right() <= center.right(), "{second:?} in {center:?}");
+        let close = window.find(close_button_id(1));
+        assert!(close.visible());
+        assert!(close.bounds().right() <= center.right());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn each_close_button_names_its_tab(cx: &mut TestAppContext) {
+    let (mercury, venus) = (agent("Mercury"), agent("Venus"));
+    let h = open(cx, connected(vec![mercury.clone(), venus.clone()]));
+    dispatch(cx, &h, Action::OpenTab(mercury.id));
+    dispatch(cx, &h, Action::OpenTab(venus.id));
+    cx.update_window(h.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(close_button_id(0)).label(),
+            Some("Close Mercury")
+        );
+        assert_eq!(window.find(close_button_id(1)).label(), Some("Close Venus"));
+        assert!(window.find_all_by_label("Close tab").is_empty());
+    })
+    .unwrap();
 }

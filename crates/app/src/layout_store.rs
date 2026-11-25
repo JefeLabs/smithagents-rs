@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::dock::{DockAreaState, DockPlacement, DockState, PanelInfo, PanelState};
-use gpui_kit::{px, size, Bounds, Pixels, Size, WindowBounds};
+use gpui_kit::{px, rems, size, Bounds, Pixels, Size, WindowBounds};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -54,17 +54,36 @@ pub const MIN_LEFT_PANE_WIDTH: Pixels = px(100.);
 pub const MAX_LEFT_PANE_WIDTH: Pixels = px(1000.);
 /// The left pane's expanded width when nothing is saved.
 pub const DEFAULT_LEFT_PANE_WIDTH: Pixels = px(240.);
-/// Height of the status bar across the bottom of the window, under the left
-/// pane, the dock area and the rail.
-pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
+/// Height of the status bar across the bottom of the window (under the left
+/// pane, the dock area and the rail), in rems: 24 px at 100% text, growing
+/// with the text scale (the window's rem size follows it).
+pub const STATUS_BAR_HEIGHT_REMS: f32 = 1.5;
+/// Height of the app-drawn title bar, in rems: 34 px (gpui-component's own
+/// height) at 100% text, growing with the text scale.
+pub const TITLE_BAR_HEIGHT_REMS: f32 = 2.125;
+
+/// The status bar's height in a window whose rem size is `rem_size`: what
+/// the bar is drawn at, so layout math must use this, never a constant.
+pub fn status_bar_height(rem_size: Pixels) -> Pixels {
+    rems(STATUS_BAR_HEIGHT_REMS).to_pixels(rem_size)
+}
+
+/// The title bar's height in a window whose rem size is `rem_size` (see
+/// [`status_bar_height`]).
+pub fn title_bar_height(rem_size: Pixels) -> Pixels {
+    rems(TITLE_BAR_HEIGHT_REMS).to_pixels(rem_size)
+}
 /// The persisted name of the left pane's panel. Never change it.
 pub const LEFT_PANE_PANEL: &str = "Agents";
 /// The persisted name gpui-base gives a tab group.
 const TAB_GROUP_PANEL: &str = "TabPanel";
 
-/// A saved window smaller than this is not reused.
-const MIN_WINDOW_WIDTH: f32 = 640.;
-const MIN_WINDOW_HEIGHT: f32 = 400.;
+/// The smallest the main window can be made (`WindowOptions::window_min_size`);
+/// a saved window smaller than this is not reused.
+pub const MIN_WINDOW_SIZE: Size<Pixels> = Size {
+    width: px(640.),
+    height: px(400.),
+};
 /// A saved window is reused only if this much of its top strip (where the
 /// title bar is) lies on one display, so it can be seen and dragged.
 const TITLE_STRIP_HEIGHT: f32 = 30.;
@@ -211,8 +230,8 @@ pub fn restored_window_bounds(
     let b = saved.bounds;
     let numbers = [b.origin.x, b.origin.y, b.size.width, b.size.height];
     if numbers.iter().any(|v| !f32::from(*v).is_finite())
-        || f32::from(b.size.width) < MIN_WINDOW_WIDTH
-        || f32::from(b.size.height) < MIN_WINDOW_HEIGHT
+        || b.size.width < MIN_WINDOW_SIZE.width
+        || b.size.height < MIN_WINDOW_SIZE.height
     {
         return None;
     }

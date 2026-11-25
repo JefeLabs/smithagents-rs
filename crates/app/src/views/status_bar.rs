@@ -14,12 +14,12 @@
 
 use gpui_kit::component::h_flex;
 use gpui_kit::{
-    div, px, App, InteractiveElement as _, IntoElement, ParentElement as _, Role,
+    div, px, rems, App, InteractiveElement as _, IntoElement, ParentElement as _, Role,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
 };
 use smithagents_theme::native::NativeTheme;
 
-use crate::layout_store::STATUS_BAR_HEIGHT;
+use crate::layout_store::STATUS_BAR_HEIGHT_REMS;
 use crate::theme_adapter::{region_paint, token_paint, Region};
 use crate::view_models::{version_text, StatusKind, StatusMessage};
 
@@ -27,6 +27,8 @@ use crate::view_models::{version_text, StatusKind, StatusMessage};
 pub const STATUS_BAR_ID: &str = "status-bar";
 /// Element id of the message (its container; absent when there is none).
 pub const STATUS_MESSAGE_ID: &str = "status-message";
+/// Element id of the message's text.
+pub const STATUS_TEXT_ID: &str = "status-text";
 /// Element id of the dot before an error message.
 pub const STATUS_ERROR_DOT_ID: &str = "status-error-dot";
 /// Element id of the version text.
@@ -66,7 +68,14 @@ pub fn status_bar(
             .items_center()
             .gap_1p5()
             .children(error_dot)
-            .child(div().min_w_0().truncate().child(message.text))
+            .child(
+                div()
+                    .id(STATUS_TEXT_ID)
+                    .test_support()
+                    .min_w_0()
+                    .truncate()
+                    .child(message.text),
+            )
     });
 
     h_flex()
@@ -76,7 +85,7 @@ pub fn status_bar(
         .aria_label(STATUS_BAR_LABEL)
         .flex_none()
         .w_full()
-        .h(STATUS_BAR_HEIGHT)
+        .h(rems(STATUS_BAR_HEIGHT_REMS))
         .items_center()
         .gap_2()
         .px_2()

@@ -197,6 +197,7 @@ impl Render for CenterPanel {
                 // its bounds are reported on every prepaint that lays it out.
                 div()
                     .id(CONTENT_ID)
+                    .test_support()
                     .relative()
                     .flex_1()
                     .min_h_0()

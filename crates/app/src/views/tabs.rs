@@ -6,7 +6,8 @@ use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{h_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, App, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Window,
+    div, px, App, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    SharedString, Styled as _, TestSupportExt as _, Window,
 };
 use smithagents_core::ids::AgentId;
 use smithagents_theme::native::NativeTheme;
@@ -17,6 +18,15 @@ use crate::theme_adapter::{region_paint, Region};
 pub fn close_button_id(ix: usize) -> (&'static str, usize) {
     ("close-tab", ix)
 }
+
+/// Element id of a tab's title text; `ix` is the tab's position.
+pub fn tab_title_id(ix: usize) -> (&'static str, usize) {
+    ("tab-title", ix)
+}
+
+/// The widest a tab is drawn; a longer title is cut short with an ellipsis,
+/// so one long agent name never pushes the other tabs off the strip.
+pub const TAB_MAX_WIDTH: Pixels = px(240.);
 
 /// Element id of the button that compacts or expands the agents pane.
 pub const TOGGLE_AGENTS_ID: &str = "toggle-agents-pane";
@@ -54,6 +64,8 @@ pub fn tab_strip(
 ) -> impl IntoElement {
     let theme = cx.theme();
     let (_, strip_foreground) = region_paint(native, Region::TabStrip, cx);
+    // The active tab sits on the center surface, so its icon follows it.
+    let (_, active_foreground) = region_paint(native, Region::Center, cx);
     let ids: Vec<AgentId> = items.iter().map(|item| item.agent).collect();
     let selected = active.and_then(|active| ids.iter().position(|id| *id == active));
     let TabStripActions {
@@ -86,26 +98,40 @@ pub fn tab_strip(
     let tabs = items.into_iter().enumerate().map(|(ix, item)| {
         let close = close.clone();
         let agent = item.agent;
+        let icon_color = if selected == Some(ix) {
+            active_foreground
+        } else {
+            strip_foreground
+        };
+        let close_label: SharedString = format!("Close {}", item.title).into();
         Tab::new()
             .aria_label(item.title.clone())
             .child(
                 h_flex()
+                    .min_w_0()
                     .gap_1p5()
                     .items_center()
                     .when_some(item.accent, |this, accent| {
                         this.child(div().flex_none().size_2().rounded_full().bg(accent))
                     })
-                    .child(item.title),
+                    .child(
+                        div()
+                            .id(tab_title_id(ix))
+                            .test_support()
+                            .min_w_0()
+                            .truncate()
+                            .child(item.title),
+                    ),
             )
             .suffix(
                 Button::new(close_button_id(ix))
-                    .icon(Icon::new(IconName::Close).text_color(strip_foreground))
+                    .icon(Icon::new(IconName::Close).text_color(icon_color))
                     .ghost()
                     .xsmall()
                     .tab_stop(false)
                     .mr_1()
-                    .tooltip("Close tab")
-                    .accessibility_label("Close tab")
+                    .tooltip(close_label.clone())
+                    .accessibility_label(close_label)
                     .on_click(move |_, window, cx| {
                         // The tab under the button must not also activate.
                         cx.stop_propagation();
@@ -115,6 +141,7 @@ pub fn tab_strip(
     });
 
     TabBar::new("center-tabs")
+        .max_width(TAB_MAX_WIDTH)
         .prefix(
             h_flex()
                 .flex_none()

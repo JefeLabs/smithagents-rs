@@ -3,6 +3,9 @@
 //! paints the surface, moves the window when dragged and zooms it on a
 //! double click (gpui-component's `TitleBar` does both).
 //!
+//! Its height is in rems ([`TITLE_BAR_HEIGHT_REMS`]), so it grows with the
+//! text scale.
+//!
 //! At its top right sits the update chip, shown only while an update needs
 //! attention (see [`crate::view_models::update_button`]). The chip takes the
 //! press (default prevented, propagation stopped), so clicking it neither
@@ -12,11 +15,12 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::{Disableable as _, Sizable as _, TitleBar};
 use gpui_kit::{
-    div, px, App, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    div, px, rems, App, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
 };
 use smithagents_theme::native::NativeTheme;
 
+use crate::layout_store::TITLE_BAR_HEIGHT_REMS;
 use crate::theme_adapter::{region_paint, token_paint, Region};
 use crate::view_models::UpdateButtonVm;
 use crate::WINDOW_TITLE;
@@ -29,13 +33,15 @@ pub const TITLE_TEXT_ID: &str = "title-text";
 pub const UPDATE_CHIP_ID: &str = "update-chip";
 /// Element id of the chip's wrapper, which shields it from the bar.
 pub const UPDATE_CHIP_SLOT_ID: &str = "update-chip-slot";
-/// The tokens the chip paints with (a validated pair, 4.5:1).
-pub const UPDATE_CHIP_TOKENS: (&str, &str) = ("accent", "accent-foreground");
+/// The tokens the chip paints with: its fill and its label (a validated
+/// pair, 4.5:1). `primary` also stands apart from the bar's `card-2`, so the
+/// chip reads as a control; its hover and pressed fills are gpui-component's
+/// primary button states, which the framework derives from `primary`.
+pub const UPDATE_CHIP_TOKENS: (&str, &str) = ("primary", "primary-foreground");
 
-/// The bar's height, as gpui-component draws it.
-pub const TITLE_BAR_HEIGHT: f32 = 34.;
-/// The chip's height, inside the bar.
-pub const UPDATE_CHIP_HEIGHT: f32 = 22.;
+/// The chip's height inside the bar, in rems: 22 px at 100% text, growing
+/// with the text scale like the bar ([`TITLE_BAR_HEIGHT_REMS`]).
+pub const UPDATE_CHIP_HEIGHT_REMS: f32 = 1.375;
 /// Space between the chip and the window's right edge.
 pub const UPDATE_CHIP_MARGIN: f32 = 8.;
 
@@ -50,10 +56,10 @@ pub fn title_bar(
 ) -> impl IntoElement {
     let (surface, foreground) = region_paint(native, Region::TitleBar, cx);
     let chip = update.map(|vm| {
-        let (bg, fg) = (
-            token_paint(native, UPDATE_CHIP_TOKENS.0, cx),
-            token_paint(native, UPDATE_CHIP_TOKENS.1, cx),
-        );
+        // The fill, hover, pressed and focus states come from the primary
+        // variant; the label sets its own color (a `Label` defaults to the
+        // theme's foreground).
+        let fg = token_paint(native, UPDATE_CHIP_TOKENS.1, cx);
         div()
             .id(UPDATE_CHIP_SLOT_ID)
             .flex_none()
@@ -68,19 +74,20 @@ pub fn title_bar(
             .child(
                 Button::new(UPDATE_CHIP_ID)
                     .child(Label::new(vm.label).text_xs().text_color(fg))
-                    .ghost()
+                    .primary()
                     .xsmall()
-                    .h(px(UPDATE_CHIP_HEIGHT))
+                    .h(rems(UPDATE_CHIP_HEIGHT_REMS))
                     .px_2()
                     .rounded_full()
-                    .bg(bg)
-                    .text_color(fg)
                     .disabled(!vm.enabled)
                     .accessibility_label(vm.a11y_label)
                     .on_click(move |_, window, cx| on_update(window, cx)),
             )
     });
     TitleBar::new()
+        // gpui-component draws the bar 34 px high whatever the text size;
+        // the same height in rems grows with the text scale.
+        .h(rems(TITLE_BAR_HEIGHT_REMS))
         .bg(surface)
         .text_color(foreground)
         .child(

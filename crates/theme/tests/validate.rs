@@ -358,3 +358,20 @@ fn agent_low_contrast_against_center() {
         "{e:?}"
     );
 }
+
+#[test]
+fn primary_must_stand_out_from_card_2() {
+    // The update chip is a `primary` pill on the `card-2` title bar: a
+    // control surface needs 3:1 against what it sits on.
+    let mut s = set();
+    let t = of(&mut s, Appearance::Light);
+    let card_2 = t.colors["card-2"];
+    t.colors.insert("primary".into(), card_2);
+    let e = errors(&s);
+    assert!(
+        e.iter().any(|e| matches!(e,
+            E::LowContrast { foreground, background, min, .. }
+            if foreground == "primary" && background == "card-2" && *min == 3.0)),
+        "{e:?}"
+    );
+}

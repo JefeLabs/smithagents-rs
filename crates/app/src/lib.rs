@@ -23,12 +23,13 @@ pub mod views;
 
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
-    px, size, App, AppContext as _, Bounds, QuitMode, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size, App, AppContext as _, Bounds, DisplayId, QuitMode, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 use smithagents_center_host::CenterTabHost;
 
 use crate::app_state::AppStateStore;
-use crate::layout_store::{restored_window_bounds, LayoutStore};
+use crate::layout_store::{restored_window_bounds, LayoutStore, MIN_WINDOW_SIZE};
 use crate::link::LinkConfig;
 use crate::model::ShellModel;
 use crate::settings::AppSettingsStore;
@@ -100,18 +101,7 @@ fn open_main_window(
             None,
         ),
     };
-    let options = WindowOptions {
-        window_bounds: Some(window_bounds),
-        display_id,
-        // The shell draws its own title bar (see `views::title_bar`); the
-        // window keeps only the traffic lights and the app's title.
-        titlebar: Some(TitlebarOptions {
-            title: Some(WINDOW_TITLE.into()),
-            ..TitleBar::title_bar_options()
-        }),
-        app_owns_titlebar_drag: true,
-        ..Default::default()
-    };
+    let options = main_window_options(Some(window_bounds), display_id);
     gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| {
             Shell::new(
@@ -137,6 +127,28 @@ fn open_main_window(
         })
     })?;
     Ok(())
+}
+
+/// The main window's options for `window_bounds` on `display_id`: the
+/// app-drawn title bar (see `views::title_bar`; the window keeps only the
+/// traffic lights and the app's title) and the minimum size
+/// ([`MIN_WINDOW_SIZE`]), below which the title and the update chip would
+/// meet.
+pub fn main_window_options(
+    window_bounds: Option<WindowBounds>,
+    display_id: Option<DisplayId>,
+) -> WindowOptions {
+    WindowOptions {
+        window_bounds,
+        display_id,
+        window_min_size: Some(MIN_WINDOW_SIZE),
+        titlebar: Some(TitlebarOptions {
+            title: Some(WINDOW_TITLE.into()),
+            ..TitleBar::title_bar_options()
+        }),
+        app_owns_titlebar_drag: true,
+        ..Default::default()
+    }
 }
 
 /// Turns the first SIGTERM or SIGINT into a normal `App::quit`, so quit

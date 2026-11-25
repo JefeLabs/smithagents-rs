@@ -18,6 +18,9 @@ pub const CONTRAST_RULES: &[(&str, &str, f64)] = &[
     ("primary-foreground", "primary", 4.5),
     ("secondary-foreground", "secondary", 4.5),
     ("accent-foreground", "accent", 4.5),
+    // A control surface on the bar it sits on (the title bar's update chip):
+    // non-text contrast, 3:1.
+    ("primary", "card-2", 3.0),
     ("muted-foreground", "background", 4.5),
     ("muted-foreground", "muted", 4.5),
     ("muted-foreground", "card", 4.5),
