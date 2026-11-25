@@ -20,9 +20,10 @@ fn main() {
     // The daemon reports `smithagents_core::VERSION`; the link refuses any
     // other version, so both sides use the same constant.
     let config = LinkConfig::new(home, daemon_bin, smithagents_core::VERSION.to_owned());
-    // The chat tabs' web engine: a placeholder that draws nothing and logs
-    // (at debug) until the real engine lands.
-    smithagents_app::run(config, Box::new(PlaceholderHost))
+    // The chat tabs' web engine, built once the GPUI app exists: a
+    // placeholder that draws nothing and logs (at debug) until the real
+    // engine lands.
+    smithagents_app::run(config, |_| Box::new(PlaceholderHost))
 }
 
 fn daemon_bin() -> PathBuf {

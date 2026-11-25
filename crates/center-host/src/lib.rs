@@ -60,6 +60,10 @@ pub trait CenterTabHost {
     fn push_theme(&mut self, state: &ThemeState);
     /// Hands a filtered target to the system browser.
     fn open_external(&mut self, url: &ExternalUrl);
+    /// The app is quitting or its window is closing: release the engine
+    /// (for CEF, `CefShutdown`). Called once, after which no other call
+    /// comes. The default does nothing.
+    fn shutdown(&mut self) {}
 }
 
 /// A boxed host is a host, so a shell can hold `Box<dyn CenterTabHost>` and
@@ -85,6 +89,9 @@ impl<H: CenterTabHost + ?Sized> CenterTabHost for Box<H> {
     }
     fn open_external(&mut self, url: &ExternalUrl) {
         (**self).open_external(url)
+    }
+    fn shutdown(&mut self) {
+        (**self).shutdown()
     }
 }
 
@@ -261,6 +268,7 @@ pub enum HostCall {
     SetBounds(PixelRect),
     PushTheme(ThemeState),
     OpenExternal(ExternalUrl),
+    Shutdown,
 }
 
 /// Records every call, for tests of code that drives a [`CenterTabHost`].
@@ -309,5 +317,8 @@ impl CenterTabHost for RecordingHost {
     }
     fn open_external(&mut self, url: &ExternalUrl) {
         self.calls.push(HostCall::OpenExternal(url.clone()));
+    }
+    fn shutdown(&mut self) {
+        self.calls.push(HostCall::Shutdown);
     }
 }

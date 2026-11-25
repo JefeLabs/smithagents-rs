@@ -29,17 +29,31 @@ use crate::model::Effect;
 /// page (`web/dist`).
 pub const DEFAULT_PAGE_ORIGIN: &str = "smithagents://app";
 
-/// Overrides the page origin; in development the Vite dev server,
-/// `http://localhost:5173`.
+/// Overrides the page origin in a debug build; in development the Vite dev
+/// server, `http://localhost:5173`.
 pub const PAGE_ORIGIN_ENV: &str = "SMITHAGENTS_WEB_ORIGIN";
 
-/// The page origin for a value of [`PAGE_ORIGIN_ENV`]: the trimmed value, or
-/// [`DEFAULT_PAGE_ORIGIN`] when it is unset or blank. It is not validated
-/// here: an invalid origin is reported by the shell and fails every open.
-pub fn page_origin_from(value: Option<&str>) -> String {
-    match value.map(str::trim) {
-        Some(origin) if !origin.is_empty() => origin.to_owned(),
-        _ => DEFAULT_PAGE_ORIGIN.to_owned(),
+/// The page origin for a value of [`PAGE_ORIGIN_ENV`].
+///
+/// - `dev_build` (the app passes `cfg!(debug_assertions)`): the trimmed
+///   value, or [`DEFAULT_PAGE_ORIGIN`] when it is unset or blank. It is not
+///   validated here: an invalid origin is reported by the shell and fails
+///   every open.
+/// - A release build always loads [`DEFAULT_PAGE_ORIGIN`]; a set value is
+///   ignored with one warning. Honoring it would hand the token-bearing boot
+///   script to whatever serves that origin.
+pub fn page_origin_from(value: Option<&str>, dev_build: bool) -> String {
+    let value = value.map(str::trim).filter(|origin| !origin.is_empty());
+    match value {
+        Some(origin) if dev_build => origin.to_owned(),
+        Some(_) => {
+            tracing::warn!(
+                "{PAGE_ORIGIN_ENV} is ignored in a release build; chat pages load from \
+                 {DEFAULT_PAGE_ORIGIN}"
+            );
+            DEFAULT_PAGE_ORIGIN.to_owned()
+        }
+        None => DEFAULT_PAGE_ORIGIN.to_owned(),
     }
 }
 
@@ -105,6 +119,8 @@ pub struct TabManager<H: CenterTabHost> {
     /// In the order they were opened (a re-open keeps the place).
     open: Vec<OpenTab>,
     shown: Option<AgentId>,
+    /// The host was shut down: it gets no further call.
+    shut_down: bool,
 }
 
 impl<H: CenterTabHost> TabManager<H> {
@@ -119,6 +135,7 @@ impl<H: CenterTabHost> TabManager<H> {
             next_id: 1,
             open: Vec::new(),
             shown: None,
+            shut_down: false,
         }
     }
 
@@ -152,6 +169,18 @@ impl<H: CenterTabHost> TabManager<H> {
     /// The agent whose tab the host shows.
     pub fn shown(&self) -> Option<AgentId> {
         self.shown
+    }
+
+    /// Shuts the host down (the app quits or the window closes), once: a
+    /// second call does nothing. The open tabs are forgotten.
+    pub fn shutdown(&mut self) {
+        if std::mem::replace(&mut self.shut_down, true) {
+            return;
+        }
+        tracing::debug!(tabs = self.open.len(), "shutting the tab host down");
+        self.open.clear();
+        self.shown = None;
+        self.host.shutdown();
     }
 
     /// Hands the window to the host (once, when the window exists).
@@ -219,11 +248,12 @@ impl<H: CenterTabHost> TabManager<H> {
     }
 
     /// The daemon connection changed. Every open tab whose page was booted
-    /// for another daemon port or token is closed and opened again with a
-    /// fresh [`PageBoot`] (the old page holds a stale token), in place and
-    /// with a new [`TabId`]; the tab that was shown is shown again. `None`
-    /// (not connected) changes nothing: a page shows its own lost-connection
-    /// state.
+    /// for another daemon port or token is opened again with a fresh
+    /// [`PageBoot`] (the old page holds a stale token), in place and with a
+    /// new [`TabId`], and only then is its old view closed, so the old page
+    /// stays on screen until the new one exists; the tab that was shown is
+    /// shown again. `None` (not connected) changes nothing: a page shows its
+    /// own lost-connection state.
     ///
     /// Returns the tabs that could not be re-opened (their agent is gone, or
     /// the host refused): they are closed on the host and forgotten, and the
@@ -248,11 +278,11 @@ impl<H: CenterTabHost> TabManager<H> {
                 kept.push(tab);
                 continue;
             }
-            self.host.close(tab.id);
             let reopened = match agents(tab.agent) {
                 Some(agent) => self.open_tab(&agent, port, token),
                 None => Err(TabError::UnknownAgent),
             };
+            self.host.close(tab.id);
             match reopened {
                 Ok(new) => kept.push(new),
                 Err(error) => failed.push((tab.agent, error)),
@@ -307,6 +337,9 @@ impl<H: CenterTabHost> TabManager<H> {
     /// Boots and opens a page for `agent`, positioned when a rectangle is
     /// known; not shown and not recorded.
     fn open_tab(&mut self, agent: &Agent, port: u16, token: &str) -> Result<OpenTab, TabError> {
+        if self.shut_down {
+            return Err(HostError::Engine("the web engine has shut down".into()).into());
+        }
         let id = TabId(self.next_id);
         self.next_id += 1;
         let spec = TabSpec {
@@ -400,6 +433,10 @@ impl CenterTabHost for PlaceholderHost {
             "placeholder host: open_external (no browser is launched)"
         );
     }
+
+    fn shutdown(&mut self) {
+        tracing::debug!("placeholder host: shutdown");
+    }
 }
 
 /// A host shared through an `Rc<RefCell<_>>`, so whoever injects it (a test,
@@ -438,5 +475,8 @@ impl<H: CenterTabHost> CenterTabHost for SharedHost<H> {
     }
     fn open_external(&mut self, url: &ExternalUrl) {
         self.0.borrow_mut().open_external(url)
+    }
+    fn shutdown(&mut self) {
+        self.0.borrow_mut().shutdown()
     }
 }

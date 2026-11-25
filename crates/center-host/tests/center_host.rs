@@ -246,6 +246,7 @@ fn drive<H: CenterTabHost>(host: &mut H) {
     host.push_theme(&theme());
     host.open_external(&external_target("https://example.com/").unwrap());
     host.close(TabId(1));
+    host.shutdown();
 }
 
 #[test]
@@ -255,7 +256,8 @@ fn a_boxed_host_is_a_host_and_forwards_every_call() {
     let mut boxed: Box<RecordingHost> = Box::default();
     drive(&mut boxed);
     assert_eq!(boxed.calls(), direct.calls());
-    assert_eq!(boxed.calls().len(), 7);
+    assert_eq!(boxed.calls().len(), 8);
+    assert_eq!(boxed.calls().last(), Some(&HostCall::Shutdown));
     // And through a trait object, as a shell holds it.
     let mut dynamic: Box<dyn CenterTabHost> = Box::new(RecordingHost::default());
     drive(&mut dynamic);
@@ -412,4 +414,27 @@ process.stdout.write(JSON.stringify({a:a.__SMITH_THEME__,got:b.got}));"#;
     assert_eq!(v["a"]["font"], t.font.as_str());
     assert_eq!(v["got"]["font"], t.font.as_str());
     assert_eq!(v["got"]["theme"], "smith-dark");
+}
+
+/// A host that implements only the required calls.
+struct Minimal;
+
+impl CenterTabHost for Minimal {
+    fn attach(&mut self, _: &dyn raw_window_handle::HasWindowHandle) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn open(&mut self, _: TabSpec, _: PageBoot) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn close(&mut self, _: TabId) {}
+    fn show(&mut self, _: TabId) {}
+    fn set_bounds(&mut self, _: PixelRect) {}
+    fn push_theme(&mut self, _: &smithagents_theme::state::ThemeState) {}
+    fn open_external(&mut self, _: &ExternalUrl) {}
+}
+
+#[test]
+fn shutdown_has_a_default_that_does_nothing() {
+    let mut host: Box<dyn CenterTabHost> = Box::new(Minimal);
+    host.shutdown();
 }

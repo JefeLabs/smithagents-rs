@@ -161,6 +161,7 @@ impl AgentsPane {
             .icon(Icon::new(IconName::Plus).text_color(paint.foreground))
             .ghost()
             .small()
+            .track_focus(&self.new_agent_focus)
             .text_color(paint.foreground)
             .accessibility_label(NEW_AGENT_LABEL)
             .map(|button| {

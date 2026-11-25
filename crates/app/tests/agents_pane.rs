@@ -44,6 +44,7 @@ use smithagents_app::views::agents::{
     NEW_AGENT_ID, NOTICE_ID, NO_AGENTS_TEXT, STATUS_DOT_ID, SWATCH_ID,
 };
 use smithagents_app::views::rail::RailEntry;
+use smithagents_app::views::tabs::TOGGLE_AGENTS_ID;
 use smithagents_client::ClientError;
 use smithagents_core::agent::{Agent, AgentState, Repo};
 use smithagents_core::event::{Event, EventKind};
@@ -1430,4 +1431,121 @@ fn enter_never_closes_even_on_the_focused_close_button_but_space_does(cx: &mut T
     cx.run_until_parked();
     assert_eq!(*fake.closes.borrow(), [mercury.id]);
     assert!(!dialog_open(cx, window));
+}
+
+#[gpui_kit::test]
+fn backspace_or_delete_on_a_focused_row_or_marker_asks_to_close(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) =
+        open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    for (key, compact) in [("backspace", false), ("delete", false), ("backspace", true)] {
+        let mode = if compact {
+            LeftPaneMode::Compact
+        } else {
+            LeftPaneMode::Expanded
+        };
+        state.update(cx, |state, cx| state.set_left_pane_mode(mode, cx));
+        let item = if compact {
+            agent_marker_id(mercury.id)
+        } else {
+            agent_row_id(mercury.id)
+        };
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(item.clone(), cx);
+            assert_eq!(window.find(item.clone()).focused(), Some(true));
+            window.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            dialog_open(cx, window),
+            "{key} on the {mode:?} item asks first"
+        );
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(window.find(CLOSE_TITLE_ID).value(), Some("Close Mercury?"));
+            assert_eq!(
+                window.find(CANCEL_CLOSE_ID).focused(),
+                Some(true),
+                "Cancel is the default"
+            );
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(!dialog_open(cx, window), "Enter dismissed it");
+    }
+    assert!(fake.closes.borrow().is_empty(), "Enter never closes");
+
+    // Without a focused item the key does nothing.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(TOGGLE_AGENTS_ID, cx);
+        window.press("backspace", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!dialog_open(cx, window));
+}
+
+#[gpui_kit::test]
+fn when_the_focused_agent_goes_the_focus_moves_to_a_neighbour_then_to_new_agent(
+    cx: &mut TestAppContext,
+) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let venus = agent_with("Venus", 1, 260.0, AgentState::Idle);
+    let earth = agent_with("Earth", 2, 140.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) = open_with_commands(
+        cx,
+        connected(vec![mercury.clone(), venus.clone(), earth.clone()], vec![]),
+        &fake,
+        None,
+    );
+    let closed = |cx: &mut TestAppContext, agent: &Agent, seq: u64| {
+        state.update(cx, |state, cx| {
+            state.dispatch(
+                Action::Event(Event {
+                    seq,
+                    at: agent.created_at,
+                    kind: EventKind::AgentClosed { agent_id: agent.id },
+                }),
+                cx,
+            )
+        });
+        cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    };
+    let focused = |cx: &mut TestAppContext, id: ElementId| {
+        let mut focused = None;
+        cx.update_window(window.into(), |_, window, _| {
+            focused = window.find(id).focused();
+        })
+        .unwrap();
+        focused
+    };
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(agent_row_id(venus.id), cx)
+    })
+    .unwrap();
+
+    // The middle one goes: the one below takes the focus.
+    closed(cx, &venus, 2);
+    assert_eq!(focused(cx, agent_row_id(earth.id)), Some(true));
+    // The list keys still work from there (nothing is selected: Up starts
+    // at the last agent).
+    cx.update_window(window.into(), |_, window, cx| {
+        window.press("up", cx);
+        window.press("up", cx);
+    })
+    .unwrap();
+    assert_eq!(selected(cx, &state), Some(mercury.id));
+    assert_eq!(focused(cx, agent_row_id(mercury.id)), Some(true));
+
+    // The first one goes: the one below again.
+    closed(cx, &mercury, 3);
+    assert_eq!(focused(cx, agent_row_id(earth.id)), Some(true));
+    // The last one goes: the New agent button.
+    closed(cx, &earth, 4);
+    assert_eq!(focused(cx, NEW_AGENT_ID.into()), Some(true));
 }

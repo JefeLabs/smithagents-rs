@@ -37,8 +37,9 @@ use gpui_kit::component::{h_flex, resize_handle, v_flex, ActiveTheme as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, FocusHandle,
-    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _, Pixels,
-    Render, Styled as _, Subscription, Task, TestSupportExt as _, Window,
+    InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
+    ParentElement as _, Pixels, Render, Styled as _, Subscription, Task, TestSupportExt as _,
+    Window,
 };
 use smithagents_center_host::CenterTabHost;
 use smithagents_theme::tokens::ThemeSet;
@@ -51,7 +52,7 @@ use crate::layout_store::{
     DEFAULT_RIGHT_DOCK_SIZE, LAYOUT_VERSION, MIN_DOCK_SIZE,
 };
 use crate::link::{AgentCommands, DaemonLink, LinkConfig};
-use crate::model::ShellModel;
+use crate::model::{Action, ShellModel};
 use crate::settings::AppSettingsStore;
 use crate::shell_state::{ConnectionInfoSource, LinkFailureSource, ShellEvent, ShellState};
 use crate::tabs::{PlaceholderHost, DEFAULT_PAGE_ORIGIN};
@@ -72,6 +73,18 @@ gpui_kit::actions!(
         ToggleAgentsPane,
         /// Collapse or expand the right dock with the Settings view.
         ToggleSettingsPane,
+        /// Close the active center tab (nothing without one; the window
+        /// stays open).
+        CloseActiveTab,
+        /// Activate the center tab after the active one (the first after
+        /// the last).
+        NextTab,
+        /// Activate the center tab before the active one (the last before
+        /// the first).
+        PreviousTab,
+        /// Quit the app the way closing its window does: the layout is
+        /// saved and the tab host shut down; the daemon keeps running.
+        Quit,
     ]
 );
 
@@ -89,20 +102,72 @@ const DOCK_AREA_ID: &str = "smithagents-shell";
 /// last one.
 const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
-/// Registers the shell's key bindings: `cmd-b` switches the agents pane
-/// between expanded and compact, `cmd-alt-b` hides or shows the settings
-/// dock, plus the agents pane's and the settings view's own
+/// Registers the shell's key bindings and the app-wide [`Quit`]:
+/// - `cmd-q` quits (anywhere, also with no window focused);
+/// - `cmd-b` switches the agents pane between expanded and compact,
+///   `cmd-alt-b` hides or shows the settings dock;
+/// - `cmd-w` closes the active tab, `ctrl-tab` and `ctrl-shift-tab` cycle
+///   the tabs;
+///
+/// plus the agents pane's and the settings view's own
 /// ([`crate::views::agents::init`], [`crate::views::settings::init`]). (v1 is
 /// macOS only. `KeyBinding::new` does not resolve the portable `secondary-`
-/// modifier and panics on it.)
+/// modifier and panics on it.) The menu bar ([`app_menus`]) shows these
+/// keys as its items' key equivalents.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-b", ToggleAgentsPane, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-alt-b", ToggleSettingsPane, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-w", CloseActiveTab, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-tab", NextTab, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(KEY_CONTEXT)),
     ]);
+    cx.on_action(quit);
     crate::views::agents::init(cx);
     crate::views::settings::init(cx);
 }
+
+/// The macOS menu bar: the app menu (Quit), View (the two pane toggles)
+/// and Window (Close Tab, enabled only while a tab is active: the shell
+/// handles [`CloseActiveTab`] only then). Set once with `App::set_menus`;
+/// each item shows its key binding.
+pub fn app_menus() -> Vec<Menu> {
+    vec![
+        Menu::new(crate::WINDOW_TITLE).items([MenuItem::action(
+            format!("Quit {}", crate::WINDOW_TITLE),
+            Quit,
+        )]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Agents Pane", ToggleAgentsPane),
+            MenuItem::action("Toggle Settings", ToggleSettingsPane),
+        ]),
+        Menu::new("Window").items([MenuItem::action("Close Tab", CloseActiveTab)]),
+    ]
+}
+
+/// [`Quit`]: closes every window first, after the action that asked (which
+/// may run inside a window), so each shell takes the same path as a closed
+/// window (saves its layout, shuts its tab host down), then quits. The
+/// daemon link is dropped with the shell, which never stops the daemon.
+fn quit(_: &Quit, cx: &mut App) {
+    tracing::info!("quit requested");
+    quit_app(cx);
+}
+
+/// What [`Quit`] does; the termination signals take the same path.
+pub(crate) fn quit_app(cx: &mut App) {
+    cx.defer(|cx| {
+        for window in cx.windows() {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
+        cx.quit();
+    });
+}
+
+/// Builds the center tabs' web engine. It runs once, in [`Shell::new`],
+/// after the GPUI app exists (an engine such as CEF must be created then).
+pub type TabHostFactory = Box<dyn FnOnce(&mut App) -> Box<dyn CenterTabHost>>;
 
 /// How to build a [`Shell`]. The default is an empty, offline shell.
 #[derive(Default)]
@@ -139,11 +204,11 @@ pub struct ShellOptions {
     /// How long an `Info` status message stays; `None` is
     /// [`DEFAULT_INFO_STATUS_DURATION`](crate::shell_state::DEFAULT_INFO_STATUS_DURATION).
     pub info_status_duration: Option<Duration>,
-    /// The web engine that draws the center tabs; `None` is
-    /// [`PlaceholderHost`], which draws nothing and logs. Tests inject a
-    /// recording host (through [`SharedHost`](crate::tabs::SharedHost) to
-    /// keep a handle on it).
-    pub tab_host: Option<Box<dyn CenterTabHost>>,
+    /// Builds the web engine that draws the center tabs (once, while the
+    /// shell is built); `None` is [`PlaceholderHost`], which draws nothing
+    /// and logs. Tests inject a recording host (through
+    /// [`SharedHost`](crate::tabs::SharedHost) to keep a handle on it).
+    pub tab_host: Option<TabHostFactory>,
     /// Where chat pages load from; `None` is [`DEFAULT_PAGE_ORIGIN`]. The app
     /// passes `SMITHAGENTS_WEB_ORIGIN` when set (see
     /// [`page_origin_from`](crate::tabs::page_origin_from)). An invalid one
@@ -215,6 +280,10 @@ impl Shell {
             link_failure,
         } = options;
         let link = link.map(DaemonLink::start);
+        let tab_host = match tab_host {
+            Some(factory) => factory(cx),
+            None => Box::new(PlaceholderHost),
+        };
 
         // The saved layout. The right dock is fitted to this window so the
         // center keeps its minimum width; the left pane's remembered expanded
@@ -261,7 +330,7 @@ impl Shell {
                 state.set_link_failure_source(source, cx);
             }
             state.set_tab_host(
-                tab_host.unwrap_or_else(|| Box::new(PlaceholderHost)),
+                tab_host,
                 page_origin.unwrap_or_else(|| DEFAULT_PAGE_ORIGIN.to_owned()),
                 cx,
             );
@@ -371,13 +440,20 @@ impl Shell {
                 tracing::debug!("focus lost; returning it to the shell");
                 this.focus.focus(window, cx);
             }),
+            // The app quits (a signal, or the system's own Quit) with the
+            // window still open.
             cx.on_app_quit(|this, cx| {
                 this.pending_save = None;
                 this.save_layout(cx);
+                this.shut_down_tabs(cx);
                 async {}
             }),
-            // Closing the window releases the shell before the app quits.
-            cx.on_release(|this, cx| this.save_layout(cx)),
+            // Closing the window (and Quit, which closes it first) releases
+            // the shell before the app quits.
+            cx.on_release(|this, cx| {
+                this.save_layout(cx);
+                this.shut_down_tabs(cx);
+            }),
         ];
 
         let focus = cx.focus_handle();
@@ -400,6 +476,12 @@ impl Shell {
 
     pub fn state(&self) -> &Entity<ShellState> {
         &self.state
+    }
+
+    /// Shuts the tab host down (once, whichever of quit and close comes
+    /// first).
+    fn shut_down_tabs(&self, cx: &mut App) {
+        self.state.update(cx, |state, _| state.shut_down_tabs());
     }
 
     pub fn dock(&self) -> &Entity<DockArea> {
@@ -524,6 +606,46 @@ impl Shell {
             .update(cx, |state, cx| state.set_left_expanded_width(width, cx));
     }
 
+    fn on_close_active_tab(&mut self, _: &CloseActiveTab, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.state.read(cx).model().active_tab() else {
+            return;
+        };
+        tracing::debug!(source = "shortcut", agent = %active, "close tab");
+        self.state
+            .update(cx, |state, cx| state.dispatch(Action::CloseTab(active), cx));
+    }
+
+    fn on_next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(true, cx);
+    }
+
+    fn on_previous_tab(&mut self, _: &PreviousTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(false, cx);
+    }
+
+    /// Activates the tab after (or before) the active one, wrapping around;
+    /// nothing without a tab.
+    fn cycle_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let next = {
+            let model = self.state.read(cx).model();
+            let tabs = model.tabs();
+            let at = model
+                .active_tab()
+                .and_then(|active| tabs.iter().position(|tab| *tab == active));
+            match (tabs.len(), at) {
+                (0, _) => None,
+                (len, Some(at)) if forward => Some(tabs[(at + 1) % len]),
+                (len, Some(at)) => Some(tabs[(at + len - 1) % len]),
+                (len, None) => Some(tabs[if forward { 0 } else { len - 1 }]),
+            }
+        };
+        if let Some(next) = next {
+            tracing::debug!(source = "shortcut", agent = %next, "switch tab");
+            self.state
+                .update(cx, |state, cx| state.dispatch(Action::OpenTab(next), cx));
+        }
+    }
+
     fn on_toggle_settings(
         &mut self,
         _: &ToggleSettingsPane,
@@ -620,6 +742,7 @@ impl Render for Shell {
             let _ = state.update(cx, |state, cx| state.install_update(cx));
         };
         let expanded = self.state.read(cx).left_pane_mode() == LeftPaneMode::Expanded;
+        let has_active_tab = self.state.read(cx).model().active_tab().is_some();
         let left_width = self.fitted_left_width(self.state.read(cx).left_pane_layout(), window, cx);
         let native = self.state.read(cx).shared_native_theme();
         let theme = cx.theme();
@@ -660,6 +783,13 @@ impl Render for Shell {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_toggle_agents))
             .on_action(cx.listener(Self::on_toggle_settings))
+            .on_action(cx.listener(Self::on_next_tab))
+            .on_action(cx.listener(Self::on_previous_tab))
+            // Only with a tab to close, so the menu's Close Tab is disabled
+            // otherwise (macOS asks whether the action is available).
+            .when(has_active_tab, |this| {
+                this.on_action(cx.listener(Self::on_close_active_tab))
+            })
             .on_drag_move(cx.listener(Self::on_left_pane_drag))
             .size_full()
             .child(title_bar(

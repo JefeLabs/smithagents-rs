@@ -612,11 +612,16 @@ fn closing_the_window_saves_the_layout(cx: &mut TestAppContext) {
     let (window, shell) = open_shell_with(cx, ShellModel::new(), Some(store.clone()));
     cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();
+    let state = shell.read_with(cx, |shell, _| shell.state().downgrade());
     // Only the window holds the shell now, so closing it releases the shell.
     drop(shell);
     cx.update_window(window.into(), |_, window, _| window.remove_window())
         .unwrap();
     cx.run_until_parked();
+    assert!(
+        state.upgrade().is_none(),
+        "the shell state (and its daemon link) is released with the window"
+    );
 
     let saved = store.load().expect("the layout was written on close");
     assert_eq!(

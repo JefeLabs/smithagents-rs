@@ -556,6 +556,11 @@ impl ShellState {
         }
     }
 
+    /// Shuts the tab host down; only the first call reaches it.
+    pub(crate) fn shut_down_tabs(&mut self) {
+        self.tabs.shutdown();
+    }
+
     /// Positions the web tabs at the center's new rectangle.
     fn set_tab_bounds(&mut self, rect: PixelRect) {
         self.tabs.on_bounds(rect);

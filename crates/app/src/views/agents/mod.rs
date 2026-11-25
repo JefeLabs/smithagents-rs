@@ -16,9 +16,13 @@
 //! In both modes a click selects and a double-click opens the agent's chat
 //! tab. On the focused row or marker (listbox keys), Space selects and Enter
 //! opens; Up and Down move the selection, the keyboard focus and the scroll
-//! position with it. The context menu's "Close agent" asks first; the
-//! confirmation's default (Enter) is Cancel. A row and a marker of the same
-//! agent share one focus handle, so switching modes keeps the focus.
+//! position with it. The context menu's "Close agent", or Backspace or Delete
+//! on the focused row or marker (gpui-component's context menu opens only on
+//! a right click), asks first; the confirmation's default (Enter) is Cancel.
+//! A row and a marker of the same agent share one focus handle, so switching
+//! modes keeps the focus. When the focused agent leaves the list, the focus
+//! moves to the row below it (else above), or to the New agent button when
+//! none is left, so the list keys keep working.
 //!
 //! The New agent button follows [`new_agent_plan`]: with no repository it
 //! shows the Settings view and a hint; with one it creates right away; with
@@ -76,6 +80,8 @@ gpui_kit::actions!(
         /// Select the agent below the selected one (the first if none is), and
         /// move the keyboard focus to it.
         SelectNextAgent,
+        /// Ask to close the agent whose row or marker has the keyboard focus.
+        CloseFocusedAgent,
     ]
 );
 
@@ -131,13 +137,16 @@ const MARKER_DOT_GAP: f32 = 2.;
 /// The opacity of a dimmed (quiet) dot.
 const DIMMED: f32 = 0.5;
 
-/// Registers the pane's key bindings: Up and Down move the selection.
-/// Enter and Space need no binding: they activate the focused row or marker
-/// (a GPUI keyboard click), Enter to open and Space to select.
+/// Registers the pane's key bindings: Up and Down move the selection;
+/// Backspace and Delete ask to close the focused agent. Enter and Space need
+/// no binding: they activate the focused row or marker (a GPUI keyboard
+/// click), Enter to open and Space to select.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", SelectPreviousAgent, Some(KEY_CONTEXT)),
         KeyBinding::new("down", SelectNextAgent, Some(KEY_CONTEXT)),
+        KeyBinding::new("backspace", CloseFocusedAgent, Some(KEY_CONTEXT)),
+        KeyBinding::new("delete", CloseFocusedAgent, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -174,6 +183,11 @@ pub struct AgentsPane {
     focus: FocusHandle,
     /// One focus handle per agent, shared by its row and its marker.
     item_focus: HashMap<AgentId, FocusHandle>,
+    /// The agents in the order last drawn, to find a gone one's neighbour.
+    order: Vec<AgentId>,
+    /// The New agent button's focus, where the focus goes when the last
+    /// agent leaves.
+    new_agent_focus: FocusHandle,
     /// The list's scroll position, so the keyboard keeps the selection in
     /// view.
     scroll: ScrollHandle,
@@ -199,6 +213,8 @@ impl AgentsPane {
             state,
             focus: cx.focus_handle(),
             item_focus: HashMap::new(),
+            order: Vec::new(),
+            new_agent_focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             create: None,
             awaiting: None,
@@ -215,7 +231,68 @@ impl AgentsPane {
             self.give_up_commands(window, cx);
         }
         self.select_awaited(cx);
+        self.keep_focus_in_the_list(window, cx);
         cx.notify();
+    }
+
+    /// The focused agent left the list: its focus handle is about to go,
+    /// which would drop the focus out of the pane. Move it to the agent drawn
+    /// below it (else above), or to the New agent button when none is left.
+    fn keep_focus_in_the_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<AgentId> = {
+            let model = self.state.read(cx).model();
+            model.agents().iter().map(|agent| agent.id).collect()
+        };
+        let Some(gone) = self
+            .item_focus
+            .iter()
+            .find(|(id, focus)| !ids.contains(id) && focus.is_focused(window))
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        let stays = |id: &&AgentId| ids.contains(id);
+        let neighbour = self.order.iter().position(|id| *id == gone).and_then(|at| {
+            self.order[at + 1..]
+                .iter()
+                .find(stays)
+                .or_else(|| self.order[..at].iter().rev().find(stays))
+                .copied()
+        });
+        tracing::debug!(agent = %gone, ?neighbour, "the focused agent left the list");
+        match neighbour.and_then(|id| self.item_focus.get(&id)) {
+            Some(focus) => focus.focus(window, cx),
+            None => self.new_agent_focus.focus(window, cx),
+        }
+    }
+
+    /// Backspace or Delete: asks to close the agent whose row or marker has
+    /// the focus (the same confirmation as the context menu's).
+    fn close_focused(
+        &mut self,
+        _: &CloseFocusedAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self
+            .item_focus
+            .iter()
+            .find(|(_, focus)| focus.is_focused(window))
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        let Some(name) = self
+            .state
+            .read(cx)
+            .model()
+            .agent(id)
+            .map(|agent| agent.name.clone())
+        else {
+            return;
+        };
+        tracing::debug!(agent = %id, source = "keyboard", "close agent asked");
+        close::confirm_close(cx.entity().downgrade(), id, name, window, cx);
     }
 
     /// The connection dropped while commands waited: their answers may never
@@ -304,8 +381,9 @@ impl AgentsPane {
         }
     }
 
-    /// Keeps one focus handle per open agent.
+    /// Keeps one focus handle per open agent, and their order.
     fn sync_item_focus(&mut self, rows: &[AgentRowVm], cx: &mut Context<Self>) {
+        self.order = rows.iter().map(|row| row.id).collect();
         self.item_focus
             .retain(|id, _| rows.iter().any(|row| row.id == *id));
         for row in rows {
@@ -508,6 +586,7 @@ impl Render for AgentsPane {
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::close_focused))
             .size_full()
             .bg(paint.surface)
             .text_color(paint.foreground)

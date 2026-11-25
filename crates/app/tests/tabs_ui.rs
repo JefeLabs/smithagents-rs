@@ -102,7 +102,9 @@ fn open_with(
     let conn: Conn = Rc::new(RefCell::new(Some((PORT, TOKEN.to_owned()))));
     let mut options = ShellOptions {
         model,
-        tab_host: Some(Box::new(host)),
+        tab_host: Some(Box::new(move |_: &mut gpui_kit::App| {
+            Box::new(host) as Box<dyn CenterTabHost>
+        })),
         connection_info: Some(conn_source(&conn)),
         ..Default::default()
     };
@@ -566,9 +568,9 @@ fn a_reconnect_to_a_new_daemon_reopens_the_tabs_with_its_token(cx: &mut TestAppC
     let calls = h.calls_since(before);
     assert!(calls.len() >= 7, "{calls:?}");
     let new = [last_opened_id(&h, &mercury), last_opened_id(&h, &venus)];
+    // Per tab: the new view first, then the old one closes.
     for ix in 0..2 {
-        assert_eq!(calls[ix * 3], HostCall::Close(old[ix]));
-        let (spec, boot) = opened(&calls[ix * 3 + 1]);
+        let (spec, boot) = opened(&calls[ix * 3]);
         assert_eq!(spec.id, new[ix]);
         assert_ne!(new[ix], old[ix]);
         assert!(boot.host_script().contains(NEW_TOKEN));
@@ -576,7 +578,8 @@ fn a_reconnect_to_a_new_daemon_reopens_the_tabs_with_its_token(cx: &mut TestAppC
         assert!(boot
             .redacted_host_script()
             .contains(&format!("http://127.0.0.1:{NEW_PORT}")));
-        assert_eq!(calls[ix * 3 + 2], HostCall::SetBounds(rect));
+        assert_eq!(calls[ix * 3 + 1], HostCall::SetBounds(rect));
+        assert_eq!(calls[ix * 3 + 2], HostCall::Close(old[ix]));
     }
     assert_eq!(calls[6], HostCall::Show(new[0]), "Mercury was shown");
     // The banner went away and the center moved back: bounds follow.
@@ -659,7 +662,9 @@ fn a_host_that_refuses_the_tab_reports_its_message_and_leaves_no_tab(cx: &mut Te
     let failing = SharedHost::new(FailingHost::default());
     let handle = failing.handle();
     let h = open_with(cx, connected(vec![mercury.clone()]), |options| {
-        options.tab_host = Some(Box::new(failing));
+        options.tab_host = Some(Box::new(move |_: &mut gpui_kit::App| {
+            Box::new(failing) as Box<dyn CenterTabHost>
+        }));
     });
 
     double_click_row(cx, &h, &mercury);

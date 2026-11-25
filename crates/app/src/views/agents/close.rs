@@ -124,7 +124,7 @@ impl AgentsPane {
 
 /// Asks before closing an agent: "Close <name>?" with Cancel (focused, and
 /// what Enter does) and a danger "Close agent" button, the only way to close.
-fn confirm_close(
+pub(super) fn confirm_close(
     pane: WeakEntity<AgentsPane>,
     id: AgentId,
     name: String,

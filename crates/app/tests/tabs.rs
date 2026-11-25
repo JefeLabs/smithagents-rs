@@ -13,6 +13,7 @@ use smithagents_app::model::Effect;
 use smithagents_app::tabs::{
     page_origin_from, PlaceholderHost, TabError, TabManager, DEFAULT_PAGE_ORIGIN,
 };
+use smithagents_app::view_models::tab_error_text;
 use smithagents_center_host::{
     CenterTabHost, ExternalUrl, HostCall, HostError, PageBoot, PixelRect, RecordingHost, TabId,
     TabKind, TabSpec,
@@ -328,9 +329,10 @@ fn a_new_token_reopens_every_tab_with_it_and_reshows_the_shown_one() {
     let new: Vec<TabId> = agents.iter().map(|a| m.tab_id(a.id).unwrap()).collect();
     let calls = calls_since(&m, before);
     assert_eq!(calls.len(), 10, "{calls:?}");
+    // Per tab: the new view first (hidden, positioned), then the old one
+    // closes, so the old page stays on screen until the new one exists.
     for (ix, a) in agents.iter().enumerate() {
-        assert_eq!(calls[ix * 3], HostCall::Close(old[ix]));
-        let (spec, boot) = opened(&calls[ix * 3 + 1]);
+        let (spec, boot) = opened(&calls[ix * 3]);
         assert_eq!(spec.id, new[ix]);
         assert_ne!(new[ix], old[ix], "a re-opened tab gets a fresh id");
         assert_eq!(spec.title, a.name);
@@ -342,7 +344,8 @@ fn a_new_token_reopens_every_tab_with_it_and_reshows_the_shown_one() {
         assert!(boot
             .redacted_host_script()
             .contains(&format!("http://127.0.0.1:{NEW_PORT}")));
-        assert_eq!(calls[ix * 3 + 2], HostCall::SetBounds(rect(800.0)));
+        assert_eq!(calls[ix * 3 + 1], HostCall::SetBounds(rect(800.0)));
+        assert_eq!(calls[ix * 3 + 2], HostCall::Close(old[ix]));
     }
     assert_eq!(calls[9], HostCall::Show(new[1]), "Venus is shown again");
     assert_eq!(m.shown(), Some(agents[1].id));
@@ -376,11 +379,11 @@ fn a_new_port_alone_reopens_the_tabs() {
     let new = m.tab_id(mercury.id).unwrap();
     let calls = calls_since(&m, before);
     assert_eq!(calls.len(), 3, "{calls:?}");
-    assert_eq!(calls[0], HostCall::Close(old));
-    let (_, boot) = opened(&calls[1]);
+    let (_, boot) = opened(&calls[0]);
     assert!(boot
         .redacted_host_script()
         .contains(&format!("http://127.0.0.1:{NEW_PORT}")));
+    assert_eq!(calls[1], HostCall::Close(old), "after the new view");
     assert_eq!(calls[2], HostCall::Show(new));
 }
 
@@ -538,17 +541,40 @@ fn the_dev_origin_is_used_for_the_page_url() {
 }
 
 #[test]
-fn the_page_origin_comes_from_the_environment_value_or_the_product_default() {
+fn a_debug_build_takes_the_page_origin_from_the_environment_value() {
     assert_eq!(DEFAULT_PAGE_ORIGIN, "smithagents://app");
-    assert_eq!(page_origin_from(None), DEFAULT_PAGE_ORIGIN);
-    assert_eq!(page_origin_from(Some("")), DEFAULT_PAGE_ORIGIN);
-    assert_eq!(page_origin_from(Some("  ")), DEFAULT_PAGE_ORIGIN);
+    let dev = |value| page_origin_from(value, true);
+    assert_eq!(dev(None), DEFAULT_PAGE_ORIGIN);
+    assert_eq!(dev(Some("")), DEFAULT_PAGE_ORIGIN);
+    assert_eq!(dev(Some("  ")), DEFAULT_PAGE_ORIGIN);
     assert_eq!(
-        page_origin_from(Some(" http://localhost:5173 ")),
+        dev(Some(" http://localhost:5173 ")),
         "http://localhost:5173"
     );
     // An invalid value is kept as given: opening reports it.
-    assert_eq!(page_origin_from(Some("file:///x")), "file:///x");
+    assert_eq!(dev(Some("file:///x")), "file:///x");
+}
+
+#[test]
+fn a_release_build_always_loads_the_product_origin_and_warns_once_when_set() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        assert_eq!(page_origin_from(None, false), DEFAULT_PAGE_ORIGIN);
+        assert_eq!(page_origin_from(Some("  "), false), DEFAULT_PAGE_ORIGIN);
+        assert_eq!(
+            page_origin_from(Some("http://localhost:5173"), false),
+            DEFAULT_PAGE_ORIGIN
+        );
+    });
+    let log = captured.text();
+    let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+    assert_eq!(warnings.len(), 1, "{log}");
+    assert!(warnings[0].contains("SMITHAGENTS_WEB_ORIGIN"), "{log}");
 }
 
 struct NoWindow;
@@ -566,15 +592,82 @@ fn attach_goes_to_the_host() {
     assert_eq!(calls(&m), vec![HostCall::Attach]);
 }
 
+/// A host that refuses every page with an error naming what it was given
+/// (the page and the redacted script, never the token).
+struct RefusingHost;
+
+impl CenterTabHost for RefusingHost {
+    fn attach(&mut self, _: &dyn HasWindowHandle) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn open(&mut self, spec: TabSpec, boot: PageBoot) -> Result<(), HostError> {
+        Err(HostError::Engine(format!(
+            "cannot load {} for {:?}: {boot:?}",
+            boot.page_url(),
+            spec.title
+        )))
+    }
+    fn close(&mut self, _: TabId) {}
+    fn show(&mut self, _: TabId) {}
+    fn set_bounds(&mut self, _: PixelRect) {}
+    fn push_theme(&mut self, _: &ThemeState) {}
+    fn open_external(&mut self, _: &ExternalUrl) {}
+}
+
 #[test]
 fn errors_never_carry_the_token() {
-    for err in [
-        TabError::NotConnected,
-        TabError::UnknownAgent,
-        TabError::Host(HostError::InvalidOrigin),
-    ] {
-        assert!(!err.to_string().contains(TOKEN));
-        assert!(!format!("{err:?}").contains(TOKEN));
+    let mercury = agent("Mercury");
+    let theme = theme_state(Appearance::Dark);
+    let open = |m: &mut TabManager<RecordingHost>, agent: Option<&Agent>, conn| {
+        m.handle(Effect::OpenCenterTab(mercury.id), agent, conn)
+            .expect_err("the open fails")
+    };
+    let given = Some((PORT, TOKEN));
+    let mut errors = vec![
+        // The open was given the token each time.
+        open(&mut manager(), None, given),
+        open(&mut manager(), Some(&agent("Venus")), given),
+        open(&mut manager(), Some(&mercury), Some((0, TOKEN))),
+        open(&mut manager(), Some(&mercury), None),
+    ];
+    let mut invalid = TabManager::new(RecordingHost::default(), "file:///x".into(), theme.clone());
+    errors.push(open(&mut invalid, Some(&mercury), given));
+    let mut refusing = TabManager::new(RefusingHost, ORIGIN.into(), theme.clone());
+    errors.push(
+        refusing
+            .handle(Effect::OpenCenterTab(mercury.id), Some(&mercury), given)
+            .unwrap_err(),
+    );
+    // A re-open for a new daemon whose agent is gone.
+    let mut reopened = manager();
+    reopened
+        .handle(Effect::OpenCenterTab(mercury.id), Some(&mercury), given)
+        .unwrap();
+    let failed = reopened.on_connection(Some((NEW_PORT, NEW_TOKEN)), &|_| None);
+    errors.extend(failed.into_iter().map(|(_, error)| error));
+
+    let kinds: Vec<String> = errors.iter().map(|e| format!("{e:?}")).collect();
+    assert!(
+        matches!(
+            errors.as_slice(),
+            [
+                TabError::UnknownAgent,
+                TabError::UnknownAgent,
+                TabError::Host(HostError::InvalidPort),
+                TabError::NotConnected,
+                TabError::Host(HostError::InvalidOrigin),
+                TabError::Host(HostError::Engine(_)),
+                TabError::UnknownAgent,
+            ]
+        ),
+        "{kinds:?}"
+    );
+    for err in &errors {
+        for token in [TOKEN, NEW_TOKEN] {
+            assert!(!err.to_string().contains(token), "{err}");
+            assert!(!format!("{err:?}").contains(token), "{err:?}");
+            assert!(!tab_error_text(err).contains(token));
+        }
     }
 }
 
@@ -662,4 +755,28 @@ fn setting_the_theme_already_in_effect_pushes_nothing() {
     m.set_theme(light.clone());
     m.set_theme(light.clone());
     assert_eq!(calls_since(&m, before), vec![HostCall::PushTheme(light)]);
+}
+
+#[test]
+fn shutdown_reaches_the_host_once_and_nothing_follows_it() {
+    let mercury = agent("Mercury");
+    let mut m = manager();
+    open(&mut m, &mercury);
+    m.shutdown();
+    m.shutdown();
+    let before = calls(&m).len();
+    assert_eq!(calls(&m).last(), Some(&HostCall::Shutdown));
+    assert_eq!(
+        calls(&m)
+            .iter()
+            .filter(|call| **call == HostCall::Shutdown)
+            .count(),
+        1
+    );
+    m.on_bounds(rect(500.0));
+    m.set_theme(theme_state(Appearance::Light));
+    assert!(m
+        .handle(Effect::OpenCenterTab(mercury.id), Some(&mercury), conn())
+        .is_err());
+    assert_eq!(calls(&m).len(), before, "no call after the shutdown");
 }
