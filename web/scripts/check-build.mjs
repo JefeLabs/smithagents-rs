@@ -15,4 +15,10 @@ assert.ok(cssFiles.length > 0, "no built css");
 const css = cssFiles.map((f) => readFileSync(`dist/assets/${f}`, "utf8")).join("\n");
 assert.ok(css.includes("--color-background"), "css lacks --color-background");
 assert.ok(/\[data-theme=["']?smith-dark["']?\]/.test(css), "css lacks smith-dark rule");
+
+
+const jsFiles = readdirSync("dist/assets").filter((f) => f.endsWith(".js"));
+const js = jsFiles.map((f) => readFileSync(`dist/assets/${f}`, "utf8")).join("\n");
+assert.ok(!js.includes("smith-dev-query-fallback"), "dev query-param fallback leaked into production build");
+assert.ok(!js.includes('"daemon"'), "dev query key leaked into production build");
 console.log("build output OK");
