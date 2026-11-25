@@ -1390,3 +1390,272 @@ async fn cors_does_not_weaken_ws_token_check() {
         other => panic!("unexpected {other:?}"),
     }
 }
+
+// ------------------------------------------------------------------ chat
+
+fn completed() -> HarnessEvent {
+    HarnessEvent::TurnCompleted {
+        session_id: "s".into(),
+        is_error: false,
+        result_text: None,
+    }
+}
+
+fn text(t: &str) -> HarnessEvent {
+    HarnessEvent::AssistantText { text: t.into() }
+}
+
+async fn post_chat(fx: &Fx, id: AgentId, body: Value) -> axum::response::Response {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/agents/{id}/chat"))
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    router(fx.state.clone()).oneshot(req).await.unwrap()
+}
+
+/// Parsed SSE events: JSON of each `data:` line, `[DONE]` as a string.
+fn parse_sse(raw: &str) -> Vec<Value> {
+    raw.split("\n\n")
+        .filter_map(|block| {
+            let data: Vec<&str> = block
+                .lines()
+                .filter(|l| !l.starts_with(':'))
+                .filter_map(|l| l.strip_prefix("data: "))
+                .collect();
+            if data.is_empty() {
+                return None;
+            }
+            let data = data.join("\n");
+            Some(if data == "[DONE]" {
+                Value::String(data)
+            } else {
+                serde_json::from_str(&data).unwrap()
+            })
+        })
+        .collect()
+}
+
+async fn chat_body(resp: axum::response::Response) -> String {
+    let bytes = tokio::time::timeout(Duration::from_secs(10), resp.into_body().collect())
+        .await
+        .expect("stream did not end")
+        .unwrap()
+        .to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn types(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|e| match e {
+            Value::String(s) => s.clone(),
+            v => v["type"].as_str().unwrap().to_string(),
+        })
+        .collect()
+}
+
+async fn wait_agent_state(fx: &Fx, id: AgentId, want: &str) {
+    for _ in 0..200 {
+        let (_, body) = fx.call(Method::GET, "/v1/agents", None).await;
+        if body
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == json!(id) && a["state"] == want)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("agent never reached {want}");
+}
+
+#[tokio::test]
+async fn chat_streams_a_normal_turn() {
+    let harness = FakeHarness::scripted(vec![vec![text("Hello"), text(", world"), completed()]]);
+    let fx = fixture(harness, 1024).await;
+    let agent = fx.create_agent(&fx.add_repo().await).await;
+    let resp = post_chat(&fx, agent.id, json!({ "text": "hi" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-cache");
+    assert_eq!(resp.headers()["x-vercel-ai-ui-message-stream"], "v1");
+    let events = parse_sse(&chat_body(resp).await);
+    assert_eq!(
+        types(&events),
+        [
+            "start",
+            "start-step",
+            "text-start",
+            "text-delta",
+            "text-delta",
+            "text-end",
+            "finish-step",
+            "finish",
+            "[DONE]"
+        ]
+    );
+    let joined: String = events
+        .iter()
+        .filter(|e| e["type"] == "text-delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(joined, "Hello, world");
+    assert!(events[0]["messageId"].is_string());
+    assert_eq!(events[2]["id"], "t1");
+}
+
+#[tokio::test]
+async fn chat_while_a_turn_runs_is_409_json() {
+    let harness = FakeHarness::scripted(vec![vec![text("a"), completed()]])
+        .with_delay(Duration::from_millis(300));
+    let fx = fixture(harness, 1024).await;
+    let agent = fx.create_agent(&fx.add_repo().await).await;
+    let first = post_chat(&fx, agent.id, json!({ "text": "one" })).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = post_chat(&fx, agent.id, json!({ "text": "two" })).await;
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    assert_ne!(second.headers()[header::CONTENT_TYPE], "text/event-stream");
+    let body: Value = serde_json::from_str(&chat_body(second).await).unwrap();
+    assert_error(&body, "turn_in_progress");
+    chat_body(first).await;
+}
+
+#[tokio::test]
+async fn chat_rejects_unknown_agent_empty_text_and_missing_token() {
+    let fx = default_fx().await;
+    let agent = fx.create_agent(&fx.add_repo().await).await;
+
+    let resp = post_chat(&fx, AgentId::new(), json!({ "text": "hi" })).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_str(&chat_body(resp).await).unwrap();
+    assert_error(&body, "agent_not_found");
+
+    for t in ["", "  \n\t "] {
+        let resp = post_chat(&fx, agent.id, json!({ "text": t })).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&chat_body(resp).await).unwrap();
+        assert_error(&body, "bad_request");
+    }
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/agents/{}/chat", agent.id))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({ "text": "hi" }).to_string()))
+        .unwrap();
+    let (status, body) = raw(&fx.state, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_error(&body, "unauthorized");
+}
+
+#[tokio::test]
+async fn chat_failed_turn_streams_an_error_then_finishes_and_agent_is_dead() {
+    let harness = FakeHarness::scripted(vec![vec![
+        text("partial"),
+        HarnessEvent::TurnCompleted {
+            session_id: "s".into(),
+            is_error: true,
+            result_text: Some("boom".into()),
+        },
+    ]]);
+    let fx = fixture(harness, 1024).await;
+    let agent = fx.create_agent(&fx.add_repo().await).await;
+    let resp = post_chat(&fx, agent.id, json!({ "text": "hi" })).await;
+    let events = parse_sse(&chat_body(resp).await);
+    let t = types(&events);
+    assert_eq!(
+        t,
+        [
+            "start",
+            "start-step",
+            "text-start",
+            "text-delta",
+            "text-end",
+            "error",
+            "finish-step",
+            "finish",
+            "[DONE]"
+        ]
+    );
+    assert_eq!(events[5]["errorText"], "The agent stopped unexpectedly.");
+    wait_agent_state(&fx, agent.id, "dead").await;
+}
+
+#[tokio::test]
+async fn chat_client_drop_does_not_cancel_the_turn() {
+    let harness = FakeHarness::scripted(vec![
+        vec![text("one"), text("two"), text("three"), completed()],
+        vec![text("again"), completed()],
+    ])
+    .with_delay(Duration::from_millis(50));
+    let fx = fixture(harness, 1024).await;
+    let agent = fx.create_agent(&fx.add_repo().await).await;
+    let resp = post_chat(&fx, agent.id, json!({ "text": "hi" })).await;
+    let mut body = resp.into_body();
+    // Read until the first text delta arrives, then drop the connection.
+    let mut seen = String::new();
+    while !seen.contains("text-delta") {
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        seen.push_str(&String::from_utf8_lossy(frame.data_ref().unwrap()));
+    }
+    drop(body);
+
+    wait_agent_state(&fx, agent.id, "done").await;
+    let (_, msgs) = fx
+        .call(
+            Method::GET,
+            &format!("/v1/agents/{}/messages", agent.id),
+            None,
+        )
+        .await;
+    let msgs: Vec<ChatMessage> = serde_json::from_value(msgs).unwrap();
+    let reply = msgs.iter().find(|m| m.role == Role::Assistant).unwrap();
+    assert_eq!(reply.text, "onetwothree");
+
+    let resp = post_chat(&fx, agent.id, json!({ "text": "next" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = parse_sse(&chat_body(resp).await);
+    assert_eq!(types(&events).last().unwrap(), "[DONE]");
+    assert_eq!(events[3]["delta"], "again");
+}
+
+#[tokio::test]
+async fn chat_without_deltas_has_no_text_part_but_still_finishes() {
+    let harness = FakeHarness::scripted(vec![vec![completed()]]);
+    let fx = fixture(harness, 1024).await;
+    let agent = fx.create_agent(&fx.add_repo().await).await;
+    let resp = post_chat(&fx, agent.id, json!({ "text": "hi" })).await;
+    let events = parse_sse(&chat_body(resp).await);
+    assert_eq!(
+        types(&events),
+        ["start", "start-step", "finish-step", "finish", "[DONE]"]
+    );
+}
+
+#[tokio::test]
+async fn chat_after_a_finished_turn_ignores_the_old_terminal_event() {
+    let harness = FakeHarness::scripted(vec![
+        vec![text("first"), completed()],
+        vec![text("second"), completed()],
+    ]);
+    let fx = fixture(harness, 1024).await;
+    let agent = fx.create_agent(&fx.add_repo().await).await;
+    for expected in ["first", "second"] {
+        let resp = post_chat(&fx, agent.id, json!({ "text": "hi" })).await;
+        let events = parse_sse(&chat_body(resp).await);
+        let joined: String = events
+            .iter()
+            .filter(|e| e["type"] == "text-delta")
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(joined, expected);
+    }
+}
