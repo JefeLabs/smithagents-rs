@@ -1,0 +1,6 @@
+@import "tailwindcss";
+@import "../../design/generated/theme.css";
+
+body {
+  @apply bg-background text-foreground font-sans;
+}
