@@ -1,6 +1,9 @@
-//! Helpers for the link tests: the daemon binary, a temporary home that stops
-//! its daemon on drop, and a git fixture.
+//! Helpers for the integration tests: the daemon binary, a temporary home
+//! that stops its daemon on drop, and a git fixture (the link tests), plus
+//! [`ui`] for the headless shell tests.
 #![allow(dead_code)]
+
+pub mod ui;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
