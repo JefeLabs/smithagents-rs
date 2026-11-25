@@ -663,3 +663,118 @@ async fn real_claude_smoke() {
     })
     .await;
 }
+
+/// Polls intent `id` until `wanted` accepts it (a failed pass ends the wait
+/// with a panic, since the smoke test never retries).
+async fn poll_intent(
+    client: &Client,
+    id: smithagents_core::ids::IntentId,
+    what: &str,
+    wanted: impl Fn(&smithagents_core::intent::Intent) -> bool,
+) -> smithagents_core::intent::Intent {
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        let intent = client.get_intent(id).await.unwrap();
+        if let smithagents_core::intent::Phase::Failed { pass, message } = &intent.phase {
+            panic!("pass {pass} failed while waiting for {what}: {message}");
+        }
+        if wanted(&intent) {
+            return intent;
+        }
+        assert!(Instant::now() < deadline, "{what} did not happen in time");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Manual smoke of the polish passes against the real `claude` CLI (see
+/// `real_claude_smoke` for the setup). It makes one short chat turn and two
+/// small structured calls (polish passes 1 and 2, on the model named by
+/// `SMITHAGENTS_POLISH_MODEL=haiku`). It does not Send, so no agent runs.
+///
+/// `cargo test -p smithagents-client --test e2e -- --ignored real_claude_polish_smoke --nocapture`
+#[tokio::test]
+#[ignore = "calls the real claude CLI, which must be installed and logged in"]
+async fn real_claude_polish_smoke() {
+    use smithagents_core::intent::{
+        AnswerInput, CreateIntentRequest, IntentState, ItemStatus, Phase, SeedInput,
+    };
+
+    let bin = daemon_bin();
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let home = TestHome::new();
+    bounded(SMOKE_DEADLINE, async {
+        let options = SpawnOptions {
+            args: Vec::new(),
+            env: vec![("SMITHAGENTS_POLISH_MODEL".into(), "haiku".into())],
+        };
+        let client = ensure(&home, bin, &options).await;
+        let mut events = client.events(None).await.unwrap();
+        let repo_dir = repo_tmp.path().join("repo");
+        init_repo(&repo_dir);
+        std::fs::write(
+            repo_dir.join("greet.py"),
+            "def greet(name):\n    return \"hello \" + name\n",
+        )
+        .unwrap();
+        git(&repo_dir, &["add", "greet.py"]);
+        git(&repo_dir, &["commit", "-m", "add greet"]);
+        let repo = client.add_repo(&repo_dir).await.unwrap();
+        let agent = client.create_agent(repo.id).await.unwrap();
+
+        client
+            .send_message(agent.id, "Reply with the single word: ok")
+            .await
+            .unwrap();
+        let end = turn_end(&mut events, agent.id).await;
+        assert_eq!(end.state, AgentState::Done, "daemon log:\n{}", home.log());
+
+        let created = client
+            .create_intent(CreateIntentRequest {
+                repo_id: None,
+                seed: SeedInput::Chat {
+                    agent_id: agent.id,
+                    from_seq: None,
+                    to_seq: None,
+                },
+            })
+            .await
+            .unwrap();
+        let pass1 = poll_intent(&client, created.id, "pass 1", |i| {
+            !matches!(i.phase, Phase::Polishing { pass: 1 })
+        })
+        .await;
+        println!("title: {}", pass1.content.title);
+        for q in &pass1.content.questions {
+            println!("question: {} ({} options)", q.text, q.options.len());
+        }
+        assert!(!pass1.content.title.trim().is_empty());
+        assert!(pass1.content.questions.len() <= 5);
+        for q in &pass1.content.questions {
+            assert!(q.options.len() >= 2, "{q:?}");
+        }
+        if pass1.phase == Phase::Questions {
+            for q in &pass1.content.questions {
+                client
+                    .answer_question(created.id, q.id, AnswerInput::Skip)
+                    .await
+                    .unwrap();
+            }
+        }
+        let done = poll_intent(&client, created.id, "pass 2", |i| {
+            matches!(i.phase, Phase::Review) || i.state == IntentState::Complete
+        })
+        .await;
+        println!("{:#?}", done.content);
+        for item in done
+            .content
+            .preconditions
+            .iter()
+            .chain(&done.content.criteria)
+            .chain(&done.content.stories)
+            .chain(&done.content.depends_on)
+        {
+            assert_eq!(item.status, ItemStatus::Pending, "{item:?}");
+        }
+    })
+    .await;
+}

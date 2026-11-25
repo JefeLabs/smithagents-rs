@@ -23,7 +23,7 @@ use smithagents_core::intent::{
 };
 use smithagents_core::VERSION;
 
-use common::{claude_fixture, daemon_bin, fake_claude, init_repo, TestHome};
+use common::{claude_fixture, daemon_bin, fake_claude, init_repo, pid_alive, TestHome};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -45,6 +45,10 @@ fn write_json(path: &Path, value: &serde_json::Value) {
 }
 
 async fn start() -> Fixture {
+    start_with(&[]).await
+}
+
+async fn start_with(extra_env: &[(&str, &str)]) -> Fixture {
     let bin = daemon_bin();
     let home = TestHome::new();
     let scratch = home.scratch().to_owned();
@@ -74,7 +78,7 @@ async fn start() -> Fixture {
         }),
     );
     std::fs::write(control_dir.join("structured"), pass1.to_str().unwrap()).unwrap();
-    let options = SpawnOptions {
+    let mut options = SpawnOptions {
         args: vec!["--claude-bin".into(), fake_claude().into()],
         env: vec![
             ("FAKE_CLAUDE_FIXTURE".into(), claude_fixture().into()),
@@ -82,6 +86,9 @@ async fn start() -> Fixture {
             ("FAKE_CLAUDE_CONTROL_DIR".into(), control_dir.clone().into()),
         ],
     };
+    options
+        .env
+        .extend(extra_env.iter().map(|&(k, v)| (k.into(), v.into())));
     let client = within(
         "ensure_daemon_with",
         ensure_daemon_with(home.path(), bin, VERSION, &options),
@@ -288,18 +295,20 @@ async fn full_loop_through_the_client() {
     })
     .await;
     let brief_agent = sent.agent_id.expect("a sent intent has an agent");
-    within("the brief turn", async {
-        while let Some(e) = events.next().await {
-            if matches!(&e.kind, EventKind::AgentUpdated(a)
-                if a.id == brief_agent && matches!(a.state, AgentState::Done | AgentState::Dead))
-            {
-                return;
-            }
+    // Poll the agent's messages: the AgentUpdated event may already have been
+    // consumed by `next_intent`, so waiting on the stream could miss it.
+    let deadline = std::time::Instant::now() + PATIENCE;
+    let messages = loop {
+        let messages = client.messages(brief_agent, 0).await.unwrap();
+        if messages.iter().any(|m| m.role == Role::User) {
+            break messages;
         }
-        panic!("stream ended");
-    })
-    .await;
-    let messages = client.messages(brief_agent, 0).await.unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the brief was not recorded within {PATIENCE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     assert!(
         messages
             .iter()
@@ -309,6 +318,167 @@ async fn full_loop_through_the_client() {
 
     let resolved = client.resolve_intent(created.id).await.unwrap();
     assert_eq!(resolved.state, IntentState::Resolved);
+}
+
+#[tokio::test]
+async fn polish_model_env_reaches_the_cli() {
+    let args_dir = tempfile::tempdir().unwrap();
+    let args_path = args_dir.path().join("args");
+    let fx = start_with(&[
+        ("SMITHAGENTS_POLISH_MODEL", "haiku"),
+        ("FAKE_CLAUDE_ARGS_FILE", args_path.to_str().unwrap()),
+    ])
+    .await;
+    let repo_dir = fx.home.scratch().join("repo");
+    init_repo(&repo_dir);
+    let repo = fx.client.add_repo(&repo_dir).await.unwrap();
+    let mut events = fx.client.events(None).await.unwrap();
+    let created = fx
+        .client
+        .create_intent(CreateIntentRequest {
+            repo_id: Some(repo.id),
+            seed: SeedInput::Text("add dark mode".into()),
+        })
+        .await
+        .unwrap();
+    next_intent(&mut events, |i| {
+        i.id == created.id && i.phase == Phase::Questions
+    })
+    .await;
+    let args: Vec<String> = std::fs::read_to_string(&args_path)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let at = args.iter().position(|a| a == "--model").expect("--model");
+    assert_eq!(args[at + 1], "haiku", "{args:?}");
+}
+
+/// Crashes the daemon (SIGKILL, so nothing shuts down cleanly).
+fn kill_daemon(home: &Path) {
+    use rustix::process::{kill_process, Pid, Signal};
+    let info = smithagents_core::daemon::read_lockfile(home)
+        .unwrap()
+        .expect("a lockfile");
+    kill_process(Pid::from_raw(info.pid as i32).unwrap(), Signal::KILL).unwrap();
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while pid_alive(info.pid) {
+        assert!(std::time::Instant::now() < deadline, "the daemon survived");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Acceptance: a daemon that dies during pass 1 leaves a Failed intent after
+/// the restart, and Retry runs pass 1 again to completion.
+#[tokio::test]
+async fn daemon_crash_during_pass_one_fails_the_intent_and_retry_works() {
+    let fx = start().await;
+    let repo_dir = fx.home.scratch().join("repo");
+    init_repo(&repo_dir);
+    let repo = fx.client.add_repo(&repo_dir).await.unwrap();
+    // Pass 1 hangs, so the daemon dies in the middle of it.
+    std::fs::write(fx.control_dir.join("sleep"), "30").unwrap();
+    let created = fx
+        .client
+        .create_intent(CreateIntentRequest {
+            repo_id: Some(repo.id),
+            seed: SeedInput::Text("add dark mode".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.phase, Phase::Polishing { pass: 1 });
+    kill_daemon(fx.home.path());
+    std::fs::remove_file(fx.control_dir.join("sleep")).unwrap();
+
+    let options = SpawnOptions {
+        args: vec!["--claude-bin".into(), fake_claude().into()],
+        env: vec![
+            ("FAKE_CLAUDE_FIXTURE".into(), claude_fixture().into()),
+            (
+                "FAKE_CLAUDE_STRUCTURED_FILE".into(),
+                fx.home.scratch().join("pass1.json").into(),
+            ),
+            (
+                "FAKE_CLAUDE_CONTROL_DIR".into(),
+                fx.control_dir.clone().into(),
+            ),
+        ],
+    };
+    let client = within(
+        "restart",
+        ensure_daemon_with(fx.home.path(), daemon_bin(), VERSION, &options),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("restart failed: {e}; log:\n{}", fx.home.log()));
+    let failed = client.get_intent(created.id).await.unwrap();
+    assert!(
+        matches!(&failed.phase, Phase::Failed { pass: 1, .. }),
+        "{:?}",
+        failed.phase
+    );
+    client.retry_polish(created.id).await.unwrap();
+    let mut events = client.events(None).await.unwrap();
+    let again = within("the retried pass", async {
+        loop {
+            let i = client.get_intent(created.id).await.unwrap();
+            if i.phase == Phase::Questions {
+                return i;
+            }
+            assert!(
+                !matches!(i.phase, Phase::Failed { .. }),
+                "retry failed: {:?}",
+                i.phase
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(100), events.next()).await;
+        }
+    })
+    .await;
+    assert_eq!(again.content.title, "Add dark mode");
+}
+
+/// Acceptance: a seed from a chat of several turns carries every message.
+#[tokio::test]
+async fn chat_seed_carries_every_message() {
+    let fx = start().await;
+    let client = &fx.client;
+    let repo_dir = fx.home.scratch().join("repo");
+    init_repo(&repo_dir);
+    let repo = client.add_repo(&repo_dir).await.unwrap();
+    let agent = client.create_agent(repo.id).await.unwrap();
+    let mut events = client.events(None).await.unwrap();
+    for text in ["first request", "second request"] {
+        client.send_message(agent.id, text).await.unwrap();
+        within("the chat turn", async {
+            while let Some(e) = events.next().await {
+                if matches!(&e.kind, EventKind::AgentUpdated(a)
+                    if a.id == agent.id && matches!(a.state, AgentState::Done | AgentState::Dead))
+                {
+                    return;
+                }
+            }
+            panic!("stream ended");
+        })
+        .await;
+    }
+    let intent = client
+        .create_intent(CreateIntentRequest {
+            repo_id: None,
+            seed: SeedInput::Chat {
+                agent_id: agent.id,
+                from_seq: None,
+                to_seq: None,
+            },
+        })
+        .await
+        .unwrap();
+    for text in ["first request", "second request"] {
+        assert!(intent.seed.text.contains(text), "{}", intent.seed.text);
+    }
+    assert!(
+        intent.seed.text.matches("Assistant:").count() >= 2,
+        "{}",
+        intent.seed.text
+    );
 }
 
 #[tokio::test]

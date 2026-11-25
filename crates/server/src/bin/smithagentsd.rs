@@ -167,6 +167,11 @@ fn main() -> ExitCode {
     }
 }
 
+/// The model for polish passes: unset or blank means the CLI's default.
+fn polish_model_from(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
 async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     // Registered before the lockfile exists, so a signal cannot leave it behind.
     let signal = shutdown_signal()?;
@@ -200,7 +205,10 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
         harness,
         service.clone(),
         paths.clone(),
-    );
+    )
+    .with_polish_model(polish_model_from(
+        std::env::var("SMITHAGENTS_POLISH_MODEL").ok(),
+    ));
     // Polish passes that were running when the last daemon died are marked
     // failed, so the user can retry them. Must precede the scheduler.
     let recovered = intents.recover().await?;
@@ -342,6 +350,17 @@ mod tests {
             }))
         );
         assert_eq!(parse(&["--help"]), Ok(Invocation::Help));
+    }
+
+    #[test]
+    fn polish_model_env_value() {
+        assert_eq!(polish_model_from(None), None);
+        assert_eq!(polish_model_from(Some(String::new())), None);
+        assert_eq!(polish_model_from(Some("  ".into())), None);
+        assert_eq!(
+            polish_model_from(Some(" haiku ".into())),
+            Some("haiku".into())
+        );
     }
 
     #[test]
