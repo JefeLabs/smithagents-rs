@@ -35,7 +35,7 @@ This is **Plan 3a, the chat-only shell**. Plan 3b (intent list, intent editor wi
 - macOS Apple silicon only in v1. Naming is `smithagents`, never `singularity`.
 - Native panes: left and right. The left pane is never hidden: it switches between Expanded and a compact strip; the right pane hides. Icon rail far right; center holds web tabs only. Web tech only in center tabs.
 - No literal colors in `crates/app`, `crates/center-host`, `crates/host-desktop` or `web/` (`cargo themegen lint` stays clean); every color is a token. Agent colors render with the theme's agent `l` and `c` and the daemon's **hue only** (Plan T finding 1).
-- An agent's name is always shown next to its color (color is never the only identifier).
+- An agent's name is always shown next to its color (color is never the only identifier), except in the compact left pane, where an agent shows its color, status dot and initial, with the full name and state in the tooltip and in the accessibility label.
 - Theme changes reach native panes and every open web tab together; a new tab gets the current theme before first paint.
 - Rust `unsafe_code = "forbid"` stays in force for every crate except where Task 16 isolates unavoidable FFI in its own crate with a comment per `unsafe` block.
 
@@ -310,7 +310,14 @@ This is **Plan 3a, the chat-only shell**. Plan 3b (intent list, intent editor wi
 - Produces:
   - Pure view models: `struct AgentRowVm { id, name, state_label: &'static str, state_kind: StateKind, accent_hue: f32, selected: bool }` and `fn agent_rows(model: &ShellModel) -> Vec<AgentRowVm>`; `enum StateKind { Idle, Working, Quiet, Done, Dead }` with `fn state_label` giving "idle", "working", "quiet", "done", "stopped unexpectedly" (Dead).
   - Native pane: header with a "New agent" button; rows with a left accent bar (color from `agent_accent` with the row's hue), the name, and a status dot whose color is a status token (working: info token pulse-free static dot; done: ok; dead: error; idle/quiet: muted). Double-click or Enter opens the agent's tab; single click selects. A context action "Close agent" calls `close_agent` after a confirmation popover.
-  - Compact rendering (`LeftPaneMode::Compact`): one marker per agent with its color, its status dot and the initial of its name. The full name is in a tooltip, so color is never the only identifier. The New agent button is icon-only. Selecting and opening work as in the expanded pane.
+  - Compact rendering (`LeftPaneMode::Compact`):
+    - One marker per agent with its color, its status dot and the initial of its name. The full name is in a tooltip, so color is never the only identifier.
+    - Markers are keyboard-focusable. Each one's accessibility label is "<name>, <state>".
+    - Initials may collide (Mercury and Mars); the tooltip and the label tell them apart.
+    - The New agent button is icon-only.
+    - Selecting and opening work as in the expanded pane.
+    - Keep `track_focus` on the pane's root in both modes.
+    - The strip has about 55 px of content width.
   - New agent flow: if no repositories exist, the button opens the Settings pane's Source repositories section (Task 14) instead of failing; with exactly one repository it creates immediately; with several it shows a repository picker popover (default: last used, stored in app settings as `last_repo_id`, loaded leniently). Daemon errors show in a transient notification with the daemon's message.
 - [ ] **Step 1: Write failing tests:** rows sorted by creation, `selected` follows the model, Dead shows "stopped unexpectedly", the accent hue passes through unchanged, an empty model yields no rows; picker logic as a pure function `fn new_agent_plan(repos: &[Repo], last_used: Option<RepoId>) -> NewAgentPlan { NeedRepo | Create(RepoId) | Pick{ repos, preselected } }` with cases (0 repos, 1 repo, 2 repos with and without a valid last-used id, last-used id no longer present).
 - [ ] **Step 2: Run `cargo test -p smithagents-app --test view_models`.** Expected: FAIL.
