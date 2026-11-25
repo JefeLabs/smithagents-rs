@@ -96,6 +96,10 @@ describe("Chat", () => {
 
   it("shows the 409 banner and recovers", async () => {
     let posts = 0;
+    // The first agent poll is held until the banner has been seen: the page
+    // clears the banner as soon as the poll reports the turn is over.
+    let releasePoll!: () => void;
+    const pollGate = new Promise<void>((resolve) => (releasePoll = resolve));
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       if (init?.method === "POST") {
         if (posts++ === 0) {
@@ -103,13 +107,18 @@ describe("Chat", () => {
         }
         return sse(textStream("recovered"));
       }
-      if (url.includes("/v1/agents?")) return new Response(JSON.stringify([{ ...agent, state: "idle" }]), { status: 200 });
+      if (url.includes("/v1/agents?")) {
+        await pollGate;
+        return new Response(JSON.stringify([{ ...agent, state: "idle" }]), { status: 200 });
+      }
       return new Response("[]", { status: 200 });
     });
     mount([]);
     const box = screen.getByRole("textbox") as HTMLTextAreaElement;
     await userEvent.type(box, "one{Enter}");
     expect(await screen.findByText("This agent is still working on the last message")).toBeTruthy();
+    expect(box.disabled).toBe(true);
+    releasePoll();
     await waitFor(() => expect(box.disabled).toBe(false));
     expect(screen.queryByText("one", { selector: "div" })).toBeNull();
     await waitFor(() => expect(box.value).toBe("one"));
