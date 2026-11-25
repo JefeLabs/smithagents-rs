@@ -6,6 +6,8 @@
 
 pub mod link;
 pub mod model;
+pub mod settings;
+pub mod theme_adapter;
 
 use gpui_kit::component::label::Label;
 use gpui_kit::{
@@ -40,6 +42,7 @@ pub fn run() -> ! {
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(|cx| {
             gpui_kit::init(cx);
+            apply_startup_theme(cx);
             #[cfg(unix)]
             quit_on_termination_signals(cx);
             if let Err(e) = open_main_window(cx) {
@@ -52,6 +55,20 @@ pub fn run() -> ! {
     // quit handlers and then exits the process itself, so `run` does not
     // return there. Exit explicitly for platforms where it does.
     std::process::exit(0)
+}
+
+/// Applies the Smith theme before the first window opens, replacing the
+/// Kit's forced light default. Persisted settings arrive in a later task.
+fn apply_startup_theme(cx: &mut App) {
+    use smithagents_theme::state::{AppearanceSettings, ThemeController};
+    use smithagents_theme::tokens::{Appearance, ThemeSet};
+
+    let controller = ThemeController::new(
+        ThemeSet::embedded().clone(),
+        AppearanceSettings::default(),
+        Appearance::Dark,
+    );
+    theme_adapter::apply_theme_state(&controller.state(), cx);
 }
 
 fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {
