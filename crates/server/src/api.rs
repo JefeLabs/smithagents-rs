@@ -10,12 +10,12 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,6 +31,7 @@ use smithagents_core::intent::{
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::error::RecvError;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::events::{BusError, EventBus, Subscription};
 use crate::git::GitError;
@@ -85,7 +86,28 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events", get(events))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
+        // CORS is added after (so outside) auth: preflights carry no token and
+        // must be answered before `authenticate` runs, and 401s still get the
+        // CORS headers so a browser can read them. Origin `*` is fine because
+        // auth is a bearer token, not cookies (credentials stay disabled).
+        // TODO(Plan 1 follow-up): add a Host-header allow-list against DNS
+        // rebinding.
+        .layer(cors_layer())
         .with_state(state)
+}
+
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .max_age(Duration::from_secs(600))
 }
 
 // ---------------------------------------------------------------- errors

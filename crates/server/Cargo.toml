@@ -27,6 +27,7 @@ fs2.workspace = true
 rand.workspace = true
 rustix = { workspace = true, features = ["process"] }
 tracing-subscriber.workspace = true
+tower-http.workspace = true
 
 [features]
 test-util = []

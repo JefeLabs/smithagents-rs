@@ -1317,3 +1317,76 @@ async fn full_loop_over_http_ends_with_the_dependent_starting() {
     let b_sent = fx.wait_intent(&b_id, |i| i["state"] == "sent").await;
     assert!(b_sent["agent_id"].is_string());
 }
+
+#[tokio::test]
+async fn cors_preflight_needs_no_token() {
+    let fx = default_fx().await;
+    let req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/v1/agents")
+        .header(header::ORIGIN, "http://localhost:5173")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "authorization,content-type",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(fx.state.clone()).oneshot(req).await.unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let h = resp.headers();
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    let allow_headers = h[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(allow_headers.contains("authorization"), "{allow_headers}");
+    assert!(allow_headers.contains("content-type"), "{allow_headers}");
+    let methods = h[header::ACCESS_CONTROL_ALLOW_METHODS].to_str().unwrap();
+    for m in ["GET", "POST", "PUT", "PATCH", "OPTIONS"] {
+        assert!(methods.contains(m), "{methods}");
+    }
+    assert!(h.contains_key(header::ACCESS_CONTROL_MAX_AGE));
+}
+
+#[tokio::test]
+async fn cors_headers_on_401_and_on_success() {
+    let fx = default_fx().await;
+    let req = Request::builder()
+        .uri("/v1/health")
+        .header(header::ORIGIN, "http://localhost:5173")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(fx.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+    let req = Request::builder()
+        .uri("/v1/health")
+        .header(header::ORIGIN, "http://localhost:5173")
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(fx.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+}
+
+#[tokio::test]
+async fn cors_does_not_weaken_ws_token_check() {
+    let fx = default_fx().await;
+    let addr = fx.serve().await;
+    let mut req = format!("ws://{addr}/v1/events")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert(header::ORIGIN, "http://localhost:5173".parse().unwrap());
+    req.headers_mut()
+        .insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+    match tokio_tungstenite::connect_async(req).await.unwrap_err() {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => {
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED)
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}

@@ -33,6 +33,7 @@ tempfile = "3.27.0"
 async-trait = "0.1.92"
 futures = "0.3.34"
 tokio-stream = "0.1.19"
+tower-http = { version = "0.7.1", features = ["cors"] }
 tower = "0.5.3"
 http-body-util = "0.1.5"
 regex = "1.13.2"
