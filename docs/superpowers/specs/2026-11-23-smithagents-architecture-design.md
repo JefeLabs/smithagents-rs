@@ -80,7 +80,17 @@ Anti-goals (failure even if it "works")
 │ (full       │├─────────────────────────────────┴┴───────────────┤│▣│
 │  height)    ││ Bottom: view for the pressed tool icon            ││▣│
 └─────────────┘└───────────────────────────────────────────────────┘└─┘
+ Status bar:        status message (centered)    [Update available] v0.1.0
 ```
+
+- Status bar: a full-width bar (24 px) at the very bottom of the window,
+  under the left pane, the center, the right pane and the icon rail. Status
+  messages show in the center (the connection status while not connected,
+  else the latest transient message such as "Agent Mercury created"); the
+  version shows at the right, with an "Update available" button next to it
+  when an update is detected. The left zone is reserved. It is separate from
+  the bottom pane below (tool views), which stays out of v1.
+  [owner decision 2026-11-25]
 
 - Left pane: full height. Space switcher (with connection and "browser
   signed out" status), personal dashboards (e.g. "Start of Day"; rendered in
