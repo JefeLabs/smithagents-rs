@@ -30,6 +30,23 @@ const MAX_PAGES = 1000;
 
 const bad = (what: string) => new ApiError(0, "bad_response", `The daemon returned a malformed ${what}.`);
 
+/** Turns a non-2xx daemon response (`{error, message}` JSON) into an ApiError. */
+export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  let code = "unknown";
+  let message = `Request failed (${res.status}).`;
+  try {
+    const body: unknown = await res.json();
+    if (typeof body === "object" && body !== null) {
+      const b = body as { error?: unknown; message?: unknown };
+      if (typeof b.error === "string") code = b.error;
+      if (typeof b.message === "string") message = b.message;
+    }
+  } catch {
+    // non-JSON body: keep defaults
+  }
+  return new ApiError(res.status, code, message);
+}
+
 async function request(cfg: HostConfig, path: string): Promise<unknown> {
   let res: Response;
   try {
@@ -37,21 +54,7 @@ async function request(cfg: HostConfig, path: string): Promise<unknown> {
   } catch {
     throw new ApiError(0, "network", "Could not reach the daemon.");
   }
-  if (!res.ok) {
-    let code = "unknown";
-    let message = `Request failed (${res.status}).`;
-    try {
-      const body: unknown = await res.json();
-      if (typeof body === "object" && body !== null) {
-        const b = body as { error?: unknown; message?: unknown };
-        if (typeof b.error === "string") code = b.error;
-        if (typeof b.message === "string") message = b.message;
-      }
-    } catch {
-      // non-JSON body: keep defaults
-    }
-    throw new ApiError(res.status, code, message);
-  }
+  if (!res.ok) throw await apiErrorFromResponse(res);
   try {
     return await res.json();
   } catch {
