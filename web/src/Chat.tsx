@@ -141,12 +141,12 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
 
   return (
     <div
-      className="bg-center text-center-foreground border-agent flex h-screen flex-col border-l-4"
+      className="bg-center-pane text-center-pane-foreground border-agent flex h-screen flex-col border-l-4"
       style={{ "--agent-h": agent.color.h } as CSSProperties}
       onClick={openExternal}
       onAuxClick={openExternal}
     >
-      <header className="border-border bg-card border-b px-4 py-2 font-semibold">{agent.name}</header>
+      <header className="border-border bg-card text-card-foreground border-b px-4 py-2 font-semibold">{agent.name}</header>
       <div className="flex-1 space-y-3 overflow-y-auto p-4" onScroll={onScroll}>
         {messages.filter((m) => m.role !== "assistant" || textOf(m) !== "").map((m) => (
           <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>

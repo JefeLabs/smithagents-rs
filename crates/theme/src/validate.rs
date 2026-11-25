@@ -11,7 +11,9 @@ pub const CONTRAST_RULES: &[(&str, &str, f64)] = &[
     ("foreground", "background", 4.5),
     ("card-foreground", "card", 4.5),
     ("card-2-foreground", "card-2", 4.5),
-    ("center-foreground", "center", 4.5),
+    ("center-pane-foreground", "center-pane", 4.5),
+    // Hovered inactive tabs: center text on the tab strip.
+    ("center-pane-foreground", "card-2", 4.5),
     ("popover-foreground", "popover", 4.5),
     ("primary-foreground", "primary", 4.5),
     ("secondary-foreground", "secondary", 4.5),
@@ -20,31 +22,31 @@ pub const CONTRAST_RULES: &[(&str, &str, f64)] = &[
     ("muted-foreground", "muted", 4.5),
     ("muted-foreground", "card", 4.5),
     ("muted-foreground", "card-2", 4.5),
-    ("muted-foreground", "center", 4.5),
+    ("muted-foreground", "center-pane", 4.5),
     ("destructive", "background", 3.0),
     ("destructive", "card", 3.0),
     ("destructive", "card-2", 3.0),
-    ("destructive", "center", 3.0),
+    ("destructive", "center-pane", 3.0),
     ("ring", "background", 3.0),
     ("ring", "card", 3.0),
     ("ring", "card-2", 3.0),
-    ("ring", "center", 3.0),
+    ("ring", "center-pane", 3.0),
     ("status-ok", "background", 3.0),
     ("status-ok", "card", 3.0),
     ("status-ok", "card-2", 3.0),
-    ("status-ok", "center", 3.0),
+    ("status-ok", "center-pane", 3.0),
     ("status-warn", "background", 3.0),
     ("status-warn", "card", 3.0),
     ("status-warn", "card-2", 3.0),
-    ("status-warn", "center", 3.0),
+    ("status-warn", "center-pane", 3.0),
     ("status-error", "background", 3.0),
     ("status-error", "card", 3.0),
     ("status-error", "card-2", 3.0),
-    ("status-error", "center", 3.0),
+    ("status-error", "center-pane", 3.0),
     ("status-info", "background", 3.0),
     ("status-info", "card", 3.0),
     ("status-info", "card-2", 3.0),
-    ("status-info", "center", 3.0),
+    ("status-info", "center-pane", 3.0),
 ];
 
 /// Status token and the reserved hue range its hue must fall in.
@@ -222,7 +224,7 @@ fn validate_theme(set: &ThemeSet, t: &ThemeFile, errs: &mut Vec<ValidationError>
             });
             continue;
         };
-        for against in ["background", "card", "card-2", "center"] {
+        for against in ["background", "card", "card-2", "center-pane"] {
             if let Some(b) = rgb.get(against) {
                 let ratio = contrast_ratio(s, *b);
                 if ratio < AGENT_MIN_CONTRAST {

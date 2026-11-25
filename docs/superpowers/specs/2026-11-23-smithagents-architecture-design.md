@@ -352,8 +352,8 @@ example "open this issue in a center tab").
     (mapped onto gpui-component's theme format; verify when building).
   - Surface levels [owner decision 2026-11-24]: `background`, two card
     surfaces (`card`, `card-2`, each with a `-foreground`), a dedicated
-    `center` surface (center pane content and the active tab) and
-    `popover`. Default regions: center = `center`; left and right panes =
+    `center-pane` surface (center pane content and the active tab) and
+    `popover`. Default regions: center = `center-pane`; left and right panes =
     `card`; title bar, icon rail, tab strip, bottom bar = `card-2`.
   - Tailwind side: utilities consume CSS variables, so a new theme is a new
     token file with no component changes. Variable names follow the shadcn

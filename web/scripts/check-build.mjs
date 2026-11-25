@@ -27,7 +27,9 @@ assert.ok(cssFiles.length > 0, "no built css");
 const css = cssFiles.map((f) => readFileSync(`dist/assets/${f}`, "utf8")).join("\n");
 assert.ok(css.includes("--color-background"), "css lacks --color-background");
 assert.ok(css.includes("--color-card-2"), "css lacks --color-card-2");
-assert.ok(css.includes("--color-center"), "css lacks --color-center");
+assert.ok(css.includes("--color-center-pane"), "css lacks --color-center-pane");
+assert.ok(!/\.bg-center-pane\s*\{[^}]*background-position/.test(css), ".bg-center-pane must not be a background-position rule");
+assert.ok(/\.bg-center-pane\s*\{[^}]*background-color/.test(css) || css.includes(".bg-center-pane"), "css lacks the bg-center-pane utility");
 assert.ok(/\[data-theme=["']?smith-dark["']?\]/.test(css), "css lacks smith-dark rule");
 
 

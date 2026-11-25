@@ -48,8 +48,8 @@ pub const COLOR_KEY_MAP: &[(&str, &str)] = &[
     ("list.highlight.foreground", "ring"),
     ("tab_bar.background", "card-2"),
     ("tab.foreground", "muted-foreground"),
-    ("tab.active.background", "center"),
-    ("tab.active.foreground", "center-foreground"),
+    ("tab.active.background", "center-pane"),
+    ("tab.active.foreground", "center-pane-foreground"),
     ("sidebar.background", "card"),
     ("sidebar.foreground", "card-foreground"),
     ("title_bar.background", "card-2"),
@@ -85,7 +85,7 @@ pub enum Region {
 /// tab bar, status bar and active tab must follow).
 pub fn region_tokens(region: Region) -> (&'static str, &'static str) {
     match region {
-        Region::Center => ("center", "center-foreground"),
+        Region::Center => ("center-pane", "center-pane-foreground"),
         Region::LeftPane | Region::RightPane => ("card", "card-foreground"),
         Region::TitleBar | Region::Rail | Region::TabStrip | Region::BottomBar => {
             ("card-2", "card-2-foreground")

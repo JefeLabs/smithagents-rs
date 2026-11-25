@@ -314,11 +314,11 @@ fn indistinct_card_surfaces() {
 #[test]
 fn missing_center() {
     let mut s = set();
-    of(&mut s, Appearance::Dark).colors.remove("center");
+    of(&mut s, Appearance::Dark).colors.remove("center-pane");
     let e = errors(&s);
     assert!(
         e.iter()
-            .any(|e| matches!(e, E::MissingToken { token, .. } if token == "center")),
+            .any(|e| matches!(e, E::MissingToken { token, .. } if token == "center-pane")),
         "{e:?}"
     );
 }
@@ -327,14 +327,14 @@ fn missing_center() {
 fn low_contrast_center_foreground() {
     let mut s = set();
     let t = of(&mut s, Appearance::Light);
-    let mut fg = t.colors["center-foreground"];
+    let mut fg = t.colors["center-pane-foreground"];
     fg.l = 0.8;
-    t.colors.insert("center-foreground".into(), fg);
+    t.colors.insert("center-pane-foreground".into(), fg);
     let e = errors(&s);
     assert!(
         e.iter().any(|e| matches!(e,
             E::LowContrast { foreground, background, .. }
-            if foreground == "center-foreground" && background == "center")),
+            if foreground == "center-pane-foreground" && background == "center-pane")),
         "{e:?}"
     );
 }
@@ -344,7 +344,7 @@ fn agent_low_contrast_against_center() {
     let mut s = set();
     let t = of(&mut s, Appearance::Dark);
     t.colors.insert(
-        "center".into(),
+        "center-pane".into(),
         Oklch {
             l: 0.72,
             c: 0.0,
@@ -354,7 +354,7 @@ fn agent_low_contrast_against_center() {
     let e = errors(&s);
     assert!(
         e.iter().any(|e| matches!(e,
-            E::AgentLowContrast { against, .. } if against == "center")),
+            E::AgentLowContrast { against, .. } if against == "center-pane")),
         "{e:?}"
     );
 }

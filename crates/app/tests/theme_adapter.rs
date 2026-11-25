@@ -176,8 +176,8 @@ const PINNED: &[(&str, &str)] = &[
     ("list.highlight.foreground", "ring"),
     ("tab_bar.background", "card-2"),
     ("tab.foreground", "muted-foreground"),
-    ("tab.active.background", "center"),
-    ("tab.active.foreground", "center-foreground"),
+    ("tab.active.background", "center-pane"),
+    ("tab.active.foreground", "center-pane-foreground"),
     ("sidebar.background", "card"),
     ("sidebar.foreground", "card-foreground"),
     ("title_bar.background", "card-2"),
@@ -257,7 +257,7 @@ fn srgb_to_hsla_keeps_the_color() {
 #[test]
 fn region_mapping_is_pinned() {
     let want = [
-        (Region::Center, ("center", "center-foreground")),
+        (Region::Center, ("center-pane", "center-pane-foreground")),
         (Region::LeftPane, ("card", "card-foreground")),
         (Region::RightPane, ("card", "card-foreground")),
         (Region::TitleBar, ("card-2", "card-2-foreground")),
