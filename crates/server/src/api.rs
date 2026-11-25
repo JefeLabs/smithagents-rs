@@ -507,7 +507,7 @@ impl ChatStream {
 }
 
 const TEXT_ID: &str = "t1";
-const LAGGED: &str = "The stream fell behind; reload to see the full reply.";
+const LAGGED: &str = "The stream fell behind; the full reply will appear when the agent finishes.";
 const STOPPED: &str = "The agent stopped unexpectedly.";
 
 fn chat_stream(state: ChatStream) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
@@ -1101,7 +1101,7 @@ mod tests {
             tx.send(delta(id, &i.to_string())).unwrap();
         }
         let out = collect(stream_of(id, fence, rx, true)).await;
-        assert!(out.contains("fell behind"), "{out}");
+        assert!(out.contains(LAGGED), "{out}");
         assert!(
             out.contains("finish-step") && out.contains(r#""type":"finish""#),
             "{out}"

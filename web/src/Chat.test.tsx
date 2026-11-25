@@ -95,9 +95,17 @@ describe("Chat", () => {
   });
 
   it("shows the 409 banner and recovers", async () => {
-    fetchMock.mockResolvedValueOnce(
-      new Response(JSON.stringify({ error: "turn_in_progress", message: "busy" }), { status: 409, headers: { "content-type": "application/json" } }),
-    );
+    let posts = 0;
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        if (posts++ === 0) {
+          return new Response(JSON.stringify({ error: "turn_in_progress", message: "busy" }), { status: 409, headers: { "content-type": "application/json" } });
+        }
+        return sse(textStream("recovered"));
+      }
+      if (url.includes("/v1/agents?")) return new Response(JSON.stringify([{ ...agent, state: "idle" }]), { status: 200 });
+      return new Response("[]", { status: 200 });
+    });
     mount([]);
     const box = screen.getByRole("textbox") as HTMLTextAreaElement;
     await userEvent.type(box, "one{Enter}");
@@ -107,7 +115,6 @@ describe("Chat", () => {
     await waitFor(() => expect(box.value).toBe("one"));
     await userEvent.clear(box);
     await userEvent.type(box, "two");
-    fetchMock.mockResolvedValueOnce(sse(textStream("recovered")));
     await userEvent.type(box, "{Enter}");
     await screen.findByText("recovered");
     await waitFor(() => expect(screen.queryByText("This agent is still working on the last message")).toBeNull());
@@ -123,7 +130,11 @@ describe("Chat", () => {
   });
 
   it("shows stream error chunks and re-enables the composer", async () => {
-    fetchMock.mockResolvedValueOnce(sse([{ type: "start" }, { type: "error", errorText: "model exploded" }, { type: "finish" }]));
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return sse([{ type: "start" }, { type: "error", errorText: "model exploded" }, { type: "finish" }]);
+      if (url.includes("/v1/agents?")) return new Response(JSON.stringify([{ ...agent, state: "idle" }]), { status: 200 });
+      return new Response("[]", { status: 200 });
+    });
     mount([]);
     const box = screen.getByRole("textbox") as HTMLTextAreaElement;
     await userEvent.type(box, "x{Enter}");
@@ -200,6 +211,7 @@ describe("rejoin a working agent", () => {
       await screen.findByText("fresh reply");
       expect(screen.queryByText(/still working\. The reply/)).toBeNull();
       expect((screen.getByRole("textbox") as HTMLTextAreaElement).disabled).toBe(false);
+      expect(fetchMock.mock.calls.some(([u, init]) => String(u).endsWith("/chat") || init?.method === "POST")).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -255,6 +267,7 @@ describe("network failure on send", () => {
     let historyCalls = 0;
     fetchMock.mockImplementation(async (url: string) => {
       if (url.endsWith("/chat")) throw new TypeError("network down");
+      if (url.includes("/v1/agents?")) return new Response(JSON.stringify([{ ...agent, state: "idle" }]), { status: 200 });
       historyCalls++;
       return new Response(
         JSON.stringify([{ id: "s1", agent_id: "ag1", seq: 1, role: "user", text: "stored msg", created_at: "" }]),
@@ -264,11 +277,110 @@ describe("network failure on send", () => {
     mount([]);
     const box = screen.getByRole("textbox") as HTMLTextAreaElement;
     await userEvent.type(box, "stored msg{Enter}");
-    expect(await screen.findByText("Could not reach the daemon.")).toBeTruthy();
+    expect(await screen.findByText("Lost the connection to the daemon.")).toBeTruthy();
     await waitFor(() => expect(historyCalls).toBe(1));
     expect(screen.getByText("stored msg", { selector: "div" })).toBeTruthy();
     expect(box.value).toBe("");
     await waitFor(() => expect(box.disabled).toBe(false));
+  });
+});
+
+describe("resync after an abnormal end", () => {
+  const j = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status });
+  const row = (seq: number, role: string, text: string) => ({ id: `r${seq}`, agent_id: "ag1", seq, role, text, created_at: "" });
+  const BANNER = "This agent is still working on the last message";
+
+  it("409 turn_in_progress: banner, poll, the other turn appears, banner clears, draft kept", async () => {
+    let running = true;
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return j({ error: "turn_in_progress", message: "busy" }, 409);
+      if (url.includes("/v1/agents?")) return j([{ ...agent, state: running ? "working" : "idle" }]);
+      return j([row(1, "user", "other client"), row(2, "assistant", "other reply")]);
+    });
+    mount([]);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    await userEvent.type(box, "mine{Enter}");
+    expect(await screen.findByText(BANNER)).toBeTruthy();
+    running = false;
+    await screen.findByText("other reply", {}, { timeout: 4000 });
+    await waitFor(() => expect(screen.queryByText(BANNER)).toBeNull());
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.value).toBe("mine");
+    await userEvent.type(box, "!");
+    expect(box.value).toBe("mine!");
+  });
+
+  it("stream error chunk: error shown, then history reloaded", async () => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return sse([{ type: "start" }, { type: "error", errorText: "model exploded" }, { type: "finish" }]);
+      if (url.includes("/v1/agents?")) return j([{ ...agent, state: "idle" }]);
+      return j([row(1, "user", "x"), row(2, "assistant", "full reply")]);
+    });
+    mount([]);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    await userEvent.type(box, "x{Enter}");
+    expect(await screen.findByText("model exploded")).toBeTruthy();
+    await screen.findByText("full reply");
+    await waitFor(() => expect(box.disabled).toBe(false));
+    expect(box.value).toBe("");
+  });
+
+  it("dropped connection mid-stream: friendly text, then resync", async () => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode(`data: ${JSON.stringify({ type: "start", messageId: "m1" })}\n\n`));
+          },
+          pull() {
+            throw new TypeError("Load failed");
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream", "x-vercel-ai-ui-message-stream": "v1" } });
+      }
+      if (url.includes("/v1/agents?")) return j([{ ...agent, state: "idle" }]);
+      return j([row(1, "user", "q"), row(2, "assistant", "settled")]);
+    });
+    mount([]);
+    await userEvent.type(screen.getByRole("textbox"), "q{Enter}");
+    expect(await screen.findByText("Lost the connection to the daemon.")).toBeTruthy();
+    expect(screen.queryByText("Load failed")).toBeNull();
+    await screen.findByText("settled");
+  });
+
+  it("a lost send restores the draft after the resync", async () => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") throw new TypeError("Load failed");
+      if (url.includes("/v1/agents?")) return j([{ ...agent, state: "idle" }]);
+      return j([]);
+    });
+    mount([]);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    await userEvent.type(box, "lost words{Enter}");
+    await waitFor(() => expect(box.value).toBe("lost words"));
+    expect(box.disabled).toBe(false);
+  });
+
+  it("a non-409 rejection restores the draft without polling", async () => {
+    fetchMock.mockResolvedValueOnce(j({ error: "bad_request", message: "Nope." }, 400));
+    mount([]);
+    const box = screen.getByRole("textbox") as HTMLTextAreaElement;
+    await userEvent.type(box, "keep me{Enter}");
+    expect(await screen.findByText("Nope.")).toBeTruthy();
+    await waitFor(() => expect(box.value).toBe("keep me"));
+    expect(box.disabled).toBe(false);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("empty assistant messages", () => {
+  it("renders no bubble for an assistant message without text", () => {
+    const { container } = mount([
+      { id: "u", role: "user", parts: [{ type: "text", text: "hi" }] },
+      { id: "a", role: "assistant", parts: [{ type: "text", text: "" }] },
+    ]);
+    expect(container.querySelectorAll(".justify-start").length).toBe(0);
   });
 });
 

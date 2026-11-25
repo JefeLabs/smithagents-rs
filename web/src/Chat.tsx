@@ -13,10 +13,14 @@ declare global {
   }
 }
 
+const LOST = "Lost the connection to the daemon.";
+
 function errorText(error: Error): string {
   if (error instanceof ApiError) {
+    if (error.code === "network") return LOST;
     return error.code === "turn_in_progress" ? "This agent is still working on the last message" : error.message;
   }
+  if (error instanceof TypeError) return LOST;
   return error.message || "Something went wrong.";
 }
 
@@ -43,22 +47,26 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
   const transport = useMemo(() => makeTransport(cfg), [cfg]);
   const [draft, setDraft] = useState("");
   const lastSent = useRef("");
+  const pollNow = useRef(false);
+  const pendingText = useRef("");
   const { messages, sendMessage, setMessages, status, error, clearError } = useChat({
     transport,
     messages: initialMessages,
     onError: (e) => {
-      if (!(e instanceof ApiError)) return;
-      if (e.status > 0) {
+      if (e instanceof ApiError && e.status > 0) {
         // The daemon answered with a rejection before any stream: it did not accept the message.
         setMessages((ms) => (ms[ms.length - 1]?.role === "user" ? ms.slice(0, -1) : ms));
         setDraft(lastSent.current);
-      } else {
-        // Network failure: the daemon may already have stored the message. Keep the bubble
-        // and resync once with what the daemon has.
-        void getMessages(cfg).then((h) => setMessages(toUiMessages(h)), () => {});
+        // Another client's turn is running: follow it with the working-agent poll.
+        if (e.code !== "turn_in_progress") return;
       }
+      // Stream error, dropped connection or a running turn: poll, then resync with the daemon.
+      pollNow.current = true;
+      setAgentWorking(true);
     },
   });
+  const errorRef = useRef(error);
+  errorRef.current = error;
   const [pollError, setPollError] = useState<string | null>(null);
   const [agentWorking, setAgentWorking] = useState(isWorking(agent.state));
   const busy = status === "submitted" || status === "streaming" || agentWorking;
@@ -75,6 +83,13 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
           const history = toUiMessages(await getMessages(cfg));
           if (!live) return;
           setMessages(history);
+          const pending = pendingText.current;
+          pendingText.current = "";
+          if (pending && !history.some((m) => m.role === "user" && textOf(m).trim() === pending)) {
+            setDraft((d) => d || pending);
+          }
+          const err = errorRef.current;
+          if (err instanceof ApiError && err.code === "turn_in_progress") clearError();
           setAgentWorking(false);
           return;
         }
@@ -88,12 +103,14 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
       }
       timer = setTimeout(() => void tick(), POLL_MS);
     };
-    timer = setTimeout(() => void tick(), POLL_MS);
+    const first = pollNow.current ? 0 : POLL_MS;
+    pollNow.current = false;
+    timer = setTimeout(() => void tick(), first);
     return () => {
       live = false;
       clearTimeout(timer);
     };
-  }, [agentWorking, pollError, cfg, setMessages]);
+  }, [agentWorking, pollError, cfg, setMessages, clearError]);
 
   const stick = useRef(true);
   const bottom = useRef<HTMLDivElement>(null);
@@ -109,6 +126,7 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
     const text = draft.trim();
     if (!text || busy) return;
     lastSent.current = text;
+    pendingText.current = text;
     setDraft("");
     clearError();
     stick.current = true;
@@ -130,7 +148,7 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
     >
       <header className="border-border bg-card border-b px-4 py-2 font-semibold">{agent.name}</header>
       <div className="flex-1 space-y-3 overflow-y-auto p-4" onScroll={onScroll}>
-        {messages.map((m) => (
+        {messages.filter((m) => m.role !== "assistant" || textOf(m) !== "").map((m) => (
           <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
             <div className={m.role === "user" ? "bg-muted max-w-[80%] rounded-lg px-3 py-2 whitespace-pre-wrap" : "max-w-[80%] px-1 py-2"}>
               {m.role === "user" ? textOf(m) : <Markdown text={textOf(m)} />}

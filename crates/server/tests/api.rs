@@ -1330,11 +1330,13 @@ async fn cors_preflight_needs_no_token() {
             header::ACCESS_CONTROL_REQUEST_HEADERS,
             "authorization,content-type",
         )
+        .header("access-control-request-private-network", "true")
         .body(Body::empty())
         .unwrap();
     let resp = router(fx.state.clone()).oneshot(req).await.unwrap();
     assert!(resp.status().is_success(), "{}", resp.status());
     let h = resp.headers();
+    assert!(!h.contains_key("access-control-allow-private-network"));
     assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
     let allow_headers = h[header::ACCESS_CONTROL_ALLOW_HEADERS]
         .to_str()
