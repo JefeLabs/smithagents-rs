@@ -64,7 +64,7 @@ use crate::theme_adapter::{
 };
 use crate::view_models::{
     agent_rows, new_agent_plan, repo_choices, state_dot, AgentRowVm, DotStyle, LeftPaneMode,
-    NewAgentPlan, DAEMON_SILENT_TEXT,
+    NewAgentPlan, StatusMessage, DAEMON_SILENT_TEXT,
 };
 
 gpui_kit::actions!(
@@ -230,7 +230,7 @@ impl AgentsPane {
         self.closing.clear();
         if let Some(title) = title {
             tracing::warn!("the connection dropped while a command waited");
-            notify_failure(title, DAEMON_SILENT_TEXT, window, cx);
+            notify_failure(&self.state, title, DAEMON_SILENT_TEXT, window, cx);
         }
     }
 
@@ -650,12 +650,19 @@ impl Paint {
     }
 }
 
+/// A failed command: a notification, and the same text as the status bar's
+/// error message.
 fn notify_failure(
+    state: &Entity<ShellState>,
     title: &'static str,
     text: impl Into<SharedString>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let text: SharedString = text.into();
+    state.update(cx, |state, cx| {
+        state.set_status(StatusMessage::error(text.to_string()), cx)
+    });
     notify(NotificationType::Error, Some(title), text, window, cx);
 }
 

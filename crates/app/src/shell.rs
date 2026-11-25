@@ -1,6 +1,8 @@
 //! The main window's root view.
 //!
-//! Layout, left to right, full height: the left pane, a gpui-component
+//! Layout, top to bottom: the title bar, the main row, and the status bar
+//! ([`status_bar`](crate::views::status_bar)) across the full width. The main
+//! row, left to right: the left pane, a gpui-component
 //! [`DockArea`] (the center and the right dock; no left or bottom dock), and
 //! the icon rail at the far right edge. The center panel ([`CenterPanel`])
 //! stacks the connection banner, the tab strip and the content area the web
@@ -44,11 +46,13 @@ use crate::link::{AgentCommands, DaemonLink, LinkConfig};
 use crate::model::ShellModel;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, Region};
+use crate::update::{NoUpdater, Updater};
 use crate::view_models::LeftPaneMode;
 use crate::views::agents::AgentsPane;
 use crate::views::center::CenterPanel;
 use crate::views::placeholder::PlaceholderPanel;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
+use crate::views::status_bar::status_bar;
 use crate::views::title_bar::title_bar;
 
 gpui_kit::actions!(
@@ -109,6 +113,12 @@ pub struct ShellOptions {
     /// How long a command may go unanswered; `None` is
     /// [`DEFAULT_COMMAND_TIMEOUT`](crate::shell_state::DEFAULT_COMMAND_TIMEOUT).
     pub command_timeout: Option<Duration>,
+    /// Detects and installs updates; `None` is [`NoUpdater`](crate::update::NoUpdater),
+    /// which never finds one.
+    pub updater: Option<Rc<dyn Updater>>,
+    /// How long an `Info` status message stays; `None` is
+    /// [`DEFAULT_INFO_STATUS_DURATION`](crate::shell_state::DEFAULT_INFO_STATUS_DURATION).
+    pub info_status_duration: Option<Duration>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -157,6 +167,8 @@ impl Shell {
             commands,
             app_state,
             command_timeout,
+            updater,
+            info_status_duration,
         } = options;
         let link = link.map(DaemonLink::start);
 
@@ -184,6 +196,11 @@ impl Shell {
                 ShellState::new(model, native_theme, link, left, commands, app_state, cx);
             if let Some(timeout) = command_timeout {
                 state.set_command_timeout(timeout);
+            }
+            // The startup check, once: the app's updater finds nothing.
+            state.set_updater(updater.unwrap_or_else(|| Rc::new(NoUpdater)), cx);
+            if let Some(duration) = info_status_duration {
+                state.set_info_status_duration(duration);
             }
             state
         });
@@ -521,6 +538,11 @@ impl Render for Shell {
             tracing::debug!(source = "rail", ?entry, "rail select");
             let _ = shell.update(cx, |this, cx| this.select_rail_entry(entry, window, cx));
         };
+        let state = self.state.downgrade();
+        let on_update = move |_: &mut Window, cx: &mut App| {
+            tracing::debug!(source = "status bar", "update button");
+            let _ = state.update(cx, |state, cx| state.install_update(cx));
+        };
         let expanded = self.state.read(cx).left_pane_mode() == LeftPaneMode::Expanded;
         let left_width = self.fitted_left_width(self.state.read(cx).left_pane_layout(), window, cx);
         let theme = cx.theme();
@@ -567,5 +589,12 @@ impl Render for Shell {
             .size_full()
             .child(title_bar(native.as_ref(), cx))
             .child(body)
+            .child(status_bar(
+                self.state.read(cx).status_message(),
+                self.state.read(cx).update_state(),
+                native.as_ref(),
+                on_update,
+                cx,
+            ))
     }
 }

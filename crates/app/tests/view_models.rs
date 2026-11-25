@@ -506,3 +506,131 @@ fn command_errors_read_as_the_daemons_message() {
         "The daemon link has stopped"
     );
 }
+
+// ---- Status bar --------------------------------------------------------------
+
+mod status_bar {
+    use smithagents_app::model::Connection;
+    use smithagents_app::update::UpdateState;
+    use smithagents_app::view_models::{
+        repository_added_text, status_to_show, update_button, version_text, StatusKind,
+        StatusMessage, UpdateButtonVm,
+    };
+
+    fn info(text: &str) -> StatusMessage {
+        StatusMessage {
+            text: text.into(),
+            kind: StatusKind::Info,
+        }
+    }
+
+    fn error(text: &str) -> StatusMessage {
+        StatusMessage {
+            text: text.into(),
+            kind: StatusKind::Error,
+        }
+    }
+
+    #[test]
+    fn nothing_shows_when_connected_and_idle() {
+        assert_eq!(status_to_show(&Connection::Connected, None, None), None);
+        // A stale link error never shows while connected.
+        assert_eq!(
+            status_to_show(&Connection::Connected, Some("refused"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn the_transient_message_shows_while_connected() {
+        let msg = info("Agent Mercury created");
+        assert_eq!(
+            status_to_show(&Connection::Connected, None, Some(&msg)),
+            Some(msg.clone())
+        );
+        let msg = error("boom");
+        assert_eq!(
+            status_to_show(&Connection::Connected, None, Some(&msg)),
+            Some(msg.clone())
+        );
+    }
+
+    #[test]
+    fn the_connection_wins_over_a_transient_message() {
+        let msg = error("boom");
+        assert_eq!(
+            status_to_show(&Connection::Connecting, None, Some(&msg)),
+            Some(info("Connecting to the local daemon…"))
+        );
+        assert_eq!(
+            status_to_show(&Connection::Reconnecting, None, Some(&msg)),
+            Some(info("Reconnecting to the local daemon…"))
+        );
+    }
+
+    #[test]
+    fn the_connection_text_carries_the_link_error_on_one_line() {
+        let shown = status_to_show(&Connection::Reconnecting, Some("  refused \n"), None).unwrap();
+        assert_eq!(shown.kind, StatusKind::Info);
+        assert_eq!(shown.text, "Reconnecting to the local daemon…: refused");
+        assert!(!shown.text.contains('\n'));
+        // A blank error adds nothing.
+        assert_eq!(
+            status_to_show(&Connection::Connecting, Some("  "), None)
+                .unwrap()
+                .text,
+            "Connecting to the local daemon…"
+        );
+    }
+
+    #[test]
+    fn the_version_text_has_a_v_prefix() {
+        assert_eq!(version_text("0.1.0"), "v0.1.0");
+    }
+
+    #[test]
+    fn no_update_button_unless_one_is_available() {
+        assert_eq!(update_button(&UpdateState::UpToDate), None);
+    }
+
+    #[test]
+    fn the_update_button_follows_the_update_state() {
+        let v = || "1.2.3".to_owned();
+        assert_eq!(
+            update_button(&UpdateState::Available { version: v() }),
+            Some(UpdateButtonVm {
+                label: "Update available".into(),
+                enabled: true,
+                a11y_label: "Update available: v1.2.3".into(),
+            })
+        );
+        let installing = update_button(&UpdateState::Installing { version: v() }).unwrap();
+        assert_eq!(installing.label, "Installing…");
+        assert!(!installing.enabled);
+        assert!(installing.a11y_label.contains("v1.2.3"));
+        let failed = update_button(&UpdateState::Failed {
+            version: v(),
+            message: "boom".into(),
+        })
+        .unwrap();
+        assert_eq!(failed.label, "Update failed, retry");
+        assert!(failed.enabled);
+        assert!(failed.a11y_label.contains("v1.2.3"));
+    }
+
+    #[test]
+    fn repository_added_names_the_last_path_component() {
+        assert_eq!(
+            repository_added_text(std::path::Path::new("/src/my-app")),
+            "Repository added: my-app"
+        );
+        assert_eq!(
+            repository_added_text(std::path::Path::new("/src/my-app/")),
+            "Repository added: my-app"
+        );
+        assert_eq!(
+            repository_added_text(std::path::Path::new("/")),
+            "Repository added: /"
+        );
+    }
+}

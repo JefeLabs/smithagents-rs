@@ -25,7 +25,7 @@ use gpui_kit::{
 use smithagents_app::layout_store::{
     saved_dock, saved_left_pane, with_left_pane, LayoutStore, LeftPaneLayout,
     COMPACT_LEFT_PANE_WIDTH, DEFAULT_LEFT_PANE_WIDTH, LAYOUT_VERSION, MIN_CENTER_WIDTH,
-    MIN_LEFT_PANE_WIDTH,
+    MIN_LEFT_PANE_WIDTH, STATUS_BAR_HEIGHT,
 };
 use smithagents_app::link::LinkConfig;
 use smithagents_app::model::{Action, Connection, Effect, ShellModel};
@@ -1026,7 +1026,11 @@ fn the_left_pane_spans_the_height_below_the_title_bar_and_the_rail_sits_at_the_f
         let title = window.find(TITLE_BAR_ID).bounds();
         let left = window.find(LEFT_PANE_ID).bounds();
         assert_eq!(left.origin, point(px(0.), title.bottom()), "{left:?}");
-        assert_eq!(left.bottom(), content.height, "to the bottom");
+        assert_eq!(
+            left.bottom(),
+            content.height - STATUS_BAR_HEIGHT,
+            "to the top of the status bar"
+        );
 
         let banner = window.find(BANNER_ID).bounds();
         assert!(banner.left() >= left.right(), "{banner:?} vs {left:?}");

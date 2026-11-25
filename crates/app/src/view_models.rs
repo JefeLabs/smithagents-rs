@@ -11,6 +11,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::link::LinkError;
 use crate::model::{Connection, ShellModel};
+use crate::update::UpdateState;
 
 /// The connection banner, or `None` when connected.
 ///
@@ -26,6 +27,95 @@ pub fn banner_text(connection: &Connection, error: Option<&str>) -> Option<Strin
         Some(error) => Some(format!("{headline}\n{error}")),
         None => Some(headline.to_owned()),
     }
+}
+
+// ---- Status bar --------------------------------------------------------------
+
+/// How a status message is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Info,
+    Error,
+}
+
+/// One line for the status bar's center.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusMessage {
+    pub text: String,
+    pub kind: StatusKind,
+}
+
+impl StatusMessage {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Info,
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Error,
+        }
+    }
+}
+
+/// What the status bar's center shows. While the connection is not
+/// `Connected` that is the connection's own status (the banner's wording on
+/// one line, the link's error after a colon), which a transient message never
+/// replaces; otherwise the transient message, if any.
+pub fn status_to_show(
+    connection: &Connection,
+    link_error: Option<&str>,
+    transient: Option<&StatusMessage>,
+) -> Option<StatusMessage> {
+    match banner_text(connection, link_error) {
+        Some(banner) => {
+            let line = banner.replacen('\n', ": ", 1);
+            Some(StatusMessage::info(line))
+        }
+        None => transient.cloned(),
+    }
+}
+
+/// The status line for a repository that was added.
+pub fn repository_added_text(path: &Path) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("Repository added: {name}")
+}
+
+/// The version as the status bar shows it.
+pub fn version_text(version: &str) -> String {
+    format!("v{version}")
+}
+
+/// The update button next to the version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateButtonVm {
+    pub label: String,
+    pub enabled: bool,
+    /// The accessible name, which includes the version.
+    pub a11y_label: String,
+}
+
+/// The update button for `state`, or `None` when there is nothing to
+/// install.
+pub fn update_button(state: &UpdateState) -> Option<UpdateButtonVm> {
+    let (label, enabled, version) = match state {
+        UpdateState::UpToDate => return None,
+        UpdateState::Available { version } => ("Update available", true, version),
+        UpdateState::Installing { version } => ("Installing…", false, version),
+        UpdateState::Failed { version, .. } => ("Update failed, retry", true, version),
+    };
+    Some(UpdateButtonVm {
+        label: label.to_owned(),
+        enabled,
+        a11y_label: format!("{label}: {}", version_text(version)),
+    })
 }
 
 /// The title of an agent's center tab: its name.

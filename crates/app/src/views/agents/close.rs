@@ -21,7 +21,9 @@ use super::{
     CONFIRM_CLOSE_ID,
 };
 use crate::link::LinkError;
-use crate::view_models::{command_error_text, DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT};
+use crate::view_models::{
+    command_error_text, StatusMessage, DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT,
+};
 
 const FAILED: &str = "Could not close the agent";
 
@@ -34,17 +36,23 @@ impl AgentsPane {
             tracing::debug!(agent = %id, "a close is already in flight");
             return;
         }
-        let (close, timeout) = {
+        let (close, timeout, name) = {
             let state = self.state.read(cx);
             (
                 state
                     .agent_commands()
                     .map(|commands| commands.close_agent(id)),
                 state.command_timeout(),
+                state
+                    .model()
+                    .agents()
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .map(|agent| agent.name.clone()),
             )
         };
         let Some(close) = close else {
-            notify_failure(FAILED, NOT_CONNECTED_TEXT, window, cx);
+            notify_failure(&self.state, FAILED, NOT_CONNECTED_TEXT, window, cx);
             return;
         };
         tracing::debug!(agent = %id, "closing an agent");
@@ -52,7 +60,7 @@ impl AgentsPane {
         let task = cx.spawn_in(window, async move |this, cx| {
             let answer = answered(close, timer).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.finish_close(id, answer, window, cx)
+                this.finish_close(id, name, answer, window, cx)
             });
         });
         self.closing.insert(id, task);
@@ -62,20 +70,29 @@ impl AgentsPane {
     fn finish_close(
         &mut self,
         id: AgentId,
+        name: Option<String>,
         answer: Option<Result<(), LinkError>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.closing.remove(&id);
         match answer {
-            Some(Ok(())) => {}
+            Some(Ok(())) => {
+                let text = name.map_or_else(
+                    || "Agent closed".to_owned(),
+                    |name| format!("Agent {name} closed"),
+                );
+                self.state.update(cx, |state, cx| {
+                    state.set_status(StatusMessage::info(text), cx)
+                });
+            }
             Some(Err(e)) => {
                 tracing::warn!("cannot close agent {id}: {e}");
-                notify_failure(FAILED, command_error_text(&e), window, cx);
+                notify_failure(&self.state, FAILED, command_error_text(&e), window, cx);
             }
             None => {
                 tracing::warn!("the daemon did not answer the close of agent {id} in time");
-                notify_failure(FAILED, DAEMON_SILENT_TEXT, window, cx);
+                notify_failure(&self.state, FAILED, DAEMON_SILENT_TEXT, window, cx);
             }
         }
     }

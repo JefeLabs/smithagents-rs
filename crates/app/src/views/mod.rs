@@ -7,5 +7,6 @@ pub mod banner;
 pub mod center;
 pub mod placeholder;
 pub mod rail;
+pub mod status_bar;
 pub mod tabs;
 pub mod title_bar;

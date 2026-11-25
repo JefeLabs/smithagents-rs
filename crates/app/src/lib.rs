@@ -14,6 +14,7 @@ pub mod settings;
 pub mod shell;
 pub mod shell_state;
 pub mod theme_adapter;
+pub mod update;
 pub mod view_models;
 pub mod views;
 
@@ -123,6 +124,8 @@ fn open_main_window(
                     commands: None,
                     app_state: Some(app_state),
                     command_timeout: None,
+                    updater: None,
+                    info_status_duration: None,
                 },
                 window,
                 cx,

@@ -22,8 +22,8 @@ use super::{
 use crate::link::LinkError;
 use crate::model::Action;
 use crate::view_models::{
-    command_error_text, new_agent_plan, NewAgentPlan, RepoChoiceVm, DAEMON_SILENT_TEXT,
-    NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
+    command_error_text, new_agent_plan, NewAgentPlan, RepoChoiceVm, StatusMessage,
+    DAEMON_SILENT_TEXT, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
 };
 
 impl AgentsPane {
@@ -76,7 +76,13 @@ impl AgentsPane {
             )
         };
         let Some(create) = create else {
-            notify_failure("Could not create the agent", NOT_CONNECTED_TEXT, window, cx);
+            notify_failure(
+                &self.state,
+                "Could not create the agent",
+                NOT_CONNECTED_TEXT,
+                window,
+                cx,
+            );
             return;
         };
         tracing::debug!(%repo, "creating an agent");
@@ -101,13 +107,23 @@ impl AgentsPane {
         self.create = None;
         let Some(result) = answer else {
             tracing::warn!("the daemon did not answer a create in time");
-            notify_failure("Could not create the agent", DAEMON_SILENT_TEXT, window, cx);
+            notify_failure(
+                &self.state,
+                "Could not create the agent",
+                DAEMON_SILENT_TEXT,
+                window,
+                cx,
+            );
             cx.notify();
             return;
         };
         match result {
             Ok(agent) => {
                 tracing::debug!(agent = %agent.id, name = %agent.name, "agent created");
+                let text = format!("Agent {} created", agent.name);
+                self.state.update(cx, |state, cx| {
+                    state.set_status(StatusMessage::info(text), cx)
+                });
                 self.awaiting = Some(AwaitedAgent {
                     id: agent.id,
                     selected_before,
@@ -117,6 +133,7 @@ impl AgentsPane {
             Err(e) => {
                 tracing::warn!("cannot create an agent: {e}");
                 notify_failure(
+                    &self.state,
                     "Could not create the agent",
                     command_error_text(&e),
                     window,

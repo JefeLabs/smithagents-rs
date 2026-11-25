@@ -54,6 +54,9 @@ pub const MIN_LEFT_PANE_WIDTH: Pixels = px(100.);
 pub const MAX_LEFT_PANE_WIDTH: Pixels = px(1000.);
 /// The left pane's expanded width when nothing is saved.
 pub const DEFAULT_LEFT_PANE_WIDTH: Pixels = px(240.);
+/// Height of the status bar across the bottom of the window, under the left
+/// pane, the dock area and the rail.
+pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
 /// The persisted name of the left pane's panel. Never change it.
 pub const LEFT_PANE_PANEL: &str = "Agents";
 /// The persisted name gpui-base gives a tab group.

@@ -17,7 +17,10 @@ use crate::app_state::{AppState, AppStateStore};
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
 use crate::link::{AgentCommands, DaemonLink};
 use crate::model::{Action, Connection, Effect, ShellModel};
-use crate::view_models::{banner_text, LeftPaneMode};
+use crate::update::{NoUpdater, UpdateState, Updater};
+use crate::view_models::{
+    banner_text, repository_added_text, status_to_show, LeftPaneMode, StatusKind, StatusMessage,
+};
 
 /// How often the link's last error is re-read while the link is not
 /// connected: it changes the error between retries without sending an action.
@@ -26,6 +29,9 @@ const LINK_ERROR_POLL: Duration = Duration::from_secs(1);
 /// How long the views wait for the daemon to answer a command (create or
 /// close an agent) before they give up on it and say so.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long an `Info` status message stays in the status bar.
+pub const DEFAULT_INFO_STATUS_DURATION: Duration = Duration::from_secs(5);
 
 /// Receives the center content area's rectangle.
 ///
@@ -73,6 +79,15 @@ pub struct ShellState {
     _pump: Option<Task<()>>,
     /// Polls the link's error; runs only while a link is not connected.
     error_watch: Option<Task<()>>,
+    /// The transient status message of the status bar.
+    status: Option<StatusMessage>,
+    /// Clears an `Info` message; replaced (so cancelled) with the message.
+    status_timer: Option<Task<()>>,
+    info_status_duration: Duration,
+    updater: Rc<dyn Updater>,
+    update: UpdateState,
+    /// The running update check or install (one at a time).
+    update_task: Option<Task<()>>,
 }
 
 impl ShellState {
@@ -108,6 +123,12 @@ impl ShellState {
             center_listener: None,
             _pump: pump,
             error_watch: None,
+            status: None,
+            status_timer: None,
+            info_status_duration: DEFAULT_INFO_STATUS_DURATION,
+            updater: Rc::new(NoUpdater),
+            update: UpdateState::UpToDate,
+            update_task: None,
         };
         state.link_error = state.current_link_error();
         state.sync_error_watch(cx);
@@ -217,7 +238,14 @@ impl ShellState {
     /// Applies a burst of actions with one redraw.
     fn dispatch_all(&mut self, actions: Vec<Action>, cx: &mut Context<Self>) {
         for action in actions {
+            let added = match &action {
+                Action::RepoAdded(repo) => Some(repository_added_text(&repo.path)),
+                _ => None,
+            };
             self.apply(action);
+            if let Some(text) = added {
+                self.set_status(StatusMessage::info(text), cx);
+            }
         }
         self.link_error = self.current_link_error();
         self.sync_error_watch(cx);
@@ -248,6 +276,129 @@ impl ShellState {
     /// The banner line(s), or `None` while connected.
     pub fn banner(&self) -> Option<String> {
         banner_text(&self.model.connection(), self.link_error.as_deref())
+    }
+
+    /// What the status bar's center shows: the connection's status while not
+    /// connected, else the transient message.
+    pub fn status_message(&self) -> Option<StatusMessage> {
+        status_to_show(
+            &self.model.connection(),
+            self.link_error.as_deref(),
+            self.status.as_ref(),
+        )
+    }
+
+    /// Shows `message` in the status bar, replacing the current one. An
+    /// `Info` message clears itself after the info duration; an `Error`
+    /// stays until replaced or [`ShellState::clear_status`].
+    pub fn set_status(&mut self, message: StatusMessage, cx: &mut Context<Self>) {
+        tracing::debug!(?message, "status message");
+        // Replacing the task cancels the previous message's timer.
+        self.status_timer = (message.kind == StatusKind::Info).then(|| {
+            let duration = self.info_status_duration;
+            cx.spawn(async move |state, cx| {
+                cx.background_executor().timer(duration).await;
+                let _ = state.update(cx, |state, cx| {
+                    state.status = None;
+                    state.status_timer = None;
+                    cx.notify();
+                });
+            })
+        });
+        self.status = Some(message);
+        cx.notify();
+    }
+
+    pub fn clear_status(&mut self, cx: &mut Context<Self>) {
+        self.status_timer = None;
+        if self.status.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Sets how long an `Info` message stays ([`DEFAULT_INFO_STATUS_DURATION`]
+    /// unless set).
+    pub fn set_info_status_duration(&mut self, duration: Duration) {
+        self.info_status_duration = duration;
+    }
+
+    /// Replaces the updater and asks it once for a newer version (the
+    /// startup check). Without it the shell runs [`NoUpdater`].
+    pub fn set_updater(&mut self, updater: Rc<dyn Updater>, cx: &mut Context<Self>) {
+        self.updater = updater;
+        self.update_task = None;
+        self.check_for_updates(cx);
+    }
+
+    pub fn update_state(&self) -> &UpdateState {
+        &self.update
+    }
+
+    /// Asks the updater for a newer version and stores its answer. Called once
+    /// at startup; call it again to re-check (nothing does yet). Ignored while
+    /// an install runs, and an install that starts meanwhile wins.
+    pub fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.update_task.is_some() {
+            return;
+        }
+        let check = self.updater.check();
+        self.update_task = Some(cx.spawn(async move |state, cx| {
+            let found = check.await;
+            let _ = state.update(cx, |state, cx| {
+                state.update_task = None;
+                if state.update != found {
+                    tracing::debug!(?found, "update state");
+                    state.update = found;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Installs the available version (or retries a failed install). Does
+    /// nothing unless an update is `Available` or `Failed`, so a second click
+    /// while installing starts no second install. On success the state is
+    /// `UpToDate` and the status asks for a restart; on failure it is
+    /// `Failed` and the status carries the error.
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        let version = match &self.update {
+            UpdateState::Available { version } | UpdateState::Failed { version, .. } => {
+                version.clone()
+            }
+            UpdateState::UpToDate | UpdateState::Installing { .. } => return,
+        };
+        tracing::debug!(%version, "installing an update");
+        self.update = UpdateState::Installing {
+            version: version.clone(),
+        };
+        let install = self.updater.install(version.clone());
+        self.update_task = Some(cx.spawn(async move |state, cx| {
+            let result = install.await;
+            let _ = state.update(cx, |state, cx| {
+                state.update_task = None;
+                match result {
+                    Ok(()) => {
+                        state.update = UpdateState::UpToDate;
+                        state.set_status(
+                            StatusMessage::info(format!(
+                                "Update v{version} installed. Restart SmithAgents to finish."
+                            )),
+                            cx,
+                        );
+                    }
+                    Err(message) => {
+                        tracing::warn!(%version, %message, "the update failed");
+                        state.update = UpdateState::Failed {
+                            version,
+                            message: message.clone(),
+                        };
+                        state.set_status(StatusMessage::error(message), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     /// The theme agent accents are drawn in.
