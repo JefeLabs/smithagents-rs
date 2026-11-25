@@ -5,10 +5,13 @@
 //! One background task ([`Scheduler`]) makes those decisions in passes. A pass
 //! runs at startup, on [`SchedulerHandle::kick`] (or a [`Kicker`] clone), and
 //! after `AgentUpdated` bus events, since an agent leaving `Working`/`Quiet`
-//! frees a slot. Triggers that arrive while a pass runs coalesce into one more
-//! pass after it, so none is lost and passes never overlap. Each pass also
-//! holds the intent service's start lock, which `IntentService::send` takes
-//! too, so the limit is checked and used atomically by both.
+//! frees a slot, and `AgentClosed` events, since closing an agent left
+//! attached to an intent lets that intent start. Triggers that arrive while a
+//! pass runs coalesce into one more pass after it, so none is lost and passes
+//! never overlap. Each pass also holds the intent service's start lock, which
+//! `IntentService::send` takes too, so the limit is checked and used
+//! atomically by both. A pass that panics is logged and the scheduler keeps
+//! running.
 //!
 //! The slot rule (spec: "Agents working at once"): `running` counts every
 //! agent with a turn in flight (`Working` or `Quiet`), whatever started it:
@@ -17,7 +20,9 @@
 //! messages directly is never held back, but takes a slot while it replies.
 
 use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 
+use futures::FutureExt;
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentFilter, IntentState, ItemStatus};
@@ -26,7 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::events::EventBus;
-use crate::intents::{IntentError, IntentService};
+use crate::intents::{panic_text, IntentError, IntentService};
 use crate::service::AgentService;
 use crate::store::{Store, StoreError};
 
@@ -157,7 +162,7 @@ impl Drop for SchedulerHandle {
 /// What woke the scheduler.
 enum Wake {
     Msg(Option<Msg>),
-    AgentUpdated,
+    AgentChanged,
     BusClosed,
 }
 
@@ -216,7 +221,7 @@ impl Scheduler {
                 // Every sender gone, or asked to stop.
                 Wake::Msg(None | Some(Msg::Shutdown)) => return,
                 Wake::Msg(Some(Msg::Pass(waiter))) => waiters.push(waiter),
-                Wake::Msg(Some(Msg::Kick)) | Wake::AgentUpdated => {}
+                Wake::Msg(Some(Msg::Kick)) | Wake::AgentChanged => {}
                 Wake::BusClosed => {
                     events = None;
                     continue;
@@ -250,11 +255,15 @@ impl Scheduler {
         }
     }
 
-    /// One pass; errors are logged, and the next trigger tries again.
+    /// One pass; errors are logged, and the next trigger tries again. A panic
+    /// (in a start, say) is caught and logged too, so it cannot end the
+    /// scheduler task; the locks the pass held are released as it unwinds.
     async fn pass(&self) {
         let _starts = self.intents.lock_starts().await;
-        if let Err(e) = self.start_ready().await {
-            tracing::warn!("queue pass failed: {e}");
+        match AssertUnwindSafe(self.start_ready()).catch_unwind().await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("queue pass failed: {e}"),
+            Err(panic) => tracing::error!("queue pass panicked: {}", panic_text(&*panic)),
         }
     }
 
@@ -285,7 +294,8 @@ impl Scheduler {
     }
 }
 
-/// Waits for an `AgentUpdated` event (or a lag, which may have hidden one).
+/// Waits for an `AgentUpdated` or `AgentClosed` event (or a lag, which may
+/// have hidden one).
 async fn next_agent_update(events: Option<&mut broadcast::Receiver<Event>>) -> Wake {
     let Some(live) = events else {
         return std::future::pending().await;
@@ -293,11 +303,11 @@ async fn next_agent_update(events: Option<&mut broadcast::Receiver<Event>>) -> W
     loop {
         match live.recv().await {
             Ok(Event {
-                kind: EventKind::AgentUpdated(_),
+                kind: EventKind::AgentUpdated(_) | EventKind::AgentClosed { .. },
                 ..
-            }) => return Wake::AgentUpdated,
+            }) => return Wake::AgentChanged,
             Ok(_) => {}
-            Err(RecvError::Lagged(_)) => return Wake::AgentUpdated,
+            Err(RecvError::Lagged(_)) => return Wake::AgentChanged,
             Err(RecvError::Closed) => return Wake::BusClosed,
         }
     }

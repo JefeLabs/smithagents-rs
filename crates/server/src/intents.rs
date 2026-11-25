@@ -24,10 +24,14 @@
 //! ([`crate::queue`]), which calls [`IntentService::start`] when its
 //! dependencies are `Resolved` and a slot is free. Deciding to start and
 //! starting happen under one service-wide start lock (`send` and every
-//! scheduler pass take it), so the queue limit is never overrun by a race.
-//! A start re-reads the intent under its reservation and does nothing to an
-//! intent already `Sent`, so an intent never gets a second agent. `send`,
-//! `start`, `resolve` and `set_agent_defaults` run detached like `create`.
+//! scheduler pass take it), so intent starts never overrun the queue limit
+//! by a race (agents the user messages directly may; they never wait).
+//! A start re-reads the intent under its reservation, does nothing to an
+//! intent already `Sent`, and refuses (recording why in `last_start_error`)
+//! while an open agent is attached to the intent, as a start interrupted
+//! between creating the agent and saving `Sent` leaves it; so an intent never
+//! gets a second agent. `send`, `start`, `resolve` and `set_agent_defaults`
+//! run detached like `create`.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -173,7 +177,14 @@ struct Inner {
     /// Held while deciding whether to start intents and starting them (by
     /// `send` and by each scheduler pass). Taken before any reservation.
     starts: AsyncMutex<()>,
+    /// Runs at the beginning of every start (see [`IntentService::set_start_hook`]).
+    #[cfg(feature = "test-util")]
+    start_hook: Mutex<Option<StartHook>>,
 }
+
+/// A test hook run with the intent's id at the beginning of every start.
+#[cfg(feature = "test-util")]
+pub type StartHook = Arc<dyn Fn(IntentId) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct IntentService {
@@ -200,7 +211,33 @@ impl IntentService {
                 locks: Mutex::new(HashMap::new()),
                 scheduler: Mutex::new(None),
                 starts: AsyncMutex::new(()),
+                #[cfg(feature = "test-util")]
+                start_hook: Mutex::new(None),
             }),
+        }
+    }
+
+    /// Test hook: `hook` runs at the beginning of every start, before the
+    /// agent is made (tests use it to make a start panic). `None` removes it.
+    #[cfg(feature = "test-util")]
+    pub fn set_start_hook(&self, hook: Option<StartHook>) {
+        *self
+            .inner
+            .start_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    #[cfg(feature = "test-util")]
+    fn run_start_hook(&self, id: IntentId) {
+        let hook = self
+            .inner
+            .start_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(id);
         }
     }
 
@@ -794,7 +831,24 @@ impl IntentService {
     /// branch and worktree), its first message (the brief), then the intent
     /// saved as `Sent`. On a failure the intent keeps its state, with the
     /// error in `last_start_error`; an agent already made is closed.
+    ///
+    /// An open agent already attached to the intent (left by a start that
+    /// stopped between creating it and saving `Sent`, or by a failed start
+    /// whose agent could not be closed) blocks the start until it is closed,
+    /// so an intent never has two agents. Closing it wakes the scheduler.
     async fn start_reserved(&self, mut intent: Intent) -> Result<Intent, IntentError> {
+        #[cfg(feature = "test-util")]
+        self.run_start_hook(intent.id);
+        let open = self.inner.store.list_agents(false).await?;
+        if let Some(attached) = open.iter().find(|a| a.intent_id == Some(intent.id)) {
+            let message = format!(
+                "agent {} is already attached to this intent; close it to start again",
+                attached.name
+            );
+            tracing::warn!(intent_id = %intent.id, agent_id = %attached.id, "not starting the intent: {message}");
+            self.record_start_error(&mut intent, message.clone()).await;
+            return Err(IntentError::Invalid(message));
+        }
         let agent_id = match self.launch_agent(&intent).await {
             Ok(id) => id,
             Err(e) => {
@@ -1442,7 +1496,7 @@ fn stopped_message(pass: u8) -> String {
     format!("polish pass {pass} stopped unexpectedly; retry")
 }
 
-fn panic_text(payload: &(dyn Any + Send)) -> &str {
+pub(crate) fn panic_text(payload: &(dyn Any + Send)) -> &str {
     if let Some(s) = payload.downcast_ref::<&str>() {
         s
     } else if let Some(s) = payload.downcast_ref::<String>() {

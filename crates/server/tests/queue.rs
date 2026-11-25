@@ -27,7 +27,7 @@ use smithagents_server::harness::{
 use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
 use smithagents_server::paths::Paths;
 use smithagents_server::queue::{Scheduler, SchedulerHandle};
-use smithagents_server::service::{AgentService, ServiceError};
+use smithagents_server::service::{AgentService, CreateAgentOptions, ServiceError};
 use smithagents_server::store::Store;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::SqlitePool;
@@ -268,6 +268,22 @@ impl Fx {
 
     async fn get(&self, id: IntentId) -> Intent {
         self.store.get_intent(id).await.unwrap().unwrap()
+    }
+
+    /// An open agent of `intent` on its branch, as a start leaves it when the
+    /// daemon stops between creating the agent and saving the intent `Sent`.
+    async fn stray_agent(&self, intent: &Intent) -> Agent {
+        self.agents
+            .create_agent_with(
+                self.repo.id,
+                CreateAgentOptions {
+                    branch: Some(format!("intent/{}", intent.slug)),
+                    intent_id: Some(intent.id),
+                    system_prompt_append: None,
+                },
+            )
+            .await
+            .unwrap()
     }
 
     async fn state(&self, id: IntentId) -> IntentState {
@@ -814,6 +830,96 @@ async fn concurrent_starts_make_one_agent() {
     f.mark_resolved(base.id).await;
     let err = f.svc.start(base.id).await.unwrap_err();
     assert!(is_invalid_state(&err, IntentState::Resolved), "{err:?}");
+}
+
+fn attached_message(agent: &Agent) -> String {
+    format!(
+        "agent {} is already attached to this intent; close it to start again",
+        agent.name
+    )
+}
+
+#[tokio::test]
+async fn an_open_agent_left_by_a_crashed_start_blocks_a_second_one() {
+    let f = fx().await;
+    let x = f.intent("x", &[]).await;
+    let stray = f.stray_agent(&x).await;
+
+    let err = f.svc.send(x.id).await.unwrap_err();
+    assert!(
+        matches!(&err, IntentError::Invalid(m) if *m == attached_message(&stray)),
+        "{err:?}"
+    );
+    let now = f.get(x.id).await;
+    assert_eq!(now.state, IntentState::Complete);
+    assert_eq!(now.agent_id, None);
+    assert_eq!(now.last_start_error, Some(attached_message(&stray)));
+    assert_eq!(f.authors(x.id).await, [VersionAuthor::Seed]);
+    assert_eq!(f.agents_for(x.id).await.len(), 1);
+
+    // Once that agent is closed, Send starts a new one.
+    f.agents.close_agent(stray.id).await.unwrap();
+    let sent = f.svc.send(x.id).await.unwrap();
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    assert_ne!(sent.agent_id, Some(stray.id));
+    assert_eq!(f.agents_for(x.id).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_queued_intent_with_a_stray_agent_starts_once_that_agent_closes() {
+    let f = fx().await;
+    let base = f.intent("base", &[]).await;
+    let q = f.intent("q", &[base.id]).await;
+    assert_eq!(f.svc.send(q.id).await.unwrap().state, IntentState::Queued);
+    let stray = f.stray_agent(&q).await;
+    f.mark_resolved(base.id).await;
+
+    f.sched().run_pass().await;
+    let now = f.get(q.id).await;
+    assert_eq!(now.state, IntentState::Queued);
+    assert_eq!(now.last_start_error, Some(attached_message(&stray)));
+    assert_eq!(f.agents_for(q.id).await.len(), 1);
+
+    // Closing the stray agent is the only trigger needed.
+    f.agents.close_agent(stray.id).await.unwrap();
+    let sent = f.wait_sent(q.id).await;
+    assert_ne!(sent.agent_id, Some(stray.id));
+    assert_eq!(sent.last_start_error, None);
+    assert_eq!(f.agents_for(q.id).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_panicking_start_does_not_stop_the_scheduler() {
+    let f = fx().await;
+    let base = f.intent("base", &[]).await;
+    let q = f.intent("q", &[base.id]).await;
+    assert_eq!(f.svc.send(q.id).await.unwrap().state, IntentState::Queued);
+    // Let the pass that Send asked for run first.
+    f.sched().run_pass().await;
+    let panics = Arc::new(AtomicUsize::new(1));
+    let left = panics.clone();
+    f.svc.set_start_hook(Some(Arc::new(move |_id| {
+        if left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            panic!("test start panic");
+        }
+    })));
+    f.mark_resolved(base.id).await;
+
+    // This pass's start panics.
+    f.sched().run_pass().await;
+    assert_eq!(panics.load(Ordering::SeqCst), 0);
+    assert_eq!(f.state(q.id).await, IntentState::Queued);
+    assert!(f.all_agents().await.is_empty());
+
+    // The scheduler still runs (and the locks the pass held are free): a
+    // later kick starts the intent.
+    f.sched().kick();
+    f.wait_sent(q.id).await;
+    assert_eq!(f.agents_for(q.id).await.len(), 1);
 }
 
 // ----------------------------------------------------------------- failures
