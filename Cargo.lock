@@ -6565,6 +6565,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "smithagents-center-host"
+version = "0.1.0"
+dependencies = [
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "smithagents-theme",
+ "tempfile",
+ "thiserror 2.0.21",
+ "url",
+]
+
+[[package]]
 name = "smithagents-client"
 version = "0.1.0"
 dependencies = [

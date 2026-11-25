@@ -42,3 +42,5 @@ ignore = "0.4.35"
 # plus gpui-component. Releases break APIs weekly: pin exactly, upgrade on purpose.
 gpui-kit = "=0.11.0"
 signal-hook = "0.4.6"
+raw-window-handle = "=0.6.2"
+url = "=2.5.9"
