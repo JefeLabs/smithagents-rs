@@ -1,0 +1,22 @@
+[package]
+name = "smithagents-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Default features: `component` (gpui-component), `assets`, and `x11` (a no-op
+# on macOS). gpui-kit itself turns on the platform crate's `runtime_shaders`,
+# so no Xcode `metal` compiler is needed at build time.
+gpui-kit.workspace = true
+futures.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

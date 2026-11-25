@@ -1,0 +1,16 @@
+[package]
+name = "host-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "host-desktop"
+path = "src/main.rs"
+
+[dependencies]
+smithagents-app = { path = "../app" }
