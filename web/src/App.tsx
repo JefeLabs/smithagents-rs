@@ -16,12 +16,12 @@ export function App({ load = loadChatProps }: { load?: () => Promise<ChatProps> 
   }, [load]);
   if (state.error !== undefined) {
     return (
-      <main role="alert" className="bg-background text-foreground min-h-screen p-6">
+      <main role="alert" className="bg-center text-center-foreground min-h-screen p-6">
         <h1 className="text-status-error mb-2 text-lg font-semibold">Could not open this chat</h1>
         <p>{state.error}</p>
       </main>
     );
   }
-  if (!state.props) return <main className="bg-background text-muted-foreground min-h-screen p-6">Loading...</main>;
+  if (!state.props) return <main className="bg-center text-muted-foreground min-h-screen p-6">Loading...</main>;
   return <Chat {...state.props} />;
 }

@@ -350,6 +350,11 @@ example "open this issue in a center tab").
     CSS-first theme (`@theme` variables plus one `[data-theme="<id>"]` block
     per theme) for `web/`, and the GPUI theme data for the native panes
     (mapped onto gpui-component's theme format; verify when building).
+  - Surface levels [owner decision 2026-11-24]: `background`, two card
+    surfaces (`card`, `card-2`, each with a `-foreground`), a dedicated
+    `center` surface (center pane content and the active tab) and
+    `popover`. Default regions: center = `center`; left and right panes =
+    `card`; title bar, icon rail, tab strip, bottom bar = `card-2`.
   - Tailwind side: utilities consume CSS variables, so a new theme is a new
     token file with no component changes. Variable names follow the shadcn
     contract (`--background`, `--foreground`, `--card`, `--primary`,

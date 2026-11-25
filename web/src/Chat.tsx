@@ -141,7 +141,7 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
 
   return (
     <div
-      className="bg-background text-foreground border-agent flex h-screen flex-col border-l-4"
+      className="bg-center text-center-foreground border-agent flex h-screen flex-col border-l-4"
       style={{ "--agent-h": agent.color.h } as CSSProperties}
       onClick={openExternal}
       onAuxClick={openExternal}

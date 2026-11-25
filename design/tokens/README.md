@@ -10,3 +10,15 @@
 2. Change `id`, `name`, and the color values (OKLCH `l`, `c`, `h`). Every required color token must be present; unknown fields are rejected.
 3. Run `cargo test -p smithagents-theme` to check it loads and passes validation.
 4. Run `cargo themegen generate` to regenerate the derived outputs.
+
+## Surfaces
+
+Required surface tokens, each with a `-foreground` pair: `background`, `card` (first card surface), `card-2` (second card surface, a step apart from `card`; the validator rejects identical colors), `center` (center pane content and the active tab; may equal `background`), `popover`.
+
+Default region mapping (one place: `region_tokens` in `crates/app/src/theme_adapter.rs`):
+
+| region | surface |
+|---|---|
+| center pane, active center tab | `center` |
+| left pane, right activity pane | `card` |
+| title bar, icon rail, tab strip, bottom bar | `card-2` |

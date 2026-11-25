@@ -2,5 +2,5 @@
 @import "../../design/generated/theme.css";
 
 body {
-  @apply bg-background text-foreground font-sans;
+  @apply bg-center text-center-foreground font-sans;
 }

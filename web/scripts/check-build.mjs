@@ -26,6 +26,8 @@ const cssFiles = readdirSync("dist/assets").filter((f) => f.endsWith(".css"));
 assert.ok(cssFiles.length > 0, "no built css");
 const css = cssFiles.map((f) => readFileSync(`dist/assets/${f}`, "utf8")).join("\n");
 assert.ok(css.includes("--color-background"), "css lacks --color-background");
+assert.ok(css.includes("--color-card-2"), "css lacks --color-card-2");
+assert.ok(css.includes("--color-center"), "css lacks --color-center");
 assert.ok(/\[data-theme=["']?smith-dark["']?\]/.test(css), "css lacks smith-dark rule");
 
 

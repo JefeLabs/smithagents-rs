@@ -247,3 +247,114 @@ fn duplicate_font_id() {
         "{e:?}"
     );
 }
+
+#[test]
+fn missing_card_2() {
+    let mut s = set();
+    of(&mut s, Appearance::Light).colors.remove("card-2");
+    let e = errors(&s);
+    assert!(
+        e.iter()
+            .any(|e| matches!(e, E::MissingToken { token, .. } if token == "card-2")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn low_contrast_card_2_foreground() {
+    let mut s = set();
+    let t = of(&mut s, Appearance::Dark);
+    let mut fg = t.colors["card-2-foreground"];
+    fg.l = 0.4;
+    t.colors.insert("card-2-foreground".into(), fg);
+    let e = errors(&s);
+    assert!(
+        e.iter().any(|e| matches!(e,
+            E::LowContrast { foreground, background, .. }
+            if foreground == "card-2-foreground" && background == "card-2")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn agent_low_contrast_against_card_2() {
+    // Make card-2 the only surface an agent color fails against.
+    let mut s = set();
+    let t = of(&mut s, Appearance::Dark);
+    t.colors.insert(
+        "card-2".into(),
+        Oklch {
+            l: 0.72,
+            c: 0.0,
+            h: 0.0,
+        },
+    );
+    let e = errors(&s);
+    assert!(
+        e.iter().any(|e| matches!(e,
+            E::AgentLowContrast { against, .. } if against == "card-2")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn indistinct_card_surfaces() {
+    let mut s = set();
+    let t = of(&mut s, Appearance::Dark);
+    let card = t.colors["card"];
+    t.colors.insert("card-2".into(), card);
+    let e = errors(&s);
+    assert!(
+        e.iter().any(|e| matches!(e,
+            E::IndistinctSurfaces { a, b, .. } if a == "card" && b == "card-2")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn missing_center() {
+    let mut s = set();
+    of(&mut s, Appearance::Dark).colors.remove("center");
+    let e = errors(&s);
+    assert!(
+        e.iter()
+            .any(|e| matches!(e, E::MissingToken { token, .. } if token == "center")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn low_contrast_center_foreground() {
+    let mut s = set();
+    let t = of(&mut s, Appearance::Light);
+    let mut fg = t.colors["center-foreground"];
+    fg.l = 0.8;
+    t.colors.insert("center-foreground".into(), fg);
+    let e = errors(&s);
+    assert!(
+        e.iter().any(|e| matches!(e,
+            E::LowContrast { foreground, background, .. }
+            if foreground == "center-foreground" && background == "center")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn agent_low_contrast_against_center() {
+    let mut s = set();
+    let t = of(&mut s, Appearance::Dark);
+    t.colors.insert(
+        "center".into(),
+        Oklch {
+            l: 0.72,
+            c: 0.0,
+            h: 0.0,
+        },
+    );
+    let e = errors(&s);
+    assert!(
+        e.iter().any(|e| matches!(e,
+            E::AgentLowContrast { against, .. } if against == "center")),
+        "{e:?}"
+    );
+}

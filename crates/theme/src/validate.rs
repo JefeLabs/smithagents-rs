@@ -10,6 +10,8 @@ use crate::tokens::{Appearance, ThemeFile, ThemeSet, COLOR_TOKENS};
 pub const CONTRAST_RULES: &[(&str, &str, f64)] = &[
     ("foreground", "background", 4.5),
     ("card-foreground", "card", 4.5),
+    ("card-2-foreground", "card-2", 4.5),
+    ("center-foreground", "center", 4.5),
     ("popover-foreground", "popover", 4.5),
     ("primary-foreground", "primary", 4.5),
     ("secondary-foreground", "secondary", 4.5),
@@ -17,18 +19,32 @@ pub const CONTRAST_RULES: &[(&str, &str, f64)] = &[
     ("muted-foreground", "background", 4.5),
     ("muted-foreground", "muted", 4.5),
     ("muted-foreground", "card", 4.5),
+    ("muted-foreground", "card-2", 4.5),
+    ("muted-foreground", "center", 4.5),
     ("destructive", "background", 3.0),
     ("destructive", "card", 3.0),
+    ("destructive", "card-2", 3.0),
+    ("destructive", "center", 3.0),
     ("ring", "background", 3.0),
     ("ring", "card", 3.0),
+    ("ring", "card-2", 3.0),
+    ("ring", "center", 3.0),
     ("status-ok", "background", 3.0),
     ("status-ok", "card", 3.0),
+    ("status-ok", "card-2", 3.0),
+    ("status-ok", "center", 3.0),
     ("status-warn", "background", 3.0),
     ("status-warn", "card", 3.0),
+    ("status-warn", "card-2", 3.0),
+    ("status-warn", "center", 3.0),
     ("status-error", "background", 3.0),
     ("status-error", "card", 3.0),
+    ("status-error", "card-2", 3.0),
+    ("status-error", "center", 3.0),
     ("status-info", "background", 3.0),
     ("status-info", "card", 3.0),
+    ("status-info", "card-2", 3.0),
+    ("status-info", "center", 3.0),
 ];
 
 /// Status token and the reserved hue range its hue must fall in.
@@ -76,6 +92,8 @@ pub enum ValidationError {
         against: String,
         ratio: f64,
     },
+    #[error("theme `{theme}`: `{a}` and `{b}` are the same color; the card surfaces must differ")]
+    IndistinctSurfaces { theme: String, a: String, b: String },
     #[error("the set needs at least one {appearance:?} theme")]
     MissingAppearance { appearance: Appearance },
     #[error("system_pair.{which:?} names `{id}`, which is not a theme of that appearance")]
@@ -162,6 +180,16 @@ fn validate_theme(set: &ThemeSet, t: &ThemeFile, errs: &mut Vec<ValidationError>
         }
     }
 
+    if let (Some(a), Some(b)) = (rgb.get("card"), rgb.get("card-2")) {
+        if a == b {
+            errs.push(ValidationError::IndistinctSurfaces {
+                theme: theme.clone(),
+                a: "card".into(),
+                b: "card-2".into(),
+            });
+        }
+    }
+
     for &(token, range) in STATUS_HUES {
         if let (Some(color), Some(r)) = (t.colors.get(token), set.reserved_hue_ranges.get(range)) {
             if !in_range(color.h, *r) {
@@ -194,7 +222,7 @@ fn validate_theme(set: &ThemeSet, t: &ThemeFile, errs: &mut Vec<ValidationError>
             });
             continue;
         };
-        for against in ["background", "card"] {
+        for against in ["background", "card", "card-2", "center"] {
             if let Some(b) = rgb.get(against) {
                 let ratio = contrast_ratio(s, *b);
                 if ratio < AGENT_MIN_CONTRAST {
