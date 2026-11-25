@@ -26,6 +26,9 @@ export type ChatMessage = {
 };
 
 const PAGE_LIMIT = 1000; // daemon MAX_MESSAGE_LIMIT
+const MAX_PAGES = 1000;
+
+const bad = (what: string) => new ApiError(0, "bad_response", `The daemon returned a malformed ${what}.`);
 
 async function request(cfg: HostConfig, path: string): Promise<unknown> {
   let res: Response;
@@ -56,25 +59,39 @@ async function request(cfg: HostConfig, path: string): Promise<unknown> {
   }
 }
 
-type RawAgent = { id: string; name: string; color: { h: number }; state: AgentState };
-
 export async function getAgent(cfg: HostConfig): Promise<AgentInfo> {
-  const agents = (await request(cfg, "/v1/agents?include_closed=true")) as RawAgent[];
-  const a = agents.find((x) => x.id === cfg.agentId);
+  const agents = await request(cfg, "/v1/agents?include_closed=true");
+  if (!Array.isArray(agents)) throw bad("agent list");
+  const a = (agents as unknown[]).find(
+    (x) => typeof x === "object" && x !== null && (x as { id?: unknown }).id === cfg.agentId,
+  ) as Record<string, unknown> | undefined;
   if (!a) throw new ApiError(404, "agent_not_found", "This agent no longer exists.");
-  return { id: a.id, name: a.name, color: { h: a.color.h }, state: a.state };
+  const color = a.color as { h?: unknown } | null | undefined;
+  if (
+    typeof a.name !== "string" ||
+    typeof a.state !== "string" ||
+    typeof color !== "object" || color === null ||
+    typeof color.h !== "number" || !Number.isFinite(color.h)
+  ) {
+    throw bad("agent");
+  }
+  return { id: cfg.agentId, name: a.name, color: { h: color.h }, state: a.state as AgentState };
 }
 
 export async function getMessages(cfg: HostConfig): Promise<ChatMessage[]> {
   const all: ChatMessage[] = [];
   let after = 0;
-  for (;;) {
+  for (let pages = 0; pages < MAX_PAGES; pages++) {
     const page = (await request(
       cfg,
       `/v1/agents/${encodeURIComponent(cfg.agentId)}/messages?after=${after}&limit=${PAGE_LIMIT}`,
     )) as ChatMessage[];
+    if (!Array.isArray(page)) throw bad("message list");
     all.push(...page);
     if (page.length < PAGE_LIMIT) return all;
-    after = page[page.length - 1]!.seq;
+    const last = page[page.length - 1]!.seq;
+    if (typeof last !== "number" || last <= after) throw bad("message page (no progress)");
+    after = last;
   }
+  throw bad("message history (too many pages)");
 }

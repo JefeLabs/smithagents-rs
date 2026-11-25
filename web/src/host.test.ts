@@ -31,6 +31,8 @@ describe("getHostConfig", () => {
     ["numeric token", { ...good, token: 5 }],
     ["remote host", { ...good, baseUrl: "http://evil.example:80" }],
     ["https", { ...good, baseUrl: "https://127.0.0.1:80" }],
+    ["port 0", { ...good, baseUrl: "http://127.0.0.1:0" }],
+    ["port too large", { ...good, baseUrl: "http://127.0.0.1:65536" }],
     ["no port", { ...good, baseUrl: "http://127.0.0.1" }],
     ["path suffix", { ...good, baseUrl: "http://127.0.0.1:80/x" }],
   ])("rejects %s without leaking the token", (_n, v) => {

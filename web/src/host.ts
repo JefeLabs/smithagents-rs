@@ -20,7 +20,8 @@ function validate(raw: unknown): HostConfig {
     }
   }
   const { baseUrl, token, agentId } = o as HostConfig;
-  if (!LOOPBACK.test(baseUrl)) {
+  const port = Number(baseUrl.slice(baseUrl.lastIndexOf(":") + 1));
+  if (!LOOPBACK.test(baseUrl) || port < 1 || port > 65535) {
     throw new HostConfigError('Host configuration is invalid: "baseUrl" must be http://127.0.0.1:<port> or http://localhost:<port>.');
   }
   return { baseUrl, token, agentId };
@@ -32,8 +33,12 @@ export function getHostConfig(): HostConfig {
   if (import.meta.env.DEV) {
     const q = new URLSearchParams(window.location.search);
     if (q.has("daemon") || q.has("token") || q.has("agent")) {
-      // marker: smith-dev-query-fallback
-      return validate({ baseUrl: q.get("daemon"), token: q.get("token"), agentId: q.get("agent") });
+      try {
+        return validate({ baseUrl: q.get("daemon"), token: q.get("token"), agentId: q.get("agent") });
+      } catch (e) {
+        // The marker string must survive minification if this branch is ever not eliminated.
+        throw new HostConfigError(`smith-dev-query-fallback: ${(e as Error).message}`);
+      }
     }
   }
   return validate(undefined);

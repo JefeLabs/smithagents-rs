@@ -38,6 +38,15 @@ describe("getAgent", () => {
   });
 });
 
+describe("getAgent validation", () => {
+  it("malformed agent becomes bad_response", async () => {
+    stub(() => json([{ id: "a1", name: "x", color: null, state: "idle" }]));
+    await expect(getAgent(cfg)).rejects.toMatchObject({ status: 0, code: "bad_response" });
+    stub(() => json([{ id: "a1", name: "x", color: { h: "1" }, state: "idle" }]));
+    await expect(getAgent(cfg)).rejects.toMatchObject({ code: "bad_response" });
+  });
+});
+
 describe("getMessages", () => {
   it("sends bearer and returns messages", async () => {
     const f = stub(() => json([msg(1)]));
@@ -59,6 +68,23 @@ describe("getMessages", () => {
     expect(all).toHaveLength(1001);
     expect(f).toHaveBeenCalledTimes(2);
     expect(new URL(f.mock.calls[1]![0]).searchParams.get("after")).toBe("1000");
+  });
+
+  it("a non-advancing full page is rejected after bounded calls", async () => {
+    const page = Array.from({ length: 1000 }, (_, i) => msg(i + 1));
+    const f = stub(() => json(page));
+    await expect(getMessages(cfg)).rejects.toMatchObject({ status: 0, code: "bad_response" });
+    expect(f.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it("caps the page count", async () => {
+    let n = 0;
+    const f = stub(() => {
+      const base = n++ * 1000;
+      return json(Array.from({ length: 1000 }, (_, i) => msg(base + i + 1)));
+    });
+    await expect(getMessages(cfg)).rejects.toMatchObject({ code: "bad_response" });
+    expect(f.mock.calls.length).toBe(1000);
   });
 
   it.each([401, 404, 409])("maps %i daemon error body", async (status) => {
