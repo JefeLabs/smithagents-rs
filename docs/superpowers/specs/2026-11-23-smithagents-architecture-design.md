@@ -115,7 +115,9 @@ Anti-goals (failure even if it "works")
 - Sign-ins: the Space card shows "n signed out"; a popover lists Coder,
   Keeper, Jira and Browser with Signed in/out, Sign in, Check now, Sign out
   and "checked Ns ago". [from screenshot]
-- All panes collapsible. [decided]
+- All panes collapsible. [decided] The left pane collapses to a compact
+  strip (markers only) and is never hidden; the right pane hides. [owner
+  decision 2026-11-24]
 - gpui-component's dock may need adjustment to get "left full height, bottom
   under center + right"; verify in the first spike. [my call]
 
