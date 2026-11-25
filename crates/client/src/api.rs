@@ -263,7 +263,8 @@ impl Client {
         self.fetch(self.http.post(url)).await
     }
 
-    /// Replaces the item's text with `text`; the item stays pending.
+    /// Replaces the item's text with `text` and accepts the item (an edit is
+    /// a decision, like accept); a depends-on item is checked as for accept.
     pub async fn edit_item(
         &self,
         id: IntentId,

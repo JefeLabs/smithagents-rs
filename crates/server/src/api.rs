@@ -642,3 +642,123 @@ async fn send_event(
     let text = serde_json::to_string(event).expect("event serializes");
     socket.send(Message::Text(text.into())).await
 }
+
+#[cfg(test)]
+mod tests {
+    use smithagents_core::intent::Phase;
+
+    use super::*;
+
+    /// The variant's name. Exhaustive on purpose: a new `IntentError`
+    /// variant does not compile here until it is named, and then fails
+    /// `every_intent_error_maps_to_a_fixed_status_and_code` until it has a case.
+    fn variant(e: &IntentError) -> &'static str {
+        match e {
+            IntentError::NotFound => "NotFound",
+            IntentError::RepoNotFound => "RepoNotFound",
+            IntentError::AgentNotFound => "AgentNotFound",
+            IntentError::InvalidState { .. } => "InvalidState",
+            IntentError::Polishing => "Polishing",
+            IntentError::AlreadyAnswered => "AlreadyAnswered",
+            IntentError::Invalid(_) => "Invalid",
+            IntentError::DependencyCycle => "DependencyCycle",
+            IntentError::DependencyCrossRepo => "DependencyCrossRepo",
+            IntentError::Service(_) => "Service",
+            IntentError::Store(_) => "Store",
+        }
+    }
+
+    const VARIANTS: [&str; 11] = [
+        "NotFound",
+        "RepoNotFound",
+        "AgentNotFound",
+        "InvalidState",
+        "Polishing",
+        "AlreadyAnswered",
+        "Invalid",
+        "DependencyCycle",
+        "DependencyCrossRepo",
+        "Service",
+        "Store",
+    ];
+
+    #[test]
+    fn every_intent_error_maps_to_a_fixed_status_and_code() {
+        use StatusCode as S;
+        let cases = [
+            (IntentError::NotFound, S::NOT_FOUND, "intent_not_found"),
+            (IntentError::RepoNotFound, S::NOT_FOUND, "repo_not_found"),
+            (IntentError::AgentNotFound, S::NOT_FOUND, "agent_not_found"),
+            (
+                IntentError::InvalidState {
+                    expected: "complete",
+                    actual: IntentState::Draft,
+                    phase: Some(Phase::Review),
+                },
+                S::CONFLICT,
+                "invalid_state",
+            ),
+            (
+                IntentError::InvalidState {
+                    expected: "sent",
+                    actual: IntentState::Queued,
+                    phase: None,
+                },
+                S::CONFLICT,
+                "invalid_state",
+            ),
+            (IntentError::Polishing, S::CONFLICT, "polishing"),
+            (
+                IntentError::AlreadyAnswered,
+                S::CONFLICT,
+                "already_answered",
+            ),
+            (
+                IntentError::Invalid("bad".into()),
+                S::BAD_REQUEST,
+                "invalid",
+            ),
+            (
+                IntentError::DependencyCycle,
+                S::CONFLICT,
+                "dependency_cycle",
+            ),
+            (
+                IntentError::DependencyCrossRepo,
+                S::CONFLICT,
+                "dependency_cross_repo",
+            ),
+            // A wrapped agent-service error keeps that error's own mapping.
+            (
+                IntentError::Service(ServiceError::TurnInProgress),
+                S::CONFLICT,
+                "turn_in_progress",
+            ),
+            (
+                IntentError::Service(ServiceError::AgentClosed),
+                S::CONFLICT,
+                "agent_closed",
+            ),
+            (
+                IntentError::Service(ServiceError::Git(GitError::BranchExists("intent/x".into()))),
+                S::CONFLICT,
+                "branch_exists",
+            ),
+            (
+                IntentError::Store(StoreError::Conflict("taken".into())),
+                S::INTERNAL_SERVER_ERROR,
+                "store_error",
+            ),
+        ];
+        let covered: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(e, ..)| variant(e)).collect();
+        assert_eq!(covered, VARIANTS.into_iter().collect());
+
+        for (e, status, code) in cases {
+            let message = e.to_string();
+            let api = ApiError::from(e);
+            assert_eq!((api.status, api.code), (status, code), "{message}");
+            assert_eq!(api.message, message);
+        }
+    }
+}
