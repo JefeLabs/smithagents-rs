@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::future::LocalBoxFuture;
+use futures::{FutureExt as _, StreamExt};
 use smithagents_client::{ensure_daemon_with, Client, ClientError, EnsureError, SpawnOptions};
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::daemon::read_lockfile;
@@ -243,6 +244,28 @@ impl DaemonLink {
         self.cmd
             .clone()
             .run(move |c, _| async move { Ok(c.close_agent(id).await?) })
+    }
+}
+
+/// The agent commands the shell's views send to the daemon. [`DaemonLink`] is
+/// the production implementation; headless tests inject a fake through
+/// `ShellOptions::commands` so they need no daemon.
+///
+/// The futures are `'static` (a UI executor holds them without borrowing the
+/// implementation) and need not be `Send`: the shell awaits them on GPUI's
+/// foreground executor.
+pub trait AgentCommands {
+    fn create_agent(&self, repo_id: RepoId) -> LocalBoxFuture<'static, Result<Agent, LinkError>>;
+    fn close_agent(&self, id: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>>;
+}
+
+impl AgentCommands for DaemonLink {
+    fn create_agent(&self, repo_id: RepoId) -> LocalBoxFuture<'static, Result<Agent, LinkError>> {
+        DaemonLink::create_agent(self, repo_id).boxed_local()
+    }
+
+    fn close_agent(&self, id: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>> {
+        DaemonLink::close_agent(self, id).boxed_local()
     }
 }
 

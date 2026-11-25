@@ -1,5 +1,5 @@
 //! Private, atomic file writes for the app's own files under the home
-//! directory (`app-settings.json`, `app-layout.json`).
+//! directory (`app-settings.json`, `app-layout.json`, `app-state.json`).
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};

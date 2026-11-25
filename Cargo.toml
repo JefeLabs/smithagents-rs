@@ -42,5 +42,7 @@ ignore = "0.4.35"
 # plus gpui-component. Releases break APIs weekly: pin exactly, upgrade on purpose.
 gpui-kit = "=0.11.0"
 signal-hook = "0.4.6"
+# Already in the lock through GPUI; the app uses it for agent initials.
+unicode-segmentation = "1.13.3"
 raw-window-handle = "=0.6.2"
 url = "=2.5.9"

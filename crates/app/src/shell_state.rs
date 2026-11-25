@@ -1,6 +1,7 @@
 //! The shell's state entity: the [`ShellModel`], the [`DaemonLink`], the
-//! [`Effect`]s for the tab lifecycle (Task 15) to carry out and the left
-//! pane's [`LeftPaneLayout`], plus the tasks that feed the link's actions in.
+//! [`Effect`]s for the tab lifecycle (Task 15) to carry out, the left pane's
+//! [`LeftPaneLayout`] and the remembered [`AppState`], plus the tasks that
+//! feed the link's actions in.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -8,11 +9,13 @@ use std::time::Duration;
 
 use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use smithagents_center_host::PixelRect;
+use smithagents_core::ids::RepoId;
 use smithagents_theme::native::NativeTheme;
 use tokio::sync::mpsc;
 
+use crate::app_state::{AppState, AppStateStore};
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
-use crate::link::DaemonLink;
+use crate::link::{AgentCommands, DaemonLink};
 use crate::model::{Action, Connection, Effect, ShellModel};
 use crate::view_models::{banner_text, LeftPaneMode};
 
@@ -38,6 +41,9 @@ pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
 pub enum ShellEvent {
     /// The left pane's mode or expanded width changed (save the layout).
     LeftPaneChanged,
+    /// Show the Settings view in the right dock (the New agent button found
+    /// no repository; Task 14 scrolls it to Source repositories).
+    RevealSettings,
 }
 
 pub struct ShellState {
@@ -48,6 +54,11 @@ pub struct ShellState {
     /// [`ShellState::take_effects`]; until then they are only logged.
     effects: VecDeque<Effect>,
     link: Option<DaemonLink>,
+    /// Replaces the link for agent commands (headless tests).
+    commands: Option<Rc<dyn AgentCommands>>,
+    /// Where [`AppState`] persists; `None` keeps it in memory.
+    app_state_store: Option<AppStateStore>,
+    app_state: AppState,
     /// The link's last connect error as last read, for the banner.
     link_error: Option<String>,
     native_theme: Option<NativeTheme>,
@@ -65,17 +76,26 @@ impl ShellState {
         native_theme: Option<NativeTheme>,
         link: Option<(DaemonLink, mpsc::Receiver<Action>)>,
         left_pane: LeftPaneLayout,
+        commands: Option<Rc<dyn AgentCommands>>,
+        app_state_store: Option<AppStateStore>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (link, pump) = match link {
             Some((link, actions)) => (Some(link), Some(pump_actions(actions, cx))),
             None => (None, None),
         };
+        let app_state = app_state_store
+            .as_ref()
+            .map(AppStateStore::load)
+            .unwrap_or_default();
         let mut state = Self {
             model,
             left_pane,
             effects: VecDeque::new(),
             link,
+            commands,
+            app_state_store,
+            app_state,
             link_error: None,
             native_theme,
             center_rect: None,
@@ -136,6 +156,40 @@ impl ShellState {
     /// The daemon link, when the shell runs one.
     pub fn link(&self) -> Option<&DaemonLink> {
         self.link.as_ref()
+    }
+
+    /// Where agent commands go: the injected commands if any, else the link;
+    /// `None` when the shell runs offline.
+    pub fn agent_commands(&self) -> Option<&dyn AgentCommands> {
+        match &self.commands {
+            Some(commands) => Some(commands.as_ref()),
+            None => self.link.as_ref().map(|link| link as &dyn AgentCommands),
+        }
+    }
+
+    /// The repository the picker preselects while it still exists.
+    pub fn last_repo_id(&self) -> Option<RepoId> {
+        self.app_state.last_repo_id
+    }
+
+    /// Remembers `id` as the last repository chosen and saves it (a failed
+    /// write is logged; the value is still used for this run).
+    pub fn set_last_repo_id(&mut self, id: RepoId) {
+        if self.app_state.last_repo_id == Some(id) {
+            return;
+        }
+        self.app_state.last_repo_id = Some(id);
+        if let Some(store) = &self.app_state_store {
+            if let Err(e) = store.save(&self.app_state) {
+                tracing::warn!("cannot save {}: {e}", store.path().display());
+            }
+        }
+    }
+
+    /// Asks the shell to show the Settings view.
+    pub fn reveal_settings(&mut self, cx: &mut Context<Self>) {
+        tracing::debug!("reveal settings");
+        cx.emit(ShellEvent::RevealSettings);
     }
 
     /// Applies one action (from the user or the link), queues its effects and

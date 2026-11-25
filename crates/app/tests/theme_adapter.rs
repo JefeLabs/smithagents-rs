@@ -4,10 +4,11 @@ use gpui_kit::component::theme::{ThemeMode, ThemeSet as GpuiThemeSet};
 use gpui_kit::WindowAppearance;
 use serde_json::Value;
 use smithagents_app::theme_adapter::{
-    agent_accent, appearance_from_window, region_colors, region_tokens, srgb_to_hsla,
-    theme_set_json, Region, COLOR_KEY_MAP,
+    agent_accent, appearance_from_window, initial_text_color, more_readable, region_colors,
+    region_tokens, srgb_to_hsla, theme_set_json, token_color, Region, COLOR_KEY_MAP,
 };
-use smithagents_theme::color::{Oklch, Srgb};
+use smithagents_core::palette::palette;
+use smithagents_theme::color::{contrast_ratio, Oklch, Srgb};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
 
 fn parse(set: &ThemeSet) -> Value {
@@ -302,4 +303,85 @@ fn gpui_rows_agree_with_the_region_mapping() {
         get("tab.active.foreground"),
         region_tokens(Region::Center).1
     );
+}
+
+const WHITE: Srgb = Srgb {
+    r: 255,
+    g: 255,
+    b: 255,
+};
+const BLACK: Srgb = Srgb { r: 0, g: 0, b: 0 };
+
+#[test]
+fn the_more_readable_candidate_wins() {
+    let light = Srgb {
+        r: 240,
+        g: 240,
+        b: 245,
+    };
+    let dark = Srgb {
+        r: 20,
+        g: 22,
+        b: 30,
+    };
+    assert_eq!(more_readable(WHITE, light, dark), dark);
+    assert_eq!(more_readable(BLACK, light, dark), light);
+    assert_eq!(
+        more_readable(WHITE, dark, light),
+        dark,
+        "order does not matter"
+    );
+    // A tie keeps the first.
+    assert_eq!(more_readable(dark, light, light), light);
+}
+
+#[test]
+fn an_initial_is_readable_on_every_agent_color_in_both_themes() {
+    let set = ThemeSet::embedded();
+    for theme in &set.themes {
+        let native = set.native(&theme.id).unwrap();
+        let (fg, bg) = (
+            native.colors["center-pane-foreground"],
+            native.colors["background"],
+        );
+        for color in palette() {
+            let accent = agent_accent(&native, color.h);
+            let chosen = initial_text_color(&native, accent).expect("both tokens exist");
+            assert!(chosen == fg || chosen == bg, "{} hue {}", theme.id, color.h);
+            let other = if chosen == fg { bg } else { fg };
+            assert!(
+                contrast_ratio(chosen, accent) >= contrast_ratio(other, accent),
+                "{} hue {}",
+                theme.id,
+                color.h
+            );
+            assert!(
+                contrast_ratio(chosen, accent) >= 3.0,
+                "{} hue {}: {:.2}",
+                theme.id,
+                color.h,
+                contrast_ratio(chosen, accent)
+            );
+        }
+    }
+}
+
+#[test]
+fn token_color_reads_the_native_theme() {
+    let set = ThemeSet::embedded();
+    let native = set.native("smith-dark").unwrap();
+    for token in [
+        "status-info",
+        "status-ok",
+        "status-error",
+        "muted-foreground",
+        "ring",
+    ] {
+        assert_eq!(
+            token_color(&native, token),
+            Some(srgb_to_hsla(native.colors[token])),
+            "{token}"
+        );
+    }
+    assert_eq!(token_color(&native, "no-such-token"), None);
 }

@@ -1,8 +1,10 @@
 //! Maps the Smith design tokens onto gpui-component's theme system.
 //!
-//! Everything except [`apply_theme_state`], [`system_appearance`] and
-//! [`observe_system_appearance`] is pure. Colors come only from
-//! [`NativeTheme`]; there are no literal colors here.
+//! Everything except [`apply_theme_state`], [`apply_theme`],
+//! [`system_appearance`] and [`observe_system_appearance`] is pure;
+//! [`region_paint`] and [`token_paint`] only read the framework theme as a
+//! fallback. Colors come only from [`NativeTheme`]; there are no literal
+//! colors here.
 
 use std::collections::BTreeMap;
 
@@ -11,7 +13,7 @@ use gpui_kit::component::theme::{try_parse_color, Theme, ThemeRegistry};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{px, App, Global, Hsla, Rgba, Subscription, Window, WindowAppearance};
 use serde::Serialize;
-use smithagents_theme::color::Srgb;
+use smithagents_theme::color::{contrast_ratio, Srgb};
 use smithagents_theme::native::NativeTheme;
 use smithagents_theme::state::ThemeState;
 use smithagents_theme::tokens::{Appearance, ThemeSet};
@@ -226,6 +228,39 @@ fn highlight_json(native: &NativeTheme) -> serde_json::Value {
 /// The agent accent color for `hue` (degrees) in `native`.
 pub fn agent_accent(native: &NativeTheme, hue: f32) -> Srgb {
     native.agent_color(f64::from(hue))
+}
+
+/// Of `a` and `b`, the one with more contrast on `on` (`a` on a tie).
+pub fn more_readable(on: Srgb, a: Srgb, b: Srgb) -> Srgb {
+    if contrast_ratio(b, on) > contrast_ratio(a, on) {
+        b
+    } else {
+        a
+    }
+}
+
+/// The text color for an agent's initial drawn on its `accent` color: the
+/// more readable of the theme's `center-pane-foreground` (light on dark
+/// themes) and `background` (dark on dark themes). `None` if the theme lacks
+/// either token (a validated set never does).
+pub fn initial_text_color(native: &NativeTheme, accent: Srgb) -> Option<Srgb> {
+    let light_or_dark = native.colors.get("center-pane-foreground")?;
+    let other = native.colors.get("background")?;
+    Some(more_readable(accent, *light_or_dark, *other))
+}
+
+/// A token's color in `native` as a GPUI color, or `None` if the theme lacks
+/// it.
+pub fn token_color(native: &NativeTheme, token: &str) -> Option<Hsla> {
+    native.colors.get(token).copied().map(srgb_to_hsla)
+}
+
+/// A token's color for painting: from `native`, or, without a native theme
+/// (never in the app), the framework theme's foreground.
+pub fn token_paint(native: Option<&NativeTheme>, token: &str, cx: &App) -> Hsla {
+    native
+        .and_then(|native| token_color(native, token))
+        .unwrap_or_else(|| cx.theme().foreground)
 }
 
 /// A token color as a GPUI color. The one place an [`Srgb`] becomes an

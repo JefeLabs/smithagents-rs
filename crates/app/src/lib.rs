@@ -5,6 +5,7 @@
 //! `host-desktop` stays a thin `main` that builds the [`link::LinkConfig`]
 //! and calls [`run`].
 
+pub mod app_state;
 mod atomic_file;
 pub mod layout_store;
 pub mod link;
@@ -22,6 +23,7 @@ use gpui_kit::{
 };
 use smithagents_theme::native::NativeTheme;
 
+use crate::app_state::AppStateStore;
 use crate::layout_store::{restored_window_bounds, LayoutStore};
 use crate::link::LinkConfig;
 use crate::model::ShellModel;
@@ -81,6 +83,7 @@ fn open_main_window(
     cx: &mut App,
 ) -> gpui_kit::Result<()> {
     let layout = LayoutStore::new(&link.home);
+    let app_state = AppStateStore::new(&link.home);
     // The saved place, on its display if that display is still attached.
     let placed = layout.load_window().and_then(|saved| {
         let display = cx
@@ -117,6 +120,8 @@ fn open_main_window(
                     link: Some(link),
                     layout: Some(layout),
                     native_theme,
+                    commands: None,
+                    app_state: Some(app_state),
                 },
                 window,
                 cx,

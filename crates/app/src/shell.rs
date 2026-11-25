@@ -17,6 +17,7 @@
 //! State lives in a separate [`ShellState`] entity, which the panes observe,
 //! so no view holds a handle back to its owner.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::base::HandleEdge;
@@ -33,18 +34,19 @@ use gpui_kit::{
 };
 use smithagents_theme::native::NativeTheme;
 
+use crate::app_state::AppStateStore;
 use crate::layout_store::{
     fitted_right_width, left_pane_extent, saved_dock, saved_left_pane, saved_window,
     with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
     DEFAULT_RIGHT_DOCK_SIZE, LAYOUT_VERSION, MIN_DOCK_SIZE,
 };
-use crate::link::{DaemonLink, LinkConfig};
+use crate::link::{AgentCommands, DaemonLink, LinkConfig};
 use crate::model::ShellModel;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, Region};
 use crate::view_models::LeftPaneMode;
+use crate::views::agents::AgentsPane;
 use crate::views::center::CenterPanel;
-use crate::views::left_pane::LeftPanePlaceholder;
 use crate::views::placeholder::PlaceholderPanel;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 use crate::views::title_bar::title_bar;
@@ -75,16 +77,19 @@ const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 /// Registers the shell's key bindings: `cmd-b` switches the agents pane
 /// between expanded and compact, `cmd-alt-b` hides or shows the settings
-/// dock. (v1 is macOS only. `KeyBinding::new` does
-/// not resolve the portable `secondary-` modifier and panics on it.)
+/// dock, plus the agents pane's own ([`crate::views::agents::init`]). (v1 is
+/// macOS only. `KeyBinding::new` does not resolve the portable `secondary-`
+/// modifier and panics on it.)
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-b", ToggleAgentsPane, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-alt-b", ToggleSettingsPane, Some(KEY_CONTEXT)),
     ]);
+    crate::views::agents::init(cx);
 }
 
-/// How to build a [`Shell`].
+/// How to build a [`Shell`]. The default is an empty, offline shell.
+#[derive(Default)]
 pub struct ShellOptions {
     /// The starting model (empty in the app; tests pre-fill it).
     pub model: ShellModel,
@@ -95,6 +100,12 @@ pub struct ShellOptions {
     pub layout: Option<LayoutStore>,
     /// The current theme, for agent accents.
     pub native_theme: Option<NativeTheme>,
+    /// Replaces the daemon link for agent commands (create, close), so
+    /// headless tests need no daemon; `None` sends them through the link.
+    pub commands: Option<Rc<dyn AgentCommands>>,
+    /// Where the app remembers small state such as the last repository
+    /// chosen (`app-state.json`); `None` keeps it in memory only.
+    pub app_state: Option<AppStateStore>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -111,8 +122,8 @@ impl Render for LeftPaneResize {
 pub struct Shell {
     state: Entity<ShellState>,
     dock: Entity<DockArea>,
-    /// The left pane's content (Task 13 replaces the placeholder).
-    left_pane: Entity<LeftPanePlaceholder>,
+    /// The left pane's content: the agents pane, in either mode.
+    left_pane: Entity<AgentsPane>,
     layout: Option<LayoutStore>,
     /// The right dock's width the user chose (a drag of its handle, or the
     /// saved layout). It is what the layout file keeps; the width drawn is
@@ -140,6 +151,8 @@ impl Shell {
             link,
             layout,
             native_theme,
+            commands,
+            app_state,
         } = options;
         let link = link.map(DaemonLink::start);
 
@@ -162,7 +175,8 @@ impl Shell {
                 "restoring the layout"
             );
         }
-        let state = cx.new(|cx| ShellState::new(model, native_theme, link, left, cx));
+        let state =
+            cx.new(|cx| ShellState::new(model, native_theme, link, left, commands, app_state, cx));
 
         let (dock, skin) = DockSkin::dock_area(DOCK_AREA_ID, Some(LAYOUT_VERSION), window, cx);
         // The skin's own collapse buttons sit in the center's title bar, which
@@ -179,7 +193,7 @@ impl Shell {
                 cx,
             )
         });
-        let left_pane = cx.new(|cx| LeftPanePlaceholder::new(state.clone(), cx));
+        let left_pane = cx.new(|cx| AgentsPane::new(state.clone(), cx));
         dock.update(cx, |area, cx| {
             let center = DockLayout::tabs().panel_view(panel_handle(center), cx);
             let right = DockLayout::tabs().panel_view(panel_handle(settings), cx);
@@ -217,6 +231,13 @@ impl Shell {
                         this.refit_right_dock(window, cx);
                         this.schedule_layout_save(cx);
                         cx.notify();
+                    }
+                    ShellEvent::RevealSettings => {
+                        if this.rail_active(cx) != Some(RailEntry::Settings) {
+                            tracing::debug!(source = "agents", "showing the settings dock");
+                            this.select_rail_entry(RailEntry::Settings, window, cx);
+                            cx.notify();
+                        }
                     }
                 }
             }),

@@ -1,0 +1,855 @@
+//! The agents pane: the left pane's content, in both of its modes.
+//!
+//! - **Expanded:** a header with the title and a New agent button, then one
+//!   row per agent: a left accent bar in the agent's color, the name (always
+//!   shown, truncated only if it must be), and a status dot with the state's
+//!   words.
+//! - **Compact** (the fixed 56 px strip, about 55 px of content): an icon-only
+//!   New agent button, then one marker per agent: the agent's color with its
+//!   initial on it, and its status dot. The tooltip and the accessibility
+//!   label carry "<name>, <state>", so the color is never the only identifier
+//!   and colliding initials (Mercury, Mars) are told apart.
+//!
+//! In both modes a click selects, a double-click opens the agent's chat tab,
+//! Enter or Space on the focused row or marker opens it too, Up and Down move
+//! the selection (and the keyboard focus with it), and the context menu's
+//! "Close agent" asks for confirmation before closing. A row and a marker of
+//! the same agent share one focus handle, so switching modes keeps the focus.
+//!
+//! The New agent button follows [`new_agent_plan`]: with no repository it
+//! shows the Settings view and a hint; with one it creates right away; with
+//! several it opens a menu of them (the preselected one first and checked).
+//! A create in flight disables the button. Agents are never inserted here: a
+//! created agent arrives through the daemon's events and is selected when it
+//! appears, unless the user selected another agent meanwhile. A failed
+//! command shows a transient notification with the daemon's message.
+//!
+//! Every color comes from the theme: the region's surface and foreground
+//! ([`region_paint`]), the status and selection tokens ([`token_paint`]) and
+//! the agent accent ([`agent_accent`]).
+
+use std::collections::{HashMap, HashSet};
+
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::{Notification, NotificationType};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
+    WindowExt as _,
+};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    div, px, AnyElement, App, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels,
+    Render, Role, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    TestSupportExt as _, WeakEntity, Window,
+};
+use smithagents_core::agent::Agent;
+use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_theme::native::NativeTheme;
+
+use crate::link::LinkError;
+use crate::model::Action;
+use crate::shell_state::ShellState;
+use crate::theme_adapter::{
+    agent_accent, initial_text_color, region_paint, srgb_to_hsla, token_paint, Region,
+};
+use crate::view_models::{
+    agent_rows, command_error_text, new_agent_plan, repo_choices, state_token, AgentRowVm,
+    LeftPaneMode, NewAgentPlan, RepoChoiceVm, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
+};
+
+gpui_kit::actions!(
+    smithagents_agents,
+    [
+        /// Select the agent above the selected one (the last if none is), and
+        /// move the keyboard focus to it.
+        SelectPreviousAgent,
+        /// Select the agent below the selected one (the first if none is), and
+        /// move the keyboard focus to it.
+        SelectNextAgent,
+    ]
+);
+
+/// Key context of the pane, for its key bindings.
+pub const KEY_CONTEXT: &str = "AgentsPane";
+/// Element id of the pane's root, which holds the pane's focus in both modes.
+pub const LEFT_PANE_CONTENT_ID: &str = "agents-pane";
+/// Element id of the "Agents" title (expanded only).
+pub const EXPANDED_TITLE_ID: &str = "agents-title";
+/// Element id of the New agent button, in both modes.
+pub const NEW_AGENT_ID: &str = "new-agent";
+/// Element id of the list of rows or markers.
+pub const AGENT_LIST_ID: &str = "agent-list";
+/// Element id of the hint shown when there is no agent (expanded only).
+pub const AGENTS_EMPTY_ID: &str = "agents-empty";
+/// Element id of a row's accent bar, inside the row.
+pub const ACCENT_BAR_ID: &str = "accent";
+/// Element id of a marker's color square, inside the marker.
+pub const SWATCH_ID: &str = "swatch";
+/// Element id of a row's or a marker's status dot, inside it.
+pub const STATUS_DOT_ID: &str = "status";
+/// Element id of the text of the pane's notification.
+pub const NOTICE_ID: &str = "agents-notice";
+
+/// The New agent button's words (its label when expanded, its tooltip and
+/// accessible name always).
+pub const NEW_AGENT_LABEL: &str = "New agent";
+/// The context action's words, and the confirmation's OK button.
+pub const CLOSE_AGENT_LABEL: &str = "Close agent";
+/// What the expanded pane says when there is no agent.
+pub const NO_AGENTS_TEXT: &str = "No agents yet";
+
+/// Height of an expanded row.
+const ROW_HEIGHT: f32 = 40.;
+const ACCENT_BAR_WIDTH: f32 = 3.;
+const ROW_DOT: f32 = 8.;
+/// A compact marker's box: a 2 px selection ring, 2 px of space, then the
+/// 32 px color square.
+const MARKER_SIZE: f32 = 40.;
+const MARKER_INSET: f32 = 2.;
+/// A marker's status dot, including its 2 px ring in the pane's surface color
+/// that sets it off from the agent color.
+const MARKER_DOT: f32 = 12.;
+
+/// Registers the pane's key bindings: Up and Down move the selection.
+/// Enter and Space need no binding: they activate the focused row or marker.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPreviousAgent, Some(KEY_CONTEXT)),
+        KeyBinding::new("down", SelectNextAgent, Some(KEY_CONTEXT)),
+    ]);
+}
+
+/// Element id of an agent's expanded row.
+pub fn agent_row_id(id: AgentId) -> ElementId {
+    ElementId::Name(format!("agent-row-{id}").into())
+}
+
+/// Element id of an agent's compact marker.
+pub fn agent_marker_id(id: AgentId) -> ElementId {
+    ElementId::Name(format!("agent-marker-{id}").into())
+}
+
+/// Element id of the repository picker's entry `ix` (in the picker's order).
+pub fn repo_choice_id(ix: usize) -> ElementId {
+    ("repo-choice", ix).into()
+}
+
+/// The agent a successful create returned, until the daemon's event adds it.
+#[derive(Debug, Clone, Copy)]
+struct AwaitedAgent {
+    id: AgentId,
+    /// The selection when the create started: if it changed by the time the
+    /// agent appears, the user chose another agent and keeps it.
+    selected_before: Option<AgentId>,
+}
+
+/// The pane's notifications replace each other rather than stack.
+struct AgentsNotice;
+
+pub struct AgentsPane {
+    state: Entity<ShellState>,
+    /// The pane's own focus, tracked on its root in both modes.
+    focus: FocusHandle,
+    /// One focus handle per agent, shared by its row and its marker.
+    item_focus: HashMap<AgentId, FocusHandle>,
+    /// A create is in flight; the New agent button is disabled.
+    creating: bool,
+    awaiting: Option<AwaitedAgent>,
+    /// Agents whose close is in flight, so a second request sends nothing.
+    closing: HashSet<AgentId>,
+    _observe: Subscription,
+}
+
+impl AgentsPane {
+    pub fn new(state: Entity<ShellState>, cx: &mut Context<Self>) -> Self {
+        Self {
+            _observe: cx.observe(&state, |this, _, cx| {
+                this.select_awaited(cx);
+                cx.notify();
+            }),
+            state,
+            focus: cx.focus_handle(),
+            item_focus: HashMap::new(),
+            creating: false,
+            awaiting: None,
+            closing: HashSet::new(),
+        }
+    }
+
+    fn dispatch(&self, action: Action, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.dispatch(action, cx));
+    }
+
+    /// A click selects; a second click of a double-click, or Enter or Space
+    /// on the focused item, opens the agent's tab.
+    fn on_item_click(&mut self, id: AgentId, event: &ClickEvent, cx: &mut Context<Self>) {
+        if event.is_keyboard() || event.click_count() >= 2 {
+            tracing::debug!(agent = %id, keyboard = event.is_keyboard(), "open agent tab");
+            self.dispatch(Action::OpenTab(id), cx);
+        } else {
+            self.dispatch(Action::SelectAgent(id), cx);
+        }
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &SelectPreviousAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(false, window, cx);
+    }
+
+    fn select_next(&mut self, _: &SelectNextAgent, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(true, window, cx);
+    }
+
+    /// Moves the selection one agent down (or up), stopping at the ends, and
+    /// focuses the newly selected item so Enter opens it.
+    fn move_selection(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (ids, selected) = {
+            let model = self.state.read(cx).model();
+            let ids: Vec<AgentId> = model.agents().iter().map(|agent| agent.id).collect();
+            (ids, model.selected())
+        };
+        let Some(last) = ids.len().checked_sub(1) else {
+            return;
+        };
+        let current = selected.and_then(|selected| ids.iter().position(|id| *id == selected));
+        let next = match (current, down) {
+            (Some(ix), true) => (ix + 1).min(last),
+            (Some(ix), false) => ix.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => last,
+        };
+        let id = ids[next];
+        self.dispatch(Action::SelectAgent(id), cx);
+        if let Some(focus) = self.item_focus.get(&id) {
+            focus.focus(window, cx);
+        }
+    }
+
+    /// Keeps one focus handle per open agent.
+    fn sync_item_focus(&mut self, rows: &[AgentRowVm], cx: &mut Context<Self>) {
+        self.item_focus
+            .retain(|id, _| rows.iter().any(|row| row.id == *id));
+        for row in rows {
+            self.item_focus
+                .entry(row.id)
+                .or_insert_with(|| cx.focus_handle().tab_stop(true));
+        }
+    }
+
+    // ---- New agent --------------------------------------------------------
+
+    /// The New agent button's click when it is not a picker: follows the plan
+    /// for the repositories there are now.
+    fn on_new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating {
+            return;
+        }
+        let plan = {
+            let state = self.state.read(cx);
+            new_agent_plan(state.model().repos(), state.last_repo_id())
+        };
+        tracing::debug!(?plan, "new agent");
+        match plan {
+            NewAgentPlan::NeedRepo => {
+                self.state.update(cx, |state, cx| state.reveal_settings(cx));
+                notify(NotificationType::Info, None, NEED_REPO_TEXT, window, cx);
+            }
+            NewAgentPlan::Create(repo) => self.start_create(repo, window, cx),
+            // Repositories arrived since the last frame: the next frame draws
+            // the picker.
+            NewAgentPlan::Pick { .. } => cx.notify(),
+        }
+    }
+
+    /// A repository chosen in the picker: remembered, then created in.
+    fn pick_repo(&mut self, repo: RepoId, window: &mut Window, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, _| state.set_last_repo_id(repo));
+        self.start_create(repo, window, cx);
+    }
+
+    fn start_create(&mut self, repo: RepoId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.creating {
+            tracing::debug!("a create is already in flight");
+            return;
+        }
+        let (create, selected_before) = {
+            let state = self.state.read(cx);
+            (
+                state
+                    .agent_commands()
+                    .map(|commands| commands.create_agent(repo)),
+                state.model().selected(),
+            )
+        };
+        let Some(create) = create else {
+            notify_failure("Could not create the agent", NOT_CONNECTED_TEXT, window, cx);
+            return;
+        };
+        tracing::debug!(%repo, "creating an agent");
+        self.creating = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let result = create.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish_create(result, selected_before, window, cx)
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_create(
+        &mut self,
+        result: Result<Agent, LinkError>,
+        selected_before: Option<AgentId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.creating = false;
+        match result {
+            Ok(agent) => {
+                tracing::debug!(agent = %agent.id, name = %agent.name, "agent created");
+                self.awaiting = Some(AwaitedAgent {
+                    id: agent.id,
+                    selected_before,
+                });
+                self.select_awaited(cx);
+            }
+            Err(e) => {
+                tracing::warn!("cannot create an agent: {e}");
+                notify_failure(
+                    "Could not create the agent",
+                    command_error_text(&e),
+                    window,
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Selects the created agent once the model has it, unless the user
+    /// selected another agent since the create started.
+    fn select_awaited(&mut self, cx: &mut Context<Self>) {
+        let Some(awaited) = self.awaiting else {
+            return;
+        };
+        let untouched = {
+            let model = self.state.read(cx).model();
+            if !model.agents().iter().any(|agent| agent.id == awaited.id) {
+                return;
+            }
+            model.selected() == awaited.selected_before
+        };
+        self.awaiting = None;
+        if untouched {
+            self.dispatch(Action::SelectAgent(awaited.id), cx);
+        }
+    }
+
+    // ---- Close agent ------------------------------------------------------
+
+    fn close_agent(&mut self, id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.closing.insert(id) {
+            return;
+        }
+        let close = self
+            .state
+            .read(cx)
+            .agent_commands()
+            .map(|commands| commands.close_agent(id));
+        let Some(close) = close else {
+            self.closing.remove(&id);
+            notify_failure("Could not close the agent", NOT_CONNECTED_TEXT, window, cx);
+            return;
+        };
+        tracing::debug!(agent = %id, "closing an agent");
+        cx.spawn_in(window, async move |this, cx| {
+            let result = close.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.closing.remove(&id);
+                if let Err(e) = result {
+                    tracing::warn!("cannot close agent {id}: {e}");
+                    notify_failure(
+                        "Could not close the agent",
+                        command_error_text(&e),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The context menu of an agent's row or marker.
+    fn close_menu(
+        &self,
+        id: AgentId,
+        name: String,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let pane = cx.entity().downgrade();
+        move |menu, _, _| {
+            let (pane, name) = (pane.clone(), name.clone());
+            menu.item(
+                PopupMenuItem::new(CLOSE_AGENT_LABEL)
+                    .icon(IconName::Close)
+                    .on_click(move |_, window, cx| {
+                        let (pane, name) = (pane.clone(), name.clone());
+                        // After the menu has closed and given focus back, so
+                        // the dialog keeps the focus it takes.
+                        window.defer(cx, move |window, cx| {
+                            confirm_close(pane, id, name, window, cx)
+                        });
+                    }),
+            )
+        }
+    }
+
+    // ---- Drawing ----------------------------------------------------------
+
+    fn new_agent_button(
+        &self,
+        compact: bool,
+        repos_plan: (NewAgentPlan, Vec<RepoChoiceVm>),
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let button = Button::new(NEW_AGENT_ID)
+            .icon(Icon::new(IconName::Plus).text_color(paint.foreground))
+            .ghost()
+            .small()
+            .text_color(paint.foreground)
+            .accessibility_label(NEW_AGENT_LABEL)
+            .map(|button| {
+                if compact {
+                    button.tooltip(NEW_AGENT_LABEL)
+                } else {
+                    button.label(NEW_AGENT_LABEL)
+                }
+            })
+            .loading(self.creating)
+            .disabled(self.creating);
+        match repos_plan {
+            (NewAgentPlan::Pick { .. }, choices) if !self.creating => {
+                let pane = cx.entity().downgrade();
+                button
+                    .dropdown_menu(move |menu, _, cx| picker_menu(menu, &choices, &pane, cx))
+                    .into_any_element()
+            }
+            _ => button
+                .on_click(cx.listener(|this, _, window, cx| this.on_new_agent(window, cx)))
+                .into_any_element(),
+        }
+    }
+
+    fn expanded_row(&self, row: AgentRowVm, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {
+        let id = row.id;
+        let selected = row.selected;
+        let (row_bg, name_color) = if selected {
+            (paint.selected, paint.selected_foreground)
+        } else {
+            (paint.surface, paint.foreground)
+        };
+        let ring = paint.ring;
+        let hover = paint.hover;
+        h_flex()
+            .id(agent_row_id(id))
+            .role(Role::ListBoxOption)
+            .test_support()
+            .track_focus(&self.item_focus[&id])
+            .aria_label(row.a11y_label.clone())
+            .aria_selected(selected)
+            .when(row.has_open_tab, |this| this.aria_description("Chat open"))
+            .flex_none()
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .items_center()
+            .gap_2()
+            .pr_2()
+            .bg(row_bg)
+            .border_1()
+            .border_color(row_bg)
+            .when(!selected, |this| this.hover(move |style| style.bg(hover)))
+            .focus_visible(move |style| style.border_color(ring))
+            .on_click(cx.listener(move |this, event, _, cx| this.on_item_click(id, event, cx)))
+            .child(
+                div()
+                    .id(ACCENT_BAR_ID)
+                    .test_support()
+                    .flex_none()
+                    .w(px(ACCENT_BAR_WIDTH))
+                    .h_full()
+                    .when_some(paint.accent(row.accent_hue), |this, accent| this.bg(accent)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        Label::new(row.name.clone())
+                            .text_sm()
+                            .text_color(name_color)
+                            .truncate(),
+                    )
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                div()
+                                    .id(STATUS_DOT_ID)
+                                    .test_support()
+                                    .flex_none()
+                                    .size(px(ROW_DOT))
+                                    .rounded_full()
+                                    .bg(paint.status(&row)),
+                            )
+                            .child(
+                                Label::new(row.state_label)
+                                    .text_xs()
+                                    .text_color(paint.muted_foreground)
+                                    .truncate(),
+                            ),
+                    ),
+            )
+            .context_menu(self.close_menu(id, row.name, cx))
+    }
+
+    fn compact_marker(
+        &self,
+        row: AgentRowVm,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let id = row.id;
+        let accent = paint
+            .native
+            .as_ref()
+            .map(|native| agent_accent(native, row.accent_hue));
+        let initial_color = paint
+            .native
+            .as_ref()
+            .zip(accent)
+            .and_then(|(native, accent)| initial_text_color(native, accent))
+            .map_or(paint.foreground, srgb_to_hsla);
+        let label: SharedString = row.a11y_label.clone().into();
+        let tooltip = label.clone();
+        let focus_ring = paint.foreground;
+        div()
+            .id(agent_marker_id(id))
+            .role(Role::ListBoxOption)
+            .test_support()
+            .track_focus(&self.item_focus[&id])
+            .aria_label(label)
+            .aria_selected(row.selected)
+            .when(row.has_open_tab, |this| this.aria_description("Chat open"))
+            .tooltip(move |window, cx| {
+                let text = tooltip.clone();
+                Tooltip::element(move |_, _| Label::new(text.clone())).build(window, cx)
+            })
+            .relative()
+            .flex_none()
+            .size(px(MARKER_SIZE))
+            .p(px(MARKER_INSET))
+            .rounded(paint.radius + px(MARKER_INSET * 2.))
+            .border_2()
+            .border_color(if row.selected {
+                paint.ring
+            } else {
+                paint.surface
+            })
+            .focus_visible(move |style| style.border_color(focus_ring))
+            .on_click(cx.listener(move |this, event, _, cx| this.on_item_click(id, event, cx)))
+            .child(
+                div()
+                    .id(SWATCH_ID)
+                    .test_support()
+                    .size_full()
+                    .rounded(paint.radius)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when_some(accent, |this, accent| this.bg(srgb_to_hsla(accent)))
+                    .child(
+                        Label::new(row.initial.clone())
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(initial_color),
+                    ),
+            )
+            .child(
+                div()
+                    .id(STATUS_DOT_ID)
+                    .test_support()
+                    .absolute()
+                    .right_0()
+                    .bottom_0()
+                    .size(px(MARKER_DOT))
+                    .rounded_full()
+                    .bg(paint.status(&row))
+                    .border_2()
+                    .border_color(paint.surface),
+            )
+            .context_menu(self.close_menu(id, row.name, cx))
+    }
+}
+
+impl Focusable for AgentsPane {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for AgentsPane {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (mode, rows, plan) = {
+            let state = self.state.read(cx);
+            let model = state.model();
+            let plan = new_agent_plan(model.repos(), state.last_repo_id());
+            let choices = match &plan {
+                NewAgentPlan::Pick { repos, preselected } => {
+                    repo_choices(model.repos(), repos, *preselected)
+                }
+                _ => Vec::new(),
+            };
+            (state.left_pane_mode(), agent_rows(model), (plan, choices))
+        };
+        self.sync_item_focus(&rows, cx);
+        let paint = Paint::new(self.state.read(cx).native_theme().cloned(), cx);
+        let compact = mode == LeftPaneMode::Compact;
+        let new_agent = self.new_agent_button(compact, plan, &paint, cx);
+        let list = v_flex()
+            .id(AGENT_LIST_ID)
+            .role(Role::ListBox)
+            .test_support()
+            .aria_label("Agents")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll();
+
+        // The focus is tracked on the root in both modes, so switching modes
+        // never drops a focused pane out of the tree.
+        v_flex()
+            .id(LEFT_PANE_CONTENT_ID)
+            // Observed before `track_focus`, so tests can read its focus.
+            .test_support()
+            .track_focus(&self.focus)
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_next))
+            .size_full()
+            .bg(paint.surface)
+            .text_color(paint.foreground)
+            .map(|this| match mode {
+                LeftPaneMode::Expanded => this
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .pl_3()
+                            .pr_1()
+                            .py_2()
+                            .child(
+                                div()
+                                    .id(EXPANDED_TITLE_ID)
+                                    // A node needs an id and a role to reach
+                                    // assistive technology.
+                                    .role(Role::Heading)
+                                    .test_support()
+                                    .aria_label("Agents")
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Agents"),
+                            )
+                            .child(new_agent),
+                    )
+                    .child(if rows.is_empty() {
+                        // A `Label` is in the accessibility tree; plain text
+                        // is not.
+                        Label::new(NO_AGENTS_TEXT)
+                            .id(AGENTS_EMPTY_ID)
+                            .px_3()
+                            .text_xs()
+                            .text_color(paint.muted_foreground)
+                            .into_any_element()
+                    } else {
+                        list.gap_0p5()
+                            .children(
+                                rows.into_iter()
+                                    .map(|row| self.expanded_row(row, &paint, cx)),
+                            )
+                            .into_any_element()
+                    }),
+                LeftPaneMode::Compact => this.items_center().gap_2().pt_2().child(new_agent).child(
+                    list.items_center().gap_1p5().pb_2().children(
+                        rows.into_iter()
+                            .map(|row| self.compact_marker(row, &paint, cx)),
+                    ),
+                ),
+            })
+    }
+}
+
+/// The colors one frame of the pane paints with, all from the theme.
+struct Paint {
+    native: Option<NativeTheme>,
+    surface: Hsla,
+    foreground: Hsla,
+    muted_foreground: Hsla,
+    /// A selected row's background and text.
+    selected: Hsla,
+    selected_foreground: Hsla,
+    hover: Hsla,
+    /// The selection ring of a marker and the focus ring of a row.
+    ring: Hsla,
+    radius: Pixels,
+}
+
+impl Paint {
+    fn new(native: Option<NativeTheme>, cx: &App) -> Self {
+        let (surface, foreground) = region_paint(native.as_ref(), Region::LeftPane, cx);
+        let token = |name: &str| token_paint(native.as_ref(), name, cx);
+        Self {
+            surface,
+            foreground,
+            muted_foreground: token("muted-foreground"),
+            selected: token("accent"),
+            selected_foreground: token("accent-foreground"),
+            hover: token("muted"),
+            ring: token("ring"),
+            radius: cx.theme().radius,
+            native,
+        }
+    }
+
+    /// The agent color for `hue`; `None` only without a native theme.
+    fn accent(&self, hue: f32) -> Option<Hsla> {
+        self.native
+            .as_ref()
+            .map(|native| srgb_to_hsla(agent_accent(native, hue)))
+    }
+
+    fn status(&self, row: &AgentRowVm) -> Hsla {
+        let token = state_token(row.state_kind);
+        self.native
+            .as_ref()
+            .and_then(|native| native.colors.get(token))
+            .map_or(self.muted_foreground, |color| srgb_to_hsla(*color))
+    }
+}
+
+/// The repository picker: one entry per choice, the folder's name over its
+/// full path, the preselected one first and checked.
+fn picker_menu(
+    mut menu: PopupMenu,
+    choices: &[RepoChoiceVm],
+    pane: &WeakEntity<AgentsPane>,
+    cx: &App,
+) -> PopupMenu {
+    let muted = cx.theme().muted_foreground;
+    menu = menu.label("New agent in").max_w(px(420.));
+    for (ix, choice) in choices.iter().enumerate() {
+        let (title, path, repo) = (choice.title.clone(), choice.path.clone(), choice.id);
+        let pane = pane.clone();
+        menu = menu.item(
+            PopupMenuItem::element(move |_, _| {
+                v_flex()
+                    .id(repo_choice_id(ix))
+                    .test_support()
+                    .aria_label(format!("{title}, {path}"))
+                    .min_w_0()
+                    .py_0p5()
+                    .child(Label::new(title.clone()).text_sm())
+                    .child(
+                        Label::new(path.clone())
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate(),
+                    )
+            })
+            .checked(choice.preselected)
+            .on_click(move |_, window, cx| {
+                let _ = pane.update(cx, |pane, cx| pane.pick_repo(repo, window, cx));
+            }),
+        );
+    }
+    menu
+}
+
+/// Asks before closing an agent; OK sends the close.
+fn confirm_close(
+    pane: WeakEntity<AgentsPane>,
+    id: AgentId,
+    name: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let pane = pane.clone();
+        alert
+            .confirm()
+            .title(format!("Close {name}?"))
+            .description("Its chat tab closes and it leaves the list. Its worktree stays on disk.")
+            .ok_text(CLOSE_AGENT_LABEL)
+            .ok_variant(ButtonVariant::Danger)
+            .on_ok(move |_, window, cx| {
+                let _ = pane.update(cx, |pane, cx| pane.close_agent(id, window, cx));
+                true
+            })
+    });
+}
+
+fn notify_failure(
+    title: &'static str,
+    text: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    notify(NotificationType::Error, Some(title), text, window, cx);
+}
+
+/// Shows a transient notification whose text is a [`Label`] with id
+/// [`NOTICE_ID`] (so it is readable by assistive technology and by tests). A
+/// newer one replaces an older one.
+fn notify(
+    kind: NotificationType,
+    title: Option<&'static str>,
+    text: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text: SharedString = text.into();
+    tracing::debug!(%text, "agents notice");
+    window.push_notification(
+        Notification::new()
+            .id::<AgentsNotice>()
+            .with_type(kind)
+            .when_some(title, |note, title| note.title(title))
+            .content(move |_, _, cx| {
+                Label::new(text.clone())
+                    .id(NOTICE_ID)
+                    .text_sm()
+                    .text_color(cx.theme().popover_foreground)
+                    .into_any_element()
+            }),
+        cx,
+    );
+}

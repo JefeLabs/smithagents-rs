@@ -1,10 +1,16 @@
 //! Pure view models for the shell: what the views show, computed without
 //! GPUI so it can be unit-tested.
 
-use smithagents_center_host::PixelRect;
-use smithagents_core::agent::Agent;
+use std::path::Path;
 
-use crate::model::Connection;
+use smithagents_center_host::PixelRect;
+use smithagents_client::ClientError;
+use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::ids::{AgentId, RepoId};
+use unicode_segmentation::UnicodeSegmentation as _;
+
+use crate::link::LinkError;
+use crate::model::{Connection, ShellModel};
 
 /// The connection banner, or `None` when connected.
 ///
@@ -86,5 +92,217 @@ impl LeftPaneMode {
             "compact" => Some(LeftPaneMode::Compact),
             _ => None,
         }
+    }
+}
+
+// ---- Agents pane -------------------------------------------------------------
+
+/// What the agents pane shows of an agent's activity. Each kind has one label
+/// and one status token, so a state never reads as an agent color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StateKind {
+    Idle,
+    Working,
+    Quiet,
+    Done,
+    /// The process died; the next message resumes the session.
+    Dead,
+}
+
+/// The pane's kind for a daemon state. The chat-only daemon never sets
+/// `Blocked`, `Waiting` or `Stopped` (they arrive with Plan 2's queue); until
+/// they get kinds of their own they read as idle.
+pub fn state_kind(state: AgentState) -> StateKind {
+    match state {
+        AgentState::Idle | AgentState::Blocked | AgentState::Waiting | AgentState::Stopped => {
+            StateKind::Idle
+        }
+        AgentState::Working => StateKind::Working,
+        AgentState::Quiet => StateKind::Quiet,
+        AgentState::Done => StateKind::Done,
+        AgentState::Dead => StateKind::Dead,
+    }
+}
+
+/// The words a state shows as.
+pub fn state_label(kind: StateKind) -> &'static str {
+    match kind {
+        StateKind::Idle => "idle",
+        StateKind::Working => "working",
+        StateKind::Quiet => "quiet",
+        StateKind::Done => "done",
+        StateKind::Dead => "stopped unexpectedly",
+    }
+}
+
+/// The theme token a state's status dot paints with. Status colors (red,
+/// yellow, green, and the info blue) are reserved; idle and quiet stay muted.
+pub fn state_token(kind: StateKind) -> &'static str {
+    match kind {
+        StateKind::Working => "status-info",
+        StateKind::Done => "status-ok",
+        StateKind::Dead => "status-error",
+        StateKind::Idle | StateKind::Quiet => "muted-foreground",
+    }
+}
+
+/// One agent as the pane shows it, in either mode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRowVm {
+    pub id: AgentId,
+    pub name: String,
+    /// What a compact marker shows: [`agent_initial`] of the name.
+    pub initial: String,
+    pub state_label: &'static str,
+    pub state_kind: StateKind,
+    /// The agent color's hue in degrees, unchanged; the theme supplies the
+    /// lightness and chroma.
+    pub accent_hue: f32,
+    pub selected: bool,
+    pub has_open_tab: bool,
+    /// "<name>, <state label>": the accessibility label, and the compact
+    /// marker's tooltip, so colliding initials are told apart.
+    pub a11y_label: String,
+}
+
+/// Every open agent in the model's order (oldest first).
+pub fn agent_rows(model: &ShellModel) -> Vec<AgentRowVm> {
+    model
+        .agents()
+        .into_iter()
+        .map(|agent| {
+            let kind = state_kind(agent.state);
+            AgentRowVm {
+                id: agent.id,
+                name: agent.name.clone(),
+                initial: agent_initial(&agent.name),
+                state_label: state_label(kind),
+                state_kind: kind,
+                accent_hue: agent.color.h,
+                selected: model.selected() == Some(agent.id),
+                has_open_tab: model.tabs().contains(&agent.id),
+                a11y_label: agent_label(&agent.name, kind),
+            }
+        })
+        .collect()
+}
+
+/// What a blank name reads as in labels.
+const UNNAMED: &str = "Unnamed agent";
+
+/// "<name>, <state label>".
+fn agent_label(name: &str, kind: StateKind) -> String {
+    let name = if name.trim().is_empty() {
+        UNNAMED
+    } else {
+        name
+    };
+    format!("{name}, {}", state_label(kind))
+}
+
+/// The first grapheme of `name` (after leading blanks), uppercased: "Mercury"
+/// and "mars" both give "M", an emoji stays whole. A blank name gives "?".
+pub fn agent_initial(name: &str) -> String {
+    name.trim_start()
+        .graphemes(true)
+        .next()
+        .map_or_else(|| "?".to_owned(), str::to_uppercase)
+}
+
+/// What the New agent button does with the repositories there are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewAgentPlan {
+    /// No repository yet: send the user to Source repositories.
+    NeedRepo,
+    /// Exactly one: create in it right away.
+    Create(RepoId),
+    /// Several: ask. `repos` is the order to list them in: `preselected`
+    /// first, then the rest newest first.
+    Pick {
+        repos: Vec<RepoId>,
+        preselected: RepoId,
+    },
+}
+
+/// Decides the New agent flow. With several repositories the preselected one
+/// is `last_used` while it still exists, else the most recently added (by
+/// `created_at`; on a tie, the later in `repos`).
+pub fn new_agent_plan(repos: &[Repo], last_used: Option<RepoId>) -> NewAgentPlan {
+    match repos {
+        [] => NewAgentPlan::NeedRepo,
+        [only] => NewAgentPlan::Create(only.id),
+        _ => {
+            let mut sorted: Vec<&Repo> = repos.iter().collect();
+            // Reversed, then a stable sort: a tie keeps the later one first.
+            sorted.reverse();
+            sorted.sort_by_key(|repo| std::cmp::Reverse(repo.created_at));
+            let preselected = last_used
+                .filter(|id| repos.iter().any(|repo| repo.id == *id))
+                .unwrap_or(sorted[0].id);
+            let mut order = vec![preselected];
+            order.extend(
+                sorted
+                    .iter()
+                    .map(|repo| repo.id)
+                    .filter(|id| *id != preselected),
+            );
+            NewAgentPlan::Pick {
+                repos: order,
+                preselected,
+            }
+        }
+    }
+}
+
+/// One entry of the repository picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoChoiceVm {
+    pub id: RepoId,
+    /// The folder's name ([`repo_title`]).
+    pub title: String,
+    /// The full path, shown as secondary text.
+    pub path: String,
+    pub preselected: bool,
+}
+
+/// The picker's entries for a [`NewAgentPlan::Pick`], in its order. Ids not in
+/// `repos` are skipped.
+pub fn repo_choices(repos: &[Repo], order: &[RepoId], preselected: RepoId) -> Vec<RepoChoiceVm> {
+    order
+        .iter()
+        .filter_map(|id| repos.iter().find(|repo| repo.id == *id))
+        .map(|repo| RepoChoiceVm {
+            id: repo.id,
+            title: repo_title(&repo.path),
+            path: repo.path.display().to_string(),
+            preselected: repo.id == preselected,
+        })
+        .collect()
+}
+
+/// A repository's short name: the last component of its path, or the whole
+/// path when it has none (such as `/`).
+pub fn repo_title(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// What a failed command says when the daemon cannot be reached.
+pub const NOT_CONNECTED_TEXT: &str = "Not connected to the daemon";
+/// What the New agent button says when there is no repository.
+pub const NEED_REPO_TEXT: &str = "Add a source repository first";
+
+/// A failed command as one line for a notification: the daemon's own message
+/// when it sent one, else the error.
+pub fn command_error_text(error: &LinkError) -> String {
+    match error {
+        LinkError::NotConnected => NOT_CONNECTED_TEXT.to_owned(),
+        LinkError::Stopped => "The daemon link has stopped".to_owned(),
+        LinkError::Client(ClientError::Api { message, .. }) if !message.trim().is_empty() => {
+            message.trim().to_owned()
+        }
+        LinkError::Client(_) => error.to_string(),
     }
 }
