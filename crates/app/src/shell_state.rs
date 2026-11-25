@@ -11,7 +11,7 @@ use smithagents_center_host::PixelRect;
 use smithagents_theme::native::NativeTheme;
 use tokio::sync::mpsc;
 
-use crate::layout_store::{LeftPaneLayout, MAX_DOCK_SIZE, MIN_DOCK_SIZE};
+use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
 use crate::link::DaemonLink;
 use crate::model::{Action, Connection, Effect, ShellModel};
 use crate::view_models::{banner_text, LeftPaneMode};
@@ -116,13 +116,14 @@ impl ShellState {
         cx.notify();
     }
 
-    /// Sets the width the left pane has when expanded, clamped like a dock's
-    /// (a non-finite width is ignored). It is kept while compact.
+    /// Sets the width the left pane has when expanded, clamped to
+    /// `MIN_LEFT_PANE_WIDTH..=MAX_LEFT_PANE_WIDTH` (a non-finite width is
+    /// ignored). It is kept while compact.
     pub fn set_left_expanded_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
         if !f32::from(width).is_finite() {
             return;
         }
-        let width = width.clamp(MIN_DOCK_SIZE, MAX_DOCK_SIZE);
+        let width = width.clamp(MIN_LEFT_PANE_WIDTH, MAX_LEFT_PANE_WIDTH);
         if self.left_pane.expanded_width == width {
             return;
         }

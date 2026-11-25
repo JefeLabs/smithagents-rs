@@ -13,6 +13,8 @@ use gpui_kit::{
 use crate::shell_state::ShellState;
 use crate::view_models::LeftPaneMode;
 
+/// Element id of the pane's root, which holds the pane's focus.
+pub const LEFT_PANE_CONTENT_ID: &str = "agents-pane";
 /// Element id of the title shown when expanded.
 pub const EXPANDED_TITLE_ID: &str = "agents-title";
 /// Element id of the marker shown when compact.
@@ -47,7 +49,9 @@ impl Render for LeftPanePlaceholder {
         // The focus is tracked on the root in both modes, so switching modes
         // never drops a focused pane out of the tree.
         v_flex()
-            .id("agents-pane")
+            .id(LEFT_PANE_CONTENT_ID)
+            // Observed before `track_focus`, so tests can read its focus.
+            .test_support()
             .track_focus(&self.focus)
             .size_full()
             .map(|this| match mode {

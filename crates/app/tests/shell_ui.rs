@@ -19,6 +19,7 @@ use gpui_kit::{
 use smithagents_app::layout_store::{
     saved_dock, saved_left_pane, with_left_pane, LayoutStore, LeftPaneLayout,
     COMPACT_LEFT_PANE_WIDTH, DEFAULT_LEFT_PANE_WIDTH, LAYOUT_VERSION, MIN_CENTER_WIDTH,
+    MIN_LEFT_PANE_WIDTH,
 };
 use smithagents_app::link::LinkConfig;
 use smithagents_app::model::{Action, Connection, Effect, ShellModel};
@@ -27,7 +28,9 @@ use smithagents_app::shell_state::ShellState;
 use smithagents_app::view_models::LeftPaneMode;
 use smithagents_app::views::banner::BANNER_ID;
 use smithagents_app::views::center::EMPTY_HINT_ID;
-use smithagents_app::views::left_pane::{COMPACT_MARKER_ID, EXPANDED_TITLE_ID};
+use smithagents_app::views::left_pane::{
+    COMPACT_MARKER_ID, EXPANDED_TITLE_ID, LEFT_PANE_CONTENT_ID,
+};
 use smithagents_app::views::rail::{RailEntry, RAIL_WIDTH};
 use smithagents_app::views::tabs::{close_button_id, TOGGLE_AGENTS_ID};
 use smithagents_center_host::PixelRect;
@@ -481,45 +484,59 @@ fn every_saved_variant_restores_a_drawn_left_pane(cx: &mut TestAppContext) {
         )
     };
     // (file contents, expected mode, expected drawn width)
-    let cases: Vec<(Option<String>, LeftPaneMode, Pixels)> = vec![
-        (None, LeftPaneMode::Expanded, DEFAULT_LEFT_PANE_WIDTH),
+    // (file contents, expected mode, drawn width, drawn width after one cmd-b)
+    let compact = COMPACT_LEFT_PANE_WIDTH;
+    let cases: Vec<(Option<String>, LeftPaneMode, Pixels, Pixels)> = vec![
+        (
+            None,
+            LeftPaneMode::Expanded,
+            DEFAULT_LEFT_PANE_WIDTH,
+            compact,
+        ),
         (
             Some("{ corrupt".into()),
             LeftPaneMode::Expanded,
             DEFAULT_LEFT_PANE_WIDTH,
+            compact,
         ),
         (
             Some(serde_json::to_string(&area(None)).unwrap()),
             LeftPaneMode::Expanded,
             DEFAULT_LEFT_PANE_WIDTH,
+            compact,
         ),
         (
             Some(serde_json::to_string(&new(LeftPaneMode::Compact, 300.)).unwrap()),
             LeftPaneMode::Compact,
-            COMPACT_LEFT_PANE_WIDTH,
+            compact,
+            px(300.),
         ),
         (
             Some(serde_json::to_string(&new(LeftPaneMode::Expanded, 300.)).unwrap()),
             LeftPaneMode::Expanded,
             px(300.),
+            compact,
         ),
         (
             Some(serde_json::to_string(&old(260., false)).unwrap()),
             LeftPaneMode::Compact,
-            COMPACT_LEFT_PANE_WIDTH,
+            compact,
+            px(260.),
         ),
         (
             Some(serde_json::to_string(&old(260., true)).unwrap()),
             LeftPaneMode::Expanded,
             px(260.),
+            compact,
         ),
         (
             Some(serde_json::to_string(&old(1., true)).unwrap()),
             LeftPaneMode::Expanded,
-            px(100.),
+            MIN_LEFT_PANE_WIDTH,
+            compact,
         ),
     ];
-    for (contents, want_mode, want_width) in cases {
+    for (contents, want_mode, want_width, toggled_width) in cases {
         let home = tempfile::tempdir().unwrap();
         let store = LayoutStore::new(home.path());
         if let Some(contents) = &contents {
@@ -529,11 +546,12 @@ fn every_saved_variant_restores_a_drawn_left_pane(cx: &mut TestAppContext) {
         let state = shell.read_with(cx, |shell, _| shell.state().clone());
         assert_eq!(mode(cx, &state), want_mode, "{contents:?}");
         assert_eq!(left_pane_width(cx, window), want_width, "{contents:?}");
-        // And it stays drawn through a round of toggles.
-        for _ in 0..2 {
+        // And it stays drawn through a round of toggles, at the remembered
+        // width when expanded.
+        for want in [toggled_width, want_width] {
             cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
                 .unwrap();
-            left_pane_width(cx, window);
+            assert_eq!(left_pane_width(cx, window), want, "{contents:?}");
         }
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
@@ -578,9 +596,15 @@ fn shortcuts_still_work_after_the_focused_pane_changes(cx: &mut TestAppContext) 
     // The left pane: focus inside it, compact it, expand it again.
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        assert_eq!(window.find(LEFT_PANE_CONTENT_ID).focused(), Some(false));
         let at = window.find(LEFT_PANE_ID).bounds().center();
         window.pointer_down(at, MouseButton::Left, cx);
         window.pointer_up(at, MouseButton::Left, cx);
+        assert_eq!(
+            window.find(LEFT_PANE_CONTENT_ID).focused(),
+            Some(true),
+            "the click moved focus into the left pane"
+        );
         window.press("cmd-b", cx);
     })
     .unwrap();
@@ -711,20 +735,18 @@ fn a_narrow_window_keeps_the_center_wide_enough(cx: &mut TestAppContext) {
         })
         .unwrap();
 
-    // Reopened in a 900 px window, both shrink so the center keeps its
-    // minimum.
+    // Reopened in a 900 px window: the right dock gives way first, and the
+    // left pane is narrowed only where it is drawn, its remembered width kept
+    // (for a larger window later).
     let (window, shell) = open_shell_full(cx, ShellModel::new(), Some(store), None, (900., 700.));
     let (dock, state) =
         shell.read_with(cx, |shell, _| (shell.dock().clone(), shell.state().clone()));
-    let left = state.read_with(cx, |state, _| state.left_pane_layout().expanded_width);
+    let remembered = state.read_with(cx, |state, _| state.left_pane_layout().expanded_width);
+    assert_eq!(remembered, px(600.));
     let right = dock.read_with(cx, |area, _| area.dock_size(DockPlacement::Right).unwrap());
-    assert_eq!(left_pane_width(cx, window), left);
-    assert_eq!(left, right, "both shrink in proportion");
-    assert!(left < px(600.));
-    assert!(
-        px(900. - RAIL_WIDTH) - left - right >= MIN_CENTER_WIDTH,
-        "{left:?} + {right:?}"
-    );
+    assert_eq!(right, px(100.), "the right dock is at its minimum");
+    let left = left_pane_width(cx, window);
+    assert_eq!(left, px(900. - RAIL_WIDTH) - right - MIN_CENTER_WIDTH);
 
     let mut scale = 1.0;
     cx.update_window(window.into(), |_, window, cx| {
@@ -845,6 +867,208 @@ fn the_link_error_is_polled_only_while_disconnected(cx: &mut TestAppContext) {
             "{label}"
         );
         assert!(label.contains("smithagentsd"), "{label}");
+    })
+    .unwrap();
+}
+
+/// The handle's center, after a frame.
+fn resize_handle_center(cx: &mut TestAppContext, window: WindowHandle<Root>) -> Point<Pixels> {
+    let mut at = point(px(0.), px(0.));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        at = window.find(LEFT_PANE_RESIZE_ID).bounds().center();
+    })
+    .unwrap();
+    at
+}
+
+#[gpui_kit::test]
+fn dragging_the_edge_stops_at_both_limits_and_saves_the_final_width(cx: &mut TestAppContext) {
+    let home = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(home.path());
+    let (window, shell) = open_shell_with(cx, ShellModel::new(), Some(store.clone()));
+    let (state, dock) =
+        shell.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+    let stored = |cx: &mut TestAppContext| {
+        state.read_with(cx, |state, _| state.left_pane_layout().expanded_width)
+    };
+
+    // Far left: the pane stops at its minimum, never at nothing.
+    let from = resize_handle_center(cx, window);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.drag(from, point(px(-500.), from.y), cx)
+    })
+    .unwrap();
+    assert_eq!(stored(cx), MIN_LEFT_PANE_WIDTH);
+    assert_eq!(left_pane_width(cx, window), MIN_LEFT_PANE_WIDTH);
+
+    // Far right, with the right dock open: the center keeps its minimum.
+    let right = dock.read_with(cx, |area, _| {
+        assert!(area.is_dock_open(DockPlacement::Right));
+        area.dock_size(DockPlacement::Right).unwrap()
+    });
+    let widest = px(1200. - RAIL_WIDTH) - right - MIN_CENTER_WIDTH;
+    let from = resize_handle_center(cx, window);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.drag(from, point(px(1180.), from.y), cx)
+    })
+    .unwrap();
+    assert_eq!(stored(cx), widest);
+    assert_eq!(left_pane_width(cx, window), widest);
+    let mut scale = 1.0;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        scale = f64::from(window.scale_factor());
+    })
+    .unwrap();
+    let rect = state.read_with(cx, |state, _| state.center_rect()).unwrap();
+    assert!(
+        (rect.w / scale - f64::from(f32::from(MIN_CENTER_WIDTH))).abs() < 1.0,
+        "{rect:?}"
+    );
+
+    // Once the drag settles and the debounce elapses, the file has it.
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    let saved = store.load().expect("the layout was written");
+    assert_eq!(
+        saved_left_pane(&saved),
+        Some(LeftPaneLayout {
+            mode: LeftPaneMode::Expanded,
+            expanded_width: widest
+        })
+    );
+}
+
+#[gpui_kit::test]
+fn a_released_button_stops_the_resize(cx: &mut TestAppContext) {
+    let (window, shell) = open_shell(cx, ShellModel::new());
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    let stored = |cx: &mut TestAppContext| {
+        state.read_with(cx, |state, _| state.left_pane_layout().expanded_width)
+    };
+    let from = resize_handle_center(cx, window);
+    cx.update_window(window.into(), |_, window, cx| {
+        // As `drag` does: hover, press, then moves with the button held (the
+        // first one starts the drag).
+        window.pointer_move(from, None, cx);
+        window.pointer_down(from, MouseButton::Left, cx);
+        for dx in [10., 20., 40.] {
+            window.pointer_move(point(from.x + px(dx), from.y), Some(MouseButton::Left), cx);
+        }
+    })
+    .unwrap();
+    let dragged = stored(cx);
+    assert!(dragged > DEFAULT_LEFT_PANE_WIDTH + px(30.), "{dragged:?}");
+
+    // The mouse-up was missed: the next move reports no pressed button.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.pointer_move(point(from.x + px(120.), from.y), None, cx);
+        window.pointer_move(
+            point(from.x + px(160.), from.y),
+            Some(MouseButton::Left),
+            cx,
+        );
+    })
+    .unwrap();
+    assert_eq!(
+        stored(cx),
+        dragged,
+        "the pane no longer follows the pointer"
+    );
+}
+
+#[gpui_kit::test]
+fn expanding_shrinks_a_wide_right_dock_so_the_center_keeps_its_minimum(cx: &mut TestAppContext) {
+    let home = tempfile::tempdir().unwrap();
+    let store = LayoutStore::new(home.path());
+    let panel = |name: &str| PanelState {
+        panel_name: name.into(),
+        children: vec![],
+        info: PanelInfo::panel(serde_json::Value::Null),
+    };
+    store
+        .save(&with_left_pane(
+            DockAreaState {
+                version: Some(LAYOUT_VERSION),
+                center: panel("Center"),
+                left_dock: None,
+                right_dock: Some(DockState::new(
+                    panel("Settings"),
+                    DockPlacement::Right,
+                    px(900.),
+                    true,
+                )),
+                bottom_dock: None,
+            },
+            LeftPaneLayout {
+                mode: LeftPaneMode::Compact,
+                expanded_width: DEFAULT_LEFT_PANE_WIDTH,
+            },
+        ))
+        .unwrap();
+    let (window, shell) = open_shell_full(cx, ShellModel::new(), Some(store), None, (1000., 700.));
+    let (state, dock) =
+        shell.read_with(cx, |shell, _| (shell.state().clone(), shell.dock().clone()));
+    let available = px(1000. - RAIL_WIDTH);
+    let right = |cx: &mut TestAppContext| {
+        dock.read_with(cx, |area, _| area.dock_size(DockPlacement::Right).unwrap())
+    };
+    assert_eq!(
+        right(cx),
+        available - COMPACT_LEFT_PANE_WIDTH - MIN_CENTER_WIDTH
+    );
+
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-b", cx))
+        .unwrap();
+    assert_eq!(mode(cx, &state), LeftPaneMode::Expanded);
+    assert_eq!(
+        right(cx),
+        available - DEFAULT_LEFT_PANE_WIDTH - MIN_CENTER_WIDTH,
+        "the right dock gave way"
+    );
+    assert_eq!(left_pane_width(cx, window), DEFAULT_LEFT_PANE_WIDTH);
+    let mut scale = 1.0;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        scale = f64::from(window.scale_factor());
+    })
+    .unwrap();
+    let rect = state.read_with(cx, |state, _| state.center_rect()).unwrap();
+    assert!(
+        rect.w / scale >= f64::from(f32::from(MIN_CENTER_WIDTH)) - 1.0,
+        "{rect:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn the_left_pane_spans_the_height_and_the_rail_sits_at_the_far_right(cx: &mut TestAppContext) {
+    // Not connected, so the banner is shown above the center.
+    let (window, _shell) = open_shell(cx, ShellModel::new());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let content = window.viewport_size();
+        let left = window.find(LEFT_PANE_ID).bounds();
+        assert_eq!(left.origin, point(px(0.), px(0.)), "{left:?}");
+        assert_eq!(left.size.height, content.height, "full height");
+
+        let banner = window.find(BANNER_ID).bounds();
+        assert!(banner.left() >= left.right(), "{banner:?} vs {left:?}");
+        assert_eq!(
+            banner.top(),
+            px(0.),
+            "the banner is at the top of the center"
+        );
+        let toggle = window.find(TOGGLE_AGENTS_ID).bounds();
+        assert!(toggle.left() >= left.right() && toggle.top() >= banner.bottom());
+
+        let rail_button = window.find(RailEntry::Settings.element_id()).bounds();
+        assert!(
+            rail_button.left() >= content.width - px(RAIL_WIDTH),
+            "{rail_button:?}"
+        );
+        assert!(rail_button.right() <= content.width);
+        assert!(banner.right() <= content.width - px(RAIL_WIDTH));
     })
     .unwrap();
 }

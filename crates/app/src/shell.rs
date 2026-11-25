@@ -28,8 +28,8 @@ use gpui_kit::component::{h_flex, resize_handle, ActiveTheme as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, FocusHandle,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
-    Styled as _, Subscription, Task, TestSupportExt as _, Window,
+    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _, Pixels,
+    Render, Styled as _, Subscription, Task, TestSupportExt as _, Window,
 };
 use smithagents_theme::native::NativeTheme;
 
@@ -133,8 +133,9 @@ impl Shell {
         } = options;
         let link = link.map(DaemonLink::start);
 
-        // The saved layout, fitted to this window so the center keeps its
-        // minimum width.
+        // The saved layout. The right dock is fitted to this window so the
+        // center keeps its minimum width; the left pane's remembered expanded
+        // width is kept as saved and only narrowed where it is drawn.
         let saved = layout.as_ref().and_then(LayoutStore::load);
         let saved_right = saved
             .as_ref()
@@ -142,19 +143,16 @@ impl Shell {
         let left = saved.as_ref().and_then(saved_left_pane).unwrap_or_default();
         let available = window.viewport_size().width - px(RAIL_WIDTH);
         let right_size = saved_right.map_or(DEFAULT_RIGHT_DOCK, |right| right.size);
-        let (left_width, right_size) = fit_panes(left, right_size, available);
+        let right_size = fit_panes(left, right_size, available);
         if saved.is_some() {
             tracing::debug!(
                 mode = ?left.mode,
-                expanded_width = ?left_width,
+                expanded_width = ?left.expanded_width,
                 right = ?saved_right,
+                ?right_size,
                 "restoring the layout"
             );
         }
-        let left = LeftPaneLayout {
-            expanded_width: left_width,
-            ..left
-        };
         let state = cx.new(|cx| ShellState::new(model, native_theme, link, left, cx));
 
         let (dock, skin) = DockSkin::dock_area(DOCK_AREA_ID, Some(LAYOUT_VERSION), window, cx);
@@ -195,10 +193,14 @@ impl Shell {
                     cx.notify();
                 }
             }),
-            cx.subscribe(&state, |this, _, event: &ShellEvent, cx| match event {
-                ShellEvent::LeftPaneChanged => {
-                    this.schedule_layout_save(cx);
-                    cx.notify();
+            cx.subscribe_in(&state, window, |this, _, event: &ShellEvent, window, cx| {
+                match event {
+                    ShellEvent::LeftPaneChanged => {
+                        // An expanded pane needs room: the right dock gives way.
+                        this.refit_right_dock(window, cx);
+                        this.schedule_layout_save(cx);
+                        cx.notify();
+                    }
                 }
             }),
             // Toggles made by the dock skin itself; the shell's own entry
@@ -277,6 +279,30 @@ impl Shell {
                 area.toggle_dock(placement, window, cx);
             }
         });
+        if !showing {
+            self.refit_right_dock(window, cx);
+        }
+    }
+
+    /// Shrinks the right dock if, beside the left pane, it would leave the
+    /// center less than its minimum width (see `layout_store::fit_panes`).
+    fn refit_right_dock(&mut self, window: &mut Window, cx: &mut App) {
+        let left = self.state.read(cx).left_pane_layout();
+        let available = window.viewport_size().width - px(RAIL_WIDTH);
+        self.dock.update(cx, |area, cx| {
+            let Some(right) = area.dock_size(DockPlacement::Right) else {
+                return;
+            };
+            let fitted = fit_panes(left, right, available);
+            if fitted != right {
+                tracing::debug!(
+                    ?right,
+                    ?fitted,
+                    "fitting the right dock beside the left pane"
+                );
+                area.set_dock_size(DockPlacement::Right, fitted, window, cx);
+            }
+        });
     }
 
     fn on_toggle_agents(&mut self, _: &ToggleAgentsPane, _: &mut Window, cx: &mut Context<Self>) {
@@ -298,13 +324,20 @@ impl Shell {
         left_pane_extent(left, right_extent, available)
     }
 
-    /// Follows a drag of the left pane's edge (expanded only).
+    /// Follows a drag of the left pane's edge (expanded only). A move without
+    /// the left button held means the mouse-up was missed: the drag ends
+    /// there, so the pane never keeps following the pointer.
     fn on_left_pane_drag(
         &mut self,
         event: &DragMoveEvent<LeftPaneResize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.event.pressed_button != Some(MouseButton::Left) {
+            tracing::debug!("left pane resize ended without a mouse-up");
+            cx.stop_active_drag(window);
+            return;
+        }
         let mut layout = self.state.read(cx).left_pane_layout();
         if layout.mode != LeftPaneMode::Expanded {
             return;

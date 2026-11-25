@@ -5,8 +5,8 @@
 //!   `left_dock` entry the shell writes for its left pane, which is not a
 //!   dock ([`with_left_pane`], [`saved_left_pane`]). The panel tree is fixed,
 //!   so what it restores is the right dock's size and open state
-//!   ([`saved_dock`]) and the left pane's mode and expanded width, fitted to
-//!   the window ([`fit_panes`]).
+//!   ([`saved_dock`]), fitted to the window ([`fit_panes`]), and the left
+//!   pane's mode and expanded width.
 //! - `<home>/app-window.json`, the main window's place and size
 //!   ([`SavedWindow`]), reused only where it can be seen
 //!   ([`restored_window_bounds`]).
@@ -43,6 +43,10 @@ pub const MIN_CENTER_WIDTH: Pixels = px(320.);
 
 /// The left pane's width while compact: a fixed strip, never resized.
 pub const COMPACT_LEFT_PANE_WIDTH: Pixels = px(56.);
+/// The narrowest an expanded left pane is drawn, saved or dragged to.
+pub const MIN_LEFT_PANE_WIDTH: Pixels = px(100.);
+/// The widest remembered expanded width (a guard against corrupt files).
+pub const MAX_LEFT_PANE_WIDTH: Pixels = px(1000.);
 /// The left pane's expanded width when nothing is saved.
 pub const DEFAULT_LEFT_PANE_WIDTH: Pixels = px(240.);
 /// The persisted name of the left pane's panel. Never change it.
@@ -224,34 +228,33 @@ pub fn restored_window_bounds(
     })
 }
 
-/// The left pane's expanded width and the right dock's width fitted to
-/// `available` (the width the panes share, rail excluded) so the center keeps
-/// [`MIN_CENTER_WIDTH`] with the right dock open. Expanded, the two give way
-/// like two docks ([`fit_side_docks`]). Compact, the left pane counts as its
-/// fixed width: only the right dock gives way (never below
-/// [`MIN_DOCK_SIZE`]), and the remembered expanded width is kept (it is
-/// fitted when drawn, see [`left_pane_extent`]).
-pub fn fit_panes(left: LeftPaneLayout, right: Pixels, available: Pixels) -> (Pixels, Pixels) {
-    match left.mode {
-        LeftPaneMode::Expanded => fit_side_docks(left.expanded_width, right, available),
-        LeftPaneMode::Compact => {
-            let room = f32::from(available)
-                - f32::from(COMPACT_LEFT_PANE_WIDTH)
-                - f32::from(MIN_CENTER_WIDTH);
-            if !room.is_finite() || f32::from(right) <= room {
-                return (left.expanded_width, right);
-            }
-            let right = room.floor().max(f32::from(MIN_DOCK_SIZE));
-            (left.expanded_width, px(right))
-        }
+/// The right dock's width fitted beside the left pane in `available` (the
+/// width the panes share, rail excluded) so the center keeps
+/// [`MIN_CENTER_WIDTH`]: unchanged when it fits, otherwise shrunk, never below
+/// [`MIN_DOCK_SIZE`]. The left pane counts as [`COMPACT_LEFT_PANE_WIDTH`]
+/// when compact and as its expanded width when expanded. The expanded width
+/// is never changed here: when even a minimum right dock leaves too little
+/// room, the left pane is narrowed only where it is drawn
+/// ([`left_pane_extent`]), so a larger window shows the remembered width
+/// again. An unknown width changes nothing.
+pub fn fit_panes(left: LeftPaneLayout, right: Pixels, available: Pixels) -> Pixels {
+    let left_width = match left.mode {
+        LeftPaneMode::Compact => COMPACT_LEFT_PANE_WIDTH,
+        LeftPaneMode::Expanded => left.expanded_width,
+    };
+    let room = f32::from(available) - f32::from(left_width) - f32::from(MIN_CENTER_WIDTH);
+    if !room.is_finite() || f32::from(right) <= room {
+        return right;
     }
+    px(room.floor().max(f32::from(MIN_DOCK_SIZE)))
 }
 
 /// The width the left pane is drawn at: [`COMPACT_LEFT_PANE_WIDTH`] when
-/// compact; when expanded, its expanded width, narrowed if needed so the
-/// center keeps [`MIN_CENTER_WIDTH`] beside `right_extent` (the right dock's
-/// drawn width, 0 when hidden), but never below [`MIN_DOCK_SIZE`]. Never
-/// zero, whatever the inputs.
+/// compact; when expanded, its expanded width (the default when not finite,
+/// at most [`MAX_LEFT_PANE_WIDTH`]), narrowed if needed so the center keeps
+/// [`MIN_CENTER_WIDTH`] beside `right_extent` (the right dock's drawn width,
+/// 0 when hidden), but never below [`MIN_LEFT_PANE_WIDTH`]. Never zero,
+/// whatever the inputs.
 pub fn left_pane_extent(left: LeftPaneLayout, right_extent: Pixels, available: Pixels) -> Pixels {
     match left.mode {
         LeftPaneMode::Compact => COMPACT_LEFT_PANE_WIDTH,
@@ -260,39 +263,14 @@ pub fn left_pane_extent(left: LeftPaneLayout, right_extent: Pixels, available: P
             if !width.is_finite() {
                 width = f32::from(DEFAULT_LEFT_PANE_WIDTH);
             }
+            width = width.min(f32::from(MAX_LEFT_PANE_WIDTH));
             let room = f32::from(available) - f32::from(right_extent) - f32::from(MIN_CENTER_WIDTH);
             if room.is_finite() {
                 width = width.min(room);
             }
-            px(width.max(f32::from(MIN_DOCK_SIZE)))
+            px(width.max(f32::from(MIN_LEFT_PANE_WIDTH)))
         }
     }
-}
-
-/// Side dock widths that leave the center at least [`MIN_CENTER_WIDTH`] of
-/// `available` (the width the dock area gets) with both docks open. Docks
-/// that fit are returned unchanged; otherwise both shrink in proportion, and
-/// one that would drop below [`MIN_DOCK_SIZE`] stays at it while the other
-/// takes the rest. In a window too narrow for that, both get the minimum.
-/// A non-finite `available` changes nothing.
-pub fn fit_side_docks(left: Pixels, right: Pixels, available: Pixels) -> (Pixels, Pixels) {
-    let (l, r, avail) = (f32::from(left), f32::from(right), f32::from(available));
-    let min = f32::from(MIN_DOCK_SIZE);
-    let total = l + r;
-    let budget = (avail - f32::from(MIN_CENTER_WIDTH)).max(2.0 * min);
-    if !avail.is_finite() || !total.is_finite() || total <= budget {
-        return (left, right);
-    }
-    let mut fitted_l = (l * budget / total).floor();
-    let mut fitted_r = (r * budget / total).floor();
-    if fitted_l < min {
-        fitted_l = min;
-        fitted_r = (budget - min).floor().clamp(min, r.max(min));
-    } else if fitted_r < min {
-        fitted_r = min;
-        fitted_l = (budget - min).floor().clamp(min, l.max(min));
-    }
-    (px(fitted_l), px(fitted_r))
 }
 
 /// The left pane's layout: its mode and the width it has when expanded
@@ -342,29 +320,29 @@ pub fn with_left_pane(mut state: DockAreaState, left: LeftPaneLayout) -> DockAre
 }
 
 /// The saved left pane, or `None` (use the default) when the file has no
-/// usable `left_dock` (see [`saved_dock`]). The expanded width is clamped
-/// like a dock's. The mode is the Agents panel's `mode` when it is one this
+/// `left_dock` on the left side or its size is not finite. The expanded
+/// width is clamped to [`MIN_LEFT_PANE_WIDTH`]..=[`MAX_LEFT_PANE_WIDTH`]. The mode is the Agents panel's `mode` when it is one this
 /// build knows; otherwise an open dock is expanded and a closed one compact,
 /// which is how a layout from before the compact mode, whose closed left dock
 /// meant hidden, comes back.
 pub fn saved_left_pane(state: &DockAreaState) -> Option<LeftPaneLayout> {
-    let dock = saved_dock(state, DockPlacement::Left)?;
-    let written_mode = state
-        .left_dock
-        .as_ref()
-        .and_then(|left| find_panel(left.panel(), LEFT_PANE_PANEL))
-        .and_then(|agents| match &agents.info {
+    let left = state.left_dock.as_ref()?;
+    if left.placement() != DockPlacement::Left || !f32::from(left.size()).is_finite() {
+        return None;
+    }
+    let written_mode =
+        find_panel(left.panel(), LEFT_PANE_PANEL).and_then(|agents| match &agents.info {
             PanelInfo::Panel(info) => info.get("mode")?.as_str().and_then(LeftPaneMode::parse),
             _ => None,
         });
-    let mode = written_mode.unwrap_or(if dock.open {
+    let mode = written_mode.unwrap_or(if left.open() {
         LeftPaneMode::Expanded
     } else {
         LeftPaneMode::Compact
     });
     Some(LeftPaneLayout {
         mode,
-        expanded_width: dock.size,
+        expanded_width: left.size().clamp(MIN_LEFT_PANE_WIDTH, MAX_LEFT_PANE_WIDTH),
     })
 }
 
