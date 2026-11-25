@@ -5,7 +5,7 @@
 //! current color scheme, an unknown font to the first font, and a non-finite text scale to
 //! the default; finite scales are clamped to the bounds.
 
-use serde_json::json;
+use serde::Serialize;
 use smithagents_theme::tokens::{Appearance, ThemeSet};
 
 const TEMPLATE: &str = r#"(function () {
@@ -78,21 +78,63 @@ fn appearance_str(a: Appearance) -> &'static str {
     }
 }
 
+// The page data is serialized from structs, not `serde_json::json!`: a map's
+// key order depends on serde_json's `preserve_order` feature, which other
+// workspace crates (GPUI) turn on through feature unification, so `json!`
+// output differed between `cargo test --workspace` and `cargo themegen`.
+// Struct fields serialize in declaration order (kept alphabetical, matching
+// the committed file) whatever the features.
+
+#[derive(Serialize)]
+struct Data<'a> {
+    fonts: Vec<&'a str>,
+    pair: Pair<'a>,
+    scale: Scale,
+    themes: Vec<ThemeEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct Pair<'a> {
+    dark: &'a str,
+    light: &'a str,
+}
+
+#[derive(Serialize)]
+struct Scale {
+    default: f64,
+    max: f64,
+    min: f64,
+}
+
+#[derive(Serialize)]
+struct ThemeEntry<'a> {
+    appearance: &'static str,
+    id: &'a str,
+}
+
 /// Renders the self-contained, deterministic bootstrap script for `set`.
 pub fn render_bootstrap(set: &ThemeSet) -> String {
     let base = &set.base;
-    let data = json!({
-        "themes": set.themes.iter().map(|t| json!({
-            "id": t.id,
-            "appearance": appearance_str(t.appearance),
-        })).collect::<Vec<_>>(),
-        "fonts": base.fonts.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
-        "pair": { "dark": base.system_pair.dark, "light": base.system_pair.light },
-        "scale": {
-            "min": base.text_scale.min,
-            "max": base.text_scale.max,
-            "default": base.text_scale.default,
+    let data = Data {
+        fonts: base.fonts.iter().map(|f| f.id.as_str()).collect(),
+        pair: Pair {
+            dark: &base.system_pair.dark,
+            light: &base.system_pair.light,
         },
-    });
-    TEMPLATE.replace("__DATA__", &data.to_string())
+        scale: Scale {
+            default: base.text_scale.default,
+            max: base.text_scale.max,
+            min: base.text_scale.min,
+        },
+        themes: set
+            .themes
+            .iter()
+            .map(|t| ThemeEntry {
+                appearance: appearance_str(t.appearance),
+                id: &t.id,
+            })
+            .collect(),
+    };
+    let json = serde_json::to_string(&data).expect("bootstrap data serializes");
+    TEMPLATE.replace("__DATA__", &json)
 }
