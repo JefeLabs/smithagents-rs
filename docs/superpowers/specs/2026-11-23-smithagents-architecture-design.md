@@ -78,21 +78,27 @@ Anti-goals (failure even if it "works")
 │ Queue       ││  Terminal xterm.js <-> daemon   ││ Integration   ││▣│ rail
 │ Routines    ││  Flow     react-flow            ││ config        ││▣│
 │ (full       │├─────────────────────────────────┴┴───────────────┤│▣│
-│  height)    ││ Bottom: view for the pressed tool icon            ││▣│
+│  main row)  ││ Bottom: view for the pressed tool icon            ││▣│
 └─────────────┘└───────────────────────────────────────────────────┘└─┘
- Status bar:        status message (centered)    [Update available] v0.1.0
+ Status bar (full width):   status message (centered)             v0.1.0
+ (title bar, top right: [Update available] chip, only when needed)
 ```
 
 - Status bar: a full-width bar (24 px) at the very bottom of the window,
-  under the left pane, the center, the right pane and the icon rail. Status
-  messages show in the center (the connection status while not connected,
-  else the latest transient message such as "Agent Mercury created"); the
-  version shows at the right, with an "Update available" button next to it
-  when an update is detected. The left zone is reserved. It is separate from
-  the bottom pane below (tool views), which stays out of v1.
-  [owner decision 2026-11-25]
+  under the left pane, the center, the right pane and the icon rail, so
+  those run from the title bar to the status bar. Status messages show in
+  the center (the connection status while not connected, else the latest
+  transient message such as "Agent Mercury created"); the version shows at
+  the right. The left zone is reserved. It is separate from the bottom pane
+  below (tool views), which stays out of v1. [owner decision 2026-11-25]
+- Update chip: a small pill at the top right of the title bar (not in the
+  status bar), shown only while an update needs attention: "Update
+  available", "Installing…", "Update failed, retry", or "Restart to update".
+  v1 ships no updater (`NoUpdater`), so the chip never appears until a
+  release channel, signed bundles and signature verification exist (see the
+  plan's follow-ups). [owner decision 2026-11-25]
 
-- Left pane: full height. Space switcher (with connection and "browser
+- Left pane: full height of the main row (title bar to status bar). Space switcher (with connection and "browser
   signed out" status), personal dashboards (e.g. "Start of Day"; rendered in
   a center tab, a natural home for agent-composed UI [my call]), agents (named
   sessions with status dot), agent queue, routines (scheduled / on demand).

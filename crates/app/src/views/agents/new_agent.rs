@@ -16,14 +16,14 @@ use smithagents_core::agent::Agent;
 use smithagents_core::ids::{AgentId, RepoId};
 
 use super::{
-    answered, notify, notify_failure, repo_choice_id, AgentsPane, AwaitedAgent, Paint,
-    NEW_AGENT_ID, NEW_AGENT_LABEL,
+    answered, notify, notify_link_error, notify_unreachable, repo_choice_id, AgentsPane,
+    AwaitedAgent, Paint, NEW_AGENT_ID, NEW_AGENT_LABEL,
 };
 use crate::link::LinkError;
 use crate::model::Action;
 use crate::view_models::{
-    command_error_text, new_agent_plan, NewAgentPlan, RepoChoiceVm, StatusMessage,
-    DAEMON_SILENT_TEXT, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
+    new_agent_plan, NewAgentPlan, RepoChoiceVm, StatusMessage, DAEMON_SILENT_TEXT, NEED_REPO_TEXT,
+    NOT_CONNECTED_TEXT,
 };
 
 impl AgentsPane {
@@ -76,13 +76,7 @@ impl AgentsPane {
             )
         };
         let Some(create) = create else {
-            notify_failure(
-                &self.state,
-                "Could not create the agent",
-                NOT_CONNECTED_TEXT,
-                window,
-                cx,
-            );
+            notify_unreachable("Could not create the agent", NOT_CONNECTED_TEXT, window, cx);
             return;
         };
         tracing::debug!(%repo, "creating an agent");
@@ -107,13 +101,7 @@ impl AgentsPane {
         self.create = None;
         let Some(result) = answer else {
             tracing::warn!("the daemon did not answer a create in time");
-            notify_failure(
-                &self.state,
-                "Could not create the agent",
-                DAEMON_SILENT_TEXT,
-                window,
-                cx,
-            );
+            notify_unreachable("Could not create the agent", DAEMON_SILENT_TEXT, window, cx);
             cx.notify();
             return;
         };
@@ -132,13 +120,7 @@ impl AgentsPane {
             }
             Err(e) => {
                 tracing::warn!("cannot create an agent: {e}");
-                notify_failure(
-                    &self.state,
-                    "Could not create the agent",
-                    command_error_text(&e),
-                    window,
-                    cx,
-                );
+                notify_link_error(&self.state, "Could not create the agent", &e, window, cx);
             }
         }
         cx.notify();

@@ -36,7 +36,7 @@ use smithagents_app::shell::{ShellOptions, LEFT_PANE_ID};
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::theme_adapter::{agent_accent, region_tokens, srgb_to_hsla, Region};
 use smithagents_app::view_models::{
-    LeftPaneMode, DAEMON_SILENT_TEXT, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
+    LeftPaneMode, StatusKind, DAEMON_SILENT_TEXT, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
 };
 use smithagents_app::views::agents::{
     agent_marker_id, agent_row_id, repo_choice_id, ACCENT_BAR_ID, AGENTS_EMPTY_ID, AGENT_LIST_ID,
@@ -188,6 +188,18 @@ fn agent_created(cx: &mut TestAppContext, state: &Entity<ShellState>, agent: &Ag
             cx,
         )
     });
+}
+
+/// What the status bar shows as the transient message (the connection is up
+/// in these tests).
+fn status(cx: &mut TestAppContext, state: &Entity<ShellState>) -> Option<(StatusKind, String)> {
+    state.read_with(cx, |state, _| {
+        state.status_message().map(|m| (m.kind, m.text))
+    })
+}
+
+fn clear_status(cx: &mut TestAppContext, state: &Entity<ShellState>) {
+    state.update(cx, |state, cx| state.clear_status(cx));
 }
 
 /// The pane's notification text, if one is showing.
@@ -703,7 +715,7 @@ fn a_created_agent_does_not_take_the_selection_from_the_users_choice(cx: &mut Te
 fn a_failed_create_shows_the_daemons_message(cx: &mut TestAppContext) {
     let only = repo("/src/app", 0);
     let fake = Rc::new(FakeCommands::default());
-    let (window, _) = open_with_commands(cx, connected(vec![], vec![only]), &fake, None);
+    let (window, state) = open_with_commands(cx, connected(vec![], vec![only]), &fake, None);
     fake.create_results
         .borrow_mut()
         .push_back(Err(LinkError::Client(ClientError::Api {
@@ -720,6 +732,15 @@ fn a_failed_create_shows_the_daemons_message(cx: &mut TestAppContext) {
         notice(cx, window).as_deref(),
         Some("cannot create the worktree: branch agent/mercury exists")
     );
+    assert_eq!(
+        status(cx, &state),
+        Some((
+            StatusKind::Error,
+            "Could not create the agent: cannot create the worktree: branch agent/mercury exists"
+                .into()
+        ))
+    );
+    clear_status(cx, &state);
 
     fake.create_results
         .borrow_mut()
@@ -733,18 +754,25 @@ fn a_failed_create_shows_the_daemons_message(cx: &mut TestAppContext) {
         notice(cx, window).as_deref(),
         Some("Not connected to the daemon")
     );
+    assert_eq!(
+        status(cx, &state),
+        None,
+        "a connection failure sets no status"
+    );
 }
 
 #[gpui_kit::test]
 fn an_offline_shell_says_it_is_not_connected(cx: &mut TestAppContext) {
     // No link and no commands: nothing can create.
-    let (window, _) = open_shell(cx, connected(vec![], vec![repo("/src/app", 0)]));
+    let (window, shell) = open_shell(cx, connected(vec![], vec![repo("/src/app", 0)]));
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click(NEW_AGENT_ID, cx);
     })
     .unwrap();
     assert_eq!(notice(cx, window).as_deref(), Some(NOT_CONNECTED_TEXT));
+    assert_eq!(status(cx, &state), None, "no link: no status");
 }
 
 #[gpui_kit::test]
@@ -920,7 +948,8 @@ fn a_failed_close_shows_the_daemons_message_and_keeps_the_row(cx: &mut TestAppCo
             code: "turn_in_progress".into(),
             message: "a turn is already in progress for this agent".into(),
         })));
-    let (window, _) = open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    let (window, state) =
+        open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
     ask_to_close(cx, window, agent_row_id(mercury.id));
     cx.update_window(window.into(), |_, window, cx| {
         window.click(CONFIRM_CLOSE_ID, cx)
@@ -932,6 +961,13 @@ fn a_failed_close_shows_the_daemons_message_and_keeps_the_row(cx: &mut TestAppCo
         notice(cx, window).as_deref(),
         Some("a turn is already in progress for this agent")
     );
+    assert_eq!(
+        status(cx, &state),
+        Some((
+            StatusKind::Error,
+            "Could not close the agent: a turn is already in progress for this agent".into()
+        ))
+    );
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
@@ -940,6 +976,77 @@ fn a_failed_close_shows_the_daemons_message_and_keeps_the_row(cx: &mut TestAppCo
         );
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_close_that_cannot_reach_the_daemon_sets_no_status(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    fake.close_results
+        .borrow_mut()
+        .push_back(Err(LinkError::NotConnected));
+    let (window, state) =
+        open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(CONFIRM_CLOSE_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        notice(cx, window).as_deref(),
+        Some("Not connected to the daemon")
+    );
+    assert_eq!(status(cx, &state), None);
+}
+
+#[gpui_kit::test]
+fn a_successful_close_says_which_agent_closed(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) =
+        open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(CONFIRM_CLOSE_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        status(cx, &state),
+        Some((StatusKind::Info, "Agent Mercury closed".into()))
+    );
+}
+
+#[gpui_kit::test]
+fn a_close_of_an_agent_already_gone_says_agent_closed(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let fake = Rc::new(FakeCommands::default());
+    let (window, state) =
+        open_with_commands(cx, connected(vec![mercury.clone()], vec![]), &fake, None);
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    // The agent closes elsewhere while the confirmation is open.
+    state.update(cx, |state, cx| {
+        state.dispatch(
+            Action::Event(Event {
+                seq: 2,
+                at: mercury.created_at,
+                kind: EventKind::AgentClosed {
+                    agent_id: mercury.id,
+                },
+            }),
+            cx,
+        )
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(CONFIRM_CLOSE_ID, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        status(cx, &state),
+        Some((StatusKind::Info, "Agent closed".into()))
+    );
 }
 
 /// The topmost quads painted at the center of the status dot inside `item`
@@ -1224,7 +1331,7 @@ fn a_theme_switch_recolors_the_row_accents(cx: &mut TestAppContext) {
 fn a_create_the_daemon_never_answers_is_given_up_after_the_timeout(cx: &mut TestAppContext) {
     let only = repo("/src/app", 0);
     let fake = Rc::new(FakeCommands::default());
-    let (window, _) = open_pane(
+    let (window, state) = open_pane(
         cx,
         ShellOptions {
             model: connected(vec![], vec![only.clone()]),
@@ -1255,6 +1362,7 @@ fn a_create_the_daemon_never_answers_is_given_up_after_the_timeout(cx: &mut Test
     cx.run_until_parked();
     assert!(!disabled(cx), "given up after the timeout");
     assert_eq!(notice(cx, window).as_deref(), Some(DAEMON_SILENT_TEXT));
+    assert_eq!(status(cx, &state), None, "a silent daemon sets no status");
     // The fake still holds the first create; a new one can start.
     cx.update_window(window.into(), |_, window, cx| {
         window.click(NEW_AGENT_ID, cx)

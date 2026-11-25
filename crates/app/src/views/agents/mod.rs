@@ -57,14 +57,15 @@ use gpui_kit::{
 use smithagents_core::ids::AgentId;
 use smithagents_theme::native::NativeTheme;
 
+use crate::link::LinkError;
 use crate::model::{Action, Connection};
 use crate::shell_state::ShellState;
 use crate::theme_adapter::{
     agent_accent, initial_text_color, region_paint, srgb_to_hsla, token_color, token_paint, Region,
 };
 use crate::view_models::{
-    agent_rows, new_agent_plan, repo_choices, state_dot, AgentRowVm, DotStyle, LeftPaneMode,
-    NewAgentPlan, StatusMessage, DAEMON_SILENT_TEXT,
+    agent_rows, command_error_text, new_agent_plan, repo_choices, state_dot, AgentRowVm, DotStyle,
+    LeftPaneMode, NewAgentPlan, StatusMessage, DAEMON_SILENT_TEXT,
 };
 
 gpui_kit::actions!(
@@ -230,7 +231,7 @@ impl AgentsPane {
         self.closing.clear();
         if let Some(title) = title {
             tracing::warn!("the connection dropped while a command waited");
-            notify_failure(&self.state, title, DAEMON_SILENT_TEXT, window, cx);
+            notify_unreachable(title, DAEMON_SILENT_TEXT, window, cx);
         }
     }
 
@@ -650,8 +651,8 @@ impl Paint {
     }
 }
 
-/// A failed command: a notification, and the same text as the status bar's
-/// error message.
+/// A failed command: a notification, and the status bar's error message
+/// "<title>: <text>".
 fn notify_failure(
     state: &Entity<ShellState>,
     title: &'static str,
@@ -661,9 +662,37 @@ fn notify_failure(
 ) {
     let text: SharedString = text.into();
     state.update(cx, |state, cx| {
-        state.set_status(StatusMessage::error(text.to_string()), cx)
+        state.set_status(StatusMessage::error(format!("{title}: {text}")), cx)
     });
     notify(NotificationType::Error, Some(title), text, window, cx);
+}
+
+/// A failure caused by the connection (not connected, the link stopped, the
+/// daemon silent): a notification only. The status bar already says what the
+/// connection is doing, and an error left there would outlive it.
+fn notify_unreachable(
+    title: &'static str,
+    text: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    notify(NotificationType::Error, Some(title), text, window, cx);
+}
+
+/// A command's [`LinkError`]: an unreachable daemon is a notification only,
+/// anything the daemon answered is a failure with a status.
+fn notify_link_error(
+    state: &Entity<ShellState>,
+    title: &'static str,
+    error: &LinkError,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text = command_error_text(error);
+    match error {
+        LinkError::NotConnected | LinkError::Stopped => notify_unreachable(title, text, window, cx),
+        LinkError::Client(_) => notify_failure(state, title, text, window, cx),
+    }
 }
 
 /// Shows a transient notification whose text is a [`Label`] with id

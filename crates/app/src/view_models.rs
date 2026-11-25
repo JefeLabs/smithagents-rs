@@ -46,17 +46,21 @@ pub struct StatusMessage {
 }
 
 impl StatusMessage {
-    pub fn info(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            kind: StatusKind::Info,
-        }
+    /// An `Info` message. All whitespace, newlines included, collapses to
+    /// single spaces: the bar shows one line.
+    pub fn info(text: impl AsRef<str>) -> Self {
+        Self::new(text.as_ref(), StatusKind::Info)
     }
 
-    pub fn error(text: impl Into<String>) -> Self {
+    /// An `Error` message, normalised like [`StatusMessage::info`].
+    pub fn error(text: impl AsRef<str>) -> Self {
+        Self::new(text.as_ref(), StatusKind::Error)
+    }
+
+    fn new(text: &str, kind: StatusKind) -> Self {
         Self {
-            text: text.into(),
-            kind: StatusKind::Error,
+            text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+            kind,
         }
     }
 }
@@ -93,7 +97,7 @@ pub fn version_text(version: &str) -> String {
     format!("v{version}")
 }
 
-/// The update button next to the version.
+/// The update chip in the title bar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateButtonVm {
     pub label: String,
@@ -102,7 +106,7 @@ pub struct UpdateButtonVm {
     pub a11y_label: String,
 }
 
-/// The update button for `state`, or `None` when there is nothing to
+/// The update chip for `state`, or `None` when there is nothing to
 /// install.
 pub fn update_button(state: &UpdateState) -> Option<UpdateButtonVm> {
     let (label, enabled, version) = match state {
@@ -110,6 +114,7 @@ pub fn update_button(state: &UpdateState) -> Option<UpdateButtonVm> {
         UpdateState::Available { version } => ("Update available", true, version),
         UpdateState::Installing { version } => ("Installing…", false, version),
         UpdateState::Failed { version, .. } => ("Update failed, retry", true, version),
+        UpdateState::RestartRequired { version } => ("Restart to update", true, version),
     };
     Some(UpdateButtonVm {
         label: label.to_owned(),

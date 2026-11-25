@@ -584,6 +584,12 @@ mod status_bar {
     }
 
     #[test]
+    fn a_message_is_one_line_whatever_the_whitespace() {
+        assert_eq!(StatusMessage::error("a\nb\r\n\n  c\t d ").text, "a b c d");
+        assert_eq!(StatusMessage::info("  one\ntwo ").text, "one two");
+    }
+
+    #[test]
     fn the_version_text_has_a_v_prefix() {
         assert_eq!(version_text("0.1.0"), "v0.1.0");
     }
@@ -616,6 +622,9 @@ mod status_bar {
         assert_eq!(failed.label, "Update failed, retry");
         assert!(failed.enabled);
         assert!(failed.a11y_label.contains("v1.2.3"));
+        let restart = update_button(&UpdateState::RestartRequired { version: v() }).unwrap();
+        assert_eq!(restart.label, "Restart to update");
+        assert_eq!(restart.a11y_label, "Restart to update: v1.2.3");
     }
 
     #[test]

@@ -47,7 +47,7 @@ use crate::model::ShellModel;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, Region};
 use crate::update::{NoUpdater, Updater};
-use crate::view_models::LeftPaneMode;
+use crate::view_models::{update_button, LeftPaneMode};
 use crate::views::agents::AgentsPane;
 use crate::views::center::CenterPanel;
 use crate::views::placeholder::PlaceholderPanel;
@@ -587,13 +587,16 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_toggle_settings))
             .on_drag_move(cx.listener(Self::on_left_pane_drag))
             .size_full()
-            .child(title_bar(native.as_ref(), cx))
+            .child(title_bar(
+                native.as_ref(),
+                update_button(self.state.read(cx).update_state()),
+                on_update,
+                cx,
+            ))
             .child(body)
             .child(status_bar(
                 self.state.read(cx).status_message(),
-                self.state.read(cx).update_state(),
                 native.as_ref(),
-                on_update,
                 cx,
             ))
     }

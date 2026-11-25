@@ -83,6 +83,8 @@ pub struct ShellState {
     status: Option<StatusMessage>,
     /// Clears an `Info` message; replaced (so cancelled) with the message.
     status_timer: Option<Task<()>>,
+    /// The status was set while the connection was down.
+    status_set_offline: bool,
     info_status_duration: Duration,
     updater: Rc<dyn Updater>,
     update: UpdateState,
@@ -125,6 +127,7 @@ impl ShellState {
             error_watch: None,
             status: None,
             status_timer: None,
+            status_set_offline: false,
             info_status_duration: DEFAULT_INFO_STATUS_DURATION,
             updater: Rc::new(NoUpdater),
             update: UpdateState::UpToDate,
@@ -237,6 +240,7 @@ impl ShellState {
 
     /// Applies a burst of actions with one redraw.
     fn dispatch_all(&mut self, actions: Vec<Action>, cx: &mut Context<Self>) {
+        let was_connected = self.model.connection() == Connection::Connected;
         for action in actions {
             let added = match &action {
                 Action::RepoAdded(repo) => Some(repository_added_text(&repo.path)),
@@ -246,6 +250,19 @@ impl ShellState {
             if let Some(text) = added {
                 self.set_status(StatusMessage::info(text), cx);
             }
+        }
+        // An error that happened while the connection was down is stale once
+        // it is back.
+        if !was_connected
+            && self.model.connection() == Connection::Connected
+            && self.status_set_offline
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|s| s.kind == StatusKind::Error)
+        {
+            tracing::debug!("clearing a status error set while disconnected");
+            self.clear_status(cx);
         }
         self.link_error = self.current_link_error();
         self.sync_error_watch(cx);
@@ -305,6 +322,7 @@ impl ShellState {
                 });
             })
         });
+        self.status_set_offline = self.model.connection() != Connection::Connected;
         self.status = Some(message);
         cx.notify();
     }
@@ -323,10 +341,13 @@ impl ShellState {
     }
 
     /// Replaces the updater and asks it once for a newer version (the
-    /// startup check). Without it the shell runs [`NoUpdater`].
+    /// startup check). Without it the shell runs [`NoUpdater`]. The update
+    /// state starts over and a check or install of the old updater is
+    /// dropped.
     pub fn set_updater(&mut self, updater: Rc<dyn Updater>, cx: &mut Context<Self>) {
         self.updater = updater;
         self.update_task = None;
+        self.update = UpdateState::UpToDate;
         self.check_for_updates(cx);
     }
 
@@ -338,7 +359,8 @@ impl ShellState {
     /// at startup; call it again to re-check (nothing does yet). Ignored while
     /// an install runs, and an install that starts meanwhile wins.
     pub fn check_for_updates(&mut self, cx: &mut Context<Self>) {
-        if self.update_task.is_some() {
+        if self.update_task.is_some() || matches!(self.update, UpdateState::RestartRequired { .. })
+        {
             return;
         }
         let check = self.updater.check();
@@ -358,14 +380,16 @@ impl ShellState {
     /// Installs the available version (or retries a failed install). Does
     /// nothing unless an update is `Available` or `Failed`, so a second click
     /// while installing starts no second install. On success the state is
-    /// `UpToDate` and the status asks for a restart; on failure it is
+    /// `RestartRequired` and the status says so; on failure it is
     /// `Failed` and the status carries the error.
     pub fn install_update(&mut self, cx: &mut Context<Self>) {
         let version = match &self.update {
             UpdateState::Available { version } | UpdateState::Failed { version, .. } => {
                 version.clone()
             }
-            UpdateState::UpToDate | UpdateState::Installing { .. } => return,
+            UpdateState::UpToDate
+            | UpdateState::Installing { .. }
+            | UpdateState::RestartRequired { .. } => return,
         };
         tracing::debug!(%version, "installing an update");
         self.update = UpdateState::Installing {
@@ -378,7 +402,9 @@ impl ShellState {
                 state.update_task = None;
                 match result {
                     Ok(()) => {
-                        state.update = UpdateState::UpToDate;
+                        state.update = UpdateState::RestartRequired {
+                            version: version.clone(),
+                        };
                         state.set_status(
                             StatusMessage::info(format!(
                                 "Update v{version} installed. Restart SmithAgents to finish."
@@ -392,7 +418,10 @@ impl ShellState {
                             version,
                             message: message.clone(),
                         };
-                        state.set_status(StatusMessage::error(message), cx);
+                        state.set_status(
+                            StatusMessage::error(format!("Update failed: {message}")),
+                            cx,
+                        );
                     }
                 }
                 cx.notify();

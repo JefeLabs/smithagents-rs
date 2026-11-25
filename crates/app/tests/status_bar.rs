@@ -11,7 +11,7 @@ use common::ui::{agent, dark_native, open_shell_options, painted_at, token_backg
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
-use gpui_kit::base::Root;
+use gpui_kit::base::{test_support, Root};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{point, px, AppContext as _, Entity, Role, TestAppContext, WindowHandle};
 use smithagents_app::layout_store::STATUS_BAR_HEIGHT;
@@ -25,7 +25,10 @@ use smithagents_app::view_models::{StatusKind, StatusMessage};
 use smithagents_app::views::rail::RAIL_ID;
 use smithagents_app::views::status_bar::{
     STATUS_BAR_ID, STATUS_BAR_LABEL, STATUS_ERROR_DOT_ID, STATUS_MESSAGE_ID, STATUS_RIGHT_ID,
-    STATUS_VERSION_ID, UPDATE_BUTTON_ID,
+    STATUS_VERSION_ID,
+};
+use smithagents_app::views::title_bar::{
+    TITLE_BAR_ID, TITLE_TEXT_ID, UPDATE_CHIP_ID, UPDATE_CHIP_MARGIN, UPDATE_CHIP_TOKENS,
 };
 use smithagents_center_host::PixelRect;
 use smithagents_core::agent::{Agent, Repo};
@@ -38,6 +41,7 @@ const INFO_FOR: Duration = Duration::from_millis(300);
 struct FakeUpdater {
     found: UpdateState,
     installs: RefCell<Vec<String>>,
+    checks: Cell<usize>,
     pending: RefCell<Vec<oneshot::Sender<Result<(), String>>>>,
 }
 
@@ -46,6 +50,7 @@ impl FakeUpdater {
         Rc::new(Self {
             found,
             installs: RefCell::default(),
+            checks: Cell::new(0),
             pending: RefCell::default(),
         })
     }
@@ -64,6 +69,7 @@ impl FakeUpdater {
 
 impl Updater for FakeUpdater {
     fn check(&self) -> LocalBoxFuture<'static, UpdateState> {
+        self.checks.set(self.checks.get() + 1);
         let found = self.found.clone();
         async move { found }.boxed_local()
     }
@@ -135,7 +141,7 @@ fn button_label(
     let mut out = (None, None);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let button = window.find(UPDATE_BUTTON_ID);
+        let button = window.find(UPDATE_CHIP_ID);
         out = (button.label().map(str::to_owned), button.disabled());
     })
     .unwrap();
@@ -189,7 +195,7 @@ fn the_bar_spans_the_window_bottom_and_the_regions_end_at_its_top(cx: &mut TestA
 }
 
 #[gpui_kit::test]
-fn the_version_is_at_the_far_right_and_no_update_button_by_default(cx: &mut TestAppContext) {
+fn the_version_is_at_the_far_right_and_no_update_chip_by_default(cx: &mut TestAppContext) {
     let (window, _shell, _state) = open(cx, connected(), None);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -197,38 +203,100 @@ fn the_version_is_at_the_far_right_and_no_update_button_by_default(cx: &mut Test
         let version = window.find(STATUS_VERSION_ID).bounds();
         assert!(version.right() <= view.width);
         assert!(version.right() >= view.width - px(16.), "{version:?}");
-        assert!(window.try_find(UPDATE_BUTTON_ID).is_none());
+        assert!(window.try_find(UPDATE_CHIP_ID).is_none());
     })
     .unwrap();
 }
 
+/// The chip's painted label text.
+fn chip_text(window: &gpui_kit::Window) -> Vec<String> {
+    test_support::texts(window)
+        .into_iter()
+        .filter(|text| {
+            text.path()
+                .contains(&gpui_kit::ElementId::from(UPDATE_CHIP_ID))
+        })
+        .map(|text| text.text().to_owned())
+        .collect()
+}
+
 #[gpui_kit::test]
-fn an_available_update_shows_a_button_left_of_the_version_and_installs_once(
+fn an_available_update_shows_a_chip_at_the_title_bars_top_right_and_installs_once(
     cx: &mut TestAppContext,
 ) {
     let fake = FakeUpdater::available("9.9.9");
     let (window, _shell, _state) = open(cx, connected(), Some(fake.clone()));
+    assert_eq!(fake.checks.get(), 1, "one check at startup");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let button = window.find(UPDATE_BUTTON_ID);
-        assert!(button.bounds().right() <= window.find(STATUS_VERSION_ID).bounds().left());
-        assert_eq!(button.label(), Some("Update available: v9.9.9"));
+        window.render_frame(cx);
+        let view = window.viewport_size();
+        let bar = window.find(TITLE_BAR_ID).bounds();
+        let chip = window.find(UPDATE_CHIP_ID);
+        let b = chip.bounds();
+        assert!(
+            b.top() >= bar.top() && b.bottom() <= bar.bottom(),
+            "{b:?} in {bar:?}"
+        );
+        assert!(b.size.height < bar.size.height, "a compact chip");
+        // At the right edge, a small padding in.
+        assert!(
+            b.right() <= view.width - px(UPDATE_CHIP_MARGIN) + px(0.5),
+            "{b:?}"
+        );
+        assert!(
+            b.right() >= view.width - px(UPDATE_CHIP_MARGIN) - px(8.),
+            "{b:?}"
+        );
+        // Clear of the traffic lights and the title text.
+        let title = window.find(TITLE_TEXT_ID).bounds();
+        assert!(b.left() > title.right(), "{b:?} vs {title:?}");
+        assert!(b.left() > px(80.));
+        assert_eq!(chip.label(), Some("Update available: v9.9.9"));
+        assert_eq!(chip_text(window), ["Update available"]);
+        // A pill on its own token, not the bar's.
+        let native = dark_native();
+        let color = painted_at(window, point(b.left() + px(6.), b.center().y));
+        assert_eq!(color, token_background(&native, UPDATE_CHIP_TOKENS.0));
+        assert_ne!(
+            color,
+            painted_at(window, point(px(400.), bar.center().y)),
+            "differs from the bar"
+        );
     })
     .unwrap();
 
-    click(cx, window, UPDATE_BUTTON_ID);
-    click(cx, window, UPDATE_BUTTON_ID);
+    click(cx, window, UPDATE_CHIP_ID);
+    click(cx, window, UPDATE_CHIP_ID);
     assert_eq!(*fake.installs.borrow(), ["9.9.9"], "exactly one install");
     let (label, disabled) = button_label(cx, window);
     assert_eq!(disabled, Some(true), "disabled while installing");
     assert_eq!(label.as_deref(), Some("Installing…: v9.9.9"));
+    cx.update_window(window.into(), |_, window, _| {
+        assert_eq!(chip_text(window), ["Installing…"]);
+    })
+    .unwrap();
+    assert_eq!(fake.checks.get(), 1, "no further check");
 }
 
 #[gpui_kit::test]
-fn the_button_reads_installing_then_disappears_with_the_restart_message(cx: &mut TestAppContext) {
+fn the_status_bar_has_no_update_control(cx: &mut TestAppContext) {
+    let fake = FakeUpdater::available("9.9.9");
+    let (window, _shell, _state) = open(cx, connected(), Some(fake));
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let chip = window.find(UPDATE_CHIP_ID).bounds();
+        let bar = window.find(STATUS_BAR_ID).bounds();
+        assert!(chip.bottom() <= bar.top());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_finished_install_leaves_a_restart_chip_and_a_transient_message(cx: &mut TestAppContext) {
     let fake = FakeUpdater::available("9.9.9");
     let (window, _shell, state) = open(cx, connected(), Some(fake.clone()));
-    click(cx, window, UPDATE_BUTTON_ID);
+    click(cx, window, UPDATE_CHIP_ID);
     assert_eq!(
         state.read_with(cx, |s, _| s.update_state().clone()),
         UpdateState::Installing {
@@ -237,35 +305,77 @@ fn the_button_reads_installing_then_disappears_with_the_restart_message(cx: &mut
     );
     fake.answer(Ok(()));
     cx.run_until_parked();
-    assert!(!has(cx, window, UPDATE_BUTTON_ID));
+    assert_eq!(
+        state.read_with(cx, |s, _| s.update_state().clone()),
+        UpdateState::RestartRequired {
+            version: "9.9.9".into()
+        }
+    );
     assert_eq!(
         message(cx, window).as_deref(),
         Some("Update v9.9.9 installed. Restart SmithAgents to finish.")
     );
+    cx.update_window(window.into(), |_, window, _| {
+        assert_eq!(chip_text(window), ["Restart to update"]);
+    })
+    .unwrap();
+    // The message is transient; the chip stays and does nothing.
+    cx.executor().advance_clock(INFO_FOR * 2);
+    cx.run_until_parked();
+    assert_eq!(message(cx, window), None);
+    click(cx, window, UPDATE_CHIP_ID);
+    assert_eq!(*fake.installs.borrow(), ["9.9.9"], "no second install");
+    assert!(has(cx, window, UPDATE_CHIP_ID), "the chip stays");
+    state.update(cx, |state, cx| state.check_for_updates(cx));
+    cx.run_until_parked();
+    assert_eq!(fake.checks.get(), 1, "no check after the install");
+    assert!(matches!(
+        state.read_with(cx, |s, _| s.update_state().clone()),
+        UpdateState::RestartRequired { .. }
+    ));
 }
 
 #[gpui_kit::test]
 fn a_failed_install_shows_the_error_and_retries(cx: &mut TestAppContext) {
     let fake = FakeUpdater::available("9.9.9");
     let (window, _shell, state) = open(cx, connected(), Some(fake.clone()));
-    click(cx, window, UPDATE_BUTTON_ID);
+    click(cx, window, UPDATE_CHIP_ID);
     fake.answer(Err("boom".into()));
     cx.run_until_parked();
-    assert_eq!(message(cx, window).as_deref(), Some("boom"));
+    assert_eq!(message(cx, window).as_deref(), Some("Update failed: boom"));
     assert_eq!(
         state.read_with(cx, |s, _| s.status_message()),
-        Some(StatusMessage::error("boom"))
+        Some(StatusMessage::error("Update failed: boom"))
     );
     assert!(has(cx, window, STATUS_ERROR_DOT_ID));
+    assert_eq!(chip_text_of(cx, window), ["Update failed, retry"]);
+    cx.update_window(window.into(), |_, window, _| {
+        let dot = window.find(STATUS_ERROR_DOT_ID).bounds();
+        assert_eq!(
+            painted_at(window, dot.center()),
+            token_background(&dark_native(), "status-error")
+        );
+    })
+    .unwrap();
     let (label, disabled) = button_label(cx, window);
     assert_eq!(label.as_deref(), Some("Update failed, retry: v9.9.9"));
     assert_ne!(disabled, Some(true));
 
-    click(cx, window, UPDATE_BUTTON_ID);
+    click(cx, window, UPDATE_CHIP_ID);
     assert_eq!(*fake.installs.borrow(), ["9.9.9", "9.9.9"], "retried");
     fake.answer(Ok(()));
     cx.run_until_parked();
-    assert!(!has(cx, window, UPDATE_BUTTON_ID));
+    assert_eq!(chip_text_of(cx, window), ["Restart to update"]);
+}
+
+fn chip_text_of(cx: &mut TestAppContext, window: WindowHandle<Root>) -> Vec<String> {
+    let mut text = vec![];
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        text = chip_text(window);
+    })
+    .unwrap();
+    text
 }
 
 #[gpui_kit::test]
@@ -273,6 +383,10 @@ fn an_info_message_clears_itself_and_an_error_stays(cx: &mut TestAppContext) {
     let (window, _shell, state) = open(cx, connected(), None);
     set_status(cx, &state, StatusMessage::info("Hello"));
     assert_eq!(message(cx, window).as_deref(), Some("Hello"));
+    cx.update_window(window.into(), |_, window, _| {
+        assert_eq!(window.find(STATUS_MESSAGE_ID).role(), Some(Role::Status));
+    })
+    .unwrap();
     assert!(!has(cx, window, STATUS_ERROR_DOT_ID), "no dot for info");
     cx.executor()
         .advance_clock(INFO_FOR + Duration::from_millis(10));
@@ -330,7 +444,6 @@ fn the_connection_text_wins_over_a_transient_message(cx: &mut TestAppContext) {
 #[derive(Default)]
 struct FakeCommands {
     created: RefCell<Option<Agent>>,
-    closes: Cell<usize>,
 }
 
 impl AgentCommands for FakeCommands {
@@ -340,7 +453,6 @@ impl AgentCommands for FakeCommands {
     }
 
     fn close_agent(&self, _: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>> {
-        self.closes.set(self.closes.get() + 1);
         async { Err(LinkError::NotConnected) }.boxed_local()
     }
 }
@@ -401,9 +513,10 @@ fn a_very_long_message_is_contained_left_of_the_right_zone(cx: &mut TestAppConte
         let message = window.find(STATUS_MESSAGE_ID).bounds();
         let right = window.find(STATUS_RIGHT_ID).bounds();
         assert!(message.right() <= right.left(), "{message:?} vs {right:?}");
+        let version = window.find(STATUS_VERSION_ID).bounds();
         assert!(
-            window.find(UPDATE_BUTTON_ID).bounds().left() >= right.left(),
-            "the right zone is not squeezed"
+            version.left() >= right.left(),
+            "the version is not squeezed"
         );
         assert!(message.left() >= px(0.));
         assert!(message.size.height <= STATUS_BAR_HEIGHT);
@@ -430,4 +543,78 @@ fn a_short_message_is_centered_in_the_window(cx: &mut TestAppContext) {
         assert!(off <= px(8.), "message middle {middle:?} in {view:?}");
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_error_set_while_disconnected_is_gone_after_reconnect_but_an_info_stays(
+    cx: &mut TestAppContext,
+) {
+    let (window, _shell, state) = open(cx, connected(), None);
+    let connection = |cx: &mut TestAppContext, c: Connection| {
+        state.update(cx, |state, cx| {
+            state.dispatch(Action::ConnectionChanged(c), cx)
+        });
+    };
+    connection(cx, Connection::Reconnecting);
+    set_status(cx, &state, StatusMessage::error("stale"));
+    connection(cx, Connection::Connected);
+    assert_eq!(message(cx, window), None, "the stale error is gone");
+
+    // An error set while connected survives a later drop and reconnect.
+    set_status(cx, &state, StatusMessage::error("real"));
+    connection(cx, Connection::Reconnecting);
+    connection(cx, Connection::Connected);
+    assert_eq!(message(cx, window).as_deref(), Some("real"));
+    state.update(cx, |state, cx| state.clear_status(cx));
+
+    // An info set while disconnected shows after the reconnect, until its timer.
+    connection(cx, Connection::Reconnecting);
+    set_status(cx, &state, StatusMessage::info("still here"));
+    connection(cx, Connection::Connected);
+    assert_eq!(message(cx, window).as_deref(), Some("still here"));
+    cx.executor()
+        .advance_clock(INFO_FOR + Duration::from_millis(10));
+    cx.run_until_parked();
+    assert_eq!(message(cx, window), None);
+}
+
+#[gpui_kit::test]
+fn a_new_updater_starts_the_update_state_over(cx: &mut TestAppContext) {
+    let first = FakeUpdater::available("1.0.0");
+    let (window, _shell, state) = open(cx, connected(), Some(first.clone()));
+    click(cx, window, UPDATE_CHIP_ID);
+    assert!(matches!(
+        state.read_with(cx, |s, _| s.update_state().clone()),
+        UpdateState::Installing { .. }
+    ));
+    let second = FakeUpdater::new(UpdateState::UpToDate);
+    state.update(cx, |state, cx| state.set_updater(second.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        state.read_with(cx, |s, _| s.update_state().clone()),
+        UpdateState::UpToDate
+    );
+    assert_eq!(second.checks.get(), 1);
+    assert!(!has(cx, window, UPDATE_CHIP_ID));
+    // The old install's answer arrives late and changes nothing.
+    first.answer(Ok(()));
+    cx.run_until_parked();
+    assert_eq!(
+        state.read_with(cx, |s, _| s.update_state().clone()),
+        UpdateState::UpToDate
+    );
+}
+
+#[gpui_kit::test]
+fn a_multi_line_error_shows_on_one_line(cx: &mut TestAppContext) {
+    let (window, _shell, state) = open(cx, connected(), None);
+    set_status(
+        cx,
+        &state,
+        StatusMessage::error("line one\n\n  line two\r\n\tthree"),
+    );
+    assert_eq!(
+        message(cx, window).as_deref(),
+        Some("line one line two three")
+    );
 }

@@ -10,8 +10,16 @@
 //! for the newest version, an app bundle to replace, and signature
 //! verification of the download before it is installed; none of these exist
 //! today. [`NoUpdater`] is what the app runs with: it always reports
-//! [`UpdateState::UpToDate`], so the update button never appears in
-//! production builds.
+//! [`UpdateState::UpToDate`], so the update chip (in the title bar) never
+//! appears in production builds.
+//!
+//! What a real implementation must do:
+//! - Bound `check` and `install` with its own timeouts; the shell does not
+//!   time them out, and an install that never answers leaves the chip on
+//!   "Installing…".
+//! - Be cancel-safe: the shell may drop a future (a replaced updater, the
+//!   window closing), and dropping it must never leave a half-installed app.
+//! - Verify the download's signature before replacing anything.
 
 use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
@@ -28,6 +36,9 @@ pub enum UpdateState {
     Installing { version: String },
     /// Installing `version` failed with `message`; it can be retried.
     Failed { version: String, message: String },
+    /// `version` is installed; the app must restart to run it. Final for this
+    /// run: no further check or install happens.
+    RestartRequired { version: String },
 }
 
 /// Detects and installs updates.
