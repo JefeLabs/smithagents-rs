@@ -83,6 +83,40 @@ pub enum LinkErrorKind {
     Other,
 }
 
+/// The link's last connect error, as the UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkFailure {
+    /// A daemon of another version runs; it was left alone (the app has no
+    /// way to stop it yet). `running` is its version, `expected` the one this
+    /// app needs.
+    VersionMismatch { running: String, expected: String },
+    /// Any other failure: its text and kind.
+    Other {
+        message: String,
+        kind: LinkErrorKind,
+    },
+}
+
+impl LinkFailure {
+    /// The failure as one line of text (also what [`DaemonLink::last_error`]
+    /// returns).
+    pub fn message(&self) -> String {
+        match self {
+            LinkFailure::VersionMismatch { running, expected } => {
+                format!("smithagentsd {running} is running, but {expected} is expected")
+            }
+            LinkFailure::Other { message, .. } => message.clone(),
+        }
+    }
+
+    pub fn kind(&self) -> LinkErrorKind {
+        match self {
+            LinkFailure::VersionMismatch { .. } => LinkErrorKind::VersionMismatch,
+            LinkFailure::Other { kind, .. } => *kind,
+        }
+    }
+}
+
 /// Next reconnect delay: doubled, never above `max`.
 fn next_delay(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
@@ -114,7 +148,7 @@ impl std::fmt::Debug for Endpoint {
 struct Shared {
     /// Set while connected (snapshot taken, events subscribed).
     connected: Mutex<Option<(Client, Endpoint)>>,
-    last_error: Mutex<Option<(String, LinkErrorKind)>>,
+    last_error: Mutex<Option<LinkFailure>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -187,15 +221,22 @@ impl DaemonLink {
     }
 
     /// The latest connect error, cleared once connected again.
+    pub fn last_failure(&self) -> Option<LinkFailure> {
+        lock(&self.shared.last_error).clone()
+    }
+
+    /// The text of [`DaemonLink::last_failure`].
     pub fn last_error(&self) -> Option<String> {
         lock(&self.shared.last_error)
             .as_ref()
-            .map(|(m, _)| m.clone())
+            .map(LinkFailure::message)
     }
 
-    /// The kind of [`DaemonLink::last_error`].
+    /// The kind of [`DaemonLink::last_failure`].
     pub fn last_error_kind(&self) -> Option<LinkErrorKind> {
-        lock(&self.shared.last_error).as_ref().map(|(_, k)| *k)
+        lock(&self.shared.last_error)
+            .as_ref()
+            .map(LinkFailure::kind)
     }
 
     /// Whether the link thread has ended (shut down, or nobody listens).
@@ -315,14 +356,14 @@ enum Exit {
     ReceiverGone,
     /// The stream ended after being connected.
     StreamEnded,
-    Failed(String, LinkErrorKind),
+    Failed(LinkFailure),
 }
 
 fn unreachable(e: impl std::fmt::Display) -> Exit {
-    Exit::Failed(
-        format!("could not reach the daemon: {e}"),
-        LinkErrorKind::Unreachable,
-    )
+    Exit::Failed(LinkFailure::Other {
+        message: format!("could not reach the daemon: {e}"),
+        kind: LinkErrorKind::Unreachable,
+    })
 }
 
 async fn run(config: LinkConfig, shared: Arc<Shared>, tx: mpsc::Sender<Action>) {
@@ -340,9 +381,9 @@ async fn run(config: LinkConfig, shared: Arc<Shared>, tx: mpsc::Sender<Action>) 
         match exit {
             Exit::ReceiverGone => return,
             Exit::StreamEnded => tracing::debug!("event stream ended; reconnecting"),
-            Exit::Failed(msg, kind) => {
-                tracing::debug!("daemon link failed: {msg}");
-                *lock(&shared.last_error) = Some((msg, kind));
+            Exit::Failed(failure) => {
+                tracing::debug!("daemon link failed: {}", failure.message());
+                *lock(&shared.last_error) = Some(failure);
             }
         }
         if !announced {
@@ -388,13 +429,13 @@ async fn connect_and_forward(
     )
     .await
     .map_err(|e| match e {
-        EnsureError::VersionMismatch { .. } => {
-            Exit::Failed(e.to_string(), LinkErrorKind::VersionMismatch)
+        EnsureError::VersionMismatch { running, expected } => {
+            Exit::Failed(LinkFailure::VersionMismatch { running, expected })
         }
-        e => Exit::Failed(
-            format!("could not start {}: {e}", config.daemon_bin.display()),
-            LinkErrorKind::StartFailed,
-        ),
+        e => Exit::Failed(LinkFailure::Other {
+            message: format!("could not start {}: {e}", config.daemon_bin.display()),
+            kind: LinkErrorKind::StartFailed,
+        }),
     })?;
     let info = read_lockfile(&config.home)
         .map_err(unreachable)?

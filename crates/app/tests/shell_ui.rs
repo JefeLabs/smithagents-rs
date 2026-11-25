@@ -6,7 +6,7 @@
 
 mod common;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -27,14 +27,14 @@ use smithagents_app::layout_store::{
     COMPACT_LEFT_PANE_WIDTH, DEFAULT_LEFT_PANE_WIDTH, LAYOUT_VERSION, MIN_CENTER_WIDTH,
     MIN_LEFT_PANE_WIDTH,
 };
-use smithagents_app::link::LinkConfig;
+use smithagents_app::link::{LinkConfig, LinkFailure};
 use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::shell::{
     Shell, ShellOptions, LEFT_PANE_ID, LEFT_PANE_RESIZE_ID, SETTINGS_PANEL,
 };
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::theme_adapter::{region_tokens, Region};
-use smithagents_app::view_models::LeftPaneMode;
+use smithagents_app::view_models::{LeftPaneMode, StatusKind};
 use smithagents_app::views::agents::{EXPANDED_TITLE_ID, LEFT_PANE_CONTENT_ID, NEW_AGENT_ID};
 use smithagents_app::views::banner::BANNER_ID;
 use smithagents_app::views::center::{CENTER_PANEL_ID, EMPTY_HINT_ID};
@@ -42,7 +42,8 @@ use smithagents_app::views::rail::{RailEntry, RAIL_ID, RAIL_WIDTH};
 use smithagents_app::views::tabs::{close_button_id, TOGGLE_AGENTS_ID};
 use smithagents_app::views::title_bar::TITLE_BAR_ID;
 use smithagents_center_host::PixelRect;
-use smithagents_core::agent::Agent;
+use smithagents_core::agent::{Agent, AgentState};
+use smithagents_core::event::{Event, EventKind};
 use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
 
@@ -1463,4 +1464,82 @@ fn the_center_pane_paints_its_own_token_not_the_background(cx: &mut TestAppConte
     let painted = painted_regions(cx, window);
     assert_eq!(painted.center, token_background(&native, "selection"));
     assert_ne!(painted.center, token_background(&native, "background"));
+}
+
+#[gpui_kit::test]
+fn a_daemon_of_another_version_is_named_in_the_banner_and_the_status_bar(cx: &mut TestAppContext) {
+    let failure = LinkFailure::VersionMismatch {
+        running: "0.0.9".into(),
+        expected: "0.1.0".into(),
+    };
+    let wording = "A different SmithAgents daemon version is running (0.0.9; this app needs \
+                   0.1.0). Quit it to continue.";
+    let (window, shell) = open_shell_options(
+        cx,
+        ShellOptions {
+            link_failure: Some(Rc::new(move || Some(failure.clone()))),
+            ..Default::default()
+        },
+        (1200., 800.),
+    );
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    state.update(cx, |state, cx| {
+        state.dispatch(Action::ConnectionChanged(Connection::Reconnecting), cx)
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(BANNER_ID).label(), Some(wording));
+    })
+    .unwrap();
+    let status = state
+        .read_with(cx, |state, _| state.status_message())
+        .unwrap();
+    assert_eq!(status.kind, StatusKind::Error);
+    assert_eq!(status.text, wording);
+}
+
+#[gpui_kit::test]
+fn streamed_chunks_do_not_redraw_the_shell_but_a_state_change_does(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let (_window, shell) = open_shell(cx, connected_with_tab(&mercury));
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    cx.run_until_parked();
+    let notified = Rc::new(Cell::new(0usize));
+    let _observe = cx.update(|cx| {
+        let notified = notified.clone();
+        cx.observe(&state, move |_, _| notified.set(notified.get() + 1))
+    });
+    let event = |seq: u64, kind: EventKind| {
+        Action::Event(Event {
+            seq,
+            at: mercury.created_at,
+            kind,
+        })
+    };
+
+    for seq in 2..12 {
+        let chunk = event(
+            seq,
+            EventKind::TurnDelta {
+                agent_id: mercury.id,
+                text: format!("chunk {seq}"),
+            },
+        );
+        state.update(cx, |state, cx| state.dispatch(chunk, cx));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        notified.get(),
+        0,
+        "streamed text is the web tab's, not the shell's"
+    );
+
+    let working = Agent {
+        state: AgentState::Working,
+        ..mercury.clone()
+    };
+    let update = event(12, EventKind::AgentUpdated(working));
+    state.update(cx, |state, cx| state.dispatch(update, cx));
+    cx.run_until_parked();
+    assert_eq!(notified.get(), 1, "the agent's state shows in the pane");
 }

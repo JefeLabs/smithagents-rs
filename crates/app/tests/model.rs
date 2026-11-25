@@ -504,3 +504,69 @@ fn snapshot_dropping_active_and_earlier_tab_focuses_survivor_once() {
     );
     assert_eq!((m.tabs(), m.active_tab()), ([c.id].as_slice(), Some(c.id)));
 }
+
+#[test]
+fn the_revision_counts_only_what_the_shell_draws() {
+    let a = agent("A", 1);
+    let mut m = with(&[&a]);
+    let r = m.revision();
+    // Chat content, replays and no-op changes leave it alone.
+    m.apply(ev(
+        2,
+        EventKind::TurnDelta {
+            agent_id: a.id,
+            text: "chunk".into(),
+        },
+    ));
+    m.apply(ev(2, EventKind::AgentUpdated(a.clone())));
+    m.apply(ev(3, EventKind::AgentUpdated(a.clone())));
+    m.apply(Action::ConnectionChanged(Connection::Connecting));
+    m.apply(Action::CloseTab(a.id));
+    m.apply(Action::SelectAgent(AgentId::new()));
+    assert_eq!(m.revision(), r);
+    // A state change, a selection, a tab, the connection: each counts.
+    let working = Agent {
+        state: AgentState::Working,
+        ..a.clone()
+    };
+    m.apply(ev(4, EventKind::AgentUpdated(working)));
+    assert_eq!(m.revision(), r + 1);
+    m.apply(Action::SelectAgent(a.id));
+    m.apply(Action::OpenTab(a.id));
+    m.apply(Action::ConnectionChanged(Connection::Connected));
+    assert_eq!(m.revision(), r + 4);
+}
+
+#[test]
+fn reverting_an_open_gives_back_the_active_tab_and_the_selection() {
+    let (a, b, c, d) = (agent("A", 1), agent("B", 2), agent("C", 3), agent("D", 4));
+    let mut m = with(&[&a, &b, &c, &d]);
+    for x in [&a, &b, &c, &a] {
+        m.apply(Action::OpenTab(x.id));
+    }
+    m.apply(Action::SelectAgent(b.id));
+    m.apply(Action::OpenTab(d.id));
+    let effects = m.apply(Action::RevertOpen {
+        id: d.id,
+        active: Some(a.id),
+        selected: Some(b.id),
+    });
+    assert_eq!(
+        effects,
+        vec![Effect::CloseCenterTab(d.id), Effect::FocusCenterTab(a.id)]
+    );
+    assert_eq!(m.tabs(), [a.id, b.id, c.id]);
+    assert_eq!((m.active_tab(), m.selected()), (Some(a.id), Some(b.id)));
+
+    // With no tab before it, nothing is active and nothing selected.
+    let mut m = with(&[&a]);
+    m.apply(Action::OpenTab(a.id));
+    let effects = m.apply(Action::RevertOpen {
+        id: a.id,
+        active: None,
+        selected: None,
+    });
+    assert_eq!(effects, vec![Effect::CloseCenterTab(a.id)]);
+    assert_eq!((m.active_tab(), m.selected()), (None, None));
+    assert!(m.tabs().is_empty());
+}

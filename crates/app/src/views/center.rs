@@ -156,7 +156,7 @@ impl Render for CenterPanel {
         let items = self.tab_items(cx);
         let no_tabs = items.is_empty();
         let state = self.state.read(cx);
-        let banner_text = state.banner();
+        let banner_vm = state.banner();
         let active = state.model().active_tab();
         let left_expanded = state.left_pane_mode() == LeftPaneMode::Expanded;
         let report = {
@@ -183,7 +183,7 @@ impl Render for CenterPanel {
             .size_full()
             .bg(surface)
             .text_color(foreground)
-            .when_some(banner_text, |this, text| this.child(banner(&text, cx)))
+            .when_some(banner_vm, |this, vm| this.child(banner(&vm, cx)))
             .child(tab_strip(
                 items,
                 active,

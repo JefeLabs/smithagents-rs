@@ -1,12 +1,12 @@
 use chrono::{DateTime, Duration, Utc};
-use smithagents_app::link::LinkError;
+use smithagents_app::link::{LinkError, LinkErrorKind, LinkFailure};
 use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::tabs::TabError;
 use smithagents_app::view_models::{
-    agent_initial, agent_rows, banner_text, center_rect, command_error_text, new_agent_plan,
-    repo_choices, repo_title, state_dot, state_kind, state_label, state_token, tab_error_text,
-    tab_title, DotStyle, LeftPaneMode, NewAgentPlan, StateKind, DAEMON_SILENT_TEXT,
-    NOT_CONNECTED_TEXT, OPEN_CHAT_FAILED,
+    agent_initial, agent_rows, banner_text, center_rect, command_error_text, connection_banner,
+    new_agent_plan, repo_choices, repo_title, state_dot, state_kind, state_label, state_token,
+    tab_error_text, tab_title, BannerSeverity, DotStyle, LeftPaneMode, NewAgentPlan, StateKind,
+    DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT, OPEN_CHAT_FAILED,
 };
 use smithagents_center_host::HostError;
 use smithagents_client::ClientError;
@@ -35,11 +35,19 @@ fn agent(name: &str) -> Agent {
     }
 }
 
+/// A link failure other than a version mismatch.
+fn failed(message: &str) -> LinkFailure {
+    LinkFailure::Other {
+        message: message.into(),
+        kind: LinkErrorKind::Unreachable,
+    }
+}
+
 #[test]
 fn no_banner_while_connected() {
     assert_eq!(banner_text(&Connection::Connected, None), None);
     assert_eq!(
-        banner_text(&Connection::Connected, Some("stale error")),
+        banner_text(&Connection::Connected, Some(&failed("stale error"))),
         None,
         "a leftover error never shows once connected"
     );
@@ -66,13 +74,13 @@ fn the_error_goes_on_a_second_line() {
     assert_eq!(
         banner_text(
             &Connection::Reconnecting,
-            Some("could not start /x/smithagentsd: not found")
+            Some(&failed("could not start /x/smithagentsd: not found"))
         )
         .as_deref(),
         Some("Reconnecting to the local daemon…\ncould not start /x/smithagentsd: not found")
     );
     assert_eq!(
-        banner_text(&Connection::Connecting, Some("refused")).as_deref(),
+        banner_text(&Connection::Connecting, Some(&failed("refused"))).as_deref(),
         Some("Connecting to the local daemon…\nrefused")
     );
 }
@@ -80,12 +88,43 @@ fn the_error_goes_on_a_second_line() {
 #[test]
 fn a_blank_error_adds_no_line_and_the_error_is_trimmed() {
     assert_eq!(
-        banner_text(&Connection::Reconnecting, Some("  \n ")).as_deref(),
+        banner_text(&Connection::Reconnecting, Some(&failed("  \n "))).as_deref(),
         Some("Reconnecting to the local daemon…")
     );
     assert_eq!(
-        banner_text(&Connection::Connecting, Some("  refused\n")).as_deref(),
+        banner_text(&Connection::Connecting, Some(&failed("  refused\n"))).as_deref(),
         Some("Connecting to the local daemon…\nrefused")
+    );
+}
+
+#[test]
+fn a_version_mismatch_names_both_versions_and_is_an_error_not_a_reconnect() {
+    let failure = LinkFailure::VersionMismatch {
+        running: "0.0.9".into(),
+        expected: "0.1.0".into(),
+    };
+    assert_eq!(failure.kind(), LinkErrorKind::VersionMismatch);
+    let wording = "A different SmithAgents daemon version is running (0.0.9; this app \
+                   needs 0.1.0). Quit it to continue.";
+    for connection in [Connection::Connecting, Connection::Reconnecting] {
+        let banner = connection_banner(&connection, Some(&failure)).unwrap();
+        assert_eq!(banner.text, wording, "{connection:?}");
+        assert_eq!(banner.severity, BannerSeverity::Error);
+        assert!(!banner.text.contains("onnecting"), "{}", banner.text);
+    }
+    assert_eq!(
+        connection_banner(&Connection::Connected, Some(&failure)),
+        None
+    );
+    // Any other failure is a warning under the connection's own line.
+    let other = connection_banner(&Connection::Reconnecting, Some(&failed("refused"))).unwrap();
+    assert_eq!(other.severity, BannerSeverity::Warning);
+    assert_eq!(other.text, "Reconnecting to the local daemon…\nrefused");
+    assert_eq!(
+        connection_banner(&Connection::Connecting, None)
+            .unwrap()
+            .severity,
+        BannerSeverity::Warning
     );
 }
 
@@ -539,7 +578,11 @@ mod status_bar {
         assert_eq!(status_to_show(&Connection::Connected, None, None), None);
         // A stale link error never shows while connected.
         assert_eq!(
-            status_to_show(&Connection::Connected, Some("refused"), None),
+            status_to_show(
+                &Connection::Connected,
+                Some(&super::failed("refused")),
+                None
+            ),
             None
         );
     }
@@ -573,17 +616,39 @@ mod status_bar {
 
     #[test]
     fn the_connection_text_carries_the_link_error_on_one_line() {
-        let shown = status_to_show(&Connection::Reconnecting, Some("  refused \n"), None).unwrap();
+        let shown = status_to_show(
+            &Connection::Reconnecting,
+            Some(&super::failed("  refused \n")),
+            None,
+        )
+        .unwrap();
         assert_eq!(shown.kind, StatusKind::Info);
         assert_eq!(shown.text, "Reconnecting to the local daemon…: refused");
         assert!(!shown.text.contains('\n'));
         // A blank error adds nothing.
         assert_eq!(
-            status_to_show(&Connection::Connecting, Some("  "), None)
+            status_to_show(&Connection::Connecting, Some(&super::failed("  ")), None)
                 .unwrap()
                 .text,
             "Connecting to the local daemon…"
         );
+    }
+
+    #[test]
+    fn a_version_mismatch_is_an_error_in_the_status_bar() {
+        let failure = smithagents_app::link::LinkFailure::VersionMismatch {
+            running: "0.0.9".into(),
+            expected: "0.1.0".into(),
+        };
+        for connection in [Connection::Connecting, Connection::Reconnecting] {
+            let shown = status_to_show(&connection, Some(&failure), Some(&info("hi"))).unwrap();
+            assert_eq!(shown.kind, StatusKind::Error);
+            assert_eq!(
+                shown.text,
+                "A different SmithAgents daemon version is running (0.0.9; this app needs \
+                 0.1.0). Quit it to continue."
+            );
+        }
     }
 
     #[test]

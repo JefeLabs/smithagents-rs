@@ -649,3 +649,17 @@ fn the_placeholder_host_logs_the_page_and_the_redacted_script_never_the_token() 
     assert!(!log.contains(TOKEN), "the first token leaked:\n{log}");
     assert!(!log.contains(NEW_TOKEN), "the second token leaked:\n{log}");
 }
+
+#[test]
+fn setting_the_theme_already_in_effect_pushes_nothing() {
+    let mercury = agent("Mercury");
+    let mut m = manager();
+    open(&mut m, &mercury);
+    let before = calls(&m).len();
+    m.set_theme(theme_state(Appearance::Dark));
+    assert_eq!(calls(&m).len(), before, "unchanged: no push");
+    let light = theme_state(Appearance::Light);
+    m.set_theme(light.clone());
+    m.set_theme(light.clone());
+    assert_eq!(calls_since(&m, before), vec![HostCall::PushTheme(light)]);
+}

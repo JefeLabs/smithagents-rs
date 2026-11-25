@@ -39,6 +39,7 @@ mod close;
 mod new_agent;
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -483,7 +484,7 @@ impl Render for AgentsPane {
             (state.left_pane_mode(), agent_rows(model), (plan, choices))
         };
         self.sync_item_focus(&rows, cx);
-        let paint = Paint::new(self.state.read(cx).native_theme().cloned(), cx);
+        let paint = Paint::new(self.state.read(cx).shared_native_theme(), cx);
         let compact = mode == LeftPaneMode::Compact;
         let new_agent = self.new_agent_button(compact, plan, &paint, cx);
         let list = v_flex()
@@ -584,7 +585,8 @@ fn status_dot(style: DotStyle, size: f32, color: Hsla) -> Div {
 
 /// The colors one frame of the pane paints with, all from the theme.
 struct Paint {
-    native: Option<NativeTheme>,
+    /// Shared with the state: no copy of the theme per frame.
+    native: Option<Rc<NativeTheme>>,
     surface: Hsla,
     foreground: Hsla,
     muted_foreground: Hsla,
@@ -598,9 +600,9 @@ struct Paint {
 }
 
 impl Paint {
-    fn new(native: Option<NativeTheme>, cx: &App) -> Self {
-        let (surface, foreground) = region_paint(native.as_ref(), Region::LeftPane, cx);
-        let token = |name: &str| token_paint(native.as_ref(), name, cx);
+    fn new(native: Option<Rc<NativeTheme>>, cx: &App) -> Self {
+        let (surface, foreground) = region_paint(native.as_deref(), Region::LeftPane, cx);
+        let token = |name: &str| token_paint(native.as_deref(), name, cx);
         Self {
             surface,
             foreground,

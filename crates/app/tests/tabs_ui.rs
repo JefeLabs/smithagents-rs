@@ -790,3 +790,126 @@ fn each_close_button_names_its_tab(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn replacing_the_public_bounds_listener_keeps_the_tabs_positioned(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let h = open(cx, connected(vec![mercury.clone()]));
+    dispatch(cx, &h, Action::OpenTab(mercury.id));
+    let seen: Rc<RefCell<Vec<PixelRect>>> = Rc::default();
+    h.state.update(cx, |state, cx| {
+        let seen = seen.clone();
+        state.set_center_bounds_listener(move |rect, _| seen.borrow_mut().push(rect), cx)
+    });
+    frame(cx, h.window);
+    let before = h.count();
+
+    cx.update_window(h.window.into(), |_, window, cx| {
+        window.click(TOGGLE_AGENTS_ID, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    frame(cx, h.window);
+
+    let compact = center_rect(cx, &h);
+    assert_eq!(h.calls_since(before), vec![HostCall::SetBounds(compact)]);
+    assert_eq!(
+        seen.borrow().last(),
+        Some(&compact),
+        "the extra observer too"
+    );
+}
+
+#[gpui_kit::test]
+fn a_tab_opened_in_the_same_update_as_a_theme_change_boots_with_the_new_theme(
+    cx: &mut TestAppContext,
+) {
+    let (mercury, venus) = (agent("Mercury"), agent("Venus"));
+    let h = open(cx, connected(vec![mercury.clone(), venus.clone()]));
+    dispatch(cx, &h, Action::OpenTab(mercury.id));
+    let before = h.count();
+    h.state.update(cx, |state, cx| {
+        let settings = AppearanceSettings {
+            theme: ThemeChoice::Id("smith-light".into()),
+            ..state.appearance_settings().clone()
+        };
+        state.set_appearance(settings, cx);
+        state.dispatch(Action::OpenTab(venus.id), cx);
+    });
+    frame(cx, h.window);
+    cx.run_until_parked();
+
+    let light = theme(cx, &h);
+    assert_eq!(light.theme, "smith-light");
+    let calls = without_bounds(h.calls_since(before));
+    assert_eq!(
+        calls[0],
+        HostCall::PushTheme(light.clone()),
+        "Mercury's page"
+    );
+    let (spec, boot) = opened(&calls[1]);
+    assert_eq!(spec.title, "Venus");
+    assert!(
+        boot.host_script()
+            .contains(&serde_json::to_string(&light).unwrap()),
+        "Venus boots with the new theme"
+    );
+    let pushes = calls
+        .iter()
+        .filter(|call| matches!(call, HostCall::PushTheme(_)))
+        .count();
+    assert_eq!(pushes, 1, "one push per change: {calls:?}");
+}
+
+#[gpui_kit::test]
+fn a_failed_open_gives_the_focus_back_to_the_tab_that_had_it(cx: &mut TestAppContext) {
+    let [a, b, c, d] = ["Mercury", "Venus", "Earth", "Mars"].map(agent);
+    let h = open(
+        cx,
+        connected(vec![a.clone(), b.clone(), c.clone(), d.clone()]),
+    );
+    for agent in [&a, &b, &c] {
+        dispatch(cx, &h, Action::OpenTab(agent.id));
+    }
+    // A's tab is clicked again: active, and its row selected.
+    dispatch(cx, &h, Action::OpenTab(a.id));
+    let a_id = last_opened_id(&h, &a);
+    h.set_conn(None);
+    let before = h.count();
+
+    dispatch(cx, &h, Action::OpenTab(d.id));
+
+    assert_eq!(tabs(cx, &h), [a.id, b.id, c.id]);
+    let (active, selected) = h.state.read_with(cx, |state, _| {
+        (state.model().active_tab(), state.model().selected())
+    });
+    assert_eq!(active, Some(a.id), "the tab that was active");
+    assert_eq!(selected, Some(a.id), "the row that was selected");
+    assert_eq!(h.calls_since(before), vec![HostCall::Show(a_id)]);
+}
+
+#[gpui_kit::test]
+fn a_not_connected_failure_clears_when_the_connection_comes_back(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let h = open(cx, connected(vec![mercury.clone()]));
+    // The link dropped, but its Reconnecting has not reached the model yet.
+    h.set_conn(None);
+    dispatch(cx, &h, Action::OpenTab(mercury.id));
+    let status = |cx: &mut TestAppContext| {
+        h.state.read_with(cx, |state, _| {
+            state.status_message().map(|m| (m.kind, m.text))
+        })
+    };
+    assert_eq!(
+        status(cx),
+        Some((
+            StatusKind::Error,
+            format!("{OPEN_CHAT_FAILED}: not connected to the daemon")
+        ))
+    );
+
+    dispatch(cx, &h, Action::ConnectionChanged(Connection::Reconnecting));
+    h.set_conn(Some((PORT, TOKEN)));
+    dispatch(cx, &h, Action::ConnectionChanged(Connection::Connected));
+    assert_eq!(status(cx), None, "stale once the connection is back");
+}

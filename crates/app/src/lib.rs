@@ -120,6 +120,7 @@ fn open_main_window(
                     tab_host: Some(tab_host),
                     page_origin: Some(page_origin),
                     connection_info: None,
+                    link_failure: None,
                 },
                 window,
                 cx,

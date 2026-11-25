@@ -195,9 +195,13 @@ impl<H: CenterTabHost> TabManager<H> {
     }
 
     /// Stores the theme in effect (later pages boot with it) and pushes it to
-    /// the host once, which applies it to every open tab. With no tab open
-    /// the host is not called.
+    /// the host once, which applies it to every open tab. With no tab open,
+    /// or when `state` is the theme already in effect, the host is not
+    /// called.
     pub fn set_theme(&mut self, state: ThemeState) {
+        if state == self.theme {
+            return;
+        }
         if !self.open.is_empty() {
             tracing::debug!(theme = %state.theme, tabs = self.open.len(), "pushing the theme to the tabs");
             self.host.push_theme(&state);

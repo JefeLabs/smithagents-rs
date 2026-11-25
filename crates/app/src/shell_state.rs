@@ -6,9 +6,15 @@
 //! effect), plus the tasks that feed the link's actions in.
 //!
 //! The model and the host stay consistent: a tab the host could not open is
-//! closed again in the model (an `Action::CloseTab`), so the strip never
-//! shows a tab without a page, and the failure is reported
-//! ([`ShellEvent::TabOpenFailed`] and an Error status).
+//! closed again in the model (an `Action::RevertOpen`, which also gives the
+//! focus back to the tab that had it), so the strip never shows a tab without
+//! a page, and the failure is reported ([`ShellEvent::TabOpenFailed`] and an
+//! Error status).
+//!
+//! The tabs follow the state directly: the center's rectangle and the theme
+//! in effect reach the [`TabManager`] from inside the state (the center
+//! panel's bounds report and [`ShellState::set_appearance`]), so no outside
+//! listener or subscription is needed for them.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -26,14 +32,14 @@ use tokio::sync::mpsc;
 use crate::app_state::{AppState, AppStateStore};
 use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
-use crate::link::{AgentCommands, DaemonLink};
+use crate::link::{AgentCommands, DaemonLink, LinkFailure};
 use crate::model::{Action, Connection, Effect, ShellModel};
 use crate::tabs::{PlaceholderHost, TabError, TabManager, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::apply_framework_theme;
 use crate::update::{NoUpdater, UpdateState, Updater};
 use crate::view_models::{
-    banner_text, repository_added_text, status_to_show, tab_error_text, LeftPaneMode,
-    SettingsSection, StatusKind, StatusMessage, OPEN_CHAT_FAILED,
+    connection_banner, repository_added_text, status_to_show, tab_error_text, BannerVm,
+    LeftPaneMode, SettingsSection, StatusKind, StatusMessage, OPEN_CHAT_FAILED,
 };
 
 /// How often the link's last error is re-read while the link is not
@@ -59,15 +65,28 @@ pub const DEFAULT_INFO_STATUS_DURATION: Duration = Duration::from_secs(5);
 /// - Setting a listener calls it once with the current rectangle, if one is
 ///   known yet (also deferred).
 ///
-/// The shell sets the one listener to position the center tabs
-/// ([`TabManager::on_bounds`]); setting another replaces it, which detaches
-/// the tabs from the bounds (tests that only watch the rectangle may).
+/// It is an extra observer only: the center tabs follow the rectangle through
+/// the state itself ([`TabManager::on_bounds`], in the same deferred call,
+/// before the listener), so replacing or never setting a listener never
+/// detaches them.
 pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
 
 /// Answers the daemon's port and token for new web tabs, or `None` while not
 /// connected. The shell asks the [`DaemonLink`]; headless tests inject a fake.
 /// Keep the token out of logs.
 pub type ConnectionInfoSource = Rc<dyn Fn() -> Option<(u16, String)>>;
+
+/// Answers the link's last connect error, or `None`. The shell asks the
+/// [`DaemonLink`]; headless tests inject a fake.
+pub type LinkFailureSource = Rc<dyn Fn() -> Option<LinkFailure>>;
+
+/// An `OpenTab` being carried out: what to put back if its tab fails.
+#[derive(Debug, Clone, Copy)]
+struct PendingOpen {
+    id: AgentId,
+    active: Option<AgentId>,
+    selected: Option<AgentId>,
+}
 
 /// What `ShellState` tells the shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,14 +132,20 @@ pub struct ShellState {
     app_state_store: Option<AppStateStore>,
     app_state: AppState,
     /// The link's last connect error as last read, for the banner.
-    link_error: Option<String>,
+    link_error: Option<LinkFailure>,
+    /// Replaces the link as the source of its last error (headless tests).
+    link_failure: Option<LinkFailureSource>,
     /// The saved appearance settings and their resolution.
     appearance: AppearanceRuntime,
     /// The theme in effect (last applied).
     theme_state: ThemeState,
-    native_theme: Option<NativeTheme>,
+    /// Shared with the views, which hold it across a frame without copying.
+    native_theme: Option<Rc<NativeTheme>>,
     center_rect: Option<PixelRect>,
     center_listener: Option<CenterBoundsListener>,
+    /// The `OpenTab` whose effects are running, so a failed open can be
+    /// reverted ([`Action::RevertOpen`]).
+    opening: Option<PendingOpen>,
     /// Feeds the link's actions in; `None` without a link.
     _pump: Option<Task<()>>,
     /// Polls the link's error; runs only while a link is not connected.
@@ -159,7 +184,7 @@ impl ShellState {
             .map(AppStateStore::load)
             .unwrap_or_default();
         let theme_state = appearance.state();
-        let native_theme = apply_framework_theme(appearance.set(), &theme_state, cx);
+        let native_theme = apply_framework_theme(appearance.set(), &theme_state, cx).map(Rc::new);
         tracing::debug!(?theme_state, "starting theme");
         let tabs = TabManager::new(
             Box::new(PlaceholderHost) as Box<dyn CenterTabHost>,
@@ -178,11 +203,13 @@ impl ShellState {
             app_state_store,
             app_state,
             link_error: None,
+            link_failure: None,
             appearance,
             theme_state,
             native_theme,
             center_rect: None,
             center_listener: None,
+            opening: None,
             _pump: pump,
             error_watch: None,
             status: None,
@@ -333,9 +360,12 @@ impl ShellState {
         self.dispatch_all(vec![action], cx);
     }
 
-    /// Applies a burst of actions with one redraw.
+    /// Applies a burst of actions, with one redraw if anything the shell
+    /// draws changed (a streamed chunk changes nothing here: the web tab
+    /// shows it).
     fn dispatch_all(&mut self, actions: Vec<Action>, cx: &mut Context<Self>) {
         let was_connected = self.model.connection() == Connection::Connected;
+        let revision = self.model.revision();
         for action in actions {
             let added = match &action {
                 Action::RepoAdded(repo) => Some(repository_added_text(&repo.path)),
@@ -359,9 +389,13 @@ impl ShellState {
             tracing::debug!("clearing a status error set while disconnected");
             self.clear_status(cx);
         }
-        self.link_error = self.current_link_error();
+        let link_error = self.current_link_error();
+        let link_changed = link_error != self.link_error;
+        self.link_error = link_error;
         self.sync_error_watch(cx);
-        cx.notify();
+        if link_changed || self.model.revision() != revision {
+            cx.notify();
+        }
     }
 
     /// Applies one action to the model and carries its effects out on the
@@ -372,9 +406,18 @@ impl ShellState {
         if let Action::ConnectionChanged(connection) = &action {
             tracing::debug!(?connection, "daemon connection changed");
         }
+        self.opening = match action {
+            Action::OpenTab(id) if !self.model.tabs().contains(&id) => Some(PendingOpen {
+                id,
+                active: self.model.active_tab(),
+                selected: self.model.selected(),
+            }),
+            _ => None,
+        };
         let effects = self.model.apply(action);
         self.effects.extend(effects);
         self.run_effects(cx);
+        self.opening = None;
         if connected {
             self.refresh_tab_connections(cx);
         }
@@ -418,15 +461,30 @@ impl ShellState {
 
     /// `id`'s tab did not open: says so (an Error status and a notification
     /// through [`ShellEvent::TabOpenFailed`]) and closes it in the model, so
-    /// the strip matches the host. The resulting effects are queued.
+    /// the strip matches the host. A tab the user was opening is reverted:
+    /// the tab and the row that had the focus get it back. The resulting
+    /// effects are queued.
     fn tab_failed(&mut self, id: AgentId, error: TabError, cx: &mut Context<Self>) {
         tracing::warn!(agent = %id, %error, "a chat tab could not be opened");
         self.set_status(
             StatusMessage::error(format!("{OPEN_CHAT_FAILED}: {error}")),
             cx,
         );
+        if matches!(error, TabError::NotConnected) {
+            // The link dropped before the model saw it: the error belongs to
+            // the disconnection and clears when the connection comes back.
+            self.status_set_offline = true;
+        }
         cx.emit(ShellEvent::TabOpenFailed(tab_error_text(&error)));
-        let effects = self.model.apply(Action::CloseTab(id));
+        let undo = match self.opening.take() {
+            Some(open) if open.id == id => Action::RevertOpen {
+                id,
+                active: open.active,
+                selected: open.selected,
+            },
+            _ => Action::CloseTab(id),
+        };
+        let effects = self.model.apply(undo);
         self.effects.extend(effects);
     }
 
@@ -442,6 +500,18 @@ impl ShellState {
     /// Replaces the link as the source of the daemon's port and token.
     pub(crate) fn set_connection_info(&mut self, source: ConnectionInfoSource) {
         self.connection_info = Some(source);
+    }
+
+    /// Replaces the link as the source of its last connect error, and reads
+    /// it now.
+    pub(crate) fn set_link_failure_source(
+        &mut self,
+        source: LinkFailureSource,
+        cx: &mut Context<Self>,
+    ) {
+        self.link_failure = Some(source);
+        self.refresh_link_error(cx);
+        self.sync_error_watch(cx);
     }
 
     /// Puts the center tabs on `host`, loading pages from `page_origin`.
@@ -471,6 +541,9 @@ impl ShellState {
             self.status_set_offline = false;
         }
         self.tabs = TabManager::new(host, page_origin, self.theme_state.clone());
+        if let Some(rect) = self.center_rect {
+            self.tabs.on_bounds(rect);
+        }
     }
 
     /// Hands the window to the tab host (once, when the window exists). A
@@ -483,20 +556,14 @@ impl ShellState {
         }
     }
 
-    /// Pushes the theme in effect to the web tabs (once, for all of them).
-    /// The shell calls it on [`ShellEvent::ThemeChanged`].
-    pub(crate) fn push_theme_to_tabs(&mut self) {
-        self.tabs.set_theme(self.theme_state.clone());
-    }
-
     /// Positions the web tabs at the center's new rectangle.
-    pub(crate) fn set_tab_bounds(&mut self, rect: PixelRect) {
+    fn set_tab_bounds(&mut self, rect: PixelRect) {
         self.tabs.on_bounds(rect);
     }
 
-    /// The banner line(s), or `None` while connected.
-    pub fn banner(&self) -> Option<String> {
-        banner_text(&self.model.connection(), self.link_error.as_deref())
+    /// The connection banner, or `None` while connected.
+    pub fn banner(&self) -> Option<BannerVm> {
+        connection_banner(&self.model.connection(), self.link_error.as_ref())
     }
 
     /// What the status bar's center shows: the connection's status while not
@@ -504,7 +571,7 @@ impl ShellState {
     pub fn status_message(&self) -> Option<StatusMessage> {
         status_to_show(
             &self.model.connection(),
-            self.link_error.as_deref(),
+            self.link_error.as_ref(),
             self.status.as_ref(),
         )
     }
@@ -636,7 +703,13 @@ impl ShellState {
 
     /// The theme agent accents are drawn in.
     pub fn native_theme(&self) -> Option<&NativeTheme> {
-        self.native_theme.as_ref()
+        self.native_theme.as_deref()
+    }
+
+    /// [`ShellState::native_theme`] as a shared handle, for a view that holds
+    /// it while it draws (no copy of the theme per frame).
+    pub fn shared_native_theme(&self) -> Option<Rc<NativeTheme>> {
+        self.native_theme.clone()
     }
 
     /// The theme in effect: what the native panes and gpui-component paint
@@ -695,7 +768,8 @@ impl ShellState {
     }
 
     /// Records a theme just applied to gpui-component's theme as the one in
-    /// effect, and says so.
+    /// effect, hands it to the web tabs (one push for all of them, and the
+    /// theme a tab opened later in this same update boots with), and says so.
     fn record_theme(
         &mut self,
         state: ThemeState,
@@ -704,8 +778,9 @@ impl ShellState {
     ) {
         tracing::debug!(?state, "theme changed");
         if let Some(native) = native {
-            self.native_theme = Some(native);
+            self.native_theme = Some(Rc::new(native));
         }
+        self.tabs.set_theme(state.clone());
         self.theme_state = state;
         cx.emit(ShellEvent::ThemeChanged);
         cx.notify();
@@ -716,7 +791,8 @@ impl ShellState {
         self.center_rect
     }
 
-    /// Sets the one center-bounds listener, replacing any earlier one. See
+    /// Sets the extra center-bounds observer, replacing any earlier one (the
+    /// tabs follow the center whatever is set here). See
     /// [`CenterBoundsListener`] for when it is called.
     pub fn set_center_bounds_listener(
         &mut self,
@@ -736,18 +812,22 @@ impl ShellState {
         self.error_watch.is_some()
     }
 
-    /// Records `rect`; returns the listener to call when it changed.
-    fn record_center_rect(&mut self, rect: PixelRect) -> Option<CenterBoundsListener> {
+    /// Records `rect`: `None` when it is unchanged, else the extra listener
+    /// to call after the tabs, if one is set.
+    fn record_center_rect(&mut self, rect: PixelRect) -> Option<Option<CenterBoundsListener>> {
         if self.center_rect == Some(rect) {
             return None;
         }
         tracing::trace!(?rect, "center bounds changed");
         self.center_rect = Some(rect);
-        self.center_listener.clone()
+        Some(self.center_listener.clone())
     }
 
-    fn current_link_error(&self) -> Option<String> {
-        self.link.as_ref().and_then(DaemonLink::last_error)
+    fn current_link_error(&self) -> Option<LinkFailure> {
+        match &self.link_failure {
+            Some(source) => source(),
+            None => self.link.as_ref().and_then(DaemonLink::last_failure),
+        }
     }
 
     fn refresh_link_error(&mut self, cx: &mut Context<Self>) {
@@ -761,7 +841,8 @@ impl ShellState {
     /// Polls the link's error only while a link exists and is not connected;
     /// a connected shell never wakes for it.
     fn sync_error_watch(&mut self, cx: &mut Context<Self>) {
-        let wanted = self.link.is_some() && self.model.connection() != Connection::Connected;
+        let has_source = self.link.is_some() || self.link_failure.is_some();
+        let wanted = has_source && self.model.connection() != Connection::Connected;
         match (wanted, self.error_watch.is_some()) {
             (true, false) => {
                 tracing::debug!("polling the daemon link's error while disconnected");
@@ -815,14 +896,18 @@ fn watch_link_error(cx: &mut Context<ShellState>) -> Task<()> {
 }
 
 /// Called from the center content area's prepaint with its rectangle.
-/// Records it and, when it changed, calls the listener after the current
-/// update (see [`CenterBoundsListener`]).
+/// Records it and, when it changed, positions the tabs and then calls the
+/// extra listener, after the current update (see [`CenterBoundsListener`]).
+/// The deferred call holds the state weakly: it may run after it is gone.
 pub(crate) fn report_center_bounds(state: &WeakEntity<ShellState>, rect: PixelRect, cx: &mut App) {
-    let listener = state
-        .update(cx, |state, _| state.record_center_rect(rect))
-        .ok()
-        .flatten();
-    if let Some(listener) = listener {
-        cx.defer(move |cx| listener(rect, cx));
-    }
+    let Ok(Some(listener)) = state.update(cx, |state, _| state.record_center_rect(rect)) else {
+        return;
+    };
+    let state = state.clone();
+    cx.defer(move |cx| {
+        let _ = state.update(cx, |state, _| state.set_tab_bounds(rect));
+        if let Some(listener) = listener {
+            listener(rect, cx);
+        }
+    });
 }

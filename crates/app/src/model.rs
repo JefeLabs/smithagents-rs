@@ -32,6 +32,14 @@ pub enum Action {
     SelectAgent(AgentId),
     OpenTab(AgentId),
     CloseTab(AgentId),
+    /// The view layer could not carry out `OpenTab(id)`: closes `id`'s tab
+    /// again and puts the active tab and the selection back to what they were
+    /// before it (`active`, `selected`), as far as they still exist.
+    RevertOpen {
+        id: AgentId,
+        active: Option<AgentId>,
+        selected: Option<AgentId>,
+    },
     RepoAdded(Repo),
 }
 
@@ -54,6 +62,8 @@ pub struct ShellModel {
     active_tab: Option<AgentId>,
     connection: Connection,
     last_seq: Option<u64>,
+    /// Counts the changes to what the shell draws from the model.
+    revision: u64,
 }
 
 impl ShellModel {
@@ -97,9 +107,17 @@ impl ShellModel {
         self.last_seq
     }
 
+    /// Counts the changes to what the shell draws from the model: the agents,
+    /// the repositories, the selection, the tabs and the connection. An
+    /// action that leaves it unchanged (a streamed chunk, a replayed event,
+    /// chat content the web tab shows) needs no redraw.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn apply(&mut self, action: Action) -> Vec<Effect> {
         let mut effects = Vec::new();
-        match action {
+        let changed = match action {
             Action::Snapshot {
                 agents,
                 repos,
@@ -113,13 +131,18 @@ impl ShellModel {
                 self.last_seq = Some(latest_seq);
                 self.drop_missing_tabs(&mut effects);
                 self.fix_selection();
+                true
             }
             Action::Event(event) => self.apply_event(event, &mut effects),
-            Action::ConnectionChanged(connection) => self.connection = connection,
+            Action::ConnectionChanged(connection) => {
+                std::mem::replace(&mut self.connection, connection) != connection
+            }
             Action::SelectAgent(id) => {
-                if self.has_agent(id) {
+                let changed = self.has_agent(id) && self.selected != Some(id);
+                if changed {
                     self.selected = Some(id);
                 }
+                changed
             }
             Action::OpenTab(id) => {
                 if self.has_agent(id) {
@@ -132,44 +155,66 @@ impl ShellModel {
                     }
                     self.active_tab = Some(id);
                 }
+                self.has_agent(id)
             }
             Action::CloseTab(id) => self.close_tab(id, &mut effects),
-            Action::RepoAdded(repo) => match self.repos.iter_mut().find(|r| r.id == repo.id) {
-                Some(existing) => *existing = repo,
-                None => self.repos.push(repo),
-            },
+            Action::RevertOpen {
+                id,
+                active,
+                selected,
+            } => {
+                self.revert_open(id, active, selected, &mut effects);
+                true
+            }
+            Action::RepoAdded(repo) => {
+                match self.repos.iter_mut().find(|r| r.id == repo.id) {
+                    Some(existing) => *existing = repo,
+                    None => self.repos.push(repo),
+                }
+                true
+            }
+        };
+        if changed {
+            self.revision += 1;
         }
         effects
     }
 
-    fn apply_event(&mut self, event: Event, effects: &mut Vec<Effect>) {
+    /// Applies one daemon event; returns whether anything the shell draws
+    /// changed.
+    fn apply_event(&mut self, event: Event, effects: &mut Vec<Effect>) -> bool {
         if self.last_seq.is_some_and(|last| event.seq <= last) {
-            return;
+            return false;
         }
         self.last_seq = Some(event.seq);
         match event.kind {
             EventKind::AgentCreated(agent) | EventKind::AgentUpdated(agent) => {
                 if agent.closed_at.is_some() {
-                    self.remove_agent(agent.id, effects);
-                    return;
+                    return self.remove_agent(agent.id, effects);
                 }
                 let id = agent.id;
                 match self.agents.iter_mut().find(|a| a.id == id) {
+                    Some(existing) if *existing == agent => false,
                     Some(existing) => {
                         let recolored = existing.color != agent.color;
                         *existing = agent;
                         if recolored && self.tabs.contains(&id) {
                             effects.push(Effect::UpdateTabAccent(id));
                         }
+                        true
                     }
-                    None => self.agents.push(agent),
+                    None => {
+                        self.agents.push(agent);
+                        true
+                    }
                 }
             }
             EventKind::AgentClosed { agent_id } => self.remove_agent(agent_id, effects),
+            // Chat content belongs to the web tab.
             EventKind::MessageAppended(_)
             | EventKind::TurnDelta { .. }
             | EventKind::IntentCreated(_)
-            | EventKind::IntentUpdated(_) => {}
+            | EventKind::IntentUpdated(_) => false,
         }
     }
 
@@ -204,10 +249,13 @@ impl ShellModel {
         self.agents.iter().any(|a| a.id == id)
     }
 
-    fn remove_agent(&mut self, id: AgentId, effects: &mut Vec<Effect>) {
+    /// Removes agent `id` and its tab; returns whether the model had it.
+    fn remove_agent(&mut self, id: AgentId, effects: &mut Vec<Effect>) -> bool {
+        let had = self.has_agent(id);
         self.agents.retain(|a| a.id != id);
         self.close_tab(id, effects);
         self.fix_selection();
+        had
     }
 
     fn fix_selection(&mut self) {
@@ -216,24 +264,52 @@ impl ShellModel {
         }
     }
 
-    /// Closes `id`'s tab if open. When it was active, the tab before it (else
-    /// the one after) becomes active.
-    fn close_tab(&mut self, id: AgentId, effects: &mut Vec<Effect>) {
+    /// Closes `id`'s tab if open; returns whether it was. When it was
+    /// active, the tab before it (else the one after) becomes active.
+    fn close_tab(&mut self, id: AgentId, effects: &mut Vec<Effect>) -> bool {
         let Some(index) = self.tabs.iter().position(|t| *t == id) else {
-            return;
+            return false;
         };
         self.tabs.remove(index);
         effects.push(Effect::CloseCenterTab(id));
         if self.active_tab == Some(id) {
-            let next = index
-                .checked_sub(1)
-                .and_then(|i| self.tabs.get(i))
-                .or_else(|| self.tabs.get(index))
-                .copied();
+            let next = self.neighbour(index);
             self.active_tab = next;
             if let Some(next) = next {
                 effects.push(Effect::FocusCenterTab(next));
             }
         }
+        true
+    }
+
+    /// The tab that takes over from a removed one that sat at `index`: the
+    /// one before it, else the one after.
+    fn neighbour(&self, index: usize) -> Option<AgentId> {
+        index
+            .checked_sub(1)
+            .and_then(|i| self.tabs.get(i))
+            .or_else(|| self.tabs.get(index))
+            .copied()
+    }
+
+    /// See [`Action::RevertOpen`]. The tab that was active is focused again
+    /// (one `FocusCenterTab`), else the neighbour as for a close.
+    fn revert_open(
+        &mut self,
+        id: AgentId,
+        active: Option<AgentId>,
+        selected: Option<AgentId>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(index) = self.tabs.iter().position(|t| *t == id) {
+            self.tabs.remove(index);
+            effects.push(Effect::CloseCenterTab(id));
+            if self.active_tab == Some(id) {
+                let back = active.filter(|tab| self.tabs.contains(tab));
+                self.active_tab = back.or_else(|| self.neighbour(index));
+                effects.extend(self.active_tab.map(Effect::FocusCenterTab));
+            }
+        }
+        self.selected = selected.filter(|agent| self.has_agent(*agent));
     }
 }

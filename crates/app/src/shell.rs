@@ -20,10 +20,10 @@
 //! so no view holds a handle back to its owner.
 //!
 //! The center tabs' web engine is a [`CenterTabHost`] ([`ShellOptions::tab_host`],
-//! [`PlaceholderHost`] by default). The shell attaches it to the window once,
-//! feeds it the center's rectangle (the state's center-bounds listener) and
-//! every theme change ([`ShellEvent::ThemeChanged`]), and shows a
-//! notification when a tab does not open ([`ShellEvent::TabOpenFailed`]).
+//! [`PlaceholderHost`] by default). The shell attaches it to the window once;
+//! the state feeds it the center's rectangle and every theme change itself;
+//! the shell shows a notification when a tab does not open
+//! ([`ShellEvent::TabOpenFailed`]).
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -53,7 +53,7 @@ use crate::layout_store::{
 use crate::link::{AgentCommands, DaemonLink, LinkConfig};
 use crate::model::ShellModel;
 use crate::settings::AppSettingsStore;
-use crate::shell_state::{ConnectionInfoSource, ShellEvent, ShellState};
+use crate::shell_state::{ConnectionInfoSource, LinkFailureSource, ShellEvent, ShellState};
 use crate::tabs::{PlaceholderHost, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::{region_paint, OsAppearance, Region, SystemAppearanceSource};
 use crate::update::{NoUpdater, Updater};
@@ -153,6 +153,10 @@ pub struct ShellOptions {
     /// daemon link (and, offline, there is none). Headless tests inject a
     /// fake.
     pub connection_info: Option<ConnectionInfoSource>,
+    /// Answers the link's last connect error (the banner's and the status
+    /// bar's wording); `None` asks the daemon link. Headless tests inject a
+    /// fake.
+    pub link_failure: Option<LinkFailureSource>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -208,6 +212,7 @@ impl Shell {
             tab_host,
             page_origin,
             connection_info,
+            link_failure,
         } = options;
         let link = link.map(DaemonLink::start);
 
@@ -252,6 +257,9 @@ impl Shell {
             if let Some(source) = connection_info {
                 state.set_connection_info(source);
             }
+            if let Some(source) = link_failure {
+                state.set_link_failure_source(source, cx);
+            }
             state.set_tab_host(
                 tab_host.unwrap_or_else(|| Box::new(PlaceholderHost)),
                 page_origin.unwrap_or_else(|| DEFAULT_PAGE_ORIGIN.to_owned()),
@@ -259,19 +267,9 @@ impl Shell {
             );
             state
         });
-        // The web engine gets the window once, and the center's rectangle
-        // after every layout that changes it. The listener lives in the state,
-        // so it holds the state weakly; it may run after the shell is gone.
-        state.update(cx, |state, cx| {
-            state.attach_tab_host(&*window, cx);
-            let weak = cx.entity().downgrade();
-            state.set_center_bounds_listener(
-                move |rect, cx| {
-                    let _ = weak.update(cx, |state, _| state.set_tab_bounds(rect));
-                },
-                cx,
-            );
-        });
+        // The web engine gets the window once; the state hands it the
+        // center's rectangle after every layout that changes it.
+        state.update(cx, |state, cx| state.attach_tab_host(&*window, cx));
 
         let (dock, skin) = DockSkin::dock_area(DOCK_AREA_ID, Some(LAYOUT_VERSION), window, cx);
         // The skin's own collapse buttons sit in the center's title bar, which
@@ -336,11 +334,9 @@ impl Shell {
                             cx.notify();
                         }
                     }
-                    // The views repaint from the state's notify; the web
-                    // tabs get the new theme pushed.
-                    ShellEvent::ThemeChanged => {
-                        this.state.update(cx, |state, _| state.push_theme_to_tabs());
-                    }
+                    // The views repaint from the state's notify; the state
+                    // already pushed the theme to the web tabs.
+                    ShellEvent::ThemeChanged => {}
                     ShellEvent::TabOpenFailed(text) => {
                         notify_tab_failure(text.clone(), window, cx);
                     }
@@ -625,9 +621,9 @@ impl Render for Shell {
         };
         let expanded = self.state.read(cx).left_pane_mode() == LeftPaneMode::Expanded;
         let left_width = self.fitted_left_width(self.state.read(cx).left_pane_layout(), window, cx);
+        let native = self.state.read(cx).shared_native_theme();
         let theme = cx.theme();
-        let (left_surface, _) =
-            region_paint(self.state.read(cx).native_theme(), Region::LeftPane, cx);
+        let (left_surface, _) = region_paint(native.as_deref(), Region::LeftPane, cx);
         let left_pane = div()
             .id(LEFT_PANE_ID)
             .test_support()
@@ -651,14 +647,13 @@ impl Render for Shell {
                         }),
                 )
             });
-        let native = self.state.read(cx).native_theme().cloned();
         let body = h_flex()
             .flex_1()
             .min_h_0()
             .w_full()
             .child(left_pane)
             .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
-            .child(rail(self.rail_active(cx), on_select, native.as_ref(), cx));
+            .child(rail(self.rail_active(cx), on_select, native.as_deref(), cx));
         v_flex()
             .id("shell")
             .key_context(KEY_CONTEXT)
@@ -668,7 +663,7 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_left_pane_drag))
             .size_full()
             .child(title_bar(
-                native.as_ref(),
+                native.as_deref(),
                 update_button(self.state.read(cx).update_state()),
                 on_update,
                 cx,
@@ -676,7 +671,7 @@ impl Render for Shell {
             .child(body)
             .child(status_bar(
                 self.state.read(cx).status_message(),
-                native.as_ref(),
+                native.as_deref(),
                 cx,
             ))
     }

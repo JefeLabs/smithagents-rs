@@ -11,25 +11,72 @@ use smithagents_theme::state::ThemeChoice;
 use smithagents_theme::tokens::{TextScale, ThemeSet};
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::link::LinkError;
+use crate::link::{LinkError, LinkFailure};
 use crate::model::{Connection, ShellModel};
 use crate::tabs::TabError;
 use crate::update::UpdateState;
 
+/// How the connection banner is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerSeverity {
+    /// Connecting or reconnecting: the link keeps trying by itself.
+    Warning,
+    /// Something the user must act on (another daemon version runs).
+    Error,
+}
+
+/// The connection banner above the center.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BannerVm {
+    /// The headline, then any detail lines.
+    pub text: String,
+    pub severity: BannerSeverity,
+}
+
+/// What the banner and the status bar say when a daemon of another version
+/// runs: the link keeps retrying, but only quitting that daemon helps.
+pub fn version_mismatch_text(running: &str, expected: &str) -> String {
+    format!(
+        "A different SmithAgents daemon version is running ({running}; this app needs \
+         {expected}). Quit it to continue."
+    )
+}
+
 /// The connection banner, or `None` when connected.
 ///
-/// The first line says what the link is doing; a non-blank `error` (the
-/// link's last connect error) follows, trimmed, on a second line.
-pub fn banner_text(connection: &Connection, error: Option<&str>) -> Option<String> {
+/// A version mismatch reads as its own error sentence
+/// ([`version_mismatch_text`]), not as a reconnect. Otherwise the first line
+/// says what the link is doing; a non-blank failure (the link's last connect
+/// error) follows, trimmed, on a second line, as a warning.
+pub fn connection_banner(
+    connection: &Connection,
+    failure: Option<&LinkFailure>,
+) -> Option<BannerVm> {
     let headline = match connection {
         Connection::Connected => return None,
         Connection::Connecting => "Connecting to the local daemon…",
         Connection::Reconnecting => "Reconnecting to the local daemon…",
     };
-    match error.map(str::trim).filter(|e| !e.is_empty()) {
-        Some(error) => Some(format!("{headline}\n{error}")),
-        None => Some(headline.to_owned()),
+    if let Some(LinkFailure::VersionMismatch { running, expected }) = failure {
+        return Some(BannerVm {
+            text: version_mismatch_text(running, expected),
+            severity: BannerSeverity::Error,
+        });
     }
+    let error = failure.map(LinkFailure::message);
+    let text = match error.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        Some(error) => format!("{headline}\n{error}"),
+        None => headline.to_owned(),
+    };
+    Some(BannerVm {
+        text,
+        severity: BannerSeverity::Warning,
+    })
+}
+
+/// The text of [`connection_banner`].
+pub fn banner_text(connection: &Connection, failure: Option<&LinkFailure>) -> Option<String> {
+    connection_banner(connection, failure).map(|banner| banner.text)
 }
 
 // ---- Status bar --------------------------------------------------------------
@@ -70,17 +117,21 @@ impl StatusMessage {
 
 /// What the status bar's center shows. While the connection is not
 /// `Connected` that is the connection's own status (the banner's wording on
-/// one line, the link's error after a colon), which a transient message never
-/// replaces; otherwise the transient message, if any.
+/// one line, the link's error after a colon; an error when the banner is
+/// one), which a transient message never replaces; otherwise the transient
+/// message, if any.
 pub fn status_to_show(
     connection: &Connection,
-    link_error: Option<&str>,
+    failure: Option<&LinkFailure>,
     transient: Option<&StatusMessage>,
 ) -> Option<StatusMessage> {
-    match banner_text(connection, link_error) {
+    match connection_banner(connection, failure) {
         Some(banner) => {
-            let line = banner.replacen('\n', ": ", 1);
-            Some(StatusMessage::info(line))
+            let line = banner.text.replacen('\n', ": ", 1);
+            Some(match banner.severity {
+                BannerSeverity::Warning => StatusMessage::info(line),
+                BannerSeverity::Error => StatusMessage::error(line),
+            })
         }
         None => transient.cloned(),
     }
