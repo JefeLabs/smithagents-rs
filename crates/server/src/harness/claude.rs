@@ -132,6 +132,11 @@ fn spawn_stderr_tail(mut stderr: tokio::process::ChildStderr) -> (AbortOnDrop<()
 }
 
 /// The command line of a structured run (prompt on stdin, as for turns).
+///
+/// `--tools` limits only the built-in tools. MCP servers from the user's
+/// config or plugins would still load and, with permissions bypassed, run
+/// unprompted, so `--strict-mcp-config` (with no `--mcp-config`) loads none:
+/// a structured run can only use the tools it lists. Chat turns keep them.
 fn build_structured_args(req: &StructuredRequest) -> Vec<String> {
     let mut args: Vec<String> = ["-p", "--output-format", "json", "--json-schema"]
         .iter()
@@ -142,6 +147,7 @@ fn build_structured_args(req: &StructuredRequest) -> Vec<String> {
         [
             "--dangerously-skip-permissions",
             "--no-session-persistence",
+            "--strict-mcp-config",
             "--tools",
         ]
         .map(str::to_owned),

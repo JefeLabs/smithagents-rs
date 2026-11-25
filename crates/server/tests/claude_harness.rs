@@ -81,6 +81,11 @@ async fn args_include_stream_json_and_bypass_permissions() {
     ] {
         assert!(args.contains(needle), "missing {needle:?} in {args:?}");
     }
+    // Chat turns keep the user's MCP servers; only polish runs drop them.
+    assert!(
+        !args.lines().any(|arg| arg.contains("mcp-config")),
+        "{args:?}"
+    );
 }
 
 /// Runs one turn with `prompt` against a fake-claude that records its stdin,
@@ -463,18 +468,31 @@ async fn structured_run_passes_flags_and_prompt_on_stdin() {
     assert_eq!(res.value, serde_json::json!({"title":"probe","count":2}));
     assert_eq!(res.cost_usd, Some(0.007));
     let args = std::fs::read_to_string(env.args_file()).unwrap();
-    for needle in [
-        "-p",
-        "--output-format\njson",
-        "--json-schema",
-        "--tools\nRead,Grep,Glob",
-        "--no-session-persistence",
-        "--dangerously-skip-permissions",
-        "--model\nhaiku",
-        "--append-system-prompt\nterse",
-    ] {
-        assert!(args.contains(needle), "missing {needle:?} in {args:?}");
-    }
+    // The exact argv, one entry per line. `-p` is a flag (the prompt goes to
+    // stdin); the entry after `--json-schema` is the schema itself; and
+    // `--strict-mcp-config` with no `--mcp-config` loads no MCP server, so a
+    // polish run can use only the read-only built-in tools it lists.
+    let schema = serde_json::json!({"type":"object"}).to_string();
+    let argv: Vec<&str> = args.lines().collect();
+    assert_eq!(
+        argv,
+        [
+            "-p",
+            "--output-format",
+            "json",
+            "--json-schema",
+            schema.as_str(),
+            "--dangerously-skip-permissions",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--tools",
+            "Read,Grep,Glob",
+            "--model",
+            "haiku",
+            "--append-system-prompt",
+            "terse",
+        ]
+    );
     assert!(!args.contains("not an option"), "{args:?}");
     assert_eq!(
         std::fs::read_to_string(stdin_file).unwrap(),
