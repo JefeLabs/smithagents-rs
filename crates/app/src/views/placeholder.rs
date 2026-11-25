@@ -4,6 +4,10 @@
 
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
 use gpui_kit::component::{v_flex, ActiveTheme as _};
+use gpui_kit::{Entity, Subscription, TestSupportExt as _};
+
+use crate::shell_state::ShellState;
+use crate::theme_adapter::{region_paint, Region};
 use gpui_kit::{
     div, App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window,
@@ -15,10 +19,13 @@ pub struct PlaceholderPanel {
     title: SharedString,
     note: SharedString,
     focus: FocusHandle,
+    state: Entity<ShellState>,
+    _observe: Subscription,
 }
 
 impl PlaceholderPanel {
     pub fn new(
+        state: Entity<ShellState>,
         name: &'static str,
         title: impl Into<SharedString>,
         note: impl Into<SharedString>,
@@ -29,6 +36,8 @@ impl PlaceholderPanel {
             title: title.into(),
             note: note.into(),
             focus: cx.focus_handle(),
+            _observe: cx.observe(&state, |_, _, cx| cx.notify()),
+            state,
         }
     }
 }
@@ -81,17 +90,22 @@ impl Focusable for PlaceholderPanel {
 impl Render for PlaceholderPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let (surface, foreground) =
+            region_paint(self.state.read(cx).native_theme(), Region::RightPane, cx);
         v_flex()
             .id(self.name)
+            .test_support()
             .track_focus(&self.focus)
             .size_full()
+            .bg(surface)
+            .text_color(foreground)
             .gap_2()
             .p_3()
             .child(
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.foreground)
+                    .text_color(foreground)
                     .child(self.title.clone()),
             )
             .child(

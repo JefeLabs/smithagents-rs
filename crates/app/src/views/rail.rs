@@ -3,14 +3,19 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::DockPlacement;
+use gpui_kit::component::{
+    v_flex, ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
+};
+use gpui_kit::{
+    px, App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
+    TestSupportExt as _, Window,
+};
 use smithagents_theme::native::NativeTheme;
 
 use crate::theme_adapter::{region_paint, Region};
-use gpui_kit::component::{v_flex, ActiveTheme as _, IconName, Selectable as _, Sizable as _};
-use gpui_kit::{
-    px, App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
-    Window,
-};
+
+/// Element id of the rail.
+pub const RAIL_ID: &str = "icon-rail";
 
 /// Width of the rail.
 pub const RAIL_WIDTH: f32 = 40.;
@@ -64,7 +69,8 @@ pub fn rail(
     let theme = cx.theme();
     let (surface, foreground) = region_paint(native, Region::Rail, cx);
     v_flex()
-        .id("icon-rail")
+        .id(RAIL_ID)
+        .test_support()
         .flex_none()
         .h_full()
         .w(px(RAIL_WIDTH))
@@ -78,7 +84,7 @@ pub fn rail(
         .children(RailEntry::ALL.iter().map(|&entry| {
             let on_select = on_select.clone();
             Button::new(entry.element_id())
-                .icon(entry.icon())
+                .icon(Icon::new(entry.icon()).text_color(foreground))
                 .ghost()
                 .small()
                 .selected(active == Some(entry))

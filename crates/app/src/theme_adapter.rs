@@ -103,15 +103,54 @@ pub fn region_colors(native: &NativeTheme, region: Region) -> Option<(Hsla, Hsla
     ))
 }
 
-/// A region's `(surface, foreground)` for painting. Without a native theme
-/// (offline tests) it falls back to the framework theme's base colors.
+/// A region's `(surface, foreground)` for painting.
+///
+/// Without a native theme (never in the app; the shell always has one) it
+/// falls back to the framework theme's base colors and logs once.
+///
+/// The native theme the views read here (`ShellState::native_theme`) and the
+/// theme gpui-component paints with are two copies of one choice. Change the
+/// theme only through [`apply_theme`], which updates both; Task 15's runtime
+/// theme change must call it.
 pub fn region_paint(native: Option<&NativeTheme>, region: Region, cx: &App) -> (Hsla, Hsla) {
     native
         .and_then(|native| region_colors(native, region))
         .unwrap_or_else(|| {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::debug!(
+                    ?region,
+                    "no native theme; painting the region with the framework colors"
+                );
+            });
             let theme = cx.theme();
             (theme.background, theme.foreground)
         })
+}
+
+/// Applies `state` everywhere the theme lives: gpui-component's theme
+/// ([`apply_theme_state`]) and, when `shell` is given, the shell state's
+/// native theme (which the views' region colors and agent accents read).
+/// Returns the native theme. The shell is `None` only at startup, before it
+/// exists; it takes the returned theme through `ShellOptions`.
+pub fn apply_theme(
+    set: &ThemeSet,
+    state: &ThemeState,
+    shell: Option<&gpui_kit::Entity<crate::shell_state::ShellState>>,
+    cx: &mut App,
+) -> Option<NativeTheme> {
+    apply_theme_state(set, state, cx);
+    let native = set.native(&state.theme).or_else(|| {
+        let pair = &set.base.system_pair;
+        set.native(match state.appearance {
+            Appearance::Dark => &pair.dark,
+            Appearance::Light => &pair.light,
+        })
+    });
+    if let (Some(shell), Some(native)) = (shell, native.clone()) {
+        shell.update(cx, |shell, cx| shell.set_native_theme(native, cx));
+    }
+    native
 }
 
 /// The base font size gpui-component uses at text scale 1.0, in pixels. The

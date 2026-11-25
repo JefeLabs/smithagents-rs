@@ -18,6 +18,8 @@ use crate::views::banner::banner;
 use crate::views::tabs::{tab_strip, TabItem, TabStripActions};
 
 /// Element id of the content area whose bounds go to the web engine.
+/// Element id of the center panel's root.
+pub const CENTER_PANEL_ID: &str = "center-panel";
 pub const CONTENT_ID: &str = "center-content";
 /// Element id of the hint shown when no tab is open.
 pub const EMPTY_HINT_ID: &str = "no-chat-hint";
@@ -146,7 +148,8 @@ impl Render for CenterPanel {
         let theme = cx.theme();
 
         v_flex()
-            .id("center-panel")
+            .id(CENTER_PANEL_ID)
+            .test_support()
             .track_focus(&self.focus)
             .size_full()
             .bg(surface)
@@ -157,6 +160,7 @@ impl Render for CenterPanel {
                 active,
                 left_expanded,
                 self.strip_actions(),
+                self.state.read(cx).native_theme(),
                 cx,
             ))
             .child(

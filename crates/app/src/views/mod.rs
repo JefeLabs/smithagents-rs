@@ -8,3 +8,4 @@ pub mod left_pane;
 pub mod placeholder;
 pub mod rail;
 pub mod tabs;
+pub mod title_bar;

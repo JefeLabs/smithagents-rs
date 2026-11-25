@@ -24,7 +24,7 @@ use gpui_kit::component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSkin,
     DockToggleEvent,
 };
-use gpui_kit::component::{h_flex, resize_handle, ActiveTheme as _};
+use gpui_kit::component::{h_flex, resize_handle, v_flex, ActiveTheme as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, FocusHandle,
@@ -41,11 +41,13 @@ use crate::layout_store::{
 use crate::link::{DaemonLink, LinkConfig};
 use crate::model::ShellModel;
 use crate::shell_state::{ShellEvent, ShellState};
+use crate::theme_adapter::{region_paint, Region};
 use crate::view_models::LeftPaneMode;
 use crate::views::center::CenterPanel;
 use crate::views::left_pane::LeftPanePlaceholder;
 use crate::views::placeholder::PlaceholderPanel;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
+use crate::views::title_bar::title_bar;
 
 gpui_kit::actions!(
     smithagents_shell,
@@ -170,6 +172,7 @@ impl Shell {
         let center = cx.new(|cx| CenterPanel::new(state.clone(), cx));
         let settings = cx.new(|cx| {
             PlaceholderPanel::new(
+                state.clone(),
                 SETTINGS_PANEL,
                 "Settings",
                 "Appearance and source repositories will be set here.",
@@ -192,6 +195,8 @@ impl Shell {
         });
 
         let subscriptions = vec![
+            // A theme change reaches the views through the state.
+            cx.observe(&state, |_, _, cx| cx.notify()),
             cx.subscribe(&dock, |this, _, event: &DockEvent, cx| {
                 if matches!(event, DockEvent::LayoutChanged) {
                     tracing::trace!("dock layout changed");
@@ -488,6 +493,8 @@ impl Render for Shell {
         let expanded = self.state.read(cx).left_pane_mode() == LeftPaneMode::Expanded;
         let left_width = self.fitted_left_width(self.state.read(cx).left_pane_layout(), window, cx);
         let theme = cx.theme();
+        let (left_surface, _) =
+            region_paint(self.state.read(cx).native_theme(), Region::LeftPane, cx);
         let left_pane = div()
             .id(LEFT_PANE_ID)
             .test_support()
@@ -496,7 +503,7 @@ impl Render for Shell {
             .h_full()
             .w(left_width)
             .overflow_hidden()
-            .bg(theme.sidebar)
+            .bg(left_surface)
             .border_r_1()
             .border_color(theme.border)
             .child(self.left_pane.clone())
@@ -511,7 +518,15 @@ impl Render for Shell {
                         }),
                 )
             });
-        h_flex()
+        let native = self.state.read(cx).native_theme().cloned();
+        let body = h_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(left_pane)
+            .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
+            .child(rail(self.rail_active(cx), on_select, native.as_ref(), cx));
+        v_flex()
             .id("shell")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
@@ -519,13 +534,7 @@ impl Render for Shell {
             .on_action(cx.listener(Self::on_toggle_settings))
             .on_drag_move(cx.listener(Self::on_left_pane_drag))
             .size_full()
-            .child(left_pane)
-            .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
-            .child(rail(
-                self.rail_active(cx),
-                on_select,
-                self.state.read(cx).native_theme(),
-                cx,
-            ))
+            .child(title_bar(native.as_ref(), cx))
+            .child(body)
     }
 }

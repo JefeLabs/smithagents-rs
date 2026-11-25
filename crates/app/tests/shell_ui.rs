@@ -15,8 +15,8 @@ use gpui_kit::component::dock::{
 };
 use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
 use gpui_kit::{
-    point, px, size, AppContext as _, Bounds, Entity, MouseButton, Pixels, Point, TestAppContext,
-    WindowBounds, WindowHandle, WindowOptions,
+    point, px, size, AppContext as _, Background, Bounds, Entity, MouseButton, Pixels, Point,
+    TestAppContext, WindowBounds, WindowHandle, WindowOptions,
 };
 use smithagents_app::layout_store::{
     saved_dock, saved_left_pane, with_left_pane, LayoutStore, LeftPaneLayout,
@@ -25,21 +25,37 @@ use smithagents_app::layout_store::{
 };
 use smithagents_app::link::LinkConfig;
 use smithagents_app::model::{Action, Connection, Effect, ShellModel};
-use smithagents_app::shell::{Shell, ShellOptions, LEFT_PANE_ID, LEFT_PANE_RESIZE_ID};
+use smithagents_app::shell::{
+    Shell, ShellOptions, LEFT_PANE_ID, LEFT_PANE_RESIZE_ID, SETTINGS_PANEL,
+};
 use smithagents_app::shell_state::ShellState;
+use smithagents_app::theme_adapter::{region_tokens, srgb_to_hsla, Region};
 use smithagents_app::view_models::LeftPaneMode;
 use smithagents_app::views::banner::BANNER_ID;
-use smithagents_app::views::center::EMPTY_HINT_ID;
+use smithagents_app::views::center::{CENTER_PANEL_ID, EMPTY_HINT_ID};
 use smithagents_app::views::left_pane::{
     COMPACT_MARKER_ID, EXPANDED_TITLE_ID, LEFT_PANE_CONTENT_ID,
 };
-use smithagents_app::views::rail::{RailEntry, RAIL_WIDTH};
+use smithagents_app::views::rail::{RailEntry, RAIL_ID, RAIL_WIDTH};
 use smithagents_app::views::tabs::{close_button_id, TOGGLE_AGENTS_ID};
+use smithagents_app::views::title_bar::TITLE_BAR_ID;
 use smithagents_center_host::PixelRect;
 use smithagents_core::agent::{Agent, AgentState};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
-use smithagents_theme::tokens::ThemeSet;
+use smithagents_theme::native::NativeTheme;
+use smithagents_theme::state::{AppearanceSettings, ThemeController, ThemeState};
+use smithagents_theme::tokens::{Appearance, ThemeSet};
+
+/// The Smith theme `appearance` resolves to.
+fn theme_state(appearance: Appearance) -> ThemeState {
+    ThemeController::new(
+        ThemeSet::embedded().clone(),
+        AppearanceSettings::default(),
+        appearance,
+    )
+    .state()
+}
 
 fn agent(name: &str) -> Agent {
     let at: DateTime<Utc> = "2026-11-24T09:00:00Z".parse().unwrap();
@@ -99,8 +115,12 @@ fn open_shell_full(
     cx.update(|cx| {
         gpui_kit::init(cx);
         smithagents_app::shell::init(cx);
-        let set = ThemeSet::embedded();
-        let native_theme = set.native(&set.themes[0].id);
+        let native_theme = smithagents_app::theme_adapter::apply_theme(
+            ThemeSet::embedded(),
+            &theme_state(Appearance::Dark),
+            None,
+            cx,
+        );
         let bounds = Bounds {
             origin: Point::default(),
             size: size(px(width), px(height)),
@@ -1044,22 +1064,25 @@ fn expanding_shrinks_a_wide_right_dock_so_the_center_keeps_its_minimum(cx: &mut 
 }
 
 #[gpui_kit::test]
-fn the_left_pane_spans_the_height_and_the_rail_sits_at_the_far_right(cx: &mut TestAppContext) {
+fn the_left_pane_spans_the_height_below_the_title_bar_and_the_rail_sits_at_the_far_right(
+    cx: &mut TestAppContext,
+) {
     // Not connected, so the banner is shown above the center.
     let (window, _shell) = open_shell(cx, ShellModel::new());
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         let content = window.viewport_size();
+        let title = window.find(TITLE_BAR_ID).bounds();
         let left = window.find(LEFT_PANE_ID).bounds();
-        assert_eq!(left.origin, point(px(0.), px(0.)), "{left:?}");
-        assert_eq!(left.size.height, content.height, "full height");
+        assert_eq!(left.origin, point(px(0.), title.bottom()), "{left:?}");
+        assert_eq!(left.bottom(), content.height, "to the bottom");
 
         let banner = window.find(BANNER_ID).bounds();
         assert!(banner.left() >= left.right(), "{banner:?} vs {left:?}");
         assert_eq!(
             banner.top(),
-            px(0.),
-            "the banner is at the top of the center"
+            title.bottom(),
+            "the banner is at the top of the center, below the title bar"
         );
         let toggle = window.find(TOGGLE_AGENTS_ID).bounds();
         assert!(toggle.left() >= left.right() && toggle.top() >= banner.bottom());
@@ -1300,4 +1323,196 @@ fn resizing_the_window_refits_an_open_right_dock(cx: &mut TestAppContext) {
         .unwrap();
     assert_eq!(right_width(cx, &dock), px(500.));
     assert_eq!(saved_right_width(cx, &store), px(500.));
+}
+
+// ---- Painted colors --------------------------------------------------------
+
+/// The color of the topmost quad painted over `at`, in the last frame.
+fn painted_at(window: &gpui_kit::Window, at: Point<Pixels>) -> Background {
+    let scale = window.scale_factor();
+    let (x, y) = (f32::from(at.x) * scale, f32::from(at.y) * scale);
+    window
+        .painted_quads()
+        .into_iter()
+        .filter(|quad| {
+            // Borders are painted as full-size quads masked to their edge.
+            [quad.bounds, quad.content_mask.bounds].iter().all(|b| {
+                x >= b.origin.x.0
+                    && x < b.origin.x.0 + b.size.width.0
+                    && y >= b.origin.y.0
+                    && y < b.origin.y.0 + b.size.height.0
+            })
+        })
+        .max_by_key(|quad| quad.order)
+        .map(|quad| quad.background)
+        .expect("a quad is painted there")
+}
+
+/// A point `inset` inside the bottom-left corner of `bounds`, clear of any
+/// control placed at the top or in the middle.
+fn near_bottom_left(bounds: Bounds<Pixels>, inset: f32) -> Point<Pixels> {
+    point(
+        bounds.origin.x + px(inset),
+        bounds.origin.y + bounds.size.height - px(inset),
+    )
+}
+
+fn token_background(native: &NativeTheme, token: &str) -> Background {
+    srgb_to_hsla(native.colors[token]).into()
+}
+
+struct Painted {
+    title_bar: Background,
+    left_pane: Background,
+    right_pane: Background,
+    rail: Background,
+    center: Background,
+    tab_strip: Background,
+    active_tab: Background,
+}
+
+fn painted_regions(cx: &mut TestAppContext, window: WindowHandle<Root>) -> Painted {
+    let mut painted = None;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let bounds = |id: &str, window: &mut gpui_kit::Window| window.find(id.to_string()).bounds();
+        let title = bounds(TITLE_BAR_ID, window);
+        let left = bounds(LEFT_PANE_ID, window);
+        let right = bounds(SETTINGS_PANEL, window);
+        let rail = bounds(RAIL_ID, window);
+        let center = bounds(CENTER_PANEL_ID, window);
+        let tab = window.within("center-tabs").find(0usize).bounds();
+        painted = Some(Painted {
+            title_bar: painted_at(window, near_bottom_left(title, 3.)),
+            left_pane: painted_at(window, near_bottom_left(left, 20.)),
+            right_pane: painted_at(window, near_bottom_left(right, 20.)),
+            rail: painted_at(window, near_bottom_left(rail, 10.)),
+            center: painted_at(window, near_bottom_left(center, 20.)),
+            tab_strip: painted_at(
+                window,
+                point(
+                    center.origin.x + center.size.width - px(6.),
+                    tab.origin.y + tab.size.height / 2.,
+                ),
+            ),
+            active_tab: painted_at(
+                window,
+                point(tab.origin.x + px(2.), tab.origin.y + tab.size.height / 2.),
+            ),
+        });
+    })
+    .unwrap();
+    painted.unwrap()
+}
+
+#[gpui_kit::test]
+fn every_region_paints_its_token_color(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let (window, _shell) = open_shell(cx, connected_with_tab(&mercury));
+    let set = ThemeSet::embedded();
+    let native = set.native(&theme_state(Appearance::Dark).theme).unwrap();
+    let painted = painted_regions(cx, window);
+
+    for (region, got) in [
+        (Region::TitleBar, painted.title_bar),
+        (Region::LeftPane, painted.left_pane),
+        (Region::RightPane, painted.right_pane),
+        (Region::Rail, painted.rail),
+        (Region::Center, painted.center),
+        (Region::TabStrip, painted.tab_strip),
+    ] {
+        let want = token_background(&native, region_tokens(region).0);
+        assert_eq!(got, want, "{region:?}");
+    }
+    // The active tab is part of the content: the center surface.
+    assert_eq!(
+        painted.active_tab,
+        token_background(&native, region_tokens(Region::Center).0),
+        "active tab"
+    );
+    // The two card surfaces.
+    assert_eq!(painted.left_pane, painted.right_pane, "both panes: card");
+    assert_ne!(painted.rail, painted.left_pane, "rail card-2 vs pane card");
+    assert_eq!(painted.rail, painted.tab_strip);
+    assert_eq!(painted.rail, painted.title_bar);
+}
+
+#[gpui_kit::test]
+fn switching_the_theme_repaints_the_regions(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let (window, shell) = open_shell(cx, connected_with_tab(&mercury));
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    let set = ThemeSet::embedded();
+    let dark = painted_regions(cx, window);
+
+    let light_state = theme_state(Appearance::Light);
+    cx.update(|cx| {
+        smithagents_app::theme_adapter::apply_theme(set, &light_state, Some(&state), cx);
+    });
+    let light = painted_regions(cx, window);
+
+    let native = set.native(&light_state.theme).unwrap();
+    for (region, got) in [
+        (Region::LeftPane, light.left_pane),
+        (Region::Rail, light.rail),
+        (Region::RightPane, light.right_pane),
+        (Region::TitleBar, light.title_bar),
+        (Region::Center, light.center),
+    ] {
+        assert_eq!(
+            got,
+            token_background(&native, region_tokens(region).0),
+            "{region:?}"
+        );
+    }
+    assert_ne!(dark.left_pane, light.left_pane);
+    assert_ne!(dark.rail, light.rail);
+}
+
+#[gpui_kit::test]
+fn the_title_bar_spans_the_window_and_the_center_sits_below_it(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let (window, shell) = open_shell(cx, connected_with_tab(&mercury));
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    let seen: Rc<RefCell<Vec<PixelRect>>> = Rc::default();
+    state.update(cx, |state, cx| {
+        let seen = seen.clone();
+        state.set_center_bounds_listener(move |rect, _| seen.borrow_mut().push(rect), cx);
+    });
+    let mut title = None;
+    let mut left = None;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        title = Some(window.find(TITLE_BAR_ID).bounds());
+        left = Some(window.find(LEFT_PANE_ID).bounds());
+    })
+    .unwrap();
+    let (title, left) = (title.unwrap(), left.unwrap());
+    assert_eq!(title.size.width, px(1200.), "the bar spans the window");
+    assert_eq!(title.origin.y, px(0.));
+    assert!(left.origin.y >= title.size.height, "the left pane is below");
+    let rect = *seen.borrow().last().expect("the center reported");
+    let scale = rect.scale;
+    assert!(
+        rect.y >= f64::from(f32::from(title.size.height)) * scale,
+        "{rect:?} vs title {title:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn the_center_pane_paints_its_own_token_not_the_background(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let (window, shell) = open_shell(cx, connected_with_tab(&mercury));
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    let mut native = ThemeSet::embedded()
+        .native(&theme_state(Appearance::Dark).theme)
+        .unwrap();
+    // Give the center a color no other surface has.
+    let distinct = native.colors["selection"];
+    native.colors.insert("center-pane".into(), distinct);
+    state.update(cx, |state, cx| state.set_native_theme(native.clone(), cx));
+    let painted = painted_regions(cx, window);
+    assert_eq!(painted.center, token_background(&native, "selection"));
+    assert_ne!(painted.center, token_background(&native, "background"));
 }

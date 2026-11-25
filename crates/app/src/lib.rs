@@ -16,6 +16,7 @@ pub mod theme_adapter;
 pub mod view_models;
 pub mod views;
 
+use gpui_kit::component::TitleBar;
 use gpui_kit::{
     px, size, App, AppContext as _, Bounds, QuitMode, TitlebarOptions, WindowBounds, WindowOptions,
 };
@@ -71,8 +72,7 @@ fn apply_startup_theme(cx: &mut App) -> Option<NativeTheme> {
     let controller =
         ThemeController::new(set.clone(), AppearanceSettings::default(), Appearance::Dark);
     let state = controller.state();
-    theme_adapter::apply_theme_state(set, &state, cx);
-    set.native(&state.theme)
+    theme_adapter::apply_theme(set, &state, None, cx)
 }
 
 fn open_main_window(
@@ -100,10 +100,13 @@ fn open_main_window(
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
         display_id,
+        // The shell draws its own title bar (see `views::title_bar`); the
+        // window keeps only the traffic lights and the app's title.
         titlebar: Some(TitlebarOptions {
             title: Some(WINDOW_TITLE.into()),
-            ..Default::default()
+            ..TitleBar::title_bar_options()
         }),
+        app_owns_titlebar_drag: true,
         ..Default::default()
     };
     gpui_kit::open_window(options, cx, |window, cx| {

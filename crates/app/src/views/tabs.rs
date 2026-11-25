@@ -3,12 +3,15 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{h_flex, ActiveTheme as _, IconName, Sizable as _};
+use gpui_kit::component::{h_flex, ActiveTheme as _, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Window,
 };
 use smithagents_core::ids::AgentId;
+use smithagents_theme::native::NativeTheme;
+
+use crate::theme_adapter::{region_paint, Region};
 
 /// Element id of a tab's close button; `ix` is the tab's position.
 pub fn close_button_id(ix: usize) -> (&'static str, usize) {
@@ -46,9 +49,11 @@ pub fn tab_strip(
     active: Option<AgentId>,
     left_expanded: bool,
     actions: TabStripActions,
+    native: Option<&NativeTheme>,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
+    let (_, strip_foreground) = region_paint(native, Region::TabStrip, cx);
     let ids: Vec<AgentId> = items.iter().map(|item| item.agent).collect();
     let selected = active.and_then(|active| ids.iter().position(|id| *id == active));
     let TabStripActions {
@@ -59,11 +64,14 @@ pub fn tab_strip(
     let close = std::rc::Rc::new(close);
 
     let toggle = Button::new(TOGGLE_AGENTS_ID)
-        .icon(if left_expanded {
-            IconName::PanelLeft
-        } else {
-            IconName::PanelLeftOpen
-        })
+        .icon(
+            Icon::new(if left_expanded {
+                IconName::PanelLeft
+            } else {
+                IconName::PanelLeftOpen
+            })
+            .text_color(strip_foreground),
+        )
         .ghost()
         .xsmall()
         .tab_stop(false)
@@ -91,7 +99,7 @@ pub fn tab_strip(
             )
             .suffix(
                 Button::new(close_button_id(ix))
-                    .icon(IconName::Close)
+                    .icon(Icon::new(IconName::Close).text_color(strip_foreground))
                     .ghost()
                     .xsmall()
                     .tab_stop(false)

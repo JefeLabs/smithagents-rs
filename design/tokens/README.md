@@ -21,4 +21,6 @@ Default region mapping (one place: `region_tokens` in `crates/app/src/theme_adap
 |---|---|
 | center pane, active center tab | `center-pane` |
 | left pane, right activity pane | `card` |
-| title bar, icon rail, tab strip, bottom bar | `card-2` |
+| title bar (app-drawn), icon rail, tab strip, bottom bar | `card-2` |
+
+The bottom bar does not exist yet; its row is a mapping only. The tab strip bar and inactive tabs use `card-2`; the active tab uses `center-pane`.
