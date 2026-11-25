@@ -210,7 +210,7 @@ pub struct ShellOptions {
     /// [`SharedHost`](crate::tabs::SharedHost) to keep a handle on it).
     pub tab_host: Option<TabHostFactory>,
     /// Where chat pages load from; `None` is [`DEFAULT_PAGE_ORIGIN`]. The app
-    /// passes `SMITHAGENTS_WEB_ORIGIN` when set (see
+    /// passes `SMITHAGENTS_WEB_ORIGIN` when set, in debug builds only (see
     /// [`page_origin_from`](crate::tabs::page_origin_from)). An invalid one
     /// is an Error status at startup and fails every open.
     pub page_origin: Option<String>,
