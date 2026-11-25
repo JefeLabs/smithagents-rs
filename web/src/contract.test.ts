@@ -1,10 +1,11 @@
+// @vitest-environment node
 import { readFileSync } from "node:fs";
-import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { readUIMessageStream, type UIMessage } from "ai";
 import { describe, expect, it } from "vitest";
 import { makeTransport } from "./transport";
 
-const FIXTURE = path.resolve(process.cwd(), "../crates/server/tests/fixtures/ui_stream_golden.sse");
+const FIXTURE = fileURLToPath(new URL("../../crates/server/tests/fixtures/ui_stream_golden.sse", import.meta.url));
 
 describe("wire contract with the Rust encoder", () => {
   it("the SDK's own transport parser turns the golden stream into one assistant message", async () => {

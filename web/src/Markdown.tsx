@@ -1,15 +1,19 @@
 import ReactMarkdown from "react-markdown";
 
-const SAFE_HREF = /^(https?:|mailto:)/i;
+const SAFE_HREF = /^https?:\/\//i;
 
-/** Inert Markdown: no raw HTML (react-markdown without rehype-raw escapes it to text). */
+/** Only http(s) links are allowed; everything else is rendered as plain text. */
+export const isSafeHref = (href: string | null | undefined): href is string => !!href && SAFE_HREF.test(href);
+
+/** Inert Markdown: no raw HTML (no rehype-raw), no images (alt text only), http(s) links only. */
 export function Markdown({ text }: { text: string }) {
   return (
     <ReactMarkdown
-      urlTransform={(url) => (SAFE_HREF.test(url) ? url : "")}
+      urlTransform={(url) => (isSafeHref(url) ? url : "")}
       components={{
+        img: ({ alt }) => <span>{alt}</span>,
         a({ href, children }) {
-          if (!href || !SAFE_HREF.test(href)) return <span>{children}</span>;
+          if (!isSafeHref(href)) return <span>{children}</span>;
           return (
             <a href={href} rel="noreferrer noopener" target="_blank" className="underline">
               {children}

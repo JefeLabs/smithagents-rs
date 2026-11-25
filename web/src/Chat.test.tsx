@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Chat } from "./Chat";
 import { HostConfigError } from "./host";
+import { App } from "./App";
 import { loadChatProps } from "./load";
 import type { AgentInfo } from "./api";
 import type { UIMessage } from "ai";
@@ -11,13 +12,17 @@ const cfg = { baseUrl: "http://127.0.0.1:9", token: "SECRET-TOKEN", agentId: "ag
 const agent: AgentInfo = { id: "ag1", name: "Scout", color: { h: 123 }, state: "idle" };
 const enc = new TextEncoder();
 
-function sse(chunks: object[], gate?: Promise<void>): Response {
-  const lines = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`);
+function sse(chunks: object[], gate?: Promise<void>, split = false): Response {
+  const bytes = enc.encode(`: keep-alive\n\n${chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("")}`);
   const body = new ReadableStream<Uint8Array>({
     async start(ctrl) {
-      for (const l of lines) ctrl.enqueue(enc.encode(l));
+      const feed = (b: Uint8Array) => {
+        if (!split) return ctrl.enqueue(b);
+        for (const x of b) ctrl.enqueue(new Uint8Array([x]));
+      };
+      feed(bytes);
       if (gate) await gate;
-      ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+      feed(enc.encode(": keep-alive\n\ndata: [DONE]\n\n"));
       ctrl.close();
     },
   });
@@ -64,11 +69,11 @@ describe("Chat", () => {
   it("streams text, posts {text} with bearer, and re-enables the composer after [DONE]", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    fetchMock.mockResolvedValue(sse(textStream("Hello streamed"), gate));
+    fetchMock.mockResolvedValue(sse(textStream("Hello streamed caf\u00e9 \u2615"), gate, true));
     mount([]);
     const box = screen.getByRole("textbox") as HTMLTextAreaElement;
     await userEvent.type(box, "  hi there  {Enter}");
-    await screen.findByText("Hello streamed");
+    await screen.findByText("Hello streamed caf\u00e9 \u2615");
     expect(box.disabled).toBe(true);
     release();
     await waitFor(() => expect(box.disabled).toBe(false));
@@ -98,8 +103,12 @@ describe("Chat", () => {
     await userEvent.type(box, "one{Enter}");
     expect(await screen.findByText("This agent is still working on the last message")).toBeTruthy();
     await waitFor(() => expect(box.disabled).toBe(false));
+    expect(screen.queryByText("one", { selector: "div" })).toBeNull();
+    await waitFor(() => expect(box.value).toBe("one"));
+    await userEvent.clear(box);
+    await userEvent.type(box, "two");
     fetchMock.mockResolvedValueOnce(sse(textStream("recovered")));
-    await userEvent.type(box, "two{Enter}");
+    await userEvent.type(box, "{Enter}");
     await screen.findByText("recovered");
     await waitFor(() => expect(screen.queryByText("This agent is still working on the last message")).toBeNull());
   });
@@ -146,6 +155,96 @@ describe("Chat", () => {
     const { container } = mount([{ id: "a", role: "assistant", parts: [{ type: "text", text: "[x](https://example.com)" }] }]);
     expect(fireEvent.click(container.querySelector("a")!)).toBe(false);
     expect(open).toHaveBeenCalledWith("https://example.com", "_blank", "noopener,noreferrer");
+  });
+});
+
+describe("markdown images and links", () => {
+  it("never renders an img or a network-capable attribute", () => {
+    const md = [
+      "![inline](https://evil.example/t.png?leak=1)",
+      "![ref][r]",
+      "[![linked](https://evil.example/i.png)](https://example.com)",
+      "[mail](mailto:a@b.c)",
+      "",
+      "[r]: https://evil.example/r.png",
+    ].join("\n\n");
+    const { container } = mount([{ id: "a", role: "assistant", parts: [{ type: "text", text: md }] }]);
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("[src]")).toBeNull();
+    expect(container.querySelector('a[href^="mailto"]')).toBeNull();
+    expect(container.textContent).toContain("inline");
+    expect(container.textContent).toContain("linked");
+    expect(container.querySelectorAll("a")).toHaveLength(1);
+  });
+});
+
+describe("rejoin a working agent", () => {
+  it("shows a note, polls until idle, then reloads history", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let polls = 0;
+      fetchMock.mockImplementation(async (url: string) => {
+        const j = (b: unknown) => new Response(JSON.stringify(b), { status: 200 });
+        if (url.includes("/v1/agents?")) {
+          polls++;
+          return j([{ ...agent, state: polls < 2 ? "working" : "idle" }]);
+        }
+        return j([{ id: "n1", agent_id: "ag1", seq: 1, role: "assistant", text: "fresh reply", created_at: "" }]);
+      });
+      render(<Chat cfg={cfg} agent={{ ...agent, state: "working" }} initialMessages={[]} />);
+      expect(screen.getByText("This agent is still working. The reply will appear here when it finishes.")).toBeTruthy();
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).disabled).toBe(true);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(screen.queryByText("fresh reply")).toBeNull();
+      await vi.advanceTimersByTimeAsync(2100);
+      await screen.findByText("fresh reply");
+      expect(screen.queryByText(/still working\. The reply/)).toBeNull();
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).disabled).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("scrolling", () => {
+  it("scrolls to the bottom on render and when a message arrives", async () => {
+    const spy = vi.fn();
+    Element.prototype.scrollIntoView = spy;
+    try {
+      fetchMock.mockResolvedValue(sse(textStream("hi")));
+      mount([]);
+      expect(spy).toHaveBeenCalled();
+      const before = spy.mock.calls.length;
+      await userEvent.type(screen.getByRole("textbox"), "x{Enter}");
+      await screen.findByText("hi");
+      expect(spy.mock.calls.length).toBeGreaterThan(before);
+    } finally {
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+});
+
+describe("click policy", () => {
+  it("ignores a non-http href and handles middle-click", () => {
+    const hook = vi.fn();
+    window.__smithagentsOpenExternal = hook;
+    const { container } = mount([{ id: "a", role: "assistant", parts: [{ type: "text", text: "[x](https://example.com)" }] }]);
+    const a = container.querySelector("a")!;
+    a.setAttribute("href", "javascript:alert(1)");
+    fireEvent.click(a);
+    expect(hook).not.toHaveBeenCalled();
+    a.setAttribute("href", "https://example.com");
+    expect(fireEvent(a, new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }))).toBe(false);
+    expect(hook).toHaveBeenCalledWith("https://example.com");
+  });
+});
+
+describe("App", () => {
+  it("renders the error panel for a config failure and never the token", async () => {
+    render(<App load={() => loadChatProps(() => { throw new HostConfigError("Host configuration is missing."); })} />);
+    await screen.findByText("Could not open this chat");
+    expect(screen.getByText("Host configuration is missing.")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("SECRET-TOKEN");
   });
 });
 

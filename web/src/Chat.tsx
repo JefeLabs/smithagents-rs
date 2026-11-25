@@ -1,9 +1,10 @@
 import { useChat } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
-import { useMemo, useState, type CSSProperties, type KeyboardEvent, type MouseEvent } from "react";
-import { ApiError, type AgentInfo } from "./api";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type UIEvent } from "react";
+import { ApiError, getAgent, getMessages, type AgentInfo } from "./api";
+import { toUiMessages } from "./history";
 import type { HostConfig } from "./host";
-import { Markdown } from "./Markdown";
+import { isSafeHref, Markdown } from "./Markdown";
 import { makeTransport } from "./transport";
 
 declare global {
@@ -28,22 +29,72 @@ function openExternal(event: MouseEvent) {
   if (!anchor) return;
   event.preventDefault();
   const href = anchor.getAttribute("href");
-  if (!href) return;
+  if (!isSafeHref(href)) return;
   if (window.__smithagentsOpenExternal) window.__smithagentsOpenExternal(href);
   else window.open(href, "_blank", "noopener,noreferrer");
 }
 
+const POLL_MS = 2000;
+const isWorking = (state: string) => state === "working" || state === "quiet";
+
 export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: AgentInfo; initialMessages: UIMessage[] }) {
   const transport = useMemo(() => makeTransport(cfg), [cfg]);
-  const { messages, sendMessage, status, error, clearError } = useChat({ transport, messages: initialMessages });
   const [draft, setDraft] = useState("");
-  const busy = status === "submitted" || status === "streaming";
+  const lastSent = useRef("");
+  const { messages, sendMessage, setMessages, status, error, clearError } = useChat({
+    transport,
+    messages: initialMessages,
+    onError: (e) => {
+      // An ApiError is only thrown before any stream is read: the daemon did not accept the message.
+      if (e instanceof ApiError) {
+        setMessages((ms) => (ms[ms.length - 1]?.role === "user" ? ms.slice(0, -1) : ms));
+        setDraft(lastSent.current);
+      }
+    },
+  });
+  const [agentWorking, setAgentWorking] = useState(isWorking(agent.state));
+  const busy = status === "submitted" || status === "streaming" || agentWorking;
+
+  useEffect(() => {
+    if (!agentWorking) return;
+    let live = true;
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const a = await getAgent(cfg);
+          if (!live || isWorking(a.state)) return;
+          const history = toUiMessages(await getMessages(cfg));
+          if (!live) return;
+          setMessages(history);
+          setAgentWorking(false);
+        } catch {
+          // transient: keep polling
+        }
+      })();
+    }, POLL_MS);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [agentWorking, cfg, setMessages]);
+
+  const stick = useRef(true);
+  const bottom = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (stick.current) bottom.current?.scrollIntoView?.({ block: "end" });
+  }, [messages]);
+  const onScroll = (e: UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
 
   const submit = () => {
     const text = draft.trim();
     if (!text || busy) return;
+    lastSent.current = text;
     setDraft("");
     clearError();
+    stick.current = true;
     void sendMessage({ text });
   };
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -58,9 +109,10 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
       className="bg-background text-foreground border-agent flex h-screen flex-col border-l-4"
       style={{ "--agent-h": agent.color.h } as CSSProperties}
       onClick={openExternal}
+      onAuxClick={openExternal}
     >
       <header className="border-border bg-card border-b px-4 py-2 font-semibold">{agent.name}</header>
-      <div className="flex-1 space-y-3 overflow-y-auto p-4">
+      <div className="flex-1 space-y-3 overflow-y-auto p-4" onScroll={onScroll}>
         {messages.map((m) => (
           <div key={m.id} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
             <div className={m.role === "user" ? "bg-muted max-w-[80%] rounded-lg px-3 py-2 whitespace-pre-wrap" : "max-w-[80%] px-1 py-2"}>
@@ -68,7 +120,13 @@ export function Chat({ cfg, agent, initialMessages }: { cfg: HostConfig; agent: 
             </div>
           </div>
         ))}
+        <div ref={bottom} />
       </div>
+      {agentWorking && (
+        <div role="status" className="text-muted-foreground border-border border-t px-4 py-2 text-sm">
+          This agent is still working. The reply will appear here when it finishes.
+        </div>
+      )}
       {error && (
         <div role="alert" className="text-status-error border-border border-t px-4 py-2 text-sm">
           {errorText(error)}
