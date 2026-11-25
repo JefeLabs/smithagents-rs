@@ -149,3 +149,82 @@ fn window_appearance_maps_to_appearance() {
         Appearance::Light
     );
 }
+
+/// The expected token-to-key pairs, pinned literally so a wrong pairing fails.
+const PINNED: &[(&str, &str)] = &[
+    ("background", "background"),
+    ("foreground", "foreground"),
+    ("border", "border"),
+    ("input.border", "input"),
+    ("ring", "ring"),
+    ("selection.background", "selection"),
+    ("accent.background", "accent"),
+    ("accent.foreground", "accent-foreground"),
+    ("primary.background", "primary"),
+    ("primary.foreground", "primary-foreground"),
+    ("secondary.background", "secondary"),
+    ("secondary.foreground", "secondary-foreground"),
+    ("muted.background", "muted"),
+    ("muted.foreground", "muted-foreground"),
+    ("popover.background", "popover"),
+    ("popover.foreground", "popover-foreground"),
+    ("list.background", "card"),
+    ("list.hover.background", "muted"),
+    ("list.active.background", "selection"),
+    ("list.active.border", "ring"),
+    ("list.highlight.foreground", "ring"),
+    ("tab_bar.background", "card"),
+    ("tab.foreground", "muted-foreground"),
+    ("tab.active.background", "background"),
+    ("tab.active.foreground", "foreground"),
+    ("sidebar.background", "card"),
+    ("sidebar.foreground", "card-foreground"),
+    ("title_bar.background", "card"),
+    ("status_bar.background", "card"),
+    ("base.red", "status-error"),
+    ("base.green", "status-ok"),
+    ("base.yellow", "status-warn"),
+    ("base.blue", "status-info"),
+    ("danger.background", "status-error"),
+    ("success.background", "status-ok"),
+    ("warning.background", "status-warn"),
+    ("info.background", "status-info"),
+];
+
+#[test]
+fn mapping_table_is_the_pinned_list() {
+    let mut got: Vec<_> = COLOR_KEY_MAP.to_vec();
+    let mut want: Vec<_> = PINNED.to_vec();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn every_mapped_key_is_a_real_gpui_component_key() {
+    let set = ThemeSet::embedded();
+    let parsed: GpuiThemeSet = serde_json::from_str(&theme_set_json(set)).unwrap();
+    for theme in &parsed.themes {
+        let colors = serde_json::to_value(&theme.colors).unwrap();
+        for (key, _) in COLOR_KEY_MAP {
+            assert!(
+                colors[*key].is_string(),
+                "{}: key {key} is not a gpui-component color key",
+                theme.name
+            );
+        }
+    }
+}
+
+#[test]
+fn each_config_carries_a_highlight_theme_for_its_mode() {
+    let set = ThemeSet::embedded();
+    let parsed: GpuiThemeSet = serde_json::from_str(&theme_set_json(set)).unwrap();
+    for theme in &parsed.themes {
+        let h = theme.highlight.as_ref().expect("highlight block");
+        let native = set.native(&theme.name).unwrap();
+        let bg = gpui_kit::component::theme::try_parse_color(&native.colors["background"].hex())
+            .unwrap();
+        assert_eq!(h.editor_background, Some(bg), "{}", theme.name);
+    }
+}

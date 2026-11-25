@@ -63,12 +63,10 @@ fn apply_startup_theme(cx: &mut App) {
     use smithagents_theme::state::{AppearanceSettings, ThemeController};
     use smithagents_theme::tokens::{Appearance, ThemeSet};
 
-    let controller = ThemeController::new(
-        ThemeSet::embedded().clone(),
-        AppearanceSettings::default(),
-        Appearance::Dark,
-    );
-    theme_adapter::apply_theme_state(&controller.state(), cx);
+    let set = ThemeSet::embedded();
+    let controller =
+        ThemeController::new(set.clone(), AppearanceSettings::default(), Appearance::Dark);
+    theme_adapter::apply_theme_state(set, &controller.state(), cx);
 }
 
 fn open_main_window(cx: &mut App) -> gpui_kit::Result<()> {

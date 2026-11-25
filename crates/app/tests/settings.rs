@@ -113,3 +113,21 @@ fn failed_save_leaves_no_temp_file() {
     assert!(store.save(&AppearanceSettings::default()).is_err());
     assert_eq!(names(dir.path()), vec!["app-settings.json"]);
 }
+
+#[test]
+fn stale_temp_file_does_not_break_save_and_is_not_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let stale = dir
+        .path()
+        .join(format!(".app-settings.json.{}.tmp", std::process::id()));
+    std::fs::write(&stale, "stale").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let store = AppSettingsStore::new(dir.path());
+    store.save(&AppearanceSettings::default()).unwrap();
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
+    let mode = std::fs::metadata(dir.path().join("app-settings.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
