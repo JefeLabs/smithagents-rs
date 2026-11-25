@@ -4,6 +4,8 @@
 //! label, mounted under the Kit's `Root`. Later tasks grow it into the
 //! docked shell; `host-desktop` stays a thin `main` that calls [`run`].
 
+pub mod model;
+
 use gpui_kit::component::label::Label;
 use gpui_kit::{
     div, px, size, App, AppContext as _, Bounds, Context, IntoElement, ParentElement as _,

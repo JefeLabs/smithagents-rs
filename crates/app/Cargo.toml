@@ -13,10 +13,12 @@ workspace = true
 # on macOS). gpui-kit itself turns on the platform crate's `runtime_shaders`,
 # so no Xcode `metal` compiler is needed at build time.
 gpui-kit.workspace = true
+smithagents-core = { path = "../core" }
 futures.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 serde_json.workspace = true
