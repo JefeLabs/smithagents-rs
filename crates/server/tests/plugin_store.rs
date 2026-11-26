@@ -400,6 +400,57 @@ async fn a_failing_statement_rolls_the_whole_page_back() {
     );
 }
 
+/// The last statement of the page, the cursor write, fails: the trigger aborts
+/// every insert into and update of `resource_sync`. Everything before it
+/// (the upserts and the delete of `keep`) must be undone with it.
+#[tokio::test]
+async fn a_failing_cursor_write_rolls_back_the_upserts_and_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("s.db");
+    let store = Store::open(&db).await.unwrap();
+    store
+        .apply_page(
+            "p",
+            "r",
+            "r0",
+            &page(vec![item("keep", "K", None)], &[], Some("c0")),
+            time(AT),
+        )
+        .await
+        .unwrap();
+
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&db)
+        .connect()
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TRIGGER no_cursor_insert BEFORE INSERT ON resource_sync \
+         BEGIN SELECT RAISE(ABORT, 'no cursor'); END",
+        "CREATE TRIGGER no_cursor_update BEFORE UPDATE ON resource_sync \
+         BEGIN SELECT RAISE(ABORT, 'no cursor'); END",
+    ] {
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+    }
+    conn.close().await.unwrap();
+
+    let bad = page(
+        vec![item("fresh", "F", None), item("keep", "K2", None)],
+        &["keep"],
+        Some("c1"),
+    );
+    let err = store.apply_page("p", "r", "r1", &bad, time(AT)).await;
+    assert!(matches!(err, Err(StoreError::Sqlx(_))), "{err:?}");
+    let page = store.list_items("p", "r", 10, None, None).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, "keep");
+    assert_eq!(page.items[0].title, "K");
+    assert_eq!(
+        store.sync_state("p", "r").await.unwrap().cursor.as_deref(),
+        Some("c0")
+    );
+}
+
 #[tokio::test]
 async fn q_escapes_like_wildcards_and_ignores_case() {
     let store = Store::open_in_memory().await.unwrap();

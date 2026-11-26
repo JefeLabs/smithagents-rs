@@ -850,6 +850,7 @@ impl Store {
             .bind(&item.id)
             .fetch_optional(&mut *tx)
             .await?;
+            // Relies on serde_json's sorted-key maps (no `preserve_order`): equal values serialise equally.
             let unchanged = match &existing {
                 Some(r) => {
                     r.try_get::<String, _>("title")? == item.title
