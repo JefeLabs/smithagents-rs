@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use futures::future::LocalBoxFuture;
+use futures::future::{Either, LocalBoxFuture};
 use futures::FutureExt as _;
 use gpui_kit::{
     App, AppContext as _, Context, EventEmitter, PathPromptOptions, RenderImage, Task, Window,
@@ -30,8 +31,9 @@ use super::files::{FileKind, Refusal};
 use super::render::decode;
 use super::text::{
     capture_failed_text, more_files_text, more_notices_text, picker_failed_text,
-    CAPTURE_FRAMES_MISSED, CAPTURE_FRAMES_TIMEOUT, DRAFT_FULL_TEXT, MAX_ATTACHMENTS, MAX_BOXES,
-    MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_NOTICES, MAX_TOTAL_BYTES,
+    CAPTURE_FRAMES_MISSED, CAPTURE_FRAMES_TIMEOUT, CAPTURE_PICTURE_TIMEOUT, CAPTURE_TOO_SLOW,
+    DRAFT_FULL_TEXT, MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_NOTICES,
+    MAX_TOTAL_BYTES,
 };
 use super::work::{
     capture_error_text, copy_in, io_text, read_thumbnail, redraw, render_image, take_picture,
@@ -81,6 +83,11 @@ pub struct FeedbackOptions {
     pub picker: Option<FilePicker>,
     /// Waits for the next frame; `None` is `window.on_next_frame`.
     pub frame_hop: Option<FrameHop>,
+    /// How long the picture itself may take; `None` is
+    /// [`CAPTURE_PICTURE_TIMEOUT`]. (The test clock runs every ready job
+    /// before it moves, so a test sets a short limit instead of a slow
+    /// capturer.)
+    pub picture_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +142,7 @@ pub struct Feedback {
     capturer: Option<Arc<dyn Capturer>>,
     picker: Option<FilePicker>,
     frame_hop: FrameHop,
+    picture_timeout: Duration,
     draft: Draft,
     /// At most [`MAX_NOTICES`], then one line counting `hidden_notices`.
     notices: Vec<String>,
@@ -170,6 +178,7 @@ impl Feedback {
             capturer,
             picker,
             frame_hop,
+            picture_timeout,
         } = options;
         let files = match store {
             Some(store) => Files::Disk(store),
@@ -183,6 +192,7 @@ impl Feedback {
             frame_hop: frame_hop.unwrap_or_else(|| {
                 Rc::new(|window: &mut Window, callback| window.on_next_frame(callback))
             }),
+            picture_timeout: picture_timeout.unwrap_or(CAPTURE_PICTURE_TIMEOUT),
             draft,
             notices: Vec::new(),
             hidden_notices: 0,
@@ -255,8 +265,9 @@ impl Feedback {
     /// says so without capturing. Success adds the screenshot and opens the
     /// annotator; a failure says why and reveals the pane. When the two
     /// frames do not come within [`CAPTURE_FRAMES_TIMEOUT`] (a window that
-    /// draws nothing), the capture gives up the same way, so Capture never
-    /// stays disabled.
+    /// draws nothing), or the picture within [`CAPTURE_PICTURE_TIMEOUT`]
+    /// ([`FeedbackOptions::picture_timeout`]), the capture gives up the same
+    /// way, so Capture never stays disabled.
     pub fn capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.capturing || self.annotating.is_some() {
             return;
@@ -330,16 +341,51 @@ impl Feedback {
         let capturer = self.capturer.clone();
         let picture =
             cx.background_spawn(async move { take_picture(capturer.as_deref(), &target) });
-        // Replaces (and so stops) the fallback timer.
+        let started = cx.background_executor().now();
+        let timeout = cx.background_executor().timer(self.picture_timeout);
+        // Replaces (and so stops) the frames' fallback timer. Whichever comes
+        // first, the picture or the timeout; a picture that hangs is left to
+        // its thread, and its result is never used.
         self.capture = Some(cx.spawn(async move |this, cx| {
-            let picture = picture.await;
-            let _ = this.update(cx, |this, cx| this.finish_capture(picture, cx));
+            let picture = match futures::future::select(picture, timeout).await {
+                Either::Left((picture, _)) => Some(picture),
+                Either::Right(_) => None,
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.finish_capture(generation, started, picture, cx)
+            });
         }));
     }
 
-    fn finish_capture(&mut self, picture: Result<Picture, CaptureError>, cx: &mut Context<Self>) {
+    /// The picture, or `None` when the picture's time limit passed first. A
+    /// picture that comes at or after the limit is dropped too: nothing of
+    /// it is written (the file is written only here, on the UI thread).
+    fn finish_capture(
+        &mut self,
+        generation: u64,
+        started: Instant,
+        picture: Option<Result<Picture, CaptureError>>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.capturing || generation != self.capture_generation {
+            return;
+        }
         self.capturing = false;
         self.capture = None;
+        let waited = cx
+            .background_executor()
+            .now()
+            .saturating_duration_since(started);
+        let picture = match picture {
+            Some(picture) if waited < self.picture_timeout => picture,
+            _ => {
+                tracing::warn!(
+                    after = ?self.picture_timeout,
+                    "feedback capture: the picture took too long; giving up"
+                );
+                Err(CaptureError::Failed(CAPTURE_TOO_SLOW.to_string()))
+            }
+        };
         match self.add_screenshot(picture) {
             Ok(id) => {
                 self.annotating = Some(id.clone());

@@ -106,11 +106,12 @@ pub fn pick_window(windows: &[WindowInfo], target: &WindowTarget) -> Option<usiz
 }
 
 /// Failed(WRONG_SIZE_CAPTURE) when rgba.len() != width * height * 4; Failed(EMPTY_CAPTURE) when
-/// no pixel is opaque at all (alpha 0 everywhere, or no pixels) or every opaque pixel equals
-/// the first one; otherwise the screenshot unchanged.
+/// no pixel is fully opaque (or there are no pixels) or every fully opaque pixel has the color
+/// of the first one; otherwise the screenshot unchanged.
 ///
-/// Only pixels with some alpha count: a real window capture has fully transparent rounded
-/// corners, which would make a window of one color look like two colors.
+/// Only fully opaque pixels (alpha 255) count, compared by color: a real window capture has
+/// rounded corners, transparent and then anti-aliased (partly opaque, of other colors), which
+/// would make a window of one color look like a picture.
 pub fn checked(shot: Screenshot) -> Result<Screenshot, CaptureError> {
     let expected_len = (shot.width as usize)
         .checked_mul(shot.height as usize)
@@ -120,10 +121,13 @@ pub fn checked(shot: Screenshot) -> Result<Screenshot, CaptureError> {
     }
     // The length is a whole number of pixels, so nothing is left over.
     let (pixels, _) = shot.rgba.as_chunks::<4>();
-    let mut opaque = pixels.iter().filter(|pixel| pixel[3] > 0);
+    let mut opaque = pixels
+        .iter()
+        .filter(|pixel| pixel[3] == u8::MAX)
+        .map(|pixel| &pixel[..3]);
     let has_two_colors = opaque
         .next()
-        .is_some_and(|first| opaque.any(|pixel| pixel != first));
+        .is_some_and(|first| opaque.any(|color| color != first));
     if !has_two_colors {
         return Err(CaptureError::Failed(EMPTY_CAPTURE.into()));
     }

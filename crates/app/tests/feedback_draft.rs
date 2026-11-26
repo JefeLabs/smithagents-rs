@@ -7,7 +7,8 @@ use smithagents_app::feedback::draft::{
 };
 use smithagents_app::feedback::files::{FileKind, Usage};
 use smithagents_app::feedback::text::{
-    removed_attachments_text, save_failed_text, BROKEN_DRAFT_TEXT, DRAFT_NOT_SET_ASIDE,
+    removed_attachments_text, save_failed_text, BROKEN_DRAFT_TEXT, DRAFT_FOLDER_NOT_A_FOLDER,
+    DRAFT_NOT_SET_ASIDE,
 };
 
 fn note(x: f32, y: f32, w: f32, h: f32) -> Annotation {
@@ -604,4 +605,142 @@ fn a_failed_save_leaves_the_old_draft_intact() {
         .filter(|n| n.ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn a_draft_with_only_a_main_idea_keeps_its_file() {
+    let home = tempfile::tempdir().unwrap();
+    let store = DraftStore::new(home.path());
+    let idea = Draft {
+        main_idea: "Let the zoom follow the pointer".to_string(),
+        ..Draft::default()
+    };
+    store.save(&idea).unwrap();
+    fs::write(store.dir().join("image-4.png"), b"left behind").unwrap();
+
+    let loaded = store.load();
+
+    assert_eq!(loaded.draft, idea);
+    assert_eq!(names_in(&store.dir()), vec!["draft.json"]);
+    assert_eq!(store.load().draft, idea);
+    // A blank main idea is nothing to keep.
+    store
+        .save(&Draft {
+            main_idea: "  \n".to_string(),
+            ..Draft::default()
+        })
+        .unwrap();
+    assert!(store.load().draft.attachments.is_empty());
+    assert!(!store.dir().exists());
+}
+
+#[test]
+fn a_linked_draft_folder_is_never_swept_or_written_through() {
+    let home = tempfile::tempdir().unwrap();
+    let store = DraftStore::new(home.path());
+    let elsewhere = home.path().join("elsewhere");
+    let there = DraftStore::new(&elsewhere);
+    let draft = draft_of(vec![plain(
+        AttachmentKind::Image,
+        "a.png",
+        "image-1.png",
+        5,
+    )]);
+    write_files(&there, &draft);
+    there.save(&draft).unwrap();
+    fs::write(there.dir().join("orphan.png"), b"x").unwrap();
+    let before = fs::read(there.dir().join("draft.json")).unwrap();
+    fs::create_dir_all(home.path().join("feedback")).unwrap();
+    std::os::unix::fs::symlink(there.dir(), store.dir()).unwrap();
+
+    let loaded = store.load();
+    let saved = store.save(&Draft::default());
+    let written = store.write_file("screenshot-1.png", b"new");
+    let cleared = store.clear();
+    store.sweep(&Draft::default());
+    store.remove_file("image-1.png");
+
+    assert_eq!(loaded.draft, Draft::default());
+    assert_eq!(
+        loaded.notices,
+        vec![save_failed_text(DRAFT_FOLDER_NOT_A_FOLDER)]
+    );
+    assert!(saved.is_err() && written.is_err() && cleared.is_err());
+    assert_eq!(
+        names_in(&there.dir()),
+        vec!["draft.json", "image-1.png", "orphan.png"]
+    );
+    assert_eq!(fs::read(there.dir().join("draft.json")).unwrap(), before);
+    assert!(fs::symlink_metadata(store.dir())
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+/// `chflags uchg` on a file: it can be read and the files beside it
+/// deleted, but nothing can be renamed over it. Undone when dropped.
+#[cfg(target_os = "macos")]
+struct Immutable(std::path::PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Immutable {
+    fn new(path: std::path::PathBuf) -> Self {
+        let status = std::process::Command::new("/usr/bin/chflags")
+            .arg("uchg")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        Self(path)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("/usr/bin/chflags")
+            .arg("nouchg")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_cleaned_draft_that_cannot_be_saved_is_not_swept() {
+    let home = tempfile::tempdir().unwrap();
+    let store = DraftStore::new(home.path());
+    let draft = draft_of(vec![
+        plain(AttachmentKind::Image, "a.png", "image-1.png", 5),
+        plain(AttachmentKind::Image, "b.png", "image-2.png", 5),
+    ]);
+    write_files(&store, &draft);
+    store.save(&draft).unwrap();
+    fs::remove_file(store.path_of("image-2.png")).unwrap();
+    store.write_file("image-2.thumb.png", b"x").unwrap();
+    fs::write(store.dir().join("image-9.png"), b"left behind").unwrap();
+    let before = fs::read(store.dir().join("draft.json")).unwrap();
+
+    let loaded = {
+        let _locked = Immutable::new(store.dir().join("draft.json"));
+        store.load()
+    };
+
+    // The cleaned draft could not be saved: the one on disk still names
+    // image-2, so nothing is swept.
+    assert_eq!(loaded.draft.attachments.len(), 1);
+    assert_eq!(fs::read(store.dir().join("draft.json")).unwrap(), before);
+    assert_eq!(
+        names_in(&store.dir()),
+        vec![
+            "draft.json",
+            "image-1.png",
+            "image-2.thumb.png",
+            "image-9.png"
+        ]
+    );
+    // Saved the next time, it is swept.
+    let again = store.load();
+    assert_eq!(again.draft.attachments.len(), 1);
+    assert_eq!(names_in(&store.dir()), vec!["draft.json", "image-1.png"]);
 }

@@ -23,8 +23,9 @@ use smithagents_app::feedback::render::{decode, BOX_RGB};
 use smithagents_app::feedback::state::{Feedback, FeedbackEvent, FeedbackOptions};
 use smithagents_app::feedback::text::{
     capture_failed_text, more_files_text, more_notices_text, save_failed_text,
-    CAPTURE_FRAMES_MISSED, DRAFT_FULL_TEXT, DRAFT_NOT_SET_ASIDE, MAX_COMMENT_CHARS,
-    MAX_IMAGE_BYTES, PERMISSION_TEXT, UNSUPPORTED_TEXT, WINDOW_NOT_FOUND_TEXT,
+    CAPTURE_FRAMES_MISSED, CAPTURE_PICTURE_TIMEOUT, CAPTURE_TOO_SLOW, DRAFT_FULL_TEXT,
+    DRAFT_NOT_SET_ASIDE, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, PERMISSION_TEXT, UNSUPPORTED_TEXT,
+    WINDOW_NOT_FOUND_TEXT,
 };
 use smithagents_app::shell::ShellOptions;
 use smithagents_capture::{CaptureError, FakeCapturer, Screenshot};
@@ -593,6 +594,7 @@ fn without_a_store_the_draft_is_kept_in_memory(cx: &mut TestAppContext) {
             capturer: Some(capturer.clone()),
             picker: None,
             frame_hop: hops,
+            picture_timeout: None,
         }),
         ..Default::default()
     };
@@ -965,4 +967,85 @@ fn a_screenshot_that_does_not_decode_says_it_could_not_be_drawn(cx: &mut TestApp
     );
     assert_eq!(*events.borrow(), vec![FeedbackEvent::CloseAnnotator]);
     assert!(!busy(cx, &feedback));
+}
+
+#[gpui_kit::test]
+fn removing_the_last_attachment_keeps_a_typed_main_idea(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    // A draft with a main idea (the next step types one) and one picture.
+    let store = setup.store();
+    store.write_file("image-1.png", &png(4, 4)).unwrap();
+    let mut saved = Draft {
+        main_idea: "Let the zoom follow the pointer".to_string(),
+        ..Draft::default()
+    };
+    saved
+        .attachments
+        .push(smithagents_app::feedback::draft::Attachment {
+            id: AttachmentId::new(),
+            kind: AttachmentKind::Image,
+            original_name: "a.png".to_string(),
+            stored_name: "image-1.png".to_string(),
+            size: 4,
+            width: None,
+            height: None,
+            boxes: Vec::new(),
+            rendered: false,
+        });
+    store.save(&saved).unwrap();
+    let (window, _, feedback) = setup.open(cx);
+    let id = draft(cx, &feedback).attachments[0].id.clone();
+
+    act(cx, window, &feedback, |f, _, cx| f.remove(&id, cx));
+
+    assert_eq!(file_names(&setup.draft_dir()), vec!["draft.json"]);
+    let loaded = setup.store().load();
+    assert_eq!(loaded.draft.main_idea, saved.main_idea);
+    assert!(loaded.draft.attachments.is_empty());
+}
+
+#[gpui_kit::test]
+fn a_picture_that_takes_too_long_is_dropped(cx: &mut TestAppContext) {
+    assert_eq!(CAPTURE_PICTURE_TIMEOUT, Duration::from_secs(10));
+    let setup = FeedbackSetup::new();
+    // The test clock runs every ready job before it moves: a picture cannot
+    // be made late with it, so the limit is nothing at all here.
+    let mut options = setup.options();
+    options.feedback.as_mut().unwrap().picture_timeout = Some(Duration::ZERO);
+    let (window, shell) = open_shell_options(cx, options, (1200., 800.));
+    let feedback = cx.read(|cx| shell.read(cx).feedback().clone());
+    let events = record_events(cx, &feedback);
+
+    // Whether the picture's job ran or was dropped unstarted, its result is
+    // never used.
+    capture_now(cx, window, &feedback, &setup);
+
+    assert!(!cx.read(|cx| feedback.read(cx).capturing()));
+    assert_eq!(
+        notices(cx, &feedback),
+        vec![capture_failed_text(CAPTURE_TOO_SLOW)]
+    );
+    assert_eq!(*events.borrow(), vec![FeedbackEvent::RevealPane]);
+    assert!(draft(cx, &feedback).is_empty());
+    assert_eq!(annotating(cx, &feedback), None);
+    assert!(file_names(&setup.draft_dir()).is_empty(), "nothing written");
+
+    // Capture is not stuck: the next one runs (and is late again).
+    events.borrow_mut().clear();
+    capture_now(cx, window, &feedback, &setup);
+    assert!(!cx.read(|cx| feedback.read(cx).capturing()));
+    assert_eq!(*events.borrow(), vec![FeedbackEvent::RevealPane]);
+    assert!(draft(cx, &feedback).is_empty());
+}
+
+#[gpui_kit::test]
+fn a_picture_in_time_is_kept_whatever_the_clock_does_later(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    capture_now(cx, window, &feedback, &setup);
+    cx.executor().advance_clock(CAPTURE_PICTURE_TIMEOUT * 2);
+    cx.run_until_parked();
+    assert_eq!(draft(cx, &feedback).attachments.len(), 1);
+    assert!(annotating(cx, &feedback).is_some());
+    assert!(notices(cx, &feedback).is_empty());
 }

@@ -2,8 +2,9 @@
 //! `<home>/feedback/draft/`. Everything read from that directory is treated
 //! as untrusted: a stored name never leaves the directory, and a damaged
 //! draft is set aside instead of failing (only the newest set-aside draft is
-//! kept). A draft that cannot be set aside is never written over. Files the
-//! draft does not name are swept away.
+//! kept). A draft that cannot be set aside is never written over, and a link
+//! in the directory's place is never read, written or swept through. Files
+//! the draft does not name are swept away.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -19,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use super::annotation::Annotation;
 use super::files::{FileKind, Usage};
 use super::text::{
-    removed_attachments_text, save_failed_text, BROKEN_DRAFT_TEXT, DRAFT_NOT_SET_ASIDE,
-    MAX_ATTACHMENTS, MAX_BOXES,
+    removed_attachments_text, save_failed_text, BROKEN_DRAFT_TEXT, DRAFT_FOLDER_NOT_A_FOLDER,
+    DRAFT_NOT_SET_ASIDE, MAX_ATTACHMENTS, MAX_BOXES,
 };
 
 pub const DRAFT_VERSION: u32 = 1;
@@ -114,8 +115,15 @@ impl Default for Draft {
 }
 
 impl Draft {
+    /// No attachments (a main idea may still be there: see [`Draft::is_blank`]).
     pub fn is_empty(&self) -> bool {
         self.attachments.is_empty()
+    }
+
+    /// Nothing worth keeping: no attachments and no main idea. Only a blank
+    /// draft takes its directory, `draft.json` included, away.
+    pub fn is_blank(&self) -> bool {
+        self.attachments.is_empty() && self.main_idea.trim().is_empty()
     }
 
     pub fn usage(&self) -> Usage {
@@ -257,14 +265,40 @@ impl DraftStore {
         }
     }
 
+    /// The draft directory, to write or delete in: refused while a damaged
+    /// draft that could not be set aside is in its place, and when a link
+    /// (or a file) is in its place, which is never written or swept through.
+    /// A directory that is not there yet is fine: a write creates it.
+    fn writable_dir(&self) -> io::Result<PathBuf> {
+        if self.stuck.load(Ordering::SeqCst) {
+            return Err(stuck_error());
+        }
+        let dir = self.dir();
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_dir() => Ok(dir),
+            Ok(_) => Err(io::Error::other(DRAFT_FOLDER_NOT_A_FOLDER)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(dir),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Never fails: a draft that cannot be read is set aside and an empty one
     /// answered with a notice. A draft that cannot be set aside stays where
     /// it is, and the store refuses every write until a later load (the
-    /// notice says the draft cannot be saved). Attachments whose files are
+    /// notice says the draft cannot be saved); so does a link in the draft
+    /// directory's place, which is not read. Attachments whose files are
     /// gone are dropped first, then all but the first [`MAX_ATTACHMENTS`];
-    /// then the files the draft does not name are swept away.
+    /// then, once the cleaned draft is saved (or needed no saving), the
+    /// files it does not name are swept away.
     pub fn load(&self) -> Loaded {
         self.stuck.store(false, Ordering::SeqCst);
+        if fs::symlink_metadata(self.dir()).is_ok_and(|meta| !meta.file_type().is_dir()) {
+            tracing::warn!("the feedback draft directory is not a folder; it is left alone");
+            return Loaded {
+                draft: Draft::default(),
+                notices: vec![save_failed_text(DRAFT_FOLDER_NOT_A_FOLDER)],
+            };
+        }
         let json_path = self.dir().join(DRAFT_FILE);
         match fs::symlink_metadata(&json_path) {
             Ok(_) => {}
@@ -332,36 +366,46 @@ impl DraftStore {
         let notices = removed_attachments_text(missing, over_limit)
             .into_iter()
             .collect();
-        if draft != before {
-            if let Err(e) = self.save(&draft) {
-                tracing::warn!(error = %e, "could not save the cleaned feedback draft");
-            }
+        let saved = draft == before
+            || match self.save(&draft) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not save the cleaned feedback draft");
+                    false
+                }
+            };
+        // The draft on disk still names what was dropped: nothing to sweep.
+        if saved {
+            // Nothing else writes yet: a temp file now is left from a crash.
+            self.sweep_files(&draft, true);
         }
-        // Nothing else writes yet: a temp file now is left from a crash.
-        self.sweep_files(&draft, true);
         Loaded { draft, notices }
     }
 
     /// Deletes the regular files in the draft directory that `draft` does
-    /// not name ([`Draft::file_names`]); an empty draft takes the directory
-    /// with it. Temp files are kept: a write may be under way. Never follows
-    /// a link, never enters a folder, never leaves the directory; does
-    /// nothing while the store refuses writes. Errors are logged.
+    /// not name ([`Draft::file_names`]); a blank draft ([`Draft::is_blank`])
+    /// takes the directory with it. Temp files are kept: a write may be
+    /// under way. Never follows a link, never enters a folder, never leaves
+    /// the directory; does nothing while the store refuses writes or a link
+    /// is in the directory's place. Errors are logged.
     pub fn sweep(&self, draft: &Draft) {
         self.sweep_files(draft, false);
     }
 
     fn sweep_files(&self, draft: &Draft, with_temps: bool) {
-        if self.stuck.load(Ordering::SeqCst) {
-            return;
-        }
-        if draft.is_empty() {
+        let dir = match self.writable_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::debug!(error = %e, "the feedback draft is not swept");
+                return;
+            }
+        };
+        if draft.is_blank() {
             if let Err(e) = self.clear() {
-                tracing::warn!(error = %e, "could not delete the empty feedback draft");
+                tracing::warn!(error = %e, "could not delete the blank feedback draft");
             }
             return;
         }
-        let dir = self.dir();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -455,25 +499,21 @@ impl DraftStore {
 
     /// Atomic: the old `draft.json` stays readable when this fails.
     pub fn save(&self, draft: &Draft) -> io::Result<()> {
-        if self.stuck.load(Ordering::SeqCst) {
-            return Err(stuck_error());
-        }
+        let dir = self.writable_dir()?;
         let json = serde_json::to_vec_pretty(draft).map_err(io::Error::other)?;
-        crate::atomic_file::write_private(&self.dir(), DRAFT_FILE, &json)
+        crate::atomic_file::write_private(&dir, DRAFT_FILE, &json)
     }
 
     /// Atomic. A name that is not a plain file name is refused.
     pub fn write_file(&self, stored_name: &str, bytes: &[u8]) -> io::Result<()> {
-        if self.stuck.load(Ordering::SeqCst) {
-            return Err(stuck_error());
-        }
+        let dir = self.writable_dir()?;
         if !is_plain_name(stored_name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "not a plain file name",
             ));
         }
-        crate::atomic_file::write_private(&self.dir(), stored_name, bytes)
+        crate::atomic_file::write_private(&dir, stored_name, bytes)
     }
 
     /// Removes the file and its annotated and thumbnail files; errors are
@@ -491,13 +531,14 @@ impl DraftStore {
 
     /// Removes these files of the draft directory (a name that is not a
     /// plain file name is skipped); errors are logged, a missing file is not
-    /// an error. Nothing while the store refuses writes.
+    /// an error. Nothing while the store refuses writes or a link is in the
+    /// directory's place.
     pub fn remove_named(&self, names: &[String]) {
-        if self.stuck.load(Ordering::SeqCst) {
+        let Ok(dir) = self.writable_dir() else {
             return;
-        }
+        };
         for name in names.iter().filter(|name| is_plain_name(name)) {
-            if let Err(e) = fs::remove_file(self.path_of(name)) {
+            if let Err(e) = fs::remove_file(dir.join(name)) {
                 if e.kind() != io::ErrorKind::NotFound {
                     tracing::warn!(error = %e, file = %name, "could not remove a feedback file");
                 }
@@ -505,13 +546,11 @@ impl DraftStore {
         }
     }
 
-    /// Removes the draft directory (a link in its place is removed, not
-    /// followed).
+    /// Removes the draft directory; refused when a link (or a file) is in
+    /// its place.
     pub fn clear(&self) -> io::Result<()> {
-        if self.stuck.load(Ordering::SeqCst) {
-            return Err(stuck_error());
-        }
-        match fs::remove_dir_all(self.dir()) {
+        let dir = self.writable_dir()?;
+        match fs::remove_dir_all(dir) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }

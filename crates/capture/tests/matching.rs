@@ -159,10 +159,41 @@ fn an_empty_or_single_color_capture_is_refused() {
     assert_eq!(checked(one_pixel_changed.clone()), Ok(one_pixel_changed));
 }
 
-#[test]
-fn transparent_corners_do_not_make_a_single_color_capture_usable() {
-    assert_eq!(checked(with_transparent_corners(gray(8, 6))), empty());
+/// Anti-aliased rounded corners: pixels next to each corner that are only
+/// partly opaque, each a color of its own.
+fn with_soft_corners(mut shot: Screenshot) -> Screenshot {
+    let (width, height) = (shot.width as usize, shot.height as usize);
+    let soft = [[250, 10, 10, 1], [10, 250, 10, 128], [10, 10, 250, 254]];
+    for (corner_x, corner_y, step_x, step_y) in [
+        (0, 0, 1, 1),
+        (width - 1, 0, -1, 1),
+        (0, height - 1, 1, -1),
+        (width - 1, height - 1, -1, -1),
+    ] {
+        let near = [(1, 0), (0, 1), (1, 1)];
+        for ((dx, dy), color) in near.into_iter().zip(soft) {
+            let x = (corner_x as isize + dx * step_x) as usize;
+            let y = (corner_y as isize + dy * step_y) as usize;
+            let at = (y * width + x) * 4;
+            shot.rgba[at..at + 4].copy_from_slice(&color);
+        }
+    }
+    shot
+}
 
+#[test]
+fn only_fully_opaque_pixels_decide_whether_a_capture_is_empty() {
+    // One color inside rounded corners: transparent, then partly opaque
+    // edge pixels of other colors.
+    let one_gray = with_soft_corners(with_transparent_corners(gray(8, 6)));
+    assert_eq!(checked(one_gray), empty());
+
+    // Nothing fully opaque at all, however varied.
+    let mut partly = test_pattern(8, 6);
+    for pixel in partly.rgba.chunks_mut(4) {
+        pixel[3] = 128;
+    }
+    assert_eq!(checked(partly), empty(), "only partly opaque pixels");
     let clear = Screenshot {
         width: 4,
         height: 4,
@@ -170,12 +201,8 @@ fn transparent_corners_do_not_make_a_single_color_capture_usable() {
     };
     assert_eq!(checked(clear), empty(), "nothing opaque at all");
 
-    // A faint pixel still counts: only alpha 0 is left out.
-    let mut faint = with_transparent_corners(gray(8, 6));
-    faint.rgba[4 * 9..4 * 10].copy_from_slice(&[200, 10, 10, 1]);
-    assert_eq!(checked(faint.clone()), Ok(faint));
-
-    let varied = with_transparent_corners(test_pattern(8, 6));
+    // A real picture with the same corners is usable.
+    let varied = with_soft_corners(with_transparent_corners(test_pattern(8, 6)));
     assert_eq!(checked(varied.clone()), Ok(varied));
 }
 

@@ -153,6 +153,7 @@ fn open_main_window(
                         capturer: Some(Arc::new(XcapCapturer::new())),
                         picker: Some(native_file_picker()),
                         frame_hop: None,
+                        picture_timeout: None,
                     }),
                 },
                 window,

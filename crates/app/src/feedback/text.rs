@@ -17,6 +17,8 @@ pub const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_NOTICES: usize = 20;
 /// How long a capture waits for its two frames before it gives up.
 pub const CAPTURE_FRAMES_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a capture waits for the picture itself before it gives up.
+pub const CAPTURE_PICTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// macOS keeps reporting the permission as missing until the app restarts
 /// after it is granted, hence "quit and reopen" rather than "try again".
@@ -56,6 +58,12 @@ pub const CAPTURE_FRAMES_MISSED: &str = "the window was not drawn";
 /// set aside is still in the draft's place: nothing is written over it.
 pub const DRAFT_NOT_SET_ASIDE: &str =
     "the saved draft could not be read or set aside, so it is left untouched";
+/// The [`save_failed_text`] reason when the draft's folder is a link (or a
+/// file): nothing is read, written or deleted through it.
+pub const DRAFT_FOLDER_NOT_A_FOLDER: &str = "the draft's folder is a link or a file, not a folder";
+/// The [`capture_failed_text`] reason when the picture did not come within
+/// [`CAPTURE_PICTURE_TIMEOUT`].
+pub const CAPTURE_TOO_SLOW: &str = "taking the picture took too long";
 
 pub fn capture_failed_text(message: &str) -> String {
     format!("Could not capture the window: {message}.")

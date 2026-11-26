@@ -87,6 +87,7 @@ impl FeedbackSetup {
                 capturer: Some(self.capturer.clone()),
                 picker: Some(picker),
                 frame_hop: Some(frame_hop),
+                picture_timeout: None,
             }),
             ..Default::default()
         }
