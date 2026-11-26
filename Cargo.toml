@@ -55,3 +55,7 @@ wasmtime = { version = "=51.0.0", default-features = false, features = ["async",
 wasmtime-wasi = { version = "=51.0.0", default-features = false, features = ["p2"] }
 wasmtime-wasi-io = "=51.0.0"
 wit-bindgen = { version = "=0.63.0", default-features = false, features = ["macros", "realloc", "std"] }
+# Built-in native plugins: an ABI-stable interface checked at load. Pinned
+# exactly: host and plugins must agree on stabby's type reports.
+stabby = "=72.1.16"
+libloading = "0.9"

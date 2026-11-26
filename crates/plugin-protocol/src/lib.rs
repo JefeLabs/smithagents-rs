@@ -4,6 +4,8 @@
 //! [`HostApi::http`], and answer with a [`SyncPage`]. Everything that crosses a
 //! host boundary (dylib, WebAssembly, process) is one of these serialisable types.
 
+#[cfg(feature = "dylib")]
+pub mod dylib;
 mod envelope;
 mod manifest;
 mod types;

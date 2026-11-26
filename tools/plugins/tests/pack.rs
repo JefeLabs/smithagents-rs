@@ -1,25 +1,27 @@
 //! Packing the fixtures: valid manifests beside real components, and packing
 //! that is safe to repeat while another packer writes the same directory.
 
+use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::fs;
 use std::path::Path;
 
 use smithagents_plugin_protocol::{HostMode, Manifest, SettingKind};
 use smithagents_plugins_tool::{pack, pack_fixtures_once, PackOptions};
 
-const BEHAVIOURS: [&str; 12] = [
-    "items", "http", "post", "auth", "rate", "panic", "sleep", "huge", "dupe", "forever", "spin",
-    "bloat",
+const FIXTURES: [&str; 3] = ["fixture-dylib", "fixture-wasm", "fixture-wasm-fs"];
+
+/// What every mode runs.
+const SHARED: [&str; 9] = [
+    "items", "http", "post", "auth", "rate", "panic", "sleep", "huge", "dupe",
 ];
 
-/// Parses `<dir>/<id>/plugin.toml` and checks it describes a wasm fixture
-/// whose entry file is a WebAssembly binary.
+/// Parses `<dir>/<id>/plugin.toml` and checks the fixture's declarations, its
+/// mode-specific resources and its entry file.
 fn check_fixture(dir: &Path, id: &str) {
     let dir = dir.join(id);
     let text = fs::read_to_string(dir.join("plugin.toml")).unwrap();
     let manifest = Manifest::parse(&text).unwrap();
     assert_eq!(manifest.id.as_ref(), id);
-    assert_eq!(manifest.host, HostMode::Wasm);
     assert_eq!(manifest.hosts, ["fixture.invalid"]);
     assert_eq!(manifest.secrets.len(), 1);
     assert_eq!(manifest.secrets[0].key, "token");
@@ -34,15 +36,40 @@ fn check_fixture(dir: &Path, id: &str) {
         [("url", SettingKind::Text), ("ms", SettingKind::Text)]
     );
     let kinds: Vec<_> = manifest.resources.iter().map(|r| r.kind.as_str()).collect();
-    assert_eq!(kinds, BEHAVIOURS);
-    let entry = fs::read(dir.join(manifest.entry.unwrap())).unwrap();
-    assert!(entry.starts_with(b"\0asm"), "the entry is not WebAssembly");
+    let entry_name = manifest.entry.unwrap();
+    let entry = fs::read(dir.join(&entry_name)).unwrap();
+    if id == "fixture-dylib" {
+        assert_eq!(manifest.host, HostMode::Dylib);
+        assert_eq!(kinds, [&SHARED[..], &["stale-call"]].concat());
+        assert_eq!(
+            entry_name,
+            format!("{DLL_PREFIX}smithagents_plugin_fixture_dylib{DLL_SUFFIX}")
+        );
+        assert!(!entry.starts_with(b"\0asm"), "the entry is WebAssembly");
+    } else {
+        assert_eq!(manifest.host, HostMode::Wasm);
+        assert_eq!(kinds, [&SHARED[..], &["forever", "spin", "bloat"]].concat());
+        assert!(entry.starts_with(b"\0asm"), "the entry is not WebAssembly");
+    }
+    for file in [dir.join("plugin.toml"), dir.join(&entry_name)] {
+        assert_not_writable_by_others(&file);
+    }
 }
+
+#[cfg(unix)]
+fn assert_not_writable_by_others(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o022, 0, "{} has mode {mode:o}", path.display());
+}
+
+#[cfg(not(unix))]
+fn assert_not_writable_by_others(_path: &Path) {}
 
 #[test]
 fn the_fixtures_are_packed_with_valid_manifests() {
     let packed = pack_fixtures_once();
-    assert_eq!(packed.ids, ["fixture-wasm", "fixture-wasm-fs"]);
+    assert_eq!(packed.ids, FIXTURES);
     for id in &packed.ids {
         check_fixture(&packed.dir, id);
     }
@@ -66,19 +93,24 @@ fn concurrent_packs_into_one_directory_both_succeed() {
     for packer in packers {
         packer.join().unwrap().unwrap();
     }
-    for id in ["fixture-wasm", "fixture-wasm-fs"] {
+    for id in FIXTURES {
         check_fixture(out.path(), id);
     }
-    // Only the packed directories remain: no temporary files.
-    let mut names: Vec<_> = fs::read_dir(out.path().join("fixture-wasm"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
-    assert_eq!(
-        names,
-        ["plugin.toml", "smithagents_plugin_fixture_wasm.wasm"]
-    );
+    // Only the packed files remain: no temporary files.
+    let library = format!("{DLL_PREFIX}smithagents_plugin_fixture_dylib{DLL_SUFFIX}");
+    for (id, entry) in [
+        ("fixture-dylib", library.as_str()),
+        ("fixture-wasm", "smithagents_plugin_fixture_wasm.wasm"),
+    ] {
+        let mut names: Vec<_> = fs::read_dir(out.path().join(id))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut expected = vec![entry, "plugin.toml"];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
 }
 
 #[test]

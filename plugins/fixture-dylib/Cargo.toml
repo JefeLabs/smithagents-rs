@@ -1,0 +1,20 @@
+[package]
+name = "smithagents-plugin-fixture-dylib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+smithagents-plugin-protocol = { path = "../../crates/plugin-protocol", features = ["dylib"] }
+smithagents-plugin-fixture = { path = "../fixture" }
+serde_json.workspace = true
+# `export_dylib_plugin!` uses `#[stabby::export]`, which looks `stabby` up by
+# name in this crate's dependencies.
+stabby.workspace = true

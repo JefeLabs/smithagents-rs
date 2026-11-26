@@ -5,6 +5,7 @@
 //! named by a request's `auth` are resolved from a [`SecretSource`] and added
 //! by the host, so a plugin never sees a secret value.
 
+mod dylib;
 mod http;
 mod linked;
 mod runtime;
@@ -12,6 +13,7 @@ mod secrets;
 mod services;
 mod wasm;
 
+pub use dylib::DylibRuntime;
 pub use http::HttpPolicy;
 pub use linked::LinkedRuntime;
 pub use runtime::{CallError, LoadError, PluginRuntime};

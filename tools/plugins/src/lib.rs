@@ -5,7 +5,10 @@
 //! Builds run `$CARGO` (else `cargo`) with `--target-dir target/plugin-pack`,
 //! apart from the workspace's own target directory, so a test that packs the
 //! fixtures does not wait on the `cargo test` that started it.
+//!
+//! Packed files are never group- or world-writable: discovery refuses those.
 
+use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -43,6 +46,10 @@ pub enum PackError {
 }
 
 const WASM_TARGET: &str = "wasm32-wasip2";
+/// Manifests and WebAssembly components.
+const FILE_MODE: u32 = 0o644;
+/// Native libraries.
+const LIBRARY_MODE: u32 = 0o755;
 
 /// One plugin this tool knows how to pack.
 struct Spec {
@@ -50,16 +57,20 @@ struct Spec {
     name: &'static str,
     /// The Cargo package that builds the entry file.
     package: &'static str,
-    /// The package's library name: the entry file is `<lib>.wasm`.
+    /// The package's library name: the entry file is `<lib>.wasm` for
+    /// `wasm`, and the platform's library file name (`lib<lib>.dylib` on
+    /// macOS) for `dylib`.
     lib: &'static str,
+    /// `Wasm` or `Dylib`.
     host: HostMode,
-    /// The manifest after the generated header.
-    body: &'static str,
+    /// The manifest after the generated header, in parts.
+    body: &'static [&'static str],
     fixture: bool,
 }
 
-/// The fixture plugin's declarations: one resource per behaviour.
-const FIXTURE_BODY: &str = r#"hosts = ["fixture.invalid"]
+/// The fixture plugin's declarations, with the resources every mode runs:
+/// one per behaviour.
+const FIXTURE_DECLS: &str = r#"hosts = ["fixture.invalid"]
 
 [[secrets]]
 key = "token"
@@ -120,7 +131,10 @@ interval_secs = 60
 kind = "dupe"
 label = "Duplicate ids"
 interval_secs = 60
+"#;
 
+/// Behaviours only a WebAssembly host can stop.
+const FIXTURE_WASM_ONLY: &str = r#"
 [[resources]]
 kind = "forever"
 label = "Never done"
@@ -137,14 +151,31 @@ label = "Grows its memory without end"
 interval_secs = 60
 "#;
 
+/// The behaviour only the native fixture has.
+const FIXTURE_DYLIB_ONLY: &str = r#"
+[[resources]]
+kind = "stale-call"
+label = "Calls the host under the previous call's number"
+interval_secs = 60
+"#;
+
 const PLUGINS: &[Spec] = &[
+    Spec {
+        id: "fixture-dylib",
+        name: "Fixture (native)",
+        package: "smithagents-plugin-fixture-dylib",
+        lib: "smithagents_plugin_fixture_dylib",
+        host: HostMode::Dylib,
+        body: &[FIXTURE_DECLS, FIXTURE_DYLIB_ONLY],
+        fixture: true,
+    },
     Spec {
         id: "fixture-wasm",
         name: "Fixture (WebAssembly)",
         package: "smithagents-plugin-fixture-wasm",
         lib: "smithagents_plugin_fixture_wasm",
         host: HostMode::Wasm,
-        body: FIXTURE_BODY,
+        body: &[FIXTURE_DECLS, FIXTURE_WASM_ONLY],
         fixture: true,
     },
     Spec {
@@ -153,7 +184,7 @@ const PLUGINS: &[Spec] = &[
         package: "smithagents-plugin-fixture-wasm-fs",
         lib: "smithagents_plugin_fixture_wasm_fs",
         host: HostMode::Wasm,
-        body: FIXTURE_BODY,
+        body: &[FIXTURE_DECLS, FIXTURE_WASM_ONLY],
         fixture: true,
     },
 ];
@@ -181,24 +212,36 @@ pub fn pack(opts: &PackOptions) -> Result<Packed, PackError> {
         .filter(|s| opts.fixtures || !s.fixture)
         .collect();
     let root = workspace_root();
-    let profile = if opts.release { "release" } else { "debug" };
 
-    let wasm: Vec<&str> = specs
-        .iter()
-        .filter(|s| s.host == HostMode::Wasm)
-        .map(|s| s.package)
-        .collect();
+    let packages = |host: HostMode| -> Vec<&str> {
+        specs
+            .iter()
+            .filter(|s| s.host == host)
+            .map(|s| s.package)
+            .collect()
+    };
+    let wasm = packages(HostMode::Wasm);
     if !wasm.is_empty() {
-        build(&root, &wasm, Some(WASM_TARGET), opts.release)?;
+        let mut cmd = cargo_build(&root, opts.release);
+        cmd.args(["--target", WASM_TARGET]);
+        run(cmd, &wasm)?;
+    }
+    let native = packages(HostMode::Dylib);
+    if !native.is_empty() {
+        run(cargo_build(&root, opts.release), &native)?;
     }
 
     let mut ids = Vec::new();
     for spec in specs {
-        let artifact = build_dir(&root)
-            .join(WASM_TARGET)
-            .join(profile)
-            .join(format!("{}.wasm", spec.lib));
-        let entry = format!("{}.wasm", spec.lib);
+        let (entry, out_dir, mode) = match spec.host {
+            HostMode::Wasm => (
+                format!("{}.wasm", spec.lib),
+                build_dir(&root).join(WASM_TARGET),
+                FILE_MODE,
+            ),
+            _ => (library_file(spec.lib), build_dir(&root), LIBRARY_MODE),
+        };
+        let artifact = out_dir.join(profile(opts.release)).join(&entry);
         let manifest = manifest_text(spec, &entry);
         Manifest::parse(&manifest).map_err(|source| PackError::Manifest {
             id: spec.id.to_string(),
@@ -208,8 +251,8 @@ pub fn pack(opts: &PackOptions) -> Result<Packed, PackError> {
         let dir = opts.out_dir.join(spec.id);
         fs::create_dir_all(&dir).map_err(io_at(&dir))?;
         let bytes = fs::read(&artifact).map_err(io_at(&artifact))?;
-        write_atomic(&dir.join(&entry), &bytes)?;
-        write_atomic(&dir.join("plugin.toml"), manifest.as_bytes())?;
+        write_atomic(&dir.join(&entry), &bytes, mode)?;
+        write_atomic(&dir.join("plugin.toml"), manifest.as_bytes(), FILE_MODE)?;
         ids.push(spec.id.to_string());
     }
     Ok(Packed {
@@ -232,6 +275,37 @@ pub fn pack_fixtures_once() -> &'static Packed {
     })
 }
 
+/// Builds the `cdylib` crate in `crate_dir`, which stands apart from this
+/// workspace (its manifest has its own `[workspace]` table), and copies its
+/// library, named from `lib`, into `out_dir`. Returns the copy's path.
+///
+/// The crate is built in release from a copy of its manifest and `src`
+/// beside this workspace's `Cargo.lock`, offline, so it can use only the
+/// crate versions the workspace already locks. For tests that need a native
+/// library that is not a packed plugin.
+pub fn pack_library(crate_dir: &Path, lib: &str, out_dir: &Path) -> Result<PathBuf, PackError> {
+    let root = workspace_root();
+    let name = crate_dir.file_name().unwrap_or(crate_dir.as_os_str());
+    let copy = build_dir(&root).join("libraries").join(name);
+    copy_tree(&crate_dir.join("src"), &copy.join("src"))?;
+    copy_file(&crate_dir.join("Cargo.toml"), &copy.join("Cargo.toml"))?;
+    copy_file(&root.join("Cargo.lock"), &copy.join("Cargo.lock"))?;
+
+    let mut cmd = cargo_build(&root, true);
+    cmd.arg("--manifest-path")
+        .arg(copy.join("Cargo.toml"))
+        .arg("--offline");
+    run(cmd, &[])?;
+
+    let file = library_file(lib);
+    let artifact = build_dir(&root).join(profile(true)).join(&file);
+    let bytes = fs::read(&artifact).map_err(io_at(&artifact))?;
+    fs::create_dir_all(out_dir).map_err(io_at(out_dir))?;
+    let packed = out_dir.join(file);
+    write_atomic(&packed, &bytes, LIBRARY_MODE)?;
+    Ok(packed)
+}
+
 fn manifest_text(spec: &Spec, entry: &str) -> String {
     format!(
         "id = \"{id}\"\nname = \"{name}\"\nversion = \"{version}\"\ncontract = {CONTRACT_VERSION}\nhost = \"{host}\"\nentry = \"{entry}\"\n{body}",
@@ -239,32 +313,43 @@ fn manifest_text(spec: &Spec, entry: &str) -> String {
         name = spec.name,
         version = env!("CARGO_PKG_VERSION"),
         host = spec.host,
-        body = spec.body,
+        body = spec.body.concat(),
     )
 }
 
-/// Runs `cargo build` for `packages`. Its output is kept and shown only if
-/// the build fails.
-fn build(
-    root: &Path,
-    packages: &[&str],
-    target: Option<&str>,
-    release: bool,
-) -> Result<(), PackError> {
+fn profile(release: bool) -> &'static str {
+    if release {
+        "release"
+    } else {
+        "debug"
+    }
+}
+
+/// The file name the platform gives library `lib`: `lib<lib>.dylib` on
+/// macOS, `lib<lib>.so` on Linux, `<lib>.dll` on Windows.
+fn library_file(lib: &str) -> String {
+    format!("{DLL_PREFIX}{lib}{DLL_SUFFIX}")
+}
+
+/// `$CARGO build` (else `cargo build`) into this workspace's pack directory.
+fn cargo_build(root: &Path, release: bool) -> Command {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(root)
         .arg("build")
         .arg("--target-dir")
         .arg(build_dir(root));
-    for package in packages {
-        cmd.args(["-p", package]);
-    }
-    if let Some(target) = target {
-        cmd.args(["--target", target]);
-    }
     if release {
         cmd.arg("--release");
+    }
+    cmd
+}
+
+/// Runs a build of `packages`. Its output is kept and shown only if the
+/// build fails.
+fn run(mut cmd: Command, packages: &[&str]) -> Result<(), PackError> {
+    for package in packages {
+        cmd.args(["-p", package]);
     }
     let out = cmd.output().map_err(PackError::Spawn)?;
     if out.status.success() {
@@ -277,23 +362,78 @@ fn build(
     }
 }
 
+/// Copies the files under `from` into `to`, recursively.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), PackError> {
+    fs::create_dir_all(to).map_err(io_at(to))?;
+    for entry in fs::read_dir(from).map_err(io_at(from))? {
+        let entry = entry.map_err(io_at(from))?;
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if entry.file_type().map_err(io_at(&path))?.is_dir() {
+            copy_tree(&path, &target)?;
+        } else {
+            copy_file(&path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_file(from: &Path, to: &Path) -> Result<(), PackError> {
+    let bytes = fs::read(from).map_err(io_at(from))?;
+    write_atomic(to, &bytes, FILE_MODE)
+}
+
 /// Writes through a uniquely named file in the same directory, then renames
 /// it over `path`: a reader sees the old file or the new one, never a part.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PackError> {
+/// The file gets `mode` on Unix, whatever the umask.
+fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), PackError> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let n = WRITES.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
-    fs::write(&tmp, bytes).map_err(io_at(&tmp))?;
-    fs::rename(&tmp, path).map_err(|e| {
+    let written = fs::write(&tmp, bytes)
+        .and_then(|()| set_mode(&tmp, mode))
+        .map_err(io_at(&tmp))
+        .and_then(|()| fs::rename(&tmp, path).map_err(io_at(path)));
+    if written.is_err() {
         let _ = fs::remove_file(&tmp);
-        io_at(path)(e)
-    })
+    }
+    written
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
 }
 
 fn io_at(path: &Path) -> impl Fn(io::Error) -> PackError + '_ {
     move |source| PackError::Io {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn written_files_get_the_mode_asked_for_whatever_the_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        // Neither mode is what the usual umasks give a new file.
+        for mode in [0o600, 0o755] {
+            write_atomic(&path, b"x", mode).unwrap();
+            let got = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got, mode, "{got:o}");
+        }
     }
 }

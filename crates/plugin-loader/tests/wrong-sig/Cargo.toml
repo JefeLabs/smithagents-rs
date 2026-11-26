@@ -1,0 +1,22 @@
+# A library that exports the plugin entry with another signature, for the
+# loader's tests. Not a member of the main workspace: `[workspace]` below makes
+# it its own root. `smithagents_plugins_tool::pack_library` builds a copy of it
+# against the main workspace's lock, offline.
+[package]
+name = "smithagents-test-wrong-sig"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "smithagents_test_wrong_sig"
+crate-type = ["cdylib"]
+
+[dependencies]
+stabby = "=72.1.16"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[workspace]
