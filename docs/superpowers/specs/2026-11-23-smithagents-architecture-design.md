@@ -288,9 +288,7 @@ example "open this issue in a center tab").
     component run in Wasmtime inside the daemon, so it adds no process. The
     sandbox is the security boundary: the plugin gets no file system, no
     environment and no sockets. Its only way out is the host-provided
-    interfaces, and outgoing HTTP is checked against the hosts its manifest
-    declares before the daemon sends it. It receives only the secret keys
-    its manifest declares. Each plugin has fuel/time and memory
+    interfaces (below). Each plugin has time and memory
     limits; a trap or an exhausted limit ends that call and restarts that
     plugin only. Async calls and streams (the streaming-tail resource kind)
     use the component model's native async.
@@ -305,6 +303,17 @@ example "open this issue in a center tab").
   - `in-process` (development and tests) [my call]: the plugin crate is
     linked into the daemon. Used for the contract's reference plugin and for
     tests; shipped plugins use `dylib`.
+  - **One host interface for every mode** [my call, 2026-11-26]: a plugin
+    reaches the network only through the daemon's `http-request` function,
+    never through its own sockets or `wasi:http`. The daemon sends the
+    request itself, so policy lives in one place for `wasm`, `dylib` and
+    linked plugins alike: only hosts the manifest declares, HTTPS only, no
+    redirects followed, no private or loopback addresses, size and time caps.
+    While syncing, only GET and HEAD are allowed, which makes "writes are
+    proposals only" a property of the host rather than of each plugin.
+  - **Secrets never enter a plugin** [my call, 2026-11-26]: a request names a
+    secret key the manifest declares, and the daemon adds the credential to
+    the outgoing request. A plugin cannot read, log or forward a token.
   - Rules that keep every mode open [my call]: plugins exchange only the
     contract's serializable types with the daemon, never daemon-internal
     types, whatever the host mode; every plugin write is a proposal the
@@ -314,9 +323,11 @@ example "open this issue in a center tab").
     2026, on by default from Wasmtime 46) makes `async`, `stream<T>` and
     `future<T>` part of the component model, though the component model
     itself is still pre-1.0, so the WIT world is versioned and the Wasmtime
-    version is pinned. `wasmtime-wasi-http` has no built-in host allow-list:
-    the daemon implements the send-request hook and rejects undeclared
-    authorities. Extism (1.41) was considered: simpler, with a built-in
+    version is pinned. `wasmtime-wasi-http` is still labelled experimental and has
+    no built-in host allow-list, which is one reason plugins use the daemon's
+    own `http-request` function instead. Host-side stream consumption works
+    but its API is new and still moving, so the streaming-tail kind is kept
+    behind one adapter and built after the request/response path. Extism (1.41) was considered: simpler, with a built-in
     allowed-hosts list, but its calls are synchronous bytes-in/bytes-out with
     no typed contract or streams, and it runs on Wasmtime anyway. stabby is
     at 72.1.16 and ships a `libloading` integration.
