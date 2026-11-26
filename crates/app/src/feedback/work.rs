@@ -9,9 +9,10 @@ use std::io::{self, Read as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use gpui_kit::RenderImage;
-use image::{ImageError, RgbaImage};
+use image::RgbaImage;
 use smithagents_capture::{checked, CaptureError, Capturer, WindowTarget, WRONG_SIZE_CAPTURE};
 
 use super::annotation::Annotation;
@@ -21,8 +22,8 @@ use super::draft::{
 use super::files::{admit, Refusal, Usage};
 use super::render::{annotate, decode, encode_png, image_from_screenshot, thumbnail};
 use super::text::{
-    capture_failed_text, save_failed_text, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES, PERMISSION_TEXT,
-    UNSUPPORTED_TEXT, WINDOW_NOT_FOUND_TEXT,
+    capture_failed_text, draw_failed_text, save_failed_text, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES,
+    PERMISSION_TEXT, UNSUPPORTED_TEXT, WINDOW_NOT_FOUND_TEXT,
 };
 
 /// The sentence for a draft write or delete the disk refused.
@@ -105,13 +106,33 @@ impl Files {
 
     /// The stored file and its annotated and thumbnail files.
     pub(super) fn remove(&self, stored_name: &str) {
+        self.remove_named(&[
+            stored_name.to_string(),
+            annotated_name(stored_name),
+            thumb_name(stored_name),
+        ]);
+    }
+
+    /// These files, where they exist.
+    pub(super) fn remove_named(&self, names: &[String]) {
         match self {
-            Files::Disk(store) => store.remove_file(stored_name),
+            Files::Disk(store) => store.remove_named(names),
             Files::Memory(map) => {
                 let mut map = Self::memory(map);
-                map.remove(stored_name);
-                map.remove(&annotated_name(stored_name));
-                map.remove(&thumb_name(stored_name));
+                for name in names {
+                    map.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Deletes the files `draft` does not name ([`DraftStore::sweep`]).
+    pub(super) fn sweep(&self, draft: &Draft) {
+        match self {
+            Files::Disk(store) => store.sweep(draft),
+            Files::Memory(map) => {
+                let named = draft.file_names();
+                Self::memory(map).retain(|name, _| named.contains(name));
             }
         }
     }
@@ -137,42 +158,69 @@ pub(super) fn render_image(mut rgba: RgbaImage) -> Arc<RenderImage> {
     Arc::new(RenderImage::new(vec![image::Frame::new(rgba)]))
 }
 
+/// Why a drawing answered no thumbnail.
 #[derive(Debug)]
 pub(super) enum JobError {
+    /// Its screenshot was removed, or the draft discarded, meanwhile.
     Cancelled,
-    Failed(String),
+    /// The picture could not be read, decoded or encoded: nothing to save.
+    Draw(String),
+    /// A file could not be written.
+    Save(String),
 }
 
-impl From<io::Error> for JobError {
-    fn from(error: io::Error) -> Self {
-        JobError::Failed(error.to_string())
+impl JobError {
+    /// The sentence the pane shows; `None` for a cancel.
+    pub(super) fn sentence(&self) -> Option<String> {
+        match self {
+            JobError::Cancelled => None,
+            JobError::Draw(error) => Some(draw_failed_text(error)),
+            JobError::Save(error) => Some(save_failed_text(error)),
+        }
     }
 }
 
-impl From<ImageError> for JobError {
-    fn from(error: ImageError) -> Self {
-        JobError::Failed(error.to_string())
+/// Whether the job was cancelled; if so, `written` is deleted first.
+///
+/// Checked after a job's writes: the attachment may have been removed (or
+/// the draft discarded) on the UI thread while they ran, its files deleted
+/// before these were written. Nothing may outlive its attachment.
+pub(super) fn undone(files: &Files, written: &[String], cancel: &AtomicBool) -> bool {
+    if !cancel.load(Ordering::SeqCst) {
+        return false;
     }
+    files.remove_named(written);
+    true
 }
 
 /// Draws `boxes` over the stored original, writes the annotated image and its
-/// thumbnail, and answers the thumbnail.
+/// thumbnail, and answers the thumbnail. Cancelled, it leaves no file behind.
 pub(super) fn redraw(
     files: &Files,
     stored_name: &str,
     boxes: &[Annotation],
     cancel: &AtomicBool,
 ) -> Result<Arc<RenderImage>, JobError> {
-    let original = decode(&files.read(stored_name, MAX_IMAGE_BYTES)?)?;
+    let draw = |error: &dyn std::fmt::Display| JobError::Draw(error.to_string());
+    let bytes = files
+        .read(stored_name, MAX_IMAGE_BYTES)
+        .map_err(|e| draw(&e))?;
+    let original = decode(&bytes).map_err(|e| draw(&e))?;
     let annotated = annotate(&original, boxes);
-    let annotated_png = encode_png(&annotated)?;
+    let annotated_png = encode_png(&annotated).map_err(|e| draw(&e))?;
     let small = thumbnail(&annotated);
-    let small_png = encode_png(&small)?;
-    if cancel.load(Ordering::Relaxed) {
+    let small_png = encode_png(&small).map_err(|e| draw(&e))?;
+    if cancel.load(Ordering::SeqCst) {
         return Err(JobError::Cancelled);
     }
-    files.write(&annotated_name(stored_name), &annotated_png)?;
-    files.write(&thumb_name(stored_name), &small_png)?;
+    let names = [annotated_name(stored_name), thumb_name(stored_name)];
+    let written = files
+        .write(&names[0], &annotated_png)
+        .and_then(|()| files.write(&names[1], &small_png));
+    if undone(files, &names, cancel) {
+        return Err(JobError::Cancelled);
+    }
+    written.map_err(|e| JobError::Save(e.to_string()))?;
     Ok(render_image(small))
 }
 
@@ -202,11 +250,21 @@ pub(super) fn take_picture(
     target: &WindowTarget,
 ) -> Result<Picture, CaptureError> {
     let capturer = capturer.ok_or(CaptureError::Unsupported)?;
-    let shot = checked(capturer.capture_window(target)?)?;
+    let started = Instant::now();
+    let shot = capturer.capture_window(target);
+    let capture_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let shot = checked(shot?)?;
     let (width, height) = (shot.width, shot.height);
     let image = image_from_screenshot(shot)
         .ok_or_else(|| CaptureError::Failed(WRONG_SIZE_CAPTURE.to_string()))?;
     let png = encode_png(&image).map_err(|e| CaptureError::Failed(e.to_string()))?;
+    tracing::debug!(
+        capture_ms,
+        width,
+        height,
+        png_bytes = png.len(),
+        "feedback capture: the picture is encoded"
+    );
     Ok(Picture { png, width, height })
 }
 
@@ -243,6 +301,8 @@ fn read_leading(path: &Path) -> io::Result<Vec<u8>> {
 
 /// Checks one picked file against `usage` and copies it into the draft's
 /// files under a name `draft` does not use yet (off the UI thread).
+/// Cancelled, it leaves no file behind. Only the stored name is logged: the
+/// picked file's own name stays out of the log.
 pub(super) fn copy_in(
     files: &Files,
     path: &Path,
@@ -294,11 +354,11 @@ pub(super) fn copy_in(
         .and_then(|decoded| match decoded {
             Ok(image) => Some(thumbnail(&image)),
             Err(e) => {
-                tracing::debug!(error = %e, file = %name, "no thumbnail for a picked file");
+                tracing::debug!(error = %e, file = %stored_name, "no thumbnail for a picked file");
                 None
             }
         });
-    if cancel.load(Ordering::Relaxed) {
+    if cancel.load(Ordering::SeqCst) {
         return Copied::Cancelled;
     }
     if let Err(e) = files.write(&stored_name, &bytes) {
@@ -320,6 +380,13 @@ pub(super) fn copy_in(
         }
         render_image(small)
     });
+    if undone(
+        files,
+        &[stored_name.clone(), thumb_name(&stored_name)],
+        cancel,
+    ) {
+        return Copied::Cancelled;
+    }
     Copied::Added {
         attachment: Attachment {
             id: AttachmentId::new(),
@@ -334,5 +401,40 @@ pub(super) fn copy_in(
         },
         thumbnail,
         thumbnail_error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::{undone, Files};
+    use crate::feedback::draft::DraftStore;
+
+    /// A job cancelled while it wrote deletes what it wrote; one that was
+    /// not keeps it.
+    #[test]
+    fn a_job_cancelled_while_it_wrote_leaves_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let disk = Files::Disk(DraftStore::new(home.path()));
+        let memory = Files::Memory(Default::default());
+        for files in [disk, memory] {
+            let names = ["image-1.png".to_string(), "image-1.thumb.png".to_string()];
+            let kept = "image-2.png".to_string();
+            for name in names.iter().chain([&kept]) {
+                files.write(name, b"bytes").unwrap();
+            }
+
+            assert!(!undone(&files, &names, &AtomicBool::new(false)));
+            for name in &names {
+                assert!(files.read(name, 10).is_ok(), "{name}");
+            }
+
+            assert!(undone(&files, &names, &AtomicBool::new(true)));
+            for name in &names {
+                assert!(files.read(name, 10).is_err(), "{name} is gone");
+            }
+            assert!(files.read(&kept, 10).is_ok(), "only what the job wrote");
+        }
     }
 }

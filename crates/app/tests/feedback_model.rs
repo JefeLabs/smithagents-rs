@@ -193,6 +193,70 @@ fn decoding_refuses_garbage_and_truncated_files_without_panicking() {
     assert!(decode(&bytes[..bytes.len() / 2]).is_err());
 }
 
+/// CRC-32 (IEEE) of `bytes`, as a PNG chunk needs.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = (data.len() as u32).to_be_bytes().to_vec();
+    let mut body = kind.to_vec();
+    body.extend_from_slice(data);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+    out
+}
+
+/// A PNG that only claims a size: a valid header (8 bits per sample, of
+/// `color_type`), a few bytes of image data and the end.
+fn png_claiming(width: u32, height: u32, color_type: u8) -> Vec<u8> {
+    let mut header = width.to_be_bytes().to_vec();
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, color_type, 0, 0, 0]);
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend(chunk(b"IHDR", &header));
+    png.extend(chunk(
+        b"IDAT",
+        &[0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+    ));
+    png.extend(chunk(b"IEND", &[]));
+    png
+}
+
+#[test]
+fn a_picture_too_big_to_draw_is_refused_before_it_is_decoded() {
+    const GRAY: u8 = 0;
+    const RGBA: u8 = 6;
+    // 8-bit gray at the largest side: 256 MiB as gray, but 1 GiB once it is
+    // RGBA for drawing.
+    let gray = png_claiming(16_384, 16_384, GRAY);
+    assert!(
+        matches!(decode(&gray), Err(image::ImageError::Limits(_))),
+        "{:?}",
+        decode(&gray).map(|image| image.dimensions())
+    );
+    // 10000 x 10000 gray: within the side limit, 400 MB as RGBA.
+    let wide = png_claiming(10_000, 10_000, GRAY);
+    assert!(matches!(decode(&wide), Err(image::ImageError::Limits(_))));
+    // Far beyond any side limit.
+    let huge = png_claiming(100_000, 100_000, RGBA);
+    assert!(matches!(decode(&huge), Err(image::ImageError::Limits(_))));
+    // A real picture of a real size still decodes.
+    let bytes = encode_png(&white(64, 48)).unwrap();
+    assert_eq!(decode(&bytes).unwrap().dimensions(), (64, 48));
+}
+
 #[test]
 fn a_screenshot_with_a_short_buffer_is_none() {
     let short = Screenshot {
@@ -388,5 +452,32 @@ fn the_texts_and_limits_match_the_design() {
     assert_eq!(
         annotator_discard_description(3),
         "Its 3 comments are deleted."
+    );
+    assert_eq!(MAX_NOTICES, 20);
+    assert_eq!(
+        more_files_text(1),
+        "1 more file was not added: the draft is full."
+    );
+    assert_eq!(
+        more_files_text(5),
+        "5 more files were not added: the draft is full."
+    );
+    assert_eq!(more_notices_text(3), "…and 3 more.");
+    assert_eq!(
+        draw_failed_text("x"),
+        "Could not draw the boxes on the screenshot: x."
+    );
+    assert_eq!(removed_attachments_text(0, 0), None);
+    assert_eq!(removed_attachments_text(2, 0), Some(missing_files_text(2)));
+    assert_eq!(
+        removed_attachments_text(0, 1).as_deref(),
+        Some("1 attachment was removed because a draft holds at most 10.")
+    );
+    assert_eq!(
+        removed_attachments_text(1, 2).as_deref(),
+        Some(
+            "3 attachments were removed because their files are missing or a draft holds at \
+             most 10."
+        )
     );
 }

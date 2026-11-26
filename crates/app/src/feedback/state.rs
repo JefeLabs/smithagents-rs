@@ -7,8 +7,9 @@
 //!
 //! Image work and file copies run off the UI thread. Work for an attachment
 //! that is removed or discarded meanwhile is cancelled: its result is
-//! dropped, and work already running on another thread writes nothing more
-//! once it sees the cancel.
+//! dropped, work already running on another thread writes nothing more once
+//! it sees the cancel, and deletes what it wrote when the cancel came while
+//! it wrote. Files the draft does not name are swept away after a removal.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,8 +29,9 @@ use super::draft::{Attachment, AttachmentId, AttachmentKind, Draft, DraftStore, 
 use super::files::{FileKind, Refusal};
 use super::render::decode;
 use super::text::{
-    picker_failed_text, save_failed_text, DRAFT_FULL_TEXT, MAX_ATTACHMENTS, MAX_BOXES,
-    MAX_IMAGE_BYTES, MAX_TOTAL_BYTES,
+    capture_failed_text, more_files_text, more_notices_text, picker_failed_text,
+    CAPTURE_FRAMES_MISSED, CAPTURE_FRAMES_TIMEOUT, DRAFT_FULL_TEXT, MAX_ATTACHMENTS, MAX_BOXES,
+    MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_NOTICES, MAX_TOTAL_BYTES,
 };
 use super::work::{
     capture_error_text, copy_in, io_text, read_thumbnail, redraw, render_image, take_picture,
@@ -100,16 +102,31 @@ struct Work {
 
 impl Drop for Work {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        // Ordered with the file system: the UI thread deletes after this, a
+        // job checks it after its writes.
+        self.cancel.store(true, Ordering::SeqCst);
     }
 }
 
 /// Image work for one attachment: drawing its annotated image, or reading
 /// its thumbnail.
 struct Job {
+    /// A drawing (it writes files), not a thumbnail read.
+    draws: bool,
     /// Done is waiting for this drawing to close the annotator.
     closes: bool,
     _work: Work,
+}
+
+/// A box as `draft.json` loads it back: inside the picture (an invalid one
+/// is dropped) with a comment of at most [`MAX_COMMENT_CHARS`].
+fn sanitized(annotation: Annotation) -> Option<Annotation> {
+    let rect = annotation.rect.sanitized()?;
+    let mut comment = annotation.comment;
+    if let Some((cut, _)) = comment.char_indices().nth(MAX_COMMENT_CHARS) {
+        comment.truncate(cut);
+    }
+    Some(Annotation { rect, comment })
 }
 
 /// The feedback draft, its notices and the work running on it.
@@ -119,13 +136,22 @@ pub struct Feedback {
     picker: Option<FilePicker>,
     frame_hop: FrameHop,
     draft: Draft,
+    /// At most [`MAX_NOTICES`], then one line counting `hidden_notices`.
     notices: Vec<String>,
+    hidden_notices: usize,
     /// From `capture` until the picture is in the draft or refused.
     capturing: bool,
+    /// Which capture the frame hops and the fallback timer belong to: a
+    /// late hop of a capture that gave up takes no picture.
+    capture_generation: u64,
+    /// The fallback timer while waiting for the frames, then the picture.
     capture: Option<Task<()>>,
     annotating: Option<AttachmentId>,
     /// The picked files being checked and copied.
     adding: Option<Work>,
+    /// A removal during a pick left the sweep for the pick's end: the pick's
+    /// own files are not in the draft until each copy is done.
+    sweep_after_pick: bool,
     jobs: HashMap<AttachmentId, Job>,
     thumbnails: HashMap<AttachmentId, Arc<RenderImage>>,
     /// Thumbnails no longer shown, for the pane to release.
@@ -158,15 +184,19 @@ impl Feedback {
                 Rc::new(|window: &mut Window, callback| window.on_next_frame(callback))
             }),
             draft,
-            notices,
+            notices: Vec::new(),
+            hidden_notices: 0,
             capturing: false,
+            capture_generation: 0,
             capture: None,
             annotating: None,
             adding: None,
+            sweep_after_pick: false,
             jobs: HashMap::new(),
             thumbnails: HashMap::new(),
             retired: Vec::new(),
         };
+        this.set_notices(notices);
         let starting: Vec<(AttachmentId, AttachmentKind, bool)> = this
             .draft
             .attachments
@@ -197,8 +227,9 @@ impl Feedback {
         }
     }
 
-    /// What the person should read, newest last. The next capture or pick
-    /// that reports replaces them; a failed save adds to them.
+    /// What the person should read, newest last: at most [`MAX_NOTICES`],
+    /// then one line counting the rest. The next capture or pick that
+    /// reports replaces them; a failed save adds to them.
     pub fn notices(&self) -> &[String] {
         &self.notices
     }
@@ -222,19 +253,29 @@ impl Feedback {
     /// `capture` changed on screen (the hold's ring) is drawn away first.
     /// Ignored while a capture runs or the annotator is open. A full draft
     /// says so without capturing. Success adds the screenshot and opens the
-    /// annotator; a failure says why and reveals the pane.
+    /// annotator; a failure says why and reveals the pane. When the two
+    /// frames do not come within [`CAPTURE_FRAMES_TIMEOUT`] (a window that
+    /// draws nothing), the capture gives up the same way, so Capture never
+    /// stays disabled.
     pub fn capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.capturing || self.annotating.is_some() {
             return;
         }
         if self.draft.attachments.len() >= MAX_ATTACHMENTS {
-            self.notices = vec![DRAFT_FULL_TEXT.to_string()];
+            self.set_notices(vec![DRAFT_FULL_TEXT.to_string()]);
             cx.emit(FeedbackEvent::RevealPane);
             cx.notify();
             return;
         }
         tracing::debug!("feedback capture: waiting two frames");
         self.capturing = true;
+        self.capture_generation += 1;
+        let generation = self.capture_generation;
+        let timer = cx.background_executor().timer(CAPTURE_FRAMES_TIMEOUT);
+        self.capture = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| this.frames_missed(generation, cx));
+        }));
         cx.notify();
         let this = cx.weak_entity();
         let hop = self.frame_hop.clone();
@@ -245,14 +286,35 @@ impl Feedback {
                 second_hop(
                     window,
                     Box::new(move |window, cx| {
-                        let _ = this.update(cx, |this, cx| this.start_capture(window, cx));
+                        let _ =
+                            this.update(cx, |this, cx| this.start_capture(generation, window, cx));
                     }),
                 );
             }),
         );
     }
 
-    fn start_capture(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// The fallback timer: the frames never came.
+    fn frames_missed(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if !self.capturing || generation != self.capture_generation {
+            return;
+        }
+        tracing::warn!(
+            after = ?CAPTURE_FRAMES_TIMEOUT,
+            "feedback capture: the window drew no frames; giving up"
+        );
+        self.capturing = false;
+        self.capture = None;
+        self.set_notices(vec![capture_failed_text(CAPTURE_FRAMES_MISSED)]);
+        cx.emit(FeedbackEvent::RevealPane);
+        cx.notify();
+    }
+
+    fn start_capture(&mut self, generation: u64, window: &Window, cx: &mut Context<Self>) {
+        if !self.capturing || generation != self.capture_generation {
+            tracing::debug!("feedback capture: a late frame of a capture that gave up");
+            return;
+        }
         let bounds = window.bounds();
         let target = WindowTarget {
             pid: std::process::id(),
@@ -268,6 +330,7 @@ impl Feedback {
         let capturer = self.capturer.clone();
         let picture =
             cx.background_spawn(async move { take_picture(capturer.as_deref(), &target) });
+        // Replaces (and so stops) the fallback timer.
         self.capture = Some(cx.spawn(async move |this, cx| {
             let picture = picture.await;
             let _ = this.update(cx, |this, cx| this.finish_capture(picture, cx));
@@ -283,7 +346,7 @@ impl Feedback {
                 cx.emit(FeedbackEvent::OpenAnnotator(id));
             }
             Err(sentence) => {
-                self.notices = vec![sentence];
+                self.set_notices(vec![sentence]);
                 cx.emit(FeedbackEvent::RevealPane);
             }
         }
@@ -330,14 +393,16 @@ impl Feedback {
             boxes: Vec::new(),
             rendered: false,
         });
-        self.notices.clear();
+        self.set_notices(Vec::new());
         self.save();
         Ok(id)
     }
 
     /// Asks the picker for files and adds them one by one, in order. Each
     /// refused file gets its own sentence; the files before and after it
-    /// are still added. Ignored while an earlier pick is being added.
+    /// are still added. Once the draft is full the pick stops, with one
+    /// sentence counting the files not looked at. Ignored while an earlier
+    /// pick is being added.
     pub fn add_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.adding.is_some() {
             return;
@@ -356,7 +421,7 @@ impl Feedback {
                         this.adding = None;
                         if let Err(e) = other {
                             tracing::warn!(error = %e, "the file picker failed");
-                            this.notices = vec![picker_failed_text(&e)];
+                            this.set_notices(vec![picker_failed_text(&e)]);
                         }
                         cx.notify();
                     });
@@ -368,15 +433,23 @@ impl Feedback {
                 "adding picked files to the feedback draft"
             );
             let _ = this.update(cx, |this, cx| {
-                this.notices.clear();
+                this.set_notices(Vec::new());
                 cx.notify();
             });
-            for path in paths {
-                // What the draft holds now, files added earlier in this pick included.
-                let Ok((files, usage, draft)) = this.update(cx, |this, _| {
-                    (this.files.clone(), this.draft.usage(), this.draft.clone())
+            let mut paths = paths.into_iter();
+            while let Some(path) = paths.next() {
+                // What the draft holds now, files added earlier in this pick
+                // included; nothing once it is full.
+                let Ok(next) = this.update(cx, |this, _| {
+                    (this.draft.attachments.len() < MAX_ATTACHMENTS)
+                        .then(|| (this.files.clone(), this.draft.usage(), this.draft.clone()))
                 }) else {
                     return;
+                };
+                let Some((files, usage, draft)) = next else {
+                    let left = 1 + paths.len();
+                    let _ = this.update(cx, |this, _| this.push_notice(more_files_text(left)));
+                    break;
                 };
                 let cancelled = cancelled.clone();
                 let copied = cx
@@ -393,6 +466,9 @@ impl Feedback {
             }
             let _ = this.update(cx, |this, cx| {
                 this.adding = None;
+                if std::mem::take(&mut this.sweep_after_pick) {
+                    this.files.sweep(&this.draft);
+                }
                 cx.notify();
             });
         });
@@ -405,7 +481,7 @@ impl Feedback {
 
     fn finish_copy(&mut self, copied: Copied, cx: &mut Context<Self>) {
         match copied {
-            Copied::Refused(sentence) => self.notices.push(sentence),
+            Copied::Refused(sentence) => self.push_notice(sentence),
             Copied::Failed(sentence) => self.add_notice(sentence),
             Copied::Cancelled => {}
             Copied::Added {
@@ -424,8 +500,7 @@ impl Feedback {
                 };
                 if let Some(refusal) = late_refusal {
                     self.files.remove(&attachment.stored_name);
-                    self.notices
-                        .push(refusal.sentence(&attachment.original_name));
+                    self.push_notice(refusal.sentence(&attachment.original_name));
                 } else {
                     let id = attachment.id.clone();
                     self.draft.attachments.push(attachment);
@@ -442,16 +517,26 @@ impl Feedback {
         cx.notify();
     }
 
-    /// Removes an attachment and its files; its thumbnail is retired.
+    /// Removes an attachment; its thumbnail is retired and its work
+    /// cancelled. The draft is saved first, then its files are deleted and
+    /// the files the draft does not name are swept away; when the save
+    /// fails the files stay, since the draft on disk still names them.
     pub fn remove(&mut self, id: &AttachmentId, cx: &mut Context<Self>) {
         let Some(index) = self.draft.attachments.iter().position(|a| &a.id == id) else {
             return;
         };
         self.jobs.remove(id);
         let removed = self.draft.attachments.remove(index);
-        self.files.remove(&removed.stored_name);
         self.retire(id);
-        self.save();
+        if self.save() {
+            self.files.remove(&removed.stored_name);
+            if self.adding.is_some() {
+                // A copy may have written a file the draft does not name yet.
+                self.sweep_after_pick = true;
+            } else {
+                self.files.sweep(&self.draft);
+            }
+        }
         if self.annotating.as_ref() == Some(id) {
             self.close_annotator(cx);
         }
@@ -462,6 +547,7 @@ impl Feedback {
     /// are dropped; every thumbnail is retired.
     pub fn discard_all(&mut self, cx: &mut Context<Self>) {
         self.adding = None;
+        self.sweep_after_pick = false;
         self.jobs.clear();
         self.retired
             .extend(self.thumbnails.drain().map(|(_, thumbnail)| thumbnail));
@@ -494,14 +580,11 @@ impl Feedback {
         cx.notify();
     }
 
-    /// Replaces a screenshot's boxes (at most [`MAX_BOXES`]) and saves; its
-    /// annotated image no longer matches until Done draws it.
-    pub fn set_boxes(
-        &mut self,
-        id: &AttachmentId,
-        mut boxes: Vec<Annotation>,
-        cx: &mut Context<Self>,
-    ) {
+    /// Replaces a screenshot's boxes and saves; its annotated image no
+    /// longer matches until Done draws it. Each box is kept as `draft.json`
+    /// loads it back: one outside the picture is clamped or dropped, a
+    /// comment is cut at [`MAX_COMMENT_CHARS`], and at most [`MAX_BOXES`].
+    pub fn set_boxes(&mut self, id: &AttachmentId, boxes: Vec<Annotation>, cx: &mut Context<Self>) {
         let Some(shot) = self
             .draft
             .attachments
@@ -510,8 +593,11 @@ impl Feedback {
         else {
             return;
         };
-        boxes.truncate(MAX_BOXES);
-        shot.boxes = boxes;
+        shot.boxes = boxes
+            .into_iter()
+            .filter_map(sanitized)
+            .take(MAX_BOXES)
+            .collect();
         shot.rendered = false;
         self.save();
         cx.notify();
@@ -523,8 +609,12 @@ impl Feedback {
         let Some(id) = self.annotating.clone() else {
             return;
         };
-        if self.jobs.get(&id).is_some_and(|job| job.closes) {
-            // Done was already pressed.
+        if let Some(job) = self.jobs.get_mut(&id).filter(|job| job.draws) {
+            // Done was already pressed, or a drawing from the start runs:
+            // it closes the annotator when it is done (and draws again when
+            // the boxes changed meanwhile). Replacing it would cancel it
+            // while it may be writing.
+            job.closes = true;
             return;
         }
         let drawn = self.draft.get(&id).is_none_or(|shot| shot.rendered);
@@ -569,12 +659,12 @@ impl Feedback {
         cx.background_spawn(async move {
             let decoded = files
                 .read(&name, MAX_IMAGE_BYTES)
-                .map_err(JobError::from)
-                .and_then(|bytes| decode(&bytes).map_err(JobError::from));
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| decode(&bytes).map_err(|e| e.to_string()));
             match decoded {
                 Ok(image) => Some(render_image(image)),
                 Err(e) => {
-                    tracing::warn!(error = ?e, file = %name, "could not load a feedback image");
+                    tracing::warn!(error = %e, file = %name, "could not load a feedback image");
                     None
                 }
             }
@@ -586,17 +676,46 @@ impl Feedback {
         std::mem::take(&mut self.retired)
     }
 
-    fn save(&mut self) {
-        if let Err(e) = self.files.save(&self.draft) {
-            tracing::warn!(error = %e, "could not save the feedback draft");
-            self.add_notice(io_text(&e));
+    /// Saves the draft; whether it was saved (a failure is said).
+    fn save(&mut self) -> bool {
+        match self.files.save(&self.draft) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not save the feedback draft");
+                self.add_notice(io_text(&e));
+                false
+            }
+        }
+    }
+
+    /// Replaces the notices.
+    fn set_notices(&mut self, notices: Vec<String>) {
+        self.notices.clear();
+        self.hidden_notices = 0;
+        for sentence in notices {
+            self.push_notice(sentence);
+        }
+    }
+
+    /// Adds a notice; past [`MAX_NOTICES`] the last line counts the rest.
+    fn push_notice(&mut self, sentence: String) {
+        if self.hidden_notices == 0 && self.notices.len() < MAX_NOTICES {
+            self.notices.push(sentence);
+            return;
+        }
+        self.hidden_notices += 1;
+        let line = more_notices_text(self.hidden_notices);
+        if self.hidden_notices == 1 {
+            self.notices.push(line);
+        } else if let Some(last) = self.notices.last_mut() {
+            *last = line;
         }
     }
 
     /// Adds a notice unless it is already there.
     fn add_notice(&mut self, sentence: String) {
         if !self.notices.contains(&sentence) {
-            self.notices.push(sentence);
+            self.push_notice(sentence);
         }
     }
 
@@ -639,6 +758,7 @@ impl Feedback {
         self.jobs.insert(
             id,
             Job {
+                draws: true,
                 closes,
                 _work: Work {
                     cancel,
@@ -671,10 +791,11 @@ impl Feedback {
                     self.save();
                 }
             },
-            Err(JobError::Cancelled) => {}
-            Err(JobError::Failed(e)) => {
-                tracing::warn!(error = %e, "could not draw the annotated screenshot");
-                self.add_notice(save_failed_text(&e));
+            Err(error) => {
+                if let Some(sentence) = error.sentence() {
+                    tracing::warn!(?error, "could not draw the annotated screenshot");
+                    self.add_notice(sentence);
+                }
             }
         }
         if closes {
@@ -707,6 +828,7 @@ impl Feedback {
         self.jobs.insert(
             id,
             Job {
+                draws: false,
                 closes: false,
                 _work: Work {
                     cancel: Arc::new(AtomicBool::new(false)),

@@ -13,6 +13,10 @@ pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_VIDEO_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+/// The pane keeps at most this many notices; one more line counts the rest.
+pub const MAX_NOTICES: usize = 20;
+/// How long a capture waits for its two frames before it gives up.
+pub const CAPTURE_FRAMES_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// macOS keeps reporting the permission as missing until the app restarts
 /// after it is granted, hence "quit and reopen" rather than "try again".
@@ -42,9 +46,39 @@ pub const DISCARD_CONFIRM: &str = "Discard";
 pub const ANNOTATOR_DISCARD_TITLE: &str = "Discard this screenshot?";
 pub const ANNOTATOR_DISCARD_KEEP: &str = "Keep";
 pub const ANNOTATOR_DISCARD_CONFIRM: &str = "Discard";
+/// Shown in the annotator, where the picture would be, when it does not decode.
+pub const PICTURE_UNREADABLE_TEXT: &str =
+    "This screenshot could not be read. Discard it and capture again.";
+/// The [`capture_failed_text`] reason when the window never drew the two
+/// frames a capture waits for (a hidden or minimized window).
+pub const CAPTURE_FRAMES_MISSED: &str = "the window was not drawn";
+/// The [`save_failed_text`] reason while a damaged draft that could not be
+/// set aside is still in the draft's place: nothing is written over it.
+pub const DRAFT_NOT_SET_ASIDE: &str =
+    "the saved draft could not be read or set aside, so it is left untouched";
 
 pub fn capture_failed_text(message: &str) -> String {
     format!("Could not capture the window: {message}.")
+}
+
+/// The annotated picture could not be drawn (its screenshot does not
+/// decode, or the drawing could not be encoded): not a failed save.
+pub fn draw_failed_text(error: &str) -> String {
+    format!("Could not draw the boxes on the screenshot: {error}.")
+}
+
+/// The files of a pick that were not looked at once the draft was full.
+pub fn more_files_text(count: usize) -> String {
+    if count == 1 {
+        "1 more file was not added: the draft is full.".to_string()
+    } else {
+        format!("{count} more files were not added: the draft is full.")
+    }
+}
+
+/// The line after [`MAX_NOTICES`] notices, counting the ones not shown.
+pub fn more_notices_text(count: usize) -> String {
+    format!("…and {count} more.")
 }
 
 pub fn picker_failed_text(error: &str) -> String {
@@ -60,6 +94,28 @@ pub fn missing_files_text(count: usize) -> String {
         "1 attachment was removed because its file is missing.".to_string()
     } else {
         format!("{count} attachments were removed because their files are missing.")
+    }
+}
+
+/// What loading removed from the saved draft: `missing` attachments whose
+/// files are gone, and `over_limit` beyond [`MAX_ATTACHMENTS`]. `None` when
+/// nothing was removed.
+pub fn removed_attachments_text(missing: usize, over_limit: usize) -> Option<String> {
+    let total = missing + over_limit;
+    let (count, verb) = if total == 1 {
+        ("1 attachment".to_string(), "was")
+    } else {
+        (format!("{total} attachments"), "were")
+    };
+    match (missing, over_limit) {
+        (0, 0) => None,
+        (_, 0) => Some(missing_files_text(missing)),
+        (0, _) => Some(format!(
+            "{count} {verb} removed because a draft holds at most 10."
+        )),
+        _ => Some(format!(
+            "{count} {verb} removed because their files are missing or a draft holds at most 10."
+        )),
     }
 }
 

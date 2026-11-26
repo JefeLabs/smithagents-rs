@@ -10,6 +10,7 @@ mod common;
 
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::feedback::{act, capture_now, file_names, png, record_events, run_hop, FeedbackSetup};
 use common::ui::open_shell_options;
@@ -21,7 +22,9 @@ use smithagents_app::feedback::files::Refusal;
 use smithagents_app::feedback::render::{decode, BOX_RGB};
 use smithagents_app::feedback::state::{Feedback, FeedbackEvent, FeedbackOptions};
 use smithagents_app::feedback::text::{
-    DRAFT_FULL_TEXT, MAX_IMAGE_BYTES, PERMISSION_TEXT, UNSUPPORTED_TEXT, WINDOW_NOT_FOUND_TEXT,
+    capture_failed_text, more_files_text, more_notices_text, save_failed_text,
+    CAPTURE_FRAMES_MISSED, DRAFT_FULL_TEXT, DRAFT_NOT_SET_ASIDE, MAX_COMMENT_CHARS,
+    MAX_IMAGE_BYTES, PERMISSION_TEXT, UNSUPPORTED_TEXT, WINDOW_NOT_FOUND_TEXT,
 };
 use smithagents_app::shell::ShellOptions;
 use smithagents_capture::{CaptureError, FakeCapturer, Screenshot};
@@ -640,4 +643,326 @@ fn the_default_options_answer_unsupported_and_pick_nothing(cx: &mut TestAppConte
     }
     assert_eq!(notices(cx, &feedback), vec![UNSUPPORTED_TEXT.to_string()]);
     assert!(!cx.read(|cx| feedback.read(cx).capturing()));
+}
+
+fn busy(cx: &TestAppContext, feedback: &Entity<Feedback>) -> bool {
+    cx.read(|cx| feedback.read(cx).busy())
+}
+
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Picks `count` good PNGs named `good-<n>.png` and adds them.
+fn add_good_files(
+    cx: &mut TestAppContext,
+    window: gpui_kit::WindowHandle<gpui_kit::base::Root>,
+    feedback: &Entity<Feedback>,
+    setup: &FeedbackSetup,
+    count: usize,
+) {
+    let bytes = png(4, 4);
+    let paths = (1..=count)
+        .map(|n| setup.picked_file(&format!("good-{n}.png"), &bytes))
+        .collect();
+    setup.pick(paths);
+    act(cx, window, feedback, |f, window, cx| {
+        f.add_files(window, cx)
+    });
+}
+
+#[gpui_kit::test]
+fn a_capture_that_lands_on_a_draft_a_pick_filled_adds_nothing(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    add_good_files(cx, window, &feedback, &setup, 9);
+    let events = record_events(cx, &feedback);
+
+    // The capture waits for its frames while a pick fills the draft.
+    act(cx, window, &feedback, |f, window, cx| f.capture(window, cx));
+    setup.pick(vec![setup.picked_file("last.png", &png(4, 4))]);
+    act(cx, window, &feedback, |f, window, cx| {
+        f.add_files(window, cx)
+    });
+    assert_eq!(draft(cx, &feedback).attachments.len(), 10);
+    run_hop(cx, window, &setup);
+    run_hop(cx, window, &setup);
+
+    assert_eq!(setup.capturer.calls().len(), 1);
+    assert_eq!(notices(cx, &feedback), vec![DRAFT_FULL_TEXT.to_string()]);
+    assert_eq!(*events.borrow(), vec![FeedbackEvent::RevealPane]);
+    assert!(!file_names(&setup.draft_dir())
+        .iter()
+        .any(|name| name.starts_with("screenshot-")));
+    assert_eq!(draft(cx, &feedback).attachments.len(), 10);
+    assert!(!cx.read(|cx| feedback.read(cx).capturing()));
+}
+
+#[gpui_kit::test]
+fn removing_a_screenshot_while_done_draws_it_leaves_no_file(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    capture_now(cx, window, &feedback, &setup);
+    let id = annotating(cx, &feedback).unwrap();
+    let events = record_events(cx, &feedback);
+
+    // Without parking in between: the drawing has not run yet.
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_boxes(&id, vec![note(0.25, 0.25, 0.25, 0.25, "the toolbar")], cx);
+        f.finish_annotating(cx);
+        f.remove(&id, cx);
+    });
+
+    assert!(
+        file_names(&setup.draft_dir()).is_empty(),
+        "{:?}",
+        file_names(&setup.draft_dir())
+    );
+    assert_eq!(*events.borrow(), vec![FeedbackEvent::CloseAnnotator]);
+    assert!(!busy(cx, &feedback));
+    assert_eq!(annotating(cx, &feedback), None);
+    assert!(draft(cx, &feedback).is_empty());
+}
+
+#[gpui_kit::test]
+fn discarding_while_files_are_added_leaves_no_draft_directory(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    add_good_files(cx, window, &feedback, &setup, 1);
+    assert!(setup.draft_dir().exists());
+
+    setup.pick(vec![
+        setup.picked_file("a.png", &png(4, 4)),
+        setup.picked_file("b.png", &png(4, 4)),
+    ]);
+    act(cx, window, &feedback, |f, window, cx| {
+        f.add_files(window, cx);
+        f.discard_all(cx);
+    });
+
+    assert!(!setup.draft_dir().exists());
+    assert!(draft(cx, &feedback).is_empty());
+    assert!(!busy(cx, &feedback));
+}
+
+#[gpui_kit::test]
+fn removing_an_attachment_sweeps_files_the_draft_does_not_name(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    add_good_files(cx, window, &feedback, &setup, 2);
+    let dir = setup.draft_dir();
+    fs::write(dir.join("image-9.png"), b"left behind").unwrap();
+    fs::write(dir.join("screenshot-4.annotated.png"), b"left behind").unwrap();
+    let first = draft(cx, &feedback).attachments[0].id.clone();
+
+    act(cx, window, &feedback, |f, _, cx| f.remove(&first, cx));
+
+    assert_eq!(
+        file_names(&dir),
+        vec!["draft.json", "image-2.png", "image-2.thumb.png"]
+    );
+    let second = draft(cx, &feedback).attachments[0].id.clone();
+    act(cx, window, &feedback, |f, _, cx| f.remove(&second, cx));
+    assert!(!dir.exists(), "an empty draft leaves no directory");
+}
+
+#[gpui_kit::test]
+fn remove_saves_the_draft_before_it_deletes_the_files(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    add_good_files(cx, window, &feedback, &setup, 2);
+    let dir = setup.draft_dir();
+    let first = draft(cx, &feedback).attachments[0].id.clone();
+    // The draft cannot be saved: a folder is in its place.
+    fs::remove_file(dir.join("draft.json")).unwrap();
+    fs::create_dir_all(dir.join("draft.json").join("in-the-way")).unwrap();
+
+    act(cx, window, &feedback, |f, _, cx| f.remove(&first, cx));
+
+    let said = notices(cx, &feedback);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].starts_with("Could not save the feedback draft: "));
+    assert_eq!(draft(cx, &feedback).attachments.len(), 1);
+    // What the saved draft still names is still there.
+    assert!(dir.join("image-1.png").is_file());
+    assert!(dir.join("image-1.thumb.png").is_file());
+}
+
+#[gpui_kit::test]
+fn set_boxes_keeps_only_what_loads_back(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    capture_now(cx, window, &feedback, &setup);
+    let id = annotating(cx, &feedback).unwrap();
+    let long = "x".repeat(MAX_COMMENT_CHARS + 100);
+    let mut boxes = vec![
+        note(f32::NAN, 0.1, 0.2, 0.2, "not a number"),
+        note(0.1, 0.1, 0.0, 0.2, "no width"),
+        note(0.9, 0.1, 0.5, 0.2, "hangs over"),
+        note(0.1, 0.1, 0.2, 0.2, &long),
+    ];
+    boxes.extend((0..25).map(|n| note(0.1, 0.1, 0.2, 0.2, &format!("box {n}"))));
+
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_boxes(&id, boxes, cx)
+    });
+
+    let held = draft(cx, &feedback).attachments[0].boxes.clone();
+    assert_eq!(held.len(), 20);
+    assert_eq!(held[0].comment, "hangs over");
+    assert!((held[0].rect.w - 0.1).abs() < 1e-6, "{:?}", held[0].rect);
+    assert_eq!(held[1].comment.chars().count(), MAX_COMMENT_CHARS);
+    assert_eq!(held[19].comment, "box 17");
+    let loaded = setup.store().load();
+    assert!(loaded.notices.is_empty(), "{:?}", loaded.notices);
+    assert_eq!(loaded.draft.attachments[0].boxes, held);
+}
+
+#[cfg(unix)]
+#[gpui_kit::test]
+fn a_draft_that_could_not_be_set_aside_is_never_saved_over(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let dir = setup.draft_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let newer = r#"{"version":2,"attachments":[]}"#;
+    fs::write(dir.join("draft.json"), newer).unwrap();
+    let parent = setup.home.path().join("feedback");
+    set_mode(&parent, 0o500);
+
+    let (window, _, feedback) = setup.open(cx);
+    let at_start = notices(cx, &feedback);
+    capture_now(cx, window, &feedback, &setup);
+    let after_capture = notices(cx, &feedback);
+    set_mode(&parent, 0o700);
+
+    let sentence = save_failed_text(DRAFT_NOT_SET_ASIDE);
+    assert_eq!(at_start, vec![sentence.clone()]);
+    assert_eq!(after_capture, vec![sentence]);
+    assert!(draft(cx, &feedback).is_empty());
+    assert_eq!(file_names(&dir), vec!["draft.json"]);
+    assert_eq!(fs::read_to_string(dir.join("draft.json")).unwrap(), newer);
+}
+
+#[gpui_kit::test]
+fn a_pick_stops_once_the_draft_is_full(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let bytes = png(4, 4);
+    let mut paths: Vec<_> = (1..=9)
+        .map(|n| setup.picked_file(&format!("good-{n}.png"), &bytes))
+        .collect();
+    paths.push(setup.picked_file("notes.txt", b"words"));
+    paths.push(setup.picked_file("good-10.png", &bytes));
+    // Never looked at: neither would be added anyway.
+    paths.push(setup.picked_file("more.txt", b"words"));
+    paths.push(setup.picked_file("good-11.png", &bytes));
+    setup.pick(paths);
+    let (window, _, feedback) = setup.open(cx);
+
+    act(cx, window, &feedback, |f, window, cx| {
+        f.add_files(window, cx)
+    });
+
+    assert_eq!(draft(cx, &feedback).attachments.len(), 10);
+    assert_eq!(
+        notices(cx, &feedback),
+        vec![Refusal::Extension.sentence("notes.txt"), more_files_text(2)]
+    );
+    assert!(!busy(cx, &feedback));
+
+    // Already full: one sentence for the whole pick.
+    setup.pick(vec![
+        setup.picked_file("x.png", &bytes),
+        setup.picked_file("y.png", &bytes),
+    ]);
+    act(cx, window, &feedback, |f, window, cx| {
+        f.add_files(window, cx)
+    });
+    assert_eq!(notices(cx, &feedback), vec![more_files_text(2)]);
+}
+
+#[gpui_kit::test]
+fn at_most_twenty_notices_are_kept(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let paths = (1..=25)
+        .map(|n| setup.picked_file(&format!("notes-{n}.txt"), b"words"))
+        .collect();
+    setup.pick(paths);
+    let (window, _, feedback) = setup.open(cx);
+
+    act(cx, window, &feedback, |f, window, cx| {
+        f.add_files(window, cx)
+    });
+
+    let said = notices(cx, &feedback);
+    assert_eq!(said.len(), 21);
+    for (n, sentence) in said.iter().take(20).enumerate() {
+        assert_eq!(
+            *sentence,
+            Refusal::Extension.sentence(&format!("notes-{}.txt", n + 1))
+        );
+    }
+    assert_eq!(said[20], more_notices_text(5));
+}
+
+#[gpui_kit::test]
+fn a_capture_whose_frames_never_come_gives_up_after_two_seconds(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    let events = record_events(cx, &feedback);
+
+    act(cx, window, &feedback, |f, window, cx| f.capture(window, cx));
+    cx.executor().advance_clock(Duration::from_millis(1990));
+    cx.run_until_parked();
+    assert!(cx.read(|cx| feedback.read(cx).capturing()), "still waiting");
+    cx.executor().advance_clock(Duration::from_millis(10));
+    cx.run_until_parked();
+
+    assert!(!cx.read(|cx| feedback.read(cx).capturing()));
+    assert_eq!(
+        notices(cx, &feedback),
+        vec![capture_failed_text(CAPTURE_FRAMES_MISSED)]
+    );
+    assert_eq!(*events.borrow(), vec![FeedbackEvent::RevealPane]);
+    // Frames that come late take no picture.
+    run_hop(cx, window, &setup);
+    run_hop(cx, window, &setup);
+    assert!(setup.capturer.calls().is_empty());
+    assert!(draft(cx, &feedback).is_empty());
+
+    // Capture works again.
+    capture_now(cx, window, &feedback, &setup);
+    assert_eq!(setup.capturer.calls().len(), 1);
+    assert_eq!(draft(cx, &feedback).attachments.len(), 1);
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    assert!(
+        annotating(cx, &feedback).is_some(),
+        "a capture that ran is not undone"
+    );
+    assert!(notices(cx, &feedback).is_empty());
+}
+
+#[gpui_kit::test]
+fn a_screenshot_that_does_not_decode_says_it_could_not_be_drawn(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    capture_now(cx, window, &feedback, &setup);
+    let id = annotating(cx, &feedback).unwrap();
+    fs::write(setup.draft_dir().join("screenshot-1.png"), b"not a picture").unwrap();
+    let events = record_events(cx, &feedback);
+
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_boxes(&id, vec![note(0.25, 0.25, 0.25, 0.25, "the toolbar")], cx)
+    });
+    act(cx, window, &feedback, |f, _, cx| f.finish_annotating(cx));
+
+    let said = notices(cx, &feedback);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].starts_with("Could not draw the boxes on the screenshot: "),
+        "{said:?}"
+    );
+    assert_eq!(*events.borrow(), vec![FeedbackEvent::CloseAnnotator]);
+    assert!(!busy(cx, &feedback));
 }

@@ -6,7 +6,9 @@ use smithagents_app::feedback::draft::{
     annotated_name, thumb_name, Attachment, AttachmentId, AttachmentKind, Draft, DraftStore,
 };
 use smithagents_app::feedback::files::{FileKind, Usage};
-use smithagents_app::feedback::text::BROKEN_DRAFT_TEXT;
+use smithagents_app::feedback::text::{
+    removed_attachments_text, save_failed_text, BROKEN_DRAFT_TEXT, DRAFT_NOT_SET_ASIDE,
+};
 
 fn note(x: f32, y: f32, w: f32, h: f32) -> Annotation {
     Annotation {
@@ -89,6 +91,24 @@ fn broken_dirs(home: &Path) -> Vec<std::path::PathBuf> {
 fn write_json(store: &DraftStore, text: &str) {
     fs::create_dir_all(store.dir()).unwrap();
     fs::write(store.dir().join("draft.json"), text).unwrap();
+}
+
+/// The names directly in `dir`, sorted (none when it does not exist).
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 #[test]
@@ -175,8 +195,187 @@ fn a_broken_draft_is_set_aside_and_named() {
         write_json(&store, "{ not json");
         let again = store.load();
         assert_eq!(again.notices, vec![BROKEN_DRAFT_TEXT.to_string()]);
-        assert_eq!(broken_dirs(home.path()).len(), 2);
+        // Only the newest set-aside draft is kept.
+        let kept = broken_dirs(home.path());
+        assert_eq!(kept.len(), 1);
+        assert_ne!(kept[0], aside[0]);
+        assert!(kept[0].join("draft.json").is_file());
+        assert!(!kept[0].join("screenshot-1.png").exists());
     }
+}
+
+#[test]
+fn only_the_newest_set_aside_draft_is_kept() {
+    let home = tempfile::tempdir().unwrap();
+    let store = DraftStore::new(home.path());
+    let feedback = home.path().join("feedback");
+    for old in ["draft.broken-100", "draft.broken-200-2"] {
+        fs::create_dir_all(feedback.join(old)).unwrap();
+        fs::write(feedback.join(old).join("screenshot-1.png"), b"old").unwrap();
+    }
+    // Not set-aside drafts of ours: a file, and a link to a folder elsewhere.
+    fs::write(feedback.join("draft.broken-notes"), b"x").unwrap();
+    let elsewhere = home.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("keep.png"), b"x").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, feedback.join("draft.broken-link")).unwrap();
+    write_json(&store, "{ not json");
+
+    let loaded = store.load();
+    assert_eq!(loaded.notices, vec![BROKEN_DRAFT_TEXT.to_string()]);
+    let dirs: Vec<String> = names_in(&feedback)
+        .into_iter()
+        .filter(|name| fs::symlink_metadata(feedback.join(name)).unwrap().is_dir())
+        .collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    assert!(dirs[0].starts_with("draft.broken-"));
+    assert!(feedback.join(&dirs[0]).join("draft.json").is_file());
+    assert!(feedback.join("draft.broken-notes").is_file());
+    assert!(feedback.join("draft.broken-link").exists());
+    assert!(elsewhere.join("keep.png").is_file());
+}
+
+#[test]
+fn a_draft_that_cannot_be_set_aside_is_never_written_over() {
+    let home = tempfile::tempdir().unwrap();
+    let store = DraftStore::new(home.path());
+    write_json(&store, r#"{"version":2,"attachments":[]}"#);
+    fs::write(store.dir().join("screenshot-1.png"), b"old").unwrap();
+    let feedback = home.path().join("feedback");
+    // The draft can still be written, but not renamed: its parent is read-only.
+    set_mode(&feedback, 0o500);
+
+    let loaded = store.load();
+    let refused = |result: std::io::Result<()>| result.is_err();
+    let saved = refused(store.save(&Draft::default()));
+    let written = refused(store.write_file("screenshot-1.png", b"new"));
+    let cleared = refused(store.clear());
+    store.remove_file("screenshot-1.png");
+    set_mode(&feedback, 0o700);
+
+    assert_eq!(loaded.draft, Draft::default());
+    assert_eq!(loaded.notices, vec![save_failed_text(DRAFT_NOT_SET_ASIDE)]);
+    assert!(saved && written && cleared, "{saved} {written} {cleared}");
+    assert_eq!(
+        fs::read_to_string(store.dir().join("draft.json")).unwrap(),
+        r#"{"version":2,"attachments":[]}"#
+    );
+    assert_eq!(
+        fs::read(store.dir().join("screenshot-1.png")).unwrap(),
+        b"old"
+    );
+    assert!(broken_dirs(home.path()).is_empty());
+
+    // Once it can be set aside, the next start does.
+    let next = DraftStore::new(home.path()).load();
+    assert_eq!(next.notices, vec![BROKEN_DRAFT_TEXT.to_string()]);
+    assert_eq!(broken_dirs(home.path()).len(), 1);
+}
+
+#[test]
+fn an_orphan_file_is_gone_after_load() {
+    let home = tempfile::tempdir().unwrap();
+    let store = DraftStore::new(home.path());
+    let draft = three();
+    write_files(&store, &draft);
+    store.write_file("screenshot-1.thumb.png", b"x").unwrap();
+    store.write_file("image-1.thumb.png", b"x").unwrap();
+    store.save(&draft).unwrap();
+    let dir = store.dir();
+    for orphan in [
+        "image-7.png",
+        "image-7.thumb.png",
+        "screenshot-9.annotated.png",
+        "notes.txt",
+        ".draft.json.123.1a2b.0.tmp",
+        ".image-1.jpg.123.1a2b.1.tmp",
+    ] {
+        fs::write(dir.join(orphan), b"x").unwrap();
+    }
+    // Never followed and never entered: a link to a file outside, a folder.
+    fs::write(home.path().join("outside.png"), b"x").unwrap();
+    std::os::unix::fs::symlink(home.path().join("outside.png"), dir.join("link.png")).unwrap();
+    fs::create_dir(dir.join("folder")).unwrap();
+    fs::write(dir.join("folder").join("inside.png"), b"x").unwrap();
+
+    let loaded = store.load();
+    assert_eq!(loaded.draft, draft);
+    assert!(loaded.notices.is_empty());
+    assert_eq!(
+        names_in(&dir),
+        vec![
+            "clip-1.mp4",
+            "draft.json",
+            "folder",
+            "image-1.jpg",
+            "image-1.thumb.png",
+            "link.png",
+            "screenshot-1.annotated.png",
+            "screenshot-1.png",
+            "screenshot-1.thumb.png",
+        ]
+    );
+    assert!(home.path().join("outside.png").is_file());
+    assert!(dir.join("folder").join("inside.png").is_file());
+
+    // An empty draft leaves no directory behind; nor does a directory with
+    // files and no draft.
+    store.save(&Draft::default()).unwrap();
+    let loaded = store.load();
+    assert!(loaded.draft.is_empty());
+    assert!(!dir.exists());
+    store.write_file("screenshot-1.png", b"x").unwrap();
+    assert!(store.load().draft.is_empty());
+    assert!(!dir.exists());
+    assert!(home.path().join("outside.png").is_file());
+}
+
+#[test]
+fn ten_valid_attachments_are_kept_and_the_rest_removed_with_their_files() {
+    let home = tempfile::tempdir().unwrap();
+    let store = DraftStore::new(home.path());
+    let draft = draft_of(
+        (1..=12)
+            .map(|n| {
+                let name = format!("image-{n}.png");
+                plain(AttachmentKind::Image, &name, &name, 1)
+            })
+            .collect(),
+    );
+    write_files(&store, &draft);
+    store.write_file("image-12.thumb.png", b"x").unwrap();
+    fs::remove_file(store.path_of("image-2.png")).unwrap();
+    store.save(&draft).unwrap();
+
+    let loaded = store.load();
+    let kept: Vec<&str> = loaded
+        .draft
+        .attachments
+        .iter()
+        .map(|a| a.stored_name.as_str())
+        .collect();
+    assert_eq!(
+        kept,
+        vec![
+            "image-1.png",
+            "image-3.png",
+            "image-4.png",
+            "image-5.png",
+            "image-6.png",
+            "image-7.png",
+            "image-8.png",
+            "image-9.png",
+            "image-10.png",
+            "image-11.png",
+        ]
+    );
+    assert_eq!(
+        loaded.notices,
+        vec![removed_attachments_text(1, 1).unwrap()]
+    );
+    assert!(!store.path_of("image-12.png").exists());
+    assert!(!store.path_of("image-12.thumb.png").exists());
+    assert_eq!(store.load().draft, loaded.draft);
 }
 
 #[test]

@@ -3,8 +3,11 @@
 
 use std::io::Cursor;
 
+use image::error::{LimitError, LimitErrorKind};
 use image::imageops::{self, FilterType};
-use image::{ImageError, ImageFormat, ImageReader, Limits, Rgba, RgbaImage};
+use image::{
+    DynamicImage, ImageDecoder as _, ImageError, ImageFormat, ImageReader, Limits, Rgba, RgbaImage,
+};
 use smithagents_capture::Screenshot;
 
 use super::annotation::Annotation;
@@ -144,6 +147,10 @@ pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, ImageError> {
 
 /// Decodes png, jpeg, gif (first frame) or webp, refusing a picture whose
 /// size is beyond [`MAX_DECODE_SIDE`] or [`MAX_DECODE_ALLOC`] before decoding it.
+///
+/// The budget is checked on the size the header claims, both as decoded and
+/// as the RGBA the drawing needs (4 bytes a pixel): an 8-bit gray picture
+/// decodes to a quarter of what `into_rgba8` then allocates.
 pub fn decode(bytes: &[u8]) -> Result<RgbaImage, ImageError> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = Limits::default();
@@ -151,7 +158,18 @@ pub fn decode(bytes: &[u8]) -> Result<RgbaImage, ImageError> {
     limits.max_image_height = Some(MAX_DECODE_SIDE);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    Ok(reader.decode()?.into_rgba8())
+    // Reads the header only; the side limits are checked here.
+    let decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    let rgba_bytes = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4);
+    if rgba_bytes.max(decoder.total_bytes()) > MAX_DECODE_ALLOC {
+        return Err(ImageError::Limits(LimitError::from_kind(
+            LimitErrorKind::InsufficientMemory,
+        )));
+    }
+    Ok(DynamicImage::from_decoder(decoder)?.into_rgba8())
 }
 
 /// `None` when the buffer's length is not exactly width x height x 4.
