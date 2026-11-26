@@ -3,9 +3,9 @@
 //! ([`ShellState::right_entry`]).
 //!
 //! The pane shows one [`Screen`] at a time: the list ([`list`]), the create
-//! screen ([`create`]) or an intent's detail. The detail draws only a way
-//! back to the list for now. The filter, and the create screen's text, live
-//! in the pane, so they reset when the app restarts.
+//! screen ([`create`]) or an intent's detail ([`detail`]). The filter, and
+//! the create screen's text, live in the pane, so they reset when the app
+//! restarts.
 //!
 //! Every daemon command goes through [`IntentsPane::run`]: one at a time, so
 //! while one is in flight the others do nothing. Nothing changes on screen
@@ -14,15 +14,19 @@
 //! waiting when the connection drops, is given up with "The daemon did not
 //! answer". A failed command shows the screen's one error line, a status
 //! ([`INTENT_ERROR_ID`]); opening a screen or running the next command
-//! clears it. A detail whose intent the model no longer has (a reload after a
-//! reconnect) goes back to the list. The list is redrawn every minute so its
-//! ages advance.
+//! clears it. Leaving a screen does not give up its command, which the
+//! daemon may already be acting on: it runs to its end and frees the
+//! controls, but its failure shows only on the screen it was sent from. A
+//! detail whose intent the model no longer has (a reload after a reconnect)
+//! goes back to the list. The list is redrawn every minute so its ages
+//! advance.
 //!
 //! The pane paints its whole area from `Region::RightPane` (`card`,
 //! `card-foreground`), like Settings; everything else comes from tokens and
 //! the agent accents.
 
 mod create;
+mod detail;
 mod list;
 
 pub use create::{
@@ -31,16 +35,19 @@ pub use create::{
     CREATE_REPO_ID, CREATE_SCREEN_ID, CREATE_TITLE_ID, KIND_DESCRIPTION_ID, KIND_SHORTCUT_ID,
     KIND_TITLE_ID,
 };
+pub use detail::{
+    kind_item_id, DETAIL_BACK_ID, DETAIL_BODY_ID, DETAIL_KIND_ID, DETAIL_SCROLL_ID, DETAIL_SLUG_ID,
+    DETAIL_STATE_ID, DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, POLISHING_ID, POLISH_FAILED_ID,
+    RETRY_ID,
+};
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
-use gpui_kit::component::input::{InputEvent, TextareaState};
-use gpui_kit::component::{h_flex, v_flex, Icon, Sizable as _};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::v_flex;
 use gpui_kit::{
     div, AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, Role, ScrollHandle,
@@ -51,15 +58,15 @@ use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{Intent, IntentKind};
 use smithagents_theme::native::NativeTheme;
 
-use crate::intent_vm::{intent_error_text, IntentFilterChoice};
-use crate::link::{IntentAnswer, LinkError};
+use crate::intent_vm::{header_editable, intent_error_text, IntentFilterChoice};
+use crate::link::{IntentAnswer, IntentCommands, LinkError};
 use crate::model::Connection;
 use crate::shell::INTENTS_PANEL;
 use crate::shell_state::ShellState;
 use crate::theme_adapter::{
     agent_accent, region_paint, srgb_to_hsla, token_color, token_paint, Region,
 };
-use crate::view_models::DAEMON_SILENT_TEXT;
+use crate::view_models::{DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT};
 use crate::views::answered;
 use crate::views::rail::RailEntry;
 
@@ -85,9 +92,6 @@ pub const CARD_TITLE_ID: &str = "title";
 pub const CARD_META_ID: &str = "meta";
 pub const CARD_HEADING_ID: &str = "heading";
 pub const CARD_LINE_ID: &str = "line";
-/// Element id of the button back to the list ("Intents").
-pub const DETAIL_BACK_ID: &str = "intent-back";
-
 const TITLE: &str = "Intents";
 
 /// How often the list is redrawn, so its ages ("5m") advance.
@@ -147,6 +151,9 @@ pub struct IntentsPane {
     /// The command in flight, and its task; dropping the task gives it up.
     busy: Option<Busy>,
     command: Option<Task<()>>,
+    /// The screen the command in flight was sent from: only there does its
+    /// failure show.
+    command_screen: Option<Screen>,
     /// The connection as last seen, to notice it dropping.
     connection: Connection,
     /// One focus handle per card drawn, so each card is a tab stop.
@@ -159,6 +166,13 @@ pub struct IntentsPane {
     picked_repo: Option<RepoId>,
     /// The kind of the create in flight, whose row shows the spinner.
     creating_kind: Option<IntentKind>,
+    /// The detail's scroll position; a new one for each detail opened.
+    detail_scroll: ScrollHandle,
+    /// The detail's title as a button (a tab stop), and the input that
+    /// replaces it while the title of `editing_title` is edited.
+    title_focus: FocusHandle,
+    title_input: Entity<InputState>,
+    editing_title: Option<IntentId>,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -167,6 +181,7 @@ impl IntentsPane {
     pub fn new(state: Entity<ShellState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let text_box = create::new_text_box(window, cx);
+        let title_input = detail::new_title_input(window, cx);
         let subscriptions = vec![
             cx.observe_in(&state, window, |this, _, window, cx| {
                 this.on_state_changed(window, cx)
@@ -177,6 +192,15 @@ impl IntentsPane {
                     cx.notify();
                 }
             }),
+            cx.subscribe_in(
+                &title_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.save_title(window, cx);
+                    }
+                },
+            ),
             // The shell focuses the pane when it shows it: on the create
             // screen the text box takes that focus, as when the screen opens.
             cx.on_focus(&focus, window, |this, window, cx| {
@@ -196,11 +220,16 @@ impl IntentsPane {
             error: None,
             busy: None,
             command: None,
+            command_screen: None,
             card_focus: HashMap::new(),
             scroll: ScrollHandle::new(),
             text_box,
             picked_repo: None,
             creating_kind: None,
+            detail_scroll: ScrollHandle::new(),
+            title_focus: cx.focus_handle().tab_stop(true),
+            title_input,
+            editing_title: None,
             _age_refresh: refresh_ages(cx),
             _subscriptions: subscriptions,
         }
@@ -232,10 +261,14 @@ impl IntentsPane {
         tracing::debug!(?screen, "intents screen");
         let previous = std::mem::replace(&mut self.screen, screen);
         self.error = None;
+        self.editing_title = None;
         self.detail_seen = match screen {
             Screen::Detail(id) => self.state.read(cx).model().intent(id).is_some(),
             Screen::List | Screen::Create => false,
         };
+        if screen != previous && matches!(screen, Screen::Detail(_)) {
+            self.detail_scroll = ScrollHandle::new();
+        }
         if screen == Screen::Create {
             self.text_box
                 .update(cx, |text_box, cx| text_box.focus(window, cx));
@@ -254,8 +287,10 @@ impl IntentsPane {
     /// `key` busy and waits for the answer at most the shell's command
     /// timeout; then clears busy and either calls `done` with the answer or
     /// sets the error line (`intent_error_text`, or "The daemon did not
-    /// answer" on a timeout). The model learns of the answer from the link,
-    /// not from here.
+    /// answer" on a timeout) if the pane still shows the screen the command
+    /// was sent from. Opening another screen meanwhile does not give the
+    /// command up. The model learns of the answer from the link, not from
+    /// here.
     pub fn run(
         &mut self,
         key: Busy,
@@ -271,6 +306,7 @@ impl IntentsPane {
         tracing::debug!(?key, "sending an intent command");
         self.error = None;
         self.busy = Some(key);
+        self.command_screen = Some(self.screen);
         let timer = cx
             .background_executor()
             .timer(self.state.read(cx).command_timeout());
@@ -294,10 +330,11 @@ impl IntentsPane {
     ) {
         self.busy = None;
         self.command = None;
+        let sent_from = self.command_screen.take();
         match answer {
             None => {
                 tracing::warn!(?key, "the daemon did not answer an intent command in time");
-                self.error = Some(DAEMON_SILENT_TEXT.to_owned());
+                self.show_failure(sent_from, DAEMON_SILENT_TEXT.to_owned());
             }
             Some(Ok(intent)) => {
                 tracing::debug!(?key, intent = %intent.id, "intent command answered");
@@ -305,30 +342,81 @@ impl IntentsPane {
             }
             Some(Err(e)) => {
                 tracing::warn!(?key, "intent command failed: {e}");
-                self.error = Some(intent_error_text(&e));
+                self.show_failure(sent_from, intent_error_text(&e));
             }
         }
         cx.notify();
     }
 
-    /// Stops waiting for the command in flight and says so. The daemon may
-    /// still finish it; its change then arrives through the events.
+    /// Sends the command `make` builds through [`Self::run`]. While another
+    /// command is in flight it does nothing (`make` is not called, so nothing
+    /// is sent); without a link the error line says so.
+    fn command(
+        &mut self,
+        key: Busy,
+        make: impl FnOnce(&dyn IntentCommands) -> IntentAnswer,
+        done: impl FnOnce(&mut Self, Intent, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(busy) = self.busy {
+            tracing::debug!(?key, ?busy, "an intent command is already in flight");
+            return;
+        }
+        let Some(command) = self.state.read(cx).intent_commands().map(make) else {
+            self.error = Some(NOT_CONNECTED_TEXT.to_owned());
+            cx.notify();
+            return;
+        };
+        self.run(key, command, done, window, cx);
+    }
+
+    /// Puts a command's failure on the error line if the pane still shows
+    /// `sent_from`, the screen the command was sent from; a failure never
+    /// lands on another screen.
+    fn show_failure(&mut self, sent_from: Option<Screen>, text: String) {
+        if sent_from == Some(self.screen) {
+            self.error = Some(text);
+        } else {
+            tracing::debug!(
+                ?sent_from,
+                screen = ?self.screen,
+                "a command failed after its screen was left"
+            );
+        }
+    }
+
+    /// Stops waiting for the command in flight and says so (on the screen
+    /// that sent it). The daemon may still finish it; its change then
+    /// arrives through the events.
     fn give_up_command(&mut self) {
         tracing::warn!(busy = ?self.busy, "the connection dropped while an intent command waited");
         self.command = None;
         self.busy = None;
-        self.error = Some(DAEMON_SILENT_TEXT.to_owned());
+        let sent_from = self.command_screen.take();
+        self.show_failure(sent_from, DAEMON_SILENT_TEXT.to_owned());
     }
 
     fn on_state_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (connection, detail_present) = {
+        let (connection, detail_present, title_editable) = {
             let model = self.state.read(cx).model();
             let present = match self.screen {
                 Screen::Detail(id) => Some(model.intent(id).is_some()),
                 Screen::List | Screen::Create => None,
             };
-            (model.connection(), present)
+            let editable = self
+                .editing_title
+                .map(|id| model.intent(id).is_some_and(header_editable));
+            (model.connection(), present, editable)
         };
+        // The intent is being polished, or was sent, while its title input
+        // was open: the input goes, and a keyboard user stays in the pane.
+        if title_editable == Some(false) {
+            self.editing_title = None;
+            if self.title_input.focus_handle(cx).is_focused(window) {
+                self.focus.focus(window, cx);
+            }
+        }
         let dropped =
             self.connection == Connection::Connected && connection != Connection::Connected;
         self.connection = connection;
@@ -366,22 +454,6 @@ impl IntentsPane {
                 .text_color(paint.destructive)
                 .child(text)
                 .into_any_element(),
-        )
-    }
-
-    /// The detail screen until it is built: the way back.
-    fn placeholder_screen(&self, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {
-        v_flex().size_full().child(
-            h_flex().flex_none().w_full().px_1().py_2().child(
-                Button::new(DETAIL_BACK_ID)
-                    .icon(Icon::new(IconName::ArrowLeft).text_color(paint.foreground))
-                    .label(TITLE)
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_screen(Screen::List, window, cx)
-                    })),
-            ),
         )
     }
 }
@@ -454,7 +526,7 @@ impl Render for IntentsPane {
         let content = match self.screen {
             Screen::List => self.list_screen(&paint, cx).into_any_element(),
             Screen::Create => self.create_screen(&paint, cx).into_any_element(),
-            Screen::Detail(_) => self.placeholder_screen(&paint, cx).into_any_element(),
+            Screen::Detail(id) => self.detail_screen(id, &paint, cx),
         };
         v_flex()
             .id(INTENTS_PANEL)
