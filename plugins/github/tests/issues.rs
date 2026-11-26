@@ -72,18 +72,56 @@ fn follows_link_pages_skips_pull_requests_and_sends_since_on_the_next_run() {
 }
 
 #[test]
-fn a_next_link_on_another_host_is_not_followed() {
+fn a_refused_next_link_is_an_error_not_the_end_of_the_listing() {
     for link in [
         "<https://evil.example/issues?page=2>; rel=\"next\"",
         "<http://api.github.com/issues?page=2>; rel=\"next\"",
         "<https://api.github.com.evil.example/x>; rel=\"next\"",
+        "<https://api.github.com/issues?page=2 x>; rel=\"next\"",
+    ] {
+        let host = Scripted::new().on(FIRST, 200, &[("Link", link)], fixture("issues_page2.json"));
+        let err = sync(&host, "issue", None, s()).unwrap_err();
+        assert!(
+            matches!(err, smithagents_plugin_protocol::PluginError::Other { .. }),
+            "{link}"
+        );
+        assert_eq!(host.urls(), [FIRST], "{link}: nothing else is requested");
+    }
+}
+
+#[test]
+fn no_next_link_means_the_repository_is_finished() {
+    for link in [
         "<https://api.github.com/issues?page=2>; rel=\"prev\"",
         "garbage",
     ] {
         let host = Scripted::new().on(FIRST, 200, &[("Link", link)], fixture("issues_page2.json"));
         let page = sync(&host, "issue", None, s()).unwrap();
         assert!(page.done, "{link}");
-        assert_eq!(host.urls(), [FIRST]);
+    }
+}
+
+#[test]
+fn without_a_usable_date_no_timestamp_moves_the_mark_but_items_are_kept() {
+    let body = serde_json::to_vec(&json!([
+        entry(1, "9999-01-01T00:00:00Z"),
+        entry(2, "2026-01-01T00:00:00Z")
+    ]))
+    .unwrap();
+    for headers in [
+        vec![],
+        vec![("Date", "not a date")],
+        vec![("Date", "Fri, 31 Dec 262142 23:59:59 +0000")],
+    ] {
+        let host = Scripted::new().on_raw(FIRST, 200, &headers, body.clone());
+        let page = sync(&host, "issue", None, s()).unwrap();
+        assert_eq!(page.upserts.len(), 2, "{headers:?}");
+        assert!(
+            cursor_json(&page)["marks"]
+                .get("octo-org/widgets")
+                .is_none(),
+            "{headers:?}"
+        );
     }
 }
 
@@ -275,8 +313,9 @@ fn ids(page: &smithagents_plugin_protocol::SyncPage) -> Vec<&str> {
 
 #[test]
 fn a_page_shifted_by_one_between_pages_loses_nothing() {
-    // Between page 1 and page 2 issue 4 was updated, so it moved up and page 2
-    // repeats the boundary entry. Newest first, nothing is skipped.
+    // Between page 1 and page 2 another, later issue was updated and moved to
+    // the top of the list, pushing issue 4 down onto page 2: page 2 repeats
+    // the boundary entry. Newest first, nothing is skipped.
     let page1 = json!([
         entry(5, "2026-01-09T00:00:00Z"),
         entry(4, "2026-01-08T00:00:00Z")

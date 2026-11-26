@@ -218,11 +218,28 @@ impl Upserts {
 }
 
 /// Whether a timestamp may move the mark: not more than a day ahead of the
-/// response's own clock. Without a clock there is nothing to compare with.
+/// response's own clock. Without a usable clock nothing moves the mark; the
+/// next run simply reads from the old one again.
 pub(crate) fn plausible(ts: &str, now: Option<DateTime<Utc>>) -> bool {
-    match (parse_time(ts), now) {
-        (Some(ts), Some(now)) => ts <= now + Duration::hours(24),
-        (Some(_), None) => true,
-        _ => false,
+    let limit = now.and_then(|n| n.checked_add_signed(Duration::hours(24)));
+    parse_time(ts)
+        .zip(limit)
+        .is_some_and(|(ts, limit)| ts <= limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plausible_never_overflows_and_needs_a_clock() {
+        assert!(!plausible(
+            "2026-01-01T00:00:00Z",
+            Some(DateTime::<Utc>::MAX_UTC)
+        ));
+        assert!(!plausible("2026-01-01T00:00:00Z", None));
+        let now = parse_time("2026-11-26T10:00:00Z");
+        assert!(plausible("2026-11-27T09:00:00Z", now));
+        assert!(!plausible("2026-11-27T11:00:00Z", now));
     }
 }

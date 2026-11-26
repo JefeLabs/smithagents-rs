@@ -30,7 +30,19 @@ impl Scripted {
         Self::default()
     }
 
+    /// Like `on_raw`, but a `Date` header is added unless one is given: a
+    /// server always sends one, and the plugin trusts timestamps only
+    /// against it.
     pub fn on(self, url: &str, status: u16, headers: &[(&str, &str)], body: Vec<u8>) -> Self {
+        let mut all = headers.to_vec();
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("date")) {
+            all.push(("Date", "Thu, 26 Nov 2026 10:00:00 GMT"));
+        }
+        self.on_raw(url, status, &all, body)
+    }
+
+    /// Exactly the headers given, no more.
+    pub fn on_raw(self, url: &str, status: u16, headers: &[(&str, &str)], body: Vec<u8>) -> Self {
         let resp = HttpResponse {
             status,
             headers: headers

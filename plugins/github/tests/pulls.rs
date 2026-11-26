@@ -190,3 +190,29 @@ fn an_entry_without_a_usable_updated_at_is_kept_and_moves_nothing() {
         json!("2026-02-02T00:00:00Z")
     );
 }
+
+#[test]
+fn a_refused_next_link_is_an_error_for_pull_requests_too() {
+    let host = Scripted::new().on(
+        FIRST,
+        200,
+        &[("Link", "<https://evil.example/pulls?page=2>; rel=\"next\"")],
+        fixture("pulls_widgets.json"),
+    );
+    let err = sync(&host, "pull_request", None, s()).unwrap_err();
+    assert!(matches!(
+        err,
+        smithagents_plugin_protocol::PluginError::Other { .. }
+    ));
+    assert_eq!(host.urls(), [FIRST]);
+}
+
+#[test]
+fn without_a_date_the_mark_does_not_move_but_items_are_kept() {
+    let host = Scripted::new().on_raw(FIRST, 200, &[], fixture("pulls_widgets.json"));
+    let page = sync(&host, "pull_request", None, s()).unwrap();
+    assert_eq!(page.upserts.len(), 3);
+    assert!(cursor_json(&page)["marks"]
+        .get("octo-org/widgets")
+        .is_none());
+}

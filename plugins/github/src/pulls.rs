@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use smithagents_plugin_protocol::{HostApi, Item, PluginError, SyncPage};
 
 use crate::cursor::{keep_newest, normalize_ts, Cursor};
+use crate::http::{refused_next, Next};
 use crate::{
     http, labels, logins, nested, opt_str, parse_time, plausible, scalar, truncate_title, web_url,
     Upserts, MAX_ENTRIES,
@@ -74,13 +75,18 @@ pub fn sync(
         // Without a usable timestamp the entry is kept but moves nothing.
         upserts.push(item(&repo, entry));
     }
-    let next = if reached_mark { None } else { fetched.next };
+    let next = if reached_mark {
+        Next::None
+    } else {
+        fetched.next
+    };
     let done = match next {
-        Some(next) => {
+        Next::Url(next) => {
             cursor.continue_repo(next, newest);
             false
         }
-        None => cursor.finish_repo(&repo, repos.len(), newest),
+        Next::Refused => return Err(refused_next(&repo)),
+        Next::None => cursor.finish_repo(&repo, repos.len(), newest),
     };
     Ok(SyncPage {
         upserts: upserts.items,

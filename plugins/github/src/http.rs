@@ -8,10 +8,21 @@ use smithagents_plugin_protocol::{
 
 pub const API_PREFIX: &str = "https://api.github.com/";
 
+/// What a `Link` header says about the next page.
+#[derive(Debug, PartialEq)]
+pub enum Next {
+    /// No `rel="next"`: the listing is finished.
+    None,
+    /// A page on the API host.
+    Url(String),
+    /// A `rel="next"` this plugin will not follow; the listing is not finished.
+    Refused,
+}
+
 /// A successful, parsed answer and the next page it points to, if any.
 pub struct Fetched {
     pub body: Value,
-    pub next: Option<String>,
+    pub next: Next,
     /// The response's `date` header, when it parses.
     pub now: Option<DateTime<Utc>>,
 }
@@ -29,8 +40,8 @@ pub fn is_api_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-/// The `rel="next"` URL of a `Link` header, only when it is on the API host.
-pub fn next_link(header: &str) -> Option<String> {
+/// The `rel="next"` entry of a `Link` header, followed only on the API host.
+pub fn next_link(header: &str) -> Next {
     // Split on commas that start a new `<url>` entry, so a comma inside a URL
     // does not cut it in two.
     let mut entries: Vec<String> = Vec::new();
@@ -43,17 +54,29 @@ pub fn next_link(header: &str) -> Option<String> {
             _ => entries.push(part.to_string()),
         }
     }
-    entries.iter().find_map(|entry| {
-        let entry = entry.trim();
-        let rest = entry.strip_prefix('<')?;
+    let next_url = entries.iter().find_map(|entry| {
+        let rest = entry.trim().strip_prefix('<')?;
         let (url, params) = rest.split_once('>')?;
         let is_next = params.split(';').any(|p| {
             p.trim()
                 .strip_prefix("rel=")
                 .is_some_and(|v| v.trim_matches('"').split_whitespace().any(|r| r == "next"))
         });
-        (is_next && is_api_url(url)).then(|| url.to_string())
-    })
+        is_next.then(|| url.to_string())
+    });
+    match next_url {
+        None => Next::None,
+        Some(url) if is_api_url(&url) => Next::Url(url),
+        Some(_) => Next::Refused,
+    }
+}
+
+/// The error for a next-page link that is not followed: stopping quietly
+/// would commit a mark over pages that were never read.
+pub fn refused_next(repo: &str) -> PluginError {
+    other(format!(
+        "{repo}: GitHub returned a next page link this plugin does not follow"
+    ))
 }
 
 fn rate_limit_wait(resp: &HttpResponse) -> Option<u32> {
@@ -166,7 +189,7 @@ pub fn get(host: &dyn HostApi, url: &str, repo: &str) -> Result<Fetched, PluginE
     }
     let body: Value = serde_json::from_slice(&resp.body)
         .map_err(|_| other("GitHub sent a response that is not valid JSON"))?;
-    let next = resp.header("link").and_then(next_link);
+    let next = resp.header("link").map_or(Next::None, next_link);
     Ok(Fetched {
         body,
         next,

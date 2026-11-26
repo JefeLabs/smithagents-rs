@@ -127,6 +127,7 @@ impl Cursor {
         let ts = "2026-01-01T00:00:00Z".to_string();
         let mut worst = Self::fresh(repos);
         worst.marks = repos.iter().map(|r| (r.clone(), ts.clone())).collect();
+        worst.repo = repos.len().saturating_sub(1);
         worst.pending = Some(ts);
         worst.next = Some("a".repeat(1024));
         let fits = serde_json::to_string(&worst).is_ok_and(|t| t.len() <= MAX_CURSOR_BYTES);
@@ -157,5 +158,36 @@ impl Cursor {
 pub fn keep_newest(slot: &mut Option<String>, ts: String) {
     if slot.as_ref().is_none_or(|cur| *cur < ts) {
         *slot = Some(ts);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_fits_covers_a_real_cursor_at_the_last_index() {
+        let mut checked = 0;
+        for n in 11..=50usize {
+            for width in 1..=96usize {
+                let repos: Vec<String> = (0..n)
+                    .map(|i| format!("octo-org/{i:02}{}", "a".repeat(width)))
+                    .collect();
+                if Cursor::check_fits(&repos).is_err() {
+                    continue;
+                }
+                let mut real = Cursor::fresh(&repos);
+                real.repo = n - 1;
+                real.marks = repos
+                    .iter()
+                    .map(|r| (r.clone(), "2026-01-01T00:00:00Z".to_string()))
+                    .collect();
+                real.pending = Some("2026-01-01T00:00:00Z".into());
+                real.next = Some("a".repeat(1024));
+                assert!(real.encode().is_ok(), "n={n} width={width}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
     }
 }
