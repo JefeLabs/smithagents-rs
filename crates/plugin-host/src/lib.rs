@@ -1,0 +1,14 @@
+//! Hosts SmithAgents plugins.
+//!
+//! [`HostServices`] is the one place a plugin's network access and credentials
+//! pass through: every request is checked against [`HttpPolicy`], and secrets
+//! named by a request's `auth` are resolved from a [`SecretSource`] and added
+//! by the host, so a plugin never sees a secret value.
+
+mod http;
+mod secrets;
+mod services;
+
+pub use http::HttpPolicy;
+pub use secrets::{ConfiguredSecrets, Secret, SecretError, SecretSource, StaticSecrets};
+pub use services::{CallHandle, CallPurpose, HostServices, ServicesError};
