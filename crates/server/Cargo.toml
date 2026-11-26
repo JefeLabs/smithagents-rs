@@ -44,6 +44,7 @@ path = "tests/api.rs"
 required-features = ["test-util"]
 
 [dev-dependencies]
+smithagents-plugin-fixture = { path = "../../plugins/fixture" }
 smithagents-plugins-tool = { path = "../../tools/plugins" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
@@ -64,4 +65,9 @@ required-features = ["test-util"]
 [[test]]
 name = "plugin_store"
 path = "tests/plugin_store.rs"
+required-features = ["test-util"]
+
+[[test]]
+name = "plugin_manager"
+path = "tests/plugin_manager.rs"
 required-features = ["test-util"]

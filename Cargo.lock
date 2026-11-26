@@ -7557,6 +7557,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smithagents-core",
+ "smithagents-plugin-fixture",
  "smithagents-plugin-host",
  "smithagents-plugin-protocol",
  "smithagents-plugins-tool",

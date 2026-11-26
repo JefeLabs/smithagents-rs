@@ -1,0 +1,162 @@
+//! What the API and events say about a plugin.
+
+use smithagents_core::plugin::{PluginState, PluginStatus, ResourceStatus};
+
+use super::{Inner, Live, Managed, Problem};
+use crate::plugins::{settings, Origin};
+
+/// Messages shown to users are at most this long.
+const MAX_MESSAGE_BYTES: usize = 1024;
+const ELLIPSIS: char = '…';
+
+/// Text from a plugin, a guest or an error, made fit for an API response, an
+/// event or a log: control characters, line and paragraph separators and
+/// bidi marks become spaces, and the text is cut to 1 KiB on a character
+/// boundary, ending in an ellipsis when cut. Reads no more than it keeps.
+pub(crate) fn clean_message(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        let c = if c.is_control() || is_separator_or_bidi(c) {
+            ' '
+        } else {
+            c
+        };
+        if out.len() + c.len_utf8() > MAX_MESSAGE_BYTES {
+            while out.len() + ELLIPSIS.len_utf8() > MAX_MESSAGE_BYTES {
+                out.pop();
+            }
+            out.push(ELLIPSIS);
+            return out;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// U+2028 and U+2029, U+202A to U+202E and U+2066 to U+2069.
+fn is_separator_or_bidi(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// The plugin's state: a load failure or a stop first (enabling does not
+/// clear them), then disabled, then invalid settings, then a problem a run met.
+fn state(plugin: &Managed, live: &Live) -> PluginState {
+    if let Err(message) = &plugin.loaded {
+        return PluginState::LoadFailed {
+            message: message.clone(),
+        };
+    }
+    if let Some(Problem::Failed { message }) = &live.problem {
+        return PluginState::Failed {
+            message: message.clone(),
+        };
+    }
+    if !live.enabled {
+        return PluginState::Disabled;
+    }
+    if let Some(message) = &live.settings_error {
+        return PluginState::NeedsSettings {
+            message: message.clone(),
+        };
+    }
+    match &live.problem {
+        None => PluginState::Ready,
+        Some(Problem::NeedsAuth { missing, message }) => PluginState::NeedsAuth {
+            missing: missing.clone(),
+            message: message.clone(),
+        },
+        Some(Problem::NeedsSettings { message }) => PluginState::NeedsSettings {
+            message: message.clone(),
+        },
+        Some(Problem::Failed { message }) => PluginState::Failed {
+            message: message.clone(),
+        },
+    }
+}
+
+pub(super) async fn status(inner: &Inner, plugin: &Managed) -> PluginStatus {
+    let (enabled, state, resources) = {
+        let live = plugin.live();
+        let running = live.running.as_ref().map(|r| r.kind.as_str());
+        let resources: Vec<_> = live
+            .resources
+            .iter()
+            .map(|r| {
+                (
+                    r.kind.clone(),
+                    r.sync.clone(),
+                    running == Some(r.kind.as_str()),
+                )
+            })
+            .collect();
+        (live.enabled, state(plugin, &live), resources)
+    };
+    let manifest = &plugin.manifest;
+    let mut statuses = Vec::with_capacity(resources.len());
+    for (decl, (kind, sync, syncing)) in manifest.resources.iter().zip(resources) {
+        let item_count = match inner.store.count_items(&plugin.id, &kind).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(plugin = %plugin.id, resource = %kind, "cannot count items: {e}");
+                0
+            }
+        };
+        statuses.push(ResourceStatus {
+            kind,
+            label: decl.label.clone(),
+            item_count,
+            last_run_at: sync.last_run_at,
+            last_ok_at: sync.last_ok_at,
+            next_due_at: sync.next_due_at,
+            last_error: sync.last_error,
+            syncing,
+        });
+    }
+    PluginStatus {
+        id: plugin.id.clone(),
+        name: manifest.name.clone(),
+        version: manifest.version.to_string(),
+        host: manifest.host.to_string(),
+        builtin: plugin.origin == Origin::Builtin,
+        enabled,
+        state,
+        hosts: manifest.hosts.clone(),
+        secrets: manifest.secrets.iter().map(|s| s.key.clone()).collect(),
+        settings: settings::fields(manifest),
+        resources: statuses,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_text_only_loses_control_characters_and_bidi_marks() {
+        assert_eq!(clean_message("plain text é"), "plain text é");
+        assert_eq!(
+            clean_message("a\nb\r\tc\u{1b}[0m\u{7f}\u{85}"),
+            "a b  c [0m  "
+        );
+        assert_eq!(clean_message("x\u{2028}y\u{202e}z\u{2066}"), "x y z ");
+    }
+
+    #[test]
+    fn long_text_is_cut_to_one_kib_on_a_character_boundary() {
+        let exact = "a".repeat(MAX_MESSAGE_BYTES);
+        assert_eq!(clean_message(&exact), exact);
+
+        let cut = clean_message(&"a".repeat(MAX_MESSAGE_BYTES + 1));
+        assert_eq!(cut.len(), MAX_MESSAGE_BYTES);
+        assert!(cut.ends_with(ELLIPSIS));
+
+        // Two-byte characters: the cut never splits one.
+        let cut = clean_message(&"é".repeat(MAX_MESSAGE_BYTES));
+        assert!(cut.len() <= MAX_MESSAGE_BYTES);
+        assert!(cut.ends_with(ELLIPSIS));
+        assert!(cut.trim_end_matches(ELLIPSIS).chars().all(|c| c == 'é'));
+    }
+}
