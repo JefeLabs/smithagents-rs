@@ -10,9 +10,11 @@ mod linked;
 mod runtime;
 mod secrets;
 mod services;
+mod wasm;
 
 pub use http::HttpPolicy;
 pub use linked::LinkedRuntime;
-pub use runtime::{CallError, PluginRuntime};
+pub use runtime::{CallError, LoadError, PluginRuntime};
 pub use secrets::{ConfiguredSecrets, Secret, SecretError, SecretSource, StaticSecrets};
 pub use services::{CallHandle, CallPurpose, HostServices, ServicesError};
+pub use wasm::{WasmEngine, WasmLimits, WasmRuntime};

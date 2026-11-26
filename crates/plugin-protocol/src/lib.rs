@@ -7,6 +7,9 @@
 mod envelope;
 mod manifest;
 mod types;
+#[cfg(feature = "wasm-guest")]
+#[doc(hidden)]
+pub mod wasm_guest;
 
 pub use envelope::{HostCall, HostReply, PluginCall, PluginReply};
 pub use manifest::{

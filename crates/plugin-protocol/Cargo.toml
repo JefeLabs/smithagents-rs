@@ -8,6 +8,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The guest side of the WebAssembly contract: bindings for `wit/plugin.wit`
+# and `export_wasm_plugin!`. Only plugin crates built for wasm32 enable it.
+wasm-guest = ["dep:wit-bindgen"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -17,3 +22,4 @@ toml.workspace = true
 semver.workspace = true
 base64.workspace = true
 url.workspace = true
+wit-bindgen = { workspace = true, optional = true }

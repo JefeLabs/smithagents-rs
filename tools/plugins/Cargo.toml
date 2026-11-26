@@ -1,0 +1,23 @@
+[package]
+name = "smithagents-plugins-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "smithagents_plugins_tool"
+
+[[bin]]
+name = "smithagents-plugins"
+path = "src/main.rs"
+
+[dependencies]
+smithagents-plugin-protocol = { path = "../../crates/plugin-protocol" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

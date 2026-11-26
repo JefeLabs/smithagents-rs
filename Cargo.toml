@@ -49,3 +49,9 @@ url = "=2.5.9"
 toml = "1.2.3"
 semver = { version = "1.0.28", features = ["serde"] }
 base64 = "0.23.1"
+# The plugin sandbox. Pinned exactly: their embedding APIs change every release.
+# Only what the runtime uses is enabled; Cranelift dominates the build time.
+wasmtime = { version = "=51.0.0", default-features = false, features = ["async", "cache", "component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "=51.0.0", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = "=51.0.0"
+wit-bindgen = { version = "=0.63.0", default-features = false, features = ["macros", "realloc", "std"] }

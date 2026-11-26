@@ -21,6 +21,23 @@ pub enum CallError {
     Contract { message: String },
 }
 
+/// Why a plugin could not be loaded.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("cannot read the plugin: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("not a valid plugin: {message}")]
+    Invalid { message: String },
+    /// The plugin needs an interface the host does not provide, such as the
+    /// filesystem or sockets.
+    #[error("the plugin imports what the host does not provide: {message}")]
+    MissingImport { message: String },
+    #[error("cannot load the native plugin: {message}")]
+    Dylib { message: String },
+    #[error("refused: {message}")]
+    Refused { message: String },
+}
+
 impl From<ContractError> for CallError {
     fn from(err: ContractError) -> CallError {
         CallError::Contract {
