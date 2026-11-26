@@ -279,7 +279,9 @@ example "open this issue in a center tab").
   - `dylib` (built-in plugins): the plugin is a dynamic library with a
     stabby ABI-stable interface, loaded into the daemon at start. It runs in
     the daemon's process on its own supervised task (panics caught at the
-    boundary, restart on panic, call timeouts and sync budgets). This contains
+    boundary, call timeouts and sync budgets; a plugin that panics or times
+    out stays failed until the daemon restarts, because a stuck native thread
+    cannot be stopped safely [owner decision, 2026-11-26]). This contains
     panics and slow calls. It does not contain a hard crash, a memory or CPU
     hog, or malice: a dylib can read everything the daemon holds. Only
     plugins built and signed by us are ever loaded this way. Loaded libraries
