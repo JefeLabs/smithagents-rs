@@ -29,7 +29,8 @@ use smithagents_server::lifecycle::{
 };
 use smithagents_server::paths::{ensure_private_real_dir, Paths};
 use smithagents_server::plugins::{
-    builtin_plugins_dir, discover, load_runtime, LoadedPlugin, ManagerConfig, PluginManager,
+    builtin_plugins_dir, discover, embedded_plugins, load_runtime, LoadedPlugin, ManagerConfig,
+    PluginManager,
 };
 use smithagents_server::queue::Scheduler;
 use smithagents_server::service::AgentService;
@@ -265,10 +266,12 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     Ok(served?)
 }
 
-/// Finds the plugins, builds a runtime for each and starts the manager. A
-/// plugin that cannot load stays listed with its failure; one that is
-/// rejected is only logged. Logs name directories and fixed reasons, never a
-/// manifest's text, a setting or anything from `secrets.toml`.
+/// Finds the plugins, builds a runtime for each and starts the manager. The
+/// plugins compiled into the daemon come first, so a directory with the
+/// same id cannot replace one (the manager keeps the first of two equal
+/// ids). A plugin that cannot load stays listed with its failure; one that
+/// is rejected is only logged. Logs name directories and fixed reasons, never
+/// a manifest's text, a setting or anything from `secrets.toml`.
 async fn start_plugins(
     paths: &Paths,
     store: &Store,
@@ -279,7 +282,8 @@ async fn start_plugins(
         tracing::warn!(dir = %r.dir.display(), reason = %r.reason, "plugin rejected");
     }
     let engine = start_wasm_engine(paths);
-    let mut plugins = Vec::with_capacity(found.len());
+    let mut plugins = embedded_plugins();
+    plugins.reserve(found.len());
     for d in &found {
         // Without an engine only wasm plugins fail (inside `load_runtime`).
         let runtime = load_runtime(d, engine.as_deref())

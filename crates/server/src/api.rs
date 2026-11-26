@@ -294,6 +294,11 @@ impl From<ManagerError> for ApiError {
                 "a command-line tool is being installed now; try again when it ends",
             ),
             ManagerError::Install(e) => install_error(e),
+            // A fixed sentence with an exit status at most: nothing the tool
+            // printed.
+            ManagerError::Tool(e) => {
+                Self::new(S::BAD_GATEWAY, "tool_failed", clean_message(&e.to_string()))
+            }
             ManagerError::Store(StoreError::BadCursor) => {
                 Self::new(S::BAD_REQUEST, "bad_cursor", "malformed items cursor")
             }
@@ -507,6 +512,7 @@ async fn sync_plugin_resource(
             | ManagerError::UnknownTool
             | ManagerError::InstallInProgress
             | ManagerError::Install(_)
+            | ManagerError::Tool(_)
             | ManagerError::Store(_)),
         ) => Err(e.into()),
     }
@@ -1264,6 +1270,32 @@ mod tests {
             assert_eq!((api.status, api.code), (status, code), "{message}");
             assert_eq!(api.message, message);
         }
+    }
+
+    #[test]
+    fn a_tool_that_failed_is_a_bad_gateway_with_its_own_sentence() {
+        use smithagents_plugin_host::ToolRunError as T;
+        for e in [
+            T::NotFound,
+            T::NotStarted,
+            T::Timeout,
+            T::TooMuchOutput,
+            T::Failed { status: Some(1) },
+            T::Failed { status: None },
+        ] {
+            let message = e.to_string();
+            let api = ApiError::from(ManagerError::Tool(e));
+            assert_eq!(
+                (api.status, api.code),
+                (StatusCode::BAD_GATEWAY, "tool_failed"),
+                "{message}"
+            );
+            assert_eq!(api.message, message);
+        }
+        assert_eq!(
+            ApiError::from(ManagerError::Tool(T::Failed { status: Some(1) })).message,
+            "the tool failed (exit status 1)"
+        );
     }
 
     fn updated(agent: AgentId, state: AgentState) -> Event {

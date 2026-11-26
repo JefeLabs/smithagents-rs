@@ -7,7 +7,9 @@
 //!   pages, outcome.
 //! - [`status`]: the [`PluginStatus`] the API and events carry.
 //! - [`tools`]: the command-line tools a built-in plugin depends on: checks
-//!   before runs, installs on request, and secrets a tool prints.
+//!   before runs (and, for a plugin without resources, when its status is
+//!   read), installs on request, secrets a tool prints, and runs for the
+//!   daemon's own code.
 //!
 //! Scheduling uses tokio's clock; the times it stores come from a wall clock,
 //! which tests replace. A call into a plugin is never cancelled: a native
@@ -33,6 +35,7 @@ use smithagents_core::event::EventKind;
 use smithagents_core::plugin::{ItemsPage, MissingTool, PluginStatus};
 use smithagents_plugin_host::{
     HostServices, HttpPolicy, InstallError, PluginRuntime, SecretSource, ServicesError, ToolFinder,
+    ToolRun, ToolRunError, ToolState,
 };
 use smithagents_plugin_protocol::Manifest;
 use tokio::sync::{watch, Notify, Semaphore};
@@ -98,8 +101,9 @@ pub enum ManagerError {
     Busy,
     #[error("invalid settings: {0}")]
     InvalidSettings(String),
-    /// Only a built-in plugin's tools are installed.
-    #[error("the tools of an installed plugin are not installed by the daemon")]
+    /// Only a built-in plugin's tools are installed, checked on request or
+    /// run.
+    #[error("the daemon does not install, check or run an installed plugin's tools")]
     NotAllowed,
     #[error("the plugin declares no such tool")]
     UnknownTool,
@@ -108,6 +112,10 @@ pub enum ManagerError {
     InstallInProgress,
     #[error(transparent)]
     Install(InstallError),
+    /// A declared tool ran and did not answer; see
+    /// [`PluginManager::run_tool`]. Carries nothing the tool printed.
+    #[error(transparent)]
+    Tool(ToolRunError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -570,6 +578,37 @@ impl PluginManager {
         let plugin = self.inner.plugin(id)?;
         tools::install(&self.inner, plugin, tool).await?;
         Ok(self.inner.publish_status(plugin).await)
+    }
+
+    /// A fresh check of the tool `tool` that the built-in plugin `id`
+    /// declares (the status's cached check is neither read nor replaced).
+    /// Refused for an installed plugin (`NotAllowed`) and a tool the plugin
+    /// does not declare (`UnknownTool`).
+    pub async fn tool_state(&self, id: &str, tool: &str) -> Result<ToolState, ManagerError> {
+        let plugin = self.inner.plugin(id)?;
+        let decl = tools::builtin_tool(plugin, tool)?;
+        Ok(self.inner.tools.check(decl).await)
+    }
+
+    /// Runs the tool `tool` that the built-in plugin `id` declares, for the
+    /// daemon's own code: `<tool> <args>` in `run.cwd`, found and run as
+    /// every tool is (no shell, no `SMITHAGENTS_*` variable, a timeout, at
+    /// most 64 KiB of output). The answer is the first line it printed. The
+    /// same refusals as [`Self::tool_state`]; a run that fails is
+    /// `ManagerError::Tool`, which carries nothing the tool printed.
+    pub async fn run_tool(
+        &self,
+        id: &str,
+        tool: &str,
+        run: ToolRun<'_>,
+    ) -> Result<Option<String>, ManagerError> {
+        let plugin = self.inner.plugin(id)?;
+        let decl = tools::builtin_tool(plugin, tool)?;
+        self.inner
+            .tools
+            .run(&decl.name, run)
+            .await
+            .map_err(ManagerError::Tool)
     }
 
     pub async fn items(

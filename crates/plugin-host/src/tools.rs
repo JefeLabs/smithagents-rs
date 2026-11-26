@@ -1,5 +1,6 @@
 //! Command-line tools a built-in plugin depends on: finding them, checking
-//! their version, and installing one through mise when the user asks.
+//! their version, installing one through mise when the user asks, and
+//! running one for the daemon's own code.
 //!
 //! The daemon runs these programs; a plugin never does. Each is found by its
 //! bare name in a fixed list of absolute directories (never through a shell,
@@ -70,6 +71,38 @@ fn exit_text(status: &Option<i32>) -> String {
         Some(code) => format!("exit status {code}"),
         None => "no exit status".to_string(),
     }
+}
+
+/// One run of a tool by [`ToolFinder::run`]: `<tool> <args>` in `cwd`, with
+/// `env` added to the daemon's environment (any `SMITHAGENTS_*` variable,
+/// the daemon's or one given here, is left out), stopped after `timeout` on
+/// tokio's clock.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolRun<'a> {
+    pub args: &'a [String],
+    pub cwd: &'a Path,
+    pub env: &'a [(&'a str, &'a str)],
+    pub timeout: Duration,
+}
+
+/// Why [`ToolFinder::run`] has no answer. Carries nothing the tool printed:
+/// its messages are fixed sentences with an exit status at most.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ToolRunError {
+    /// No usable executable of that name in the search path.
+    #[error("the tool is not installed")]
+    NotFound,
+    /// It could not be started (or its output read, or its end awaited).
+    #[error("the tool could not be started")]
+    NotStarted,
+    #[error("the tool did not finish in time")]
+    Timeout,
+    /// It printed more than 64 KiB.
+    #[error("the tool printed more than 64 KiB")]
+    TooMuchOutput,
+    /// `status` is its exit code; `None` when it was ended by a signal.
+    #[error("the tool failed ({})", exit_text(.status))]
+    Failed { status: Option<i32> },
 }
 
 /// Finds tools in a fixed list of directories. The daemon uses
@@ -217,6 +250,37 @@ impl ToolFinder {
             Err(RunError::Timeout) => Err(InstallError::Timeout),
             // Its output is not read.
             Err(RunError::TooMuchOutput) => Err(InstallError::Failed { status: None }),
+        }
+    }
+
+    /// Runs `<name> <args>` in `run.cwd` as [`run_command`] runs every
+    /// command, with `run.env` added; the answer is the first line it
+    /// printed, trimmed (`None` when that is empty). `name` is found as
+    /// [`ToolFinder::find`] finds it. The caller decides which tools may run:
+    /// the daemon allows only those a built-in plugin declares.
+    pub async fn run(&self, name: &str, run: ToolRun<'_>) -> Result<Option<String>, ToolRunError> {
+        let path = self.find(name).ok_or(ToolRunError::NotFound)?;
+        let mut cmd = tokio::process::Command::new(&path);
+        cmd.args(run.args).current_dir(run.cwd);
+        for (key, value) in run.env {
+            // `run_command` removes the daemon's own; this keeps a caller
+            // from adding one.
+            if !key.starts_with("SMITHAGENTS_") {
+                cmd.env(key, value);
+            }
+        }
+        match run_command(cmd, run.timeout, Stdout::FirstLine).await {
+            Ok(line) => Ok(line),
+            Err(RunError::Status(status)) => Err(ToolRunError::Failed {
+                status: status.code(),
+            }),
+            Err(RunError::Spawn(e)) => {
+                // The kind only: the system's message may name paths.
+                tracing::warn!(tool = %name, kind = ?e.kind(), "a tool could not be started");
+                Err(ToolRunError::NotStarted)
+            }
+            Err(RunError::Timeout) => Err(ToolRunError::Timeout),
+            Err(RunError::TooMuchOutput) => Err(ToolRunError::TooMuchOutput),
         }
     }
 }

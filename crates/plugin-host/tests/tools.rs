@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use smithagents_plugin_host::{
     ConfiguredSecrets, InstallError, MissingReason, Secret, SecretError, SecretSource,
-    StaticSecrets, ToolFinder, ToolSecrets, ToolState, MISE_INSTALL_URL,
+    StaticSecrets, ToolFinder, ToolRun, ToolRunError, ToolSecrets, ToolState, MISE_INSTALL_URL,
 };
 use smithagents_plugin_protocol::{PluginId, ToolDecl, ToolSource};
 use tempfile::TempDir;
@@ -811,5 +811,147 @@ async fn a_mise_that_cannot_start_is_logged_with_its_error_kind() {
     assert!(
         text.contains("mise could not be started") && text.contains("kind=NotFound"),
         "{text}"
+    );
+}
+
+// ---------------------------------------------------------------- running
+
+/// A run of `args` in `cwd` with the given variables and a 10 s timeout.
+fn run_in<'a>(args: &'a [String], cwd: &'a Path, env: &'a [(&'a str, &'a str)]) -> ToolRun<'a> {
+    ToolRun {
+        args,
+        cwd,
+        env,
+        timeout: Duration::from_secs(10),
+    }
+}
+
+#[tokio::test]
+async fn run_returns_the_first_line_and_runs_in_the_given_directory() {
+    let (tools, work) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    script(tools.path(), "here", "pwd; echo second");
+    let f = finder(&tools);
+
+    let line = f.run("here", run_in(&[], work.path(), &[])).await;
+
+    let want = fs::canonicalize(work.path()).unwrap();
+    assert_eq!(line, Ok(Some(want.display().to_string())));
+
+    // Printing nothing is no line.
+    script(tools.path(), "quiet", "exit 0");
+    assert_eq!(
+        f.run("quiet", run_in(&[], work.path(), &[])).await,
+        Ok(None)
+    );
+}
+
+#[tokio::test]
+async fn run_passes_each_argument_as_it_is_without_a_shell() {
+    let (tools, work) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    script(tools.path(), "args", "printf '%s|' \"$@\"; echo");
+    let args: Vec<String> = ["a b", "$HOME", "--title=x; rm -rf ~", "*"]
+        .map(String::from)
+        .to_vec();
+
+    let line = finder(&tools)
+        .run("args", run_in(&args, work.path(), &[]))
+        .await;
+
+    assert_eq!(
+        line.as_ref().map(|l| l.as_deref()),
+        Ok(Some("a b|$HOME|--title=x; rm -rf ~|*|"))
+    );
+}
+
+// Review Focus 3: a tool the daemon runs never sees a `SMITHAGENTS_*`
+// variable, neither the daemon's own nor one a caller passes.
+#[tokio::test]
+async fn run_strips_smithagents_variables_and_passes_the_given_ones() {
+    std::env::set_var("SMITHAGENTS_SECRET_RUN_TEST__X", "LEAK-secret");
+    let (tools, work) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let out = work.path().join("env.txt");
+    script(tools.path(), "dump", &format!("env > '{}'", out.display()));
+    let given = [
+        ("GH_PROMPT_DISABLED", "1"),
+        ("SMITHAGENTS_GIVEN_RUN_TEST", "LEAK-given"),
+    ];
+
+    finder(&tools)
+        .run("dump", run_in(&[], work.path(), &given))
+        .await
+        .unwrap();
+
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(text.lines().any(|l| l == "GH_PROMPT_DISABLED=1"), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("PATH=")), "{text}");
+    let leaked: Vec<_> = text
+        .lines()
+        .filter(|l| l.starts_with("SMITHAGENTS_"))
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?}");
+    assert!(!text.contains("LEAK"), "{text}");
+}
+
+#[tokio::test]
+async fn run_errors_carry_no_output() {
+    let (tools, work) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    script(
+        tools.path(),
+        "noisy",
+        "echo LEAK-out; echo LEAK-err >&2; exit 3",
+    );
+    let f = finder(&tools);
+
+    let err = f
+        .run("noisy", run_in(&[], work.path(), &[]))
+        .await
+        .unwrap_err();
+    assert_eq!(err, ToolRunError::Failed { status: Some(3) });
+    for text in [format!("{err:?}"), err.to_string()] {
+        assert!(!text.contains("LEAK"), "{text}");
+    }
+    assert!(err.to_string().contains("exit status 3"), "{err}");
+
+    // Not found, or not a bare tool name: nothing runs.
+    for name in ["absent", "../noisy", "/bin/sh", ""] {
+        assert_eq!(
+            f.run(name, run_in(&[], work.path(), &[])).await,
+            Err(ToolRunError::NotFound),
+            "{name:?}"
+        );
+    }
+
+    // A directory that does not exist: the tool cannot start there.
+    let gone = work.path().join("gone");
+    assert_eq!(
+        f.run("noisy", run_in(&[], &gone, &[])).await,
+        Err(ToolRunError::NotStarted)
+    );
+
+    // More than 64 KiB of output.
+    script(
+        tools.path(),
+        "big",
+        "head -c 70000 /dev/zero | tr '\\0' 'x'; echo",
+    );
+    let err = f
+        .run("big", run_in(&[], work.path(), &[]))
+        .await
+        .unwrap_err();
+    assert_eq!(err, ToolRunError::TooMuchOutput);
+    assert!(!format!("{err:?} {err}").contains("xxxx"), "{err}");
+
+    // Too slow.
+    script(tools.path(), "slow", "sleep 5");
+    let started = std::time::Instant::now();
+    let slow = ToolRun {
+        timeout: Duration::from_millis(100),
+        ..run_in(&[], work.path(), &[])
+    };
+    assert_eq!(f.run("slow", slow).await, Err(ToolRunError::Timeout));
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
     );
 }

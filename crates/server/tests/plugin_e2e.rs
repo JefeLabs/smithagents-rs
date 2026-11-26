@@ -203,11 +203,12 @@ async fn the_real_daemon_runs_packed_native_plugins_and_survives_a_panic() {
     .await;
     let client = &daemon.client;
 
-    // Both are built-ins running as native libraries.
+    // Both are built-ins running as native libraries, beside the plugin
+    // compiled into the daemon.
     let all = client.plugins().await.unwrap();
     let ids: Vec<_> = all.iter().map(|p| p.id.as_str()).collect();
-    assert_eq!(ids, ["fixture-dylib", "github"], "{all:?}");
-    for plugin in &all {
+    assert_eq!(ids, ["feedback", "fixture-dylib", "github"], "{all:?}");
+    for plugin in all.iter().filter(|p| p.id != "feedback") {
         assert!(plugin.builtin && plugin.enabled, "{plugin:?}");
         assert_eq!(plugin.host, "dylib", "{plugin:?}");
     }

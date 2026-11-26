@@ -1,5 +1,6 @@
 //! The command-line tools a built-in plugin depends on: the check before a
-//! run, the install the user asks for, and the secrets a tool prints.
+//! run (or, for a plugin without resources, when its status is read), the
+//! install the user asks for, and the secrets a tool prints.
 //!
 //! Only built-in plugins' tools are honoured. An installed plugin that
 //! declares tools never runs: running a program a third-party manifest names
@@ -19,8 +20,9 @@ use tokio::time::Instant;
 use super::{clean_message, Inner, LoadedPlugin, Managed, ManagerError, Problem};
 use crate::plugins::Origin;
 
-/// How long a check of a plugin's tools is trusted before a run checks
-/// again. `sync_now`, enabling, new settings and an install check at once.
+/// How long a check of a plugin's tools is trusted before a run (or a status
+/// read, for a plugin without resources) checks again. `sync_now`, enabling,
+/// new settings and an install check at once.
 const TOOL_CHECK_TTL: Duration = Duration::from_secs(60);
 
 /// The state of an installed plugin that declares tools.
@@ -228,25 +230,37 @@ impl Drop for Installing<'_> {
     }
 }
 
+/// The declaration of the tool `name` of a built-in plugin: the only tools
+/// the daemon installs, checks on request or runs. `NotAllowed` for an
+/// installed plugin, then `UnknownTool` for a name it does not declare.
+pub(super) fn builtin_tool<'a>(
+    plugin: &'a Managed,
+    name: &str,
+) -> Result<&'a ToolDecl, ManagerError> {
+    match plugin.origin {
+        Origin::Builtin => {}
+        Origin::Installed => return Err(ManagerError::NotAllowed),
+    }
+    plugin
+        .manifest
+        .tools
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or(ManagerError::UnknownTool)
+}
+
 /// Installs the built-in plugin's tool `name`, then checks all its tools
 /// again: when none is missing the plugin is renewed as by enabling (any
 /// problem is looked at again and everything is due now); otherwise it
-/// needs setup for what is still missing.
+/// needs setup for what is still missing. A plugin without resources keeps
+/// no problem: its status checks its tools when it is read, so the install
+/// only forgets the last check.
 pub(super) async fn install(
     inner: &Inner,
     plugin: &Managed,
     name: &str,
 ) -> Result<(), ManagerError> {
-    match plugin.origin {
-        Origin::Builtin => {}
-        Origin::Installed => return Err(ManagerError::NotAllowed),
-    }
-    let decl = plugin
-        .manifest
-        .tools
-        .iter()
-        .find(|t| t.name == name)
-        .ok_or(ManagerError::UnknownTool)?;
+    let decl = builtin_tool(plugin, name)?;
     let _installing =
         Installing::begin(&inner.installing).ok_or(ManagerError::InstallInProgress)?;
     tracing::info!(plugin = %plugin.id, tool = %decl.name, "installing a command-line tool with mise");
@@ -257,6 +271,9 @@ pub(super) async fn install(
     }
     // A check that began before the install must not store its answer.
     plugin.live().tool_checks.forget();
+    if plugin.manifest.resources.is_empty() {
+        return Ok(());
+    }
     let missing = check_now(inner, plugin).await;
     let renewed = {
         let mut live = plugin.live();
