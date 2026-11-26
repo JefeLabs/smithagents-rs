@@ -291,7 +291,7 @@ impl From<ManagerError> for ApiError {
             ManagerError::InstallInProgress => Self::new(
                 S::CONFLICT,
                 "install_in_progress",
-                "this tool is being installed now",
+                "a command-line tool is being installed now; try again when it ends",
             ),
             ManagerError::Install(e) => install_error(e),
             ManagerError::Store(StoreError::BadCursor) => {

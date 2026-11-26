@@ -548,3 +548,268 @@ async fn an_error_of_the_configured_sources_is_not_papered_over_by_the_tool() {
     assert!(matches!(err, SecretError::NotUnicode { .. }), "{err:?}");
     assert_eq!(gh_runs(dir.path()), Vec::<String>::new());
 }
+
+// ---------------------------------------------------------------- fix round 1
+
+/// Whether `pid` is still a live process (a zombie counts as gone).
+fn alive(pid: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", pid.trim()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// Waits on a blocking thread (so a paused clock stays still) until every
+/// file in `paths` exists.
+async fn files_appear(paths: Vec<PathBuf>) {
+    let found = tokio::task::spawn_blocking(move || {
+        for _ in 0..2000 {
+            if paths.iter().all(|p| p.exists()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    })
+    .await
+    .unwrap();
+    assert!(found, "gave up waiting for the files");
+}
+
+/// The variable names in an `env` dump.
+fn env_names(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k.to_string()))
+        .collect()
+}
+
+// J1: no SMITHAGENTS_* variable reaches a program the daemon runs.
+#[tokio::test]
+async fn no_smithagents_variable_reaches_a_tool_or_mise() {
+    std::env::set_var("SMITHAGENTS_SECRET_ENV_LEAK__TOKEN", "leak-5ecret");
+    std::env::set_var("SMITHAGENTS_TEST_OTHER_J1", "other-5ecret");
+    let dir = TempDir::new().unwrap();
+    let d = dir.path().display();
+    script(
+        dir.path(),
+        "gh",
+        &format!(
+            "case \"$1\" in\n\
+             --version) env > '{d}/gh-version.env'; echo gh version 2.41.0 ;;\n\
+             auth) env > '{d}/gh-auth.env'; echo tool-token ;;\n\
+             esac"
+        ),
+    );
+    fake_mise(dir.path(), &format!("env > '{d}/mise.env'"));
+    let f = finder(&dir);
+
+    f.check(&decl("gh", Some("2.40.0"), &[])).await;
+    let secrets = tool_secrets(&dir, nothing(), "env-leak");
+    assert_eq!(
+        value(&secrets, "env-leak", "token").await.as_deref(),
+        Some("tool-token")
+    );
+    f.install(&decl("gh", None, &[("mise", "gh")]))
+        .await
+        .unwrap();
+
+    for file in ["gh-version.env", "gh-auth.env", "mise.env"] {
+        let names = env_names(&dir.path().join(file));
+        assert!(names.iter().any(|n| n == "HOME"), "{file}: no HOME");
+        assert!(names.iter().any(|n| n == "PATH"), "{file}: no PATH");
+        let leaked: Vec<_> = names
+            .iter()
+            .filter(|n| n.starts_with("SMITHAGENTS_"))
+            .collect();
+        assert!(leaked.is_empty(), "{file}: {leaked:?}");
+    }
+}
+
+// J3: search directories and executables others could have written.
+#[test]
+fn a_directory_others_can_write_is_not_searched() {
+    let root = TempDir::new().unwrap();
+    for (name, mode) in [("open", 0o777), ("sticky", 0o1777)] {
+        let dir = root.path().join(name);
+        fs::create_dir(&dir).unwrap();
+        script(&dir, "gh", "exit 0");
+        set_mode(&dir, mode);
+        assert_eq!(
+            ToolFinder::new(vec![dir.clone()]).find("gh"),
+            None,
+            "{mode:o}"
+        );
+    }
+    // Group-writable is allowed for a directory the current user owns.
+    let mine = root.path().join("mine");
+    fs::create_dir(&mine).unwrap();
+    let gh = script(&mine, "gh", "exit 0");
+    set_mode(&mine, 0o775);
+    assert_eq!(ToolFinder::new(vec![mine]).find("gh"), Some(gh));
+}
+
+#[test]
+fn an_executable_its_group_can_write_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let gh = script(dir.path(), "gh", "exit 0");
+    set_mode(&gh, 0o775);
+    assert_eq!(finder(&dir).find("gh"), None);
+    set_mode(&gh, 0o755);
+    assert_eq!(finder(&dir).find("gh"), Some(gh));
+}
+
+// J4: a timeout kills the command's whole process group.
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_install_leaves_no_process_behind() {
+    let dir = TempDir::new().unwrap();
+    let (child, me) = (dir.path().join("child.pid"), dir.path().join("mise.pid"));
+    fake_mise(
+        dir.path(),
+        &format!(
+            "sleep 600 &\necho $! > '{}'\necho $$ > '{}'\nwait",
+            child.display(),
+            me.display()
+        ),
+    );
+    let install = {
+        let f = finder(&dir);
+        tokio::spawn(async move { f.install(&decl("gh", None, &[("mise", "gh")])).await })
+    };
+    files_appear(vec![child.clone(), me.clone()]).await;
+    let (child, me) = (
+        fs::read_to_string(child).unwrap(),
+        fs::read_to_string(me).unwrap(),
+    );
+    assert!(alive(&child) && alive(&me));
+
+    assert_eq!(install.await.unwrap(), Err(InstallError::Timeout));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive(&child) || alive(&me) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "left running: mise {me} {}, its child {child} {}",
+            alive(&me),
+            alive(&child)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// J4: at most 64 KiB of output is read.
+#[tokio::test]
+async fn more_than_64_kib_of_output_is_refused() {
+    let dir = TempDir::new().unwrap();
+    // 70 000 bytes: "gh version 2.41.0" then filler on the same line.
+    script(
+        dir.path(),
+        "gh",
+        "printf 'gh version 2.41.0 '; head -c 70000 /dev/zero | tr '\\0' 'x'; echo",
+    );
+    assert_eq!(
+        finder(&dir).check(&decl("gh", Some("2.40.0"), &[])).await,
+        ToolState::Missing {
+            reason: MissingReason::UnreadableVersion
+        }
+    );
+    let secrets = tool_secrets(&dir, nothing(), "big-tool");
+    let err = secrets.get(&id("big-tool"), "token").await.unwrap_err();
+    assert!(matches!(err, SecretError::TooMuchOutput { .. }), "{err:?}");
+    assert!(!format!("{err:?} {err}").contains("xxxx"), "{err}");
+
+    // Exactly 64 KiB is fine.
+    script(
+        dir.path(),
+        "gh",
+        "printf 'gh version 2.41.0 '; head -c 65517 /dev/zero | tr '\\0' 'x'; echo",
+    );
+    assert!(matches!(
+        finder(&dir).check(&decl("gh", Some("2.40.0"), &[])).await,
+        ToolState::Ready { .. }
+    ));
+}
+
+// J6: an explicit secrets.toml entry decides alone.
+#[tokio::test]
+async fn an_explicit_entry_that_resolves_to_nothing_is_missing_without_env_or_tool() {
+    std::env::set_var("SMITHAGENTS_SECRET_EXPLICIT_TOOL__TOKEN", "env-5ecret");
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path(), "tool-5ecret\\n");
+    let home = TempDir::new().unwrap();
+    let path = home.path().join("secrets.toml");
+    fs::write(
+        &path,
+        "[explicit-tool]\ntoken = { env = \"SMITHAGENTS_TEST_NEVER_SET_J6\" }\n\
+         [empty-tool]\ntoken = { command = [\"true\"] }\n",
+    )
+    .unwrap();
+    set_mode(&path, 0o600);
+    let configured: Arc<dyn SecretSource> = Arc::new(ConfiguredSecrets::load(home.path()).unwrap());
+    let mut secrets = ToolSecrets::new(Arc::clone(&configured), finder(&dir));
+    secrets.register(&id("explicit-tool"), "token", gh_token());
+    secrets.register(&id("empty-tool"), "token", gh_token());
+
+    assert_eq!(value(&secrets, "explicit-tool", "token").await, None);
+    assert_eq!(value(&secrets, "empty-tool", "token").await, None);
+    assert_eq!(gh_runs(dir.path()), Vec::<String>::new(), "the tool ran");
+    assert!(configured.is_explicit(&id("explicit-tool"), "token"));
+    assert!(!configured.is_explicit(&id("explicit-tool"), "other"));
+}
+
+// J7: a mise that cannot start is logged with the OS error kind.
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Everything this test binary logs (global: see the server tests).
+fn logs() -> &'static Logs {
+    static LOGS: std::sync::OnceLock<Logs> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let logs = Logs::default();
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the only global subscriber");
+        logs
+    })
+}
+
+#[tokio::test]
+async fn a_mise_that_cannot_start_is_logged_with_its_error_kind() {
+    let logs = logs();
+    let dir = TempDir::new().unwrap();
+    // Executable, but its interpreter does not exist: exec fails.
+    let mise = dir.path().join("mise");
+    fs::write(&mise, "#!/nonexistent/smithagents-no-shell\n").unwrap();
+    set_mode(&mise, 0o755);
+
+    let err = finder(&dir)
+        .install(&decl("gh", None, &[("mise", "gh")]))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, InstallError::Failed { status: None });
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    assert!(
+        text.contains("mise could not be started") && text.contains("kind=NotFound"),
+        "{text}"
+    );
+}

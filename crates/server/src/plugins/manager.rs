@@ -101,7 +101,8 @@ pub enum ManagerError {
     NotAllowed,
     #[error("the plugin declares no such tool")]
     UnknownTool,
-    #[error("this tool is being installed now")]
+    /// Another install runs: one at a time in the whole daemon.
+    #[error("a command-line tool is being installed now")]
     InstallInProgress,
     #[error(transparent)]
     Install(InstallError),
@@ -135,8 +136,8 @@ struct Inner {
     /// Runs started and not yet ended.
     active: watch::Sender<usize>,
     tools: ToolFinder,
-    /// The names of the tools being installed now.
-    installing: Mutex<HashSet<String>>,
+    /// An install runs; see [`tools::install`].
+    installing: AtomicBool,
     next_token: AtomicU64,
     stopping: AtomicBool,
     scheduler: Mutex<Option<JoinHandle<()>>>,
@@ -187,7 +188,7 @@ struct Live {
     /// In manifest order.
     resources: Vec<ResourceLive>,
     /// The last check of the plugin's tools; see [`tools::missing_tools`].
-    tool_check: Option<tools::ToolCheck>,
+    tool_checks: tools::ToolChecks,
 }
 
 /// What stops a plugin from syncing on schedule.
@@ -293,7 +294,7 @@ impl Live {
         if !self.is_failed() {
             self.problem = None;
         }
-        self.tool_check = None;
+        self.tool_checks.forget();
         for r in &mut self.resources {
             r.sync.failures = 0;
             r.sync.next_due_at = Some(wall);
@@ -398,7 +399,7 @@ impl PluginManager {
             wake: Arc::new(Notify::new()),
             active,
             tools: cfg.tools,
-            installing: Mutex::new(HashSet::new()),
+            installing: AtomicBool::new(false),
             next_token: AtomicU64::new(1),
             stopping: AtomicBool::new(false),
             scheduler: Mutex::new(None),
@@ -511,7 +512,7 @@ impl PluginManager {
             if let Some(r) = live.resource_mut(resource) {
                 r.forced = true;
             }
-            live.tool_check = None;
+            live.tool_checks.forget();
         }
         self.inner.wake.notify_one();
         Ok(())
@@ -520,8 +521,9 @@ impl PluginManager {
     /// Installs one of a built-in plugin's tools with `mise use --global`,
     /// then checks the plugin's tools again; when none is missing any more
     /// the plugin is renewed as by enabling. Asking is the approval: nothing
-    /// is installed otherwise. One install at a time per tool. Refused for
-    /// an installed plugin.
+    /// is installed otherwise. One install at a time in the whole daemon
+    /// (`mise use --global` edits one global file). Refused for an installed
+    /// plugin.
     pub async fn install_tool(&self, id: &str, tool: &str) -> Result<PluginStatus, ManagerError> {
         let plugin = self.inner.plugin(id)?;
         tools::install(&self.inner, plugin, tool).await?;
@@ -707,7 +709,7 @@ async fn prepare(
             generation: 0,
             running: None,
             resources,
-            tool_check: None,
+            tool_checks: tools::ToolChecks::default(),
         }),
         config_writes: tokio::sync::Mutex::new(()),
         sync_writes: tokio::sync::Mutex::new(()),

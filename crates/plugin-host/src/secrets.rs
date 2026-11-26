@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use smithagents_plugin_protocol::{PluginId, SecretDecl, ToolSource};
+use tokio::io::AsyncReadExt;
 
 use crate::tools::{tool_command, ToolFinder};
 
@@ -53,6 +54,8 @@ pub enum SecretError {
     Spawn { program: String, message: String },
     #[error("secret command {program:?} did not finish within 10 s")]
     CommandTimeout { program: String },
+    #[error("secret command {program:?} printed more than 64 KiB")]
+    TooMuchOutput { program: String },
     #[error("secret command failed: {status}")]
     Command { status: ExitStatus },
 }
@@ -62,6 +65,13 @@ pub enum SecretError {
 pub trait SecretSource: Send + Sync {
     /// `Ok(None)` when nothing provides the secret.
     async fn get(&self, plugin: &PluginId, key: &str) -> Result<Option<Secret>, SecretError>;
+
+    /// Whether this source has an explicit entry for the secret, which then
+    /// decides alone: when it resolves to nothing the secret is missing, and
+    /// no other source is asked. Sources that only look values up say no.
+    fn is_explicit(&self, _plugin: &PluginId, _key: &str) -> bool {
+        false
+    }
 }
 
 /// Fixed secrets keyed by `(plugin id, key)`. For tests.
@@ -137,6 +147,12 @@ impl SecretSource for ConfiguredSecrets {
         }
         Ok(resolved)
     }
+
+    /// The file lists the key.
+    fn is_explicit(&self, plugin: &PluginId, key: &str) -> bool {
+        self.entries
+            .contains_key(&(plugin.to_string(), key.to_string()))
+    }
 }
 
 /// Values resolved in the last five minutes. Failures are not kept.
@@ -164,9 +180,11 @@ impl ValueCache {
 
 /// Secrets from `inner` (the daemon passes [`ConfiguredSecrets`]: the file,
 /// then the environment) and, for the plugin and key pairs registered here
-/// when `inner` has no value, from a command-line tool: `<tool> <args>` found
-/// by the [`ToolFinder`] and run like a `secrets.toml` command. An error of
-/// `inner` is returned as it is; the tool does not paper over it.
+/// when `inner` has no value and no explicit entry for them, from a
+/// command-line tool: `<tool> <args>` found by the [`ToolFinder`] and run
+/// like a `secrets.toml` command. An error of `inner` is returned as it is,
+/// and an explicit entry that resolves to nothing leaves the secret missing:
+/// the tool papers over neither.
 ///
 /// Only the daemon registers anything: a plugin's manifest asks for a tool
 /// with `from_tool`, and the daemon honours that for built-in plugins only.
@@ -201,6 +219,9 @@ impl SecretSource for ToolSecrets {
         if let Some(secret) = self.inner.get(plugin, key).await? {
             return Ok(Some(secret));
         }
+        if self.inner.is_explicit(plugin, key) {
+            return Ok(None);
+        }
         let id = (plugin.to_string(), key.to_string());
         let Some(source) = self.sources.get(&id) else {
             return Ok(None);
@@ -217,6 +238,10 @@ impl SecretSource for ToolSecrets {
             self.cache.remember(id, secret);
         }
         Ok(resolved)
+    }
+
+    fn is_explicit(&self, plugin: &PluginId, key: &str) -> bool {
+        self.inner.is_explicit(plugin, key)
     }
 }
 
@@ -264,21 +289,28 @@ async fn command_secret(
 ) -> Result<Option<Secret>, SecretError> {
     match run_command(cmd, COMMAND_TIMEOUT, Stdout::FirstLine).await {
         Ok(line) => Ok(line.map(Secret)),
-        Err(RunError::Spawn(message)) => Err(SecretError::Spawn {
+        Err(RunError::Spawn(e)) => Err(SecretError::Spawn {
             program: program.to_string(),
-            message,
+            message: e.to_string(),
         }),
         Err(RunError::Timeout) => Err(SecretError::CommandTimeout {
+            program: program.to_string(),
+        }),
+        Err(RunError::TooMuchOutput) => Err(SecretError::TooMuchOutput {
             program: program.to_string(),
         }),
         Err(RunError::Status(status)) => Err(SecretError::Command { status }),
     }
 }
 
+/// The most of a command's output the host reads.
+const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+
 /// What [`run_command`] does with the command's standard output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stdout {
-    /// Returns the first line, trimmed; `None` when it is empty.
+    /// Returns the first line, trimmed; `None` when it is empty. More than
+    /// 64 KiB of output is an error.
     FirstLine,
     /// Never reads it.
     Discard,
@@ -287,20 +319,30 @@ pub(crate) enum Stdout {
 /// Why a command the host ran did not succeed. Never carries its output.
 #[derive(Debug)]
 pub(crate) enum RunError {
-    /// It could not be started or waited for; the system's message.
-    Spawn(String),
+    /// It could not be started, read or waited for.
+    Spawn(std::io::Error),
     Timeout,
+    /// It printed more than 64 KiB.
+    TooMuchOutput,
     Status(ExitStatus),
 }
 
 /// The one way the host runs a program: `cmd` as given (a program and its
 /// arguments, never through a shell), stdin closed, stderr discarded, and
-/// killed once `timeout` passes on tokio's clock.
+/// without any `SMITHAGENTS_*` variable (plugin secrets among them) in its
+/// environment. It runs in a process group of its own; when `timeout` passes
+/// on tokio's clock, or its output is too long, the whole group is killed,
+/// so nothing it started is left behind.
 pub(crate) async fn run_command(
     mut cmd: tokio::process::Command,
     timeout: Duration,
     stdout: Stdout,
 ) -> Result<Option<String>, RunError> {
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"SMITHAGENTS_") {
+            cmd.env_remove(&name);
+        }
+    }
     cmd.stdin(Stdio::null())
         .stdout(match stdout {
             Stdout::FirstLine => Stdio::piped(),
@@ -308,25 +350,69 @@ pub(crate) async fn run_command(
         })
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let child = cmd.spawn().map_err(|e| RunError::Spawn(e.to_string()))?;
-    // Dropping the child on a timeout kills it.
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(RunError::Spawn(e.to_string())),
-        Err(_) => return Err(RunError::Timeout),
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(RunError::Spawn)?;
+    // The group's id: the child's pid, which stays reserved until the child
+    // is reaped, and nothing below reaps it before the group is killed.
+    let group = child.id();
+    let run = async {
+        let mut out = Vec::new();
+        if let Some(pipe) = child.stdout.take() {
+            pipe.take(MAX_OUTPUT_BYTES + 1)
+                .read_to_end(&mut out)
+                .await
+                .map_err(RunError::Spawn)?;
+            if out.len() as u64 > MAX_OUTPUT_BYTES {
+                return Err(RunError::TooMuchOutput);
+            }
+        }
+        let status = child.wait().await.map_err(RunError::Spawn)?;
+        Ok((status, out))
     };
-    if !output.status.success() {
-        return Err(RunError::Status(output.status));
+    let (status, out) = match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(done)) => done,
+        Ok(Err(e)) => {
+            kill_group(group);
+            return Err(e);
+        }
+        Err(_) => {
+            kill_group(group);
+            return Err(RunError::Timeout);
+        }
+    };
+    if !status.success() {
+        return Err(RunError::Status(status));
     }
     Ok(match stdout {
         Stdout::FirstLine => {
-            let text = String::from_utf8_lossy(&output.stdout);
+            let text = String::from_utf8_lossy(&out);
             let first = text.lines().next().unwrap_or("").trim();
             (!first.is_empty()).then(|| first.to_string())
         }
         Stdout::Discard => None,
     })
 }
+
+/// Kills the process group led by `leader`. It may be gone already.
+#[cfg(unix)]
+fn kill_group(leader: Option<u32>) {
+    use rustix::process::{kill_process_group, Pid, Signal};
+    let Some(pid) = leader
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(Pid::from_raw)
+    else {
+        return;
+    };
+    if let Err(e) = kill_process_group(pid, Signal::KILL) {
+        tracing::debug!("cannot kill a command's process group: {e}");
+    }
+}
+
+/// Without process groups only the command itself is killed, when the child
+/// is dropped.
+#[cfg(not(unix))]
+fn kill_group(_leader: Option<u32>) {}
 
 /// The file's text, or `None` when it does not exist. Checks the mode on the
 /// open handle so the check and the read see the same file.

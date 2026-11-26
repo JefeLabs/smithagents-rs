@@ -392,9 +392,9 @@ impl Client {
     /// Installs one of a built-in plugin's command-line tools with mise and
     /// returns the plugin's status after its tools are checked again. It may
     /// take minutes. Fails with code `not_allowed` (an installed plugin),
-    /// `tool_not_found`, `install_in_progress`, `no_installer` (the tool has
-    /// no mise package), `mise_missing` (the message names mise's install
-    /// page) or `install_failed`.
+    /// `tool_not_found`, `install_in_progress` (another install runs: one at
+    /// a time), `no_installer` (the tool has no mise package), `mise_missing`
+    /// (the message names mise's install page) or `install_failed`.
     pub async fn install_plugin_tool(
         &self,
         id: &str,

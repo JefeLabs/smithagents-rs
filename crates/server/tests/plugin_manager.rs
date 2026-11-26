@@ -2057,7 +2057,7 @@ fn missing_gh(reason: &str) -> MissingTool {
         name: "gh".into(),
         label: "GitHub CLI".into(),
         reason: reason.into(),
-        install_url: Some("https://cli.github.com".into()),
+        install_url: Some("https://cli.github.com/".into()),
         install: gh_hints(),
     }
 }
@@ -2501,7 +2501,7 @@ async fn file_appears(path: PathBuf) {
 }
 
 #[tokio::test]
-async fn one_install_per_tool_at_a_time_released_after_a_timeout_and_a_failure() {
+async fn one_install_at_a_time_released_after_a_timeout_and_a_failure() {
     let env = env().await;
     let dir = tempfile::tempdir().unwrap();
     let started = dir.path().join("started");
@@ -2529,12 +2529,16 @@ async fn one_install_per_tool_at_a_time_released_after_a_timeout_and_a_failure()
     };
     file_appears(started.clone()).await;
 
-    // The same tool, even for another plugin, waits its turn.
-    for id in ["tooled", "also"] {
-        assert!(matches!(
-            m.install_tool(id, "gh").await,
-            Err(ManagerError::InstallInProgress)
-        ));
+    // Any install waits its turn: the same tool, for this or another
+    // plugin, and another tool (mise edits one global file).
+    for (id, tool) in [("tooled", "gh"), ("also", "gh"), ("tooled", "jq")] {
+        assert!(
+            matches!(
+                m.install_tool(id, tool).await,
+                Err(ManagerError::InstallInProgress)
+            ),
+            "{id} {tool}"
+        );
     }
 
     // Ten minutes later the first install is stopped.
@@ -2558,4 +2562,57 @@ async fn one_install_per_tool_at_a_time_released_after_a_timeout_and_a_failure()
     fake_mise(dir.path(), &installs_gh(dir.path()));
     let s = m.install_tool("also", "gh").await.unwrap();
     assert_eq!(s.state, PluginState::Ready);
+}
+
+/// Replaces `<dir>/<name>` with a new script by renaming over it, so a shell
+/// still running the old one keeps reading the old file.
+fn replace_script(dir: &Path, name: &str, body: &str) {
+    let fresh = script(dir, &format!("{name}.new"), body);
+    std::fs::rename(fresh, dir.join(name)).unwrap();
+}
+
+#[tokio::test]
+async fn a_check_that_ends_after_sync_now_does_not_overwrite_the_newer_one() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (started, go) = (dir.path().join("started"), dir.path().join("go"));
+    // An old gh whose version check waits for the test.
+    script(
+        dir.path(),
+        "gh",
+        &format!(
+            "touch '{}'; while [ ! -f '{}' ]; do sleep 0.02; done; echo 'gh version 2.30.0'",
+            started.display(),
+            go.display()
+        ),
+    );
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("racing", &[("a", 60), ("b", 60)], GH_TOOL),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    // The run of `a` starts its check and waits in the old gh.
+    let runs = {
+        let m = m.clone();
+        tokio::spawn(async move { m.run_due().await })
+    };
+    file_appears(started).await;
+
+    // Meanwhile a new gh is installed and `b` is asked for, which checks
+    // again; then the old check ends, finding the old version.
+    replace_script(dir.path(), "gh", "echo 'gh version 2.41.0'");
+    m.sync_now("racing", "b").await.unwrap();
+    std::fs::write(&go, "").unwrap();
+    runs.await.unwrap();
+
+    // `b` ran on the new check (the old result was not kept for it), and
+    // then `a`, no longer held. Had the old result been kept, neither would.
+    assert_eq!(rt.calls(), 2);
+    assert_eq!(status(&m, "racing").await.state, PluginState::Ready);
 }

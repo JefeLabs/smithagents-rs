@@ -152,7 +152,8 @@ pub struct ToolDecl {
     /// Compared with the first version `<name> --version` prints.
     #[serde(default)]
     pub min_version: Option<semver::Version>,
-    /// An `https` page that explains how to install the tool.
+    /// An `https` page that explains how to install the tool; after
+    /// [`Manifest::parse`], in its normal URL form.
     #[serde(default)]
     pub install_url: Option<String>,
     /// Installer name to package spec, such as `mise = "gh"`. The daemon runs
@@ -183,10 +184,21 @@ impl ToolDecl {
 /// The longest `install_url` a manifest may give.
 const MAX_INSTALL_URL_BYTES: usize = 2048;
 
-fn is_install_url(raw: &str) -> bool {
-    raw.len() <= MAX_INSTALL_URL_BYTES
-        && url::Url::parse(raw)
-            .is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some_and(|h| !h.is_empty()))
+/// `raw` in its normal form (`Url::as_str`), if it is an `https` URL with a
+/// host and no whitespace or control character anywhere (a URL parser would
+/// quietly strip or encode them), at most 2048 bytes once normalised.
+fn install_url(raw: &str) -> Option<String> {
+    if raw
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let url = url::Url::parse(raw).ok()?;
+    let usable = url.scheme() == "https"
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.as_str().len() <= MAX_INSTALL_URL_BYTES;
+    usable.then(|| url.as_str().to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,11 +398,11 @@ impl Manifest {
             .collect::<Result<_, _>>()?;
 
         let mut seen = HashSet::new();
-        for t in &m.tools {
+        for t in m.tools.iter_mut() {
             if !ToolDecl::is_valid_name(&t.name) {
                 return Err(ManifestError::BadToolName(t.name.clone()));
             }
-            if !seen.insert(t.name.as_str()) {
+            if !seen.insert(t.name.clone()) {
                 return Err(ManifestError::DuplicateTool(t.name.clone()));
             }
             // Every entry, not only `mise`: a hint may be shown as a command
@@ -402,8 +414,10 @@ impl Manifest {
             {
                 return Err(ManifestError::BadInstall(t.name.clone()));
             }
-            if t.install_url.as_deref().is_some_and(|u| !is_install_url(u)) {
-                return Err(ManifestError::BadInstallUrl(t.name.clone()));
+            if let Some(raw) = &t.install_url {
+                let normal =
+                    install_url(raw).ok_or_else(|| ManifestError::BadInstallUrl(t.name.clone()))?;
+                t.install_url = Some(normal);
             }
         }
 

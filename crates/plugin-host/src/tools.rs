@@ -147,8 +147,9 @@ impl ToolFinder {
         }
         self.dirs
             .iter()
+            .filter(|dir| is_trusted_dir(dir))
             .map(|dir| dir.join(name))
-            .find(|path| is_executable_file(path))
+            .find(|path| is_trusted_executable(path))
     }
 
     /// Whether the tool is there and, when the declaration sets a
@@ -208,8 +209,14 @@ impl ToolFinder {
             Err(RunError::Status(status)) => Err(InstallError::Failed {
                 status: status.code(),
             }),
-            Err(RunError::Spawn(_)) => Err(InstallError::Failed { status: None }),
+            Err(RunError::Spawn(e)) => {
+                // The kind only: the system's message may name paths.
+                tracing::warn!(kind = ?e.kind(), "mise could not be started");
+                Err(InstallError::Failed { status: None })
+            }
             Err(RunError::Timeout) => Err(InstallError::Timeout),
+            // Its output is not read.
+            Err(RunError::TooMuchOutput) => Err(InstallError::Failed { status: None }),
         }
     }
 }
@@ -240,18 +247,55 @@ pub(crate) fn tool_command(path: &Path, args: &[String]) -> tokio::process::Comm
     cmd
 }
 
+// What the daemon runs must not be something another user could have put
+// there: a search directory others can write (or a group can, unless the
+// current user or root owns it) is skipped, and an executable must belong to
+// the current user or root and be writable by neither its group nor others.
+// Homebrew's `/opt/homebrew/bin` (the user's) and `/usr/local/bin` (root's)
+// pass. Unix only: other platforms have no such permission bits here.
+
+/// A search directory to use: not world-writable, and group-writable only
+/// when root or the current user owns it.
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    // Follows links: brew's and mise's commands are links.
-    std::fs::metadata(path).is_ok_and(|meta| {
-        let mode = meta.permissions().mode();
-        meta.is_file() && mode & 0o111 != 0 && mode & 0o002 == 0
-    })
+fn dir_mode_ok(mode: u32, owner: u32, me: u32) -> bool {
+    mode & 0o002 == 0 && (mode & 0o020 == 0 || owner == 0 || owner == me)
+}
+
+/// An executable to run: owned by root or the current user, executable, and
+/// writable by neither its group nor others.
+#[cfg(unix)]
+fn exe_mode_ok(mode: u32, owner: u32, me: u32) -> bool {
+    (owner == 0 || owner == me) && mode & 0o111 != 0 && mode & 0o022 == 0
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(unix)]
+fn is_trusted_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir)
+        .is_ok_and(|meta| meta.is_dir() && dir_mode_ok(meta.mode(), meta.uid(), effective_uid()))
+}
+
+#[cfg(unix)]
+fn is_trusted_executable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // Follows links: brew's and mise's commands are links; their targets are
+    // what runs.
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && exe_mode_ok(meta.mode(), meta.uid(), effective_uid()))
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+fn is_trusted_dir(dir: &Path) -> bool {
+    dir.is_dir()
+}
+
+#[cfg(not(unix))]
+fn is_trusted_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
@@ -316,6 +360,40 @@ mod tests {
             finder.dirs(),
             ["/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_search_directory_others_could_fill_is_skipped() {
+        let (me, other, root) = (501, 502, 0);
+        // Not writable by group or others: anyone's.
+        for owner in [me, other, root] {
+            assert!(dir_mode_ok(0o755, owner, me));
+        }
+        // Group-writable: only root's or the current user's.
+        assert!(dir_mode_ok(0o775, me, me));
+        assert!(dir_mode_ok(0o775, root, me));
+        assert!(!dir_mode_ok(0o775, other, me));
+        // World-writable, sticky or not: nobody's.
+        for owner in [me, other, root] {
+            assert!(!dir_mode_ok(0o777, owner, me));
+            assert!(!dir_mode_ok(0o1777, owner, me));
+            assert!(!dir_mode_ok(0o757, owner, me));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_must_be_root_s_or_the_user_s_and_written_by_no_one_else() {
+        let (me, other, root) = (501, 502, 0);
+        assert!(exe_mode_ok(0o755, me, me));
+        assert!(exe_mode_ok(0o755, root, me));
+        assert!(exe_mode_ok(0o700, me, me));
+        assert!(exe_mode_ok(0o4755, root, me));
+        assert!(!exe_mode_ok(0o755, other, me), "another user's");
+        assert!(!exe_mode_ok(0o775, me, me), "group-writable");
+        assert!(!exe_mode_ok(0o757, root, me), "world-writable");
+        assert!(!exe_mode_ok(0o644, me, me), "not executable");
     }
 
     #[test]

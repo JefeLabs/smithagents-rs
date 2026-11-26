@@ -7,8 +7,8 @@
 //! the manifest's tool names and labels and fixed sentences, never from what
 //! a tool printed.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use smithagents_core::plugin::MissingTool;
@@ -30,6 +30,25 @@ pub(super) const UNAPPROVED: &str = "command-line tools need approval, which is 
 pub(super) struct ToolCheck {
     at: Instant,
     missing: Vec<MissingTool>,
+}
+
+/// The last check of a plugin's tools, and which checks may still replace
+/// it. Lives in the plugin's `Live`.
+#[derive(Default)]
+pub(super) struct ToolChecks {
+    last: Option<ToolCheck>,
+    /// Bumped whenever the last check is forgotten: a check that began
+    /// before keeps its answer for its own run but does not store it.
+    epoch: u64,
+}
+
+impl ToolChecks {
+    /// `sync_now`, enabling, new settings and an install: the next run
+    /// checks again, and checks already running do not store their result.
+    pub(super) fn forget(&mut self) {
+        self.epoch += 1;
+        self.last = None;
+    }
 }
 
 /// `secrets`, then, for each built-in plugin's `from_tool` secret, the tool
@@ -61,7 +80,8 @@ pub(super) async fn missing_tools(inner: &Inner, plugin: &Managed) -> Vec<Missin
     }
     let cached = plugin
         .live()
-        .tool_check
+        .tool_checks
+        .last
         .as_ref()
         .filter(|check| check.at.elapsed() < TOOL_CHECK_TTL)
         .map(|check| check.missing.clone());
@@ -71,17 +91,22 @@ pub(super) async fn missing_tools(inner: &Inner, plugin: &Managed) -> Vec<Missin
     }
 }
 
-/// Checks every tool of the plugin now and keeps the result.
+/// Checks every tool of the plugin now and keeps the result, unless the
+/// last check was forgotten while this one ran.
 async fn check_now(inner: &Inner, plugin: &Managed) -> Vec<MissingTool> {
+    let epoch = plugin.live().tool_checks.epoch;
     let mut missing = Vec::new();
     for decl in &plugin.manifest.tools {
         let state = inner.tools.check(decl).await;
         missing.extend(missing_tool(decl, &state));
     }
-    plugin.live().tool_check = Some(ToolCheck {
-        at: Instant::now(),
-        missing: missing.clone(),
-    });
+    let mut live = plugin.live();
+    if live.tool_checks.epoch == epoch {
+        live.tool_checks.last = Some(ToolCheck {
+            at: Instant::now(),
+            missing: missing.clone(),
+        });
+    }
     missing
 }
 
@@ -172,28 +197,24 @@ fn secret_tool<'a>(plugin: &'a Managed, decl: &SecretDecl) -> Option<&'a ToolDec
     plugin.manifest.tools.iter().find(|t| t.name == source.tool)
 }
 
-/// Holds a tool's name while it installs and frees it however the install
-/// ends: success, an error, a timeout or a panic.
-struct Installing<'a> {
-    names: &'a Mutex<HashSet<String>>,
-    name: String,
-}
+/// Held while a tool installs, and released however the install ends:
+/// success, an error, a timeout or a panic. One install at a time in the
+/// whole daemon, whatever the tool: `mise use --global` edits one global
+/// configuration file.
+struct Installing<'a>(&'a AtomicBool);
 
 impl<'a> Installing<'a> {
-    /// `None` while another install of the tool runs.
-    fn begin(names: &'a Mutex<HashSet<String>>, name: &str) -> Option<Installing<'a>> {
-        let mut held = names.lock().unwrap_or_else(PoisonError::into_inner);
-        held.insert(name.to_string()).then(|| Installing {
-            names,
-            name: name.to_string(),
-        })
+    /// `None` while another install runs.
+    fn begin(busy: &'a AtomicBool) -> Option<Installing<'a>> {
+        busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Installing(busy))
     }
 }
 
 impl Drop for Installing<'_> {
     fn drop(&mut self) {
-        let mut held = self.names.lock().unwrap_or_else(PoisonError::into_inner);
-        held.remove(&self.name);
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -217,13 +238,15 @@ pub(super) async fn install(
         .find(|t| t.name == name)
         .ok_or(ManagerError::UnknownTool)?;
     let _installing =
-        Installing::begin(&inner.installing, &decl.name).ok_or(ManagerError::InstallInProgress)?;
+        Installing::begin(&inner.installing).ok_or(ManagerError::InstallInProgress)?;
     tracing::info!(plugin = %plugin.id, tool = %decl.name, "installing a command-line tool with mise");
     if let Err(e) = inner.tools.install(decl).await {
         // The error carries an exit status at most, never mise's output.
         tracing::warn!(plugin = %plugin.id, tool = %decl.name, "the tool was not installed: {e}");
         return Err(ManagerError::Install(e));
     }
+    // A check that began before the install must not store its answer.
+    plugin.live().tool_checks.forget();
     let missing = check_now(inner, plugin).await;
     let renewed = {
         let mut live = plugin.live();
@@ -231,7 +254,7 @@ pub(super) async fn install(
             false
         } else if missing.is_empty() {
             live.reset(Instant::now(), inner.now());
-            live.tool_check = Some(ToolCheck {
+            live.tool_checks.last = Some(ToolCheck {
                 at: Instant::now(),
                 missing: Vec::new(),
             });

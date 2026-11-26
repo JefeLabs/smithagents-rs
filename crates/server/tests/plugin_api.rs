@@ -768,7 +768,7 @@ async fn installing_a_tool_runs_mise_use_global_and_the_plugin_becomes_ready() {
             "name": "gh",
             "label": "Tool gh",
             "reason": "not installed",
-            "install_url": "https://tools.example.com",
+            "install_url": "https://tools.example.com/",
             "install": {"brew": "gh", "mise": "gh"},
         }]),
         "{before}"
@@ -853,7 +853,7 @@ async fn install_refusals_say_why() {
 }
 
 #[tokio::test]
-async fn a_second_install_of_a_tool_waits_for_the_first_to_end() {
+async fn a_second_install_waits_for_the_first_to_end() {
     let dir = TempDir::new().unwrap();
     fake_mise(dir.path());
     let fx = tool_app(dir.path()).await;
@@ -861,8 +861,12 @@ async fn a_second_install_of_a_tool_waits_for_the_first_to_end() {
     let first = tokio::spawn(router(fx.state.clone()).oneshot(install_request(uri)));
     file_appears(dir.path().join("started-slow")).await;
 
-    let (status, body) = fx.post(uri).await;
-    assert_error(status, &body, StatusCode::CONFLICT, "install_in_progress");
+    // The same tool, and any other: one install at a time.
+    for other in [uri, "/v1/plugins/tooled/tools/gh/install"] {
+        let (status, body) = fx.post(other).await;
+        assert_error(status, &body, StatusCode::CONFLICT, "install_in_progress");
+    }
+    assert_eq!(mise_log(dir.path(), "gh"), "", "a second mise ran");
 
     std::fs::write(dir.path().join("go"), "").unwrap();
     let response = first.await.unwrap().unwrap();

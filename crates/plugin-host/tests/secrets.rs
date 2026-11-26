@@ -317,3 +317,38 @@ async fn static_secrets_and_the_secret_debug_output() {
         .unwrap()
         .is_none());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_sees_no_smithagents_variable() {
+    std::env::set_var("SMITHAGENTS_SECRET_CMD_LEAK__TOKEN", "leak-5ecret");
+    std::env::set_var("SMITHAGENTS_TEST_OTHER_CMD_J1", "other-5ecret");
+    let home = tempfile::tempdir().unwrap();
+    let dump = home.path().join("cmd.env");
+    let text = format!(
+        r#"
+        [cmd-leak]
+        token = {{ command = ["sh", "-c", "env > \"$1\"; echo cmd-value", "sh", '{}'] }}
+        "#,
+        dump.display()
+    );
+    write_secrets(home.path(), &text, 0o600);
+    let secrets = ConfiguredSecrets::load(home.path()).unwrap();
+
+    assert_eq!(
+        value(&secrets, "cmd-leak", "token").await.as_deref(),
+        Some("cmd-value")
+    );
+    let env = std::fs::read_to_string(&dump).unwrap();
+    let names: Vec<&str> = env
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, _)| k)
+        .collect();
+    assert!(names.contains(&"HOME") && names.contains(&"PATH"));
+    let leaked: Vec<_> = names
+        .iter()
+        .filter(|n| n.starts_with("SMITHAGENTS_"))
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?}");
+}

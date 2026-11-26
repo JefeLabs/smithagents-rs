@@ -382,7 +382,8 @@ fn the_tools_sample_parses() {
             name: "gh".into(),
             label: "GitHub CLI".into(),
             min_version: Some(semver::Version::new(2, 40, 0)),
-            install_url: Some("https://cli.github.com".into()),
+            // Stored in its normal form.
+            install_url: Some("https://cli.github.com/".into()),
             install: [("brew", "gh"), ("mise", "gh")]
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -559,6 +560,15 @@ fn an_install_url_is_an_https_url() {
         "https://",
         "file:///etc/passwd",
         "",
+        // Whitespace or control characters anywhere, even where a URL
+        // parser would strip or encode them (TOML escapes, so the value
+        // reaches the manifest check rather than the TOML parser).
+        " https://cli.github.com",
+        "https://cli.github.com/a b",
+        "https://cli.github.com/\\t",
+        "https://cli.github.com/\\u007F",
+        "https://cli.github.com/\\n",
+        "https://cli.github.com\\r",
     ] {
         let text = TOOLS_SAMPLE.replace("https://cli.github.com", url);
         assert_eq!(
@@ -570,11 +580,26 @@ fn an_install_url_is_an_https_url() {
     let long = format!("https://cli.github.com/{}", "a".repeat(2048));
     let text = TOOLS_SAMPLE.replace("https://cli.github.com", &long);
     assert_eq!(err(&text), ManifestError::BadInstallUrl("gh".into()));
-    let ok = TOOLS_SAMPLE.replace(
-        "https://cli.github.com",
-        "https://cli.github.com/manual/installation",
-    );
-    Manifest::parse(&ok).unwrap();
+    for (given, stored) in [
+        (
+            "https://cli.github.com/manual/installation",
+            "https://cli.github.com/manual/installation",
+        ),
+        ("HTTPS://CLI.GitHub.com", "https://cli.github.com/"),
+        (
+            "https://cli.github.com/a/../b?x=1",
+            "https://cli.github.com/b?x=1",
+        ),
+    ] {
+        let ok = TOOLS_SAMPLE.replace("https://cli.github.com", given);
+        assert_eq!(
+            Manifest::parse(&ok).unwrap().tools[0]
+                .install_url
+                .as_deref(),
+            Some(stored),
+            "{given:?}"
+        );
+    }
 }
 
 #[test]
