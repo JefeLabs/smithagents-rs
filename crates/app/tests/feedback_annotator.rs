@@ -578,7 +578,7 @@ fn done_returns_to_the_pane_and_releases_the_image(cx: &mut TestAppContext) {
         .draft_dir()
         .join("screenshot-1.annotated.png")
         .is_file());
-    // The shell has the focus: its shortcut works.
+    // The focus is back in the shell (on the Feedback pane): its shortcut works.
     let before = rail_active(cx, &shell);
     press(cx, window, "cmd-alt-f");
     assert_ne!(rail_active(cx, &shell), before);
@@ -690,7 +690,11 @@ fn the_second_screenshot_says_two_of_two(cx: &mut TestAppContext) {
     click(cx, window, ANNOTATOR_DONE_ID);
     frame(cx, window);
 
-    click(cx, window, RailEntry::Feedback.element_id());
+    assert_eq!(
+        rail_active(cx, &shell),
+        Some(RailEntry::Feedback),
+        "Done shows the pane"
+    );
     click(cx, window, card_id(&first));
     frame(cx, window);
     assert!(annotator(cx, &shell).is_some());

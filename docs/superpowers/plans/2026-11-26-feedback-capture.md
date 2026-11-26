@@ -42,7 +42,7 @@ Exact sentences (constants in `crates/app/src/feedback/text.rs`; `{}` is filled 
 
 | Constant | Text |
 |---|---|
-| `PERMISSION_TEXT` | `SmithAgents needs Screen Recording permission to capture its window. Allow it in System Settings → Privacy & Security → Screen Recording, then try again.` |
+| `PERMISSION_TEXT` | `SmithAgents needs Screen Recording permission to capture its window. Allow it in System Settings → Privacy & Security → Screen Recording, then quit and reopen SmithAgents.` |
 | `WINDOW_NOT_FOUND_TEXT` | `Could not find the SmithAgents window to capture. Try again.` |
 | `UNSUPPORTED_TEXT` | `Capturing the window is not supported on this system. You can still add files.` |
 | `capture_failed_text(m)` | `Could not capture the window: {m}.` |

@@ -25,7 +25,8 @@
 //! so no view holds a handle back to its owner.
 //!
 //! While a screenshot is annotated, the [`Annotator`] covers the whole
-//! window (title bar, panes, dock and rail) as the root's last child.
+//! window (title bar, panes, dock and rail) as the root's last child. When
+//! it closes, the Feedback pane is shown.
 //!
 //! The center tabs' web engine is a [`CenterTabHost`] ([`ShellOptions::tab_host`],
 //! [`PlaceholderHost`] by default). The shell attaches it to the window once;
@@ -530,7 +531,13 @@ impl Shell {
                     FeedbackEvent::OpenAnnotator(id) => {
                         this.open_annotator(id.clone(), window, cx)
                     }
-                    FeedbackEvent::CloseAnnotator => this.close_annotator(window, cx),
+                    FeedbackEvent::CloseAnnotator => {
+                        this.close_annotator(window, cx);
+                        // Back to the pane, where the screenshot's card is.
+                        tracing::debug!(source = "feedback", "rail show");
+                        this.show_rail_entry(RailEntry::Feedback, window, cx);
+                        cx.notify();
+                    }
                 }
             }),
             // Toggles made by the dock skin itself; the shell's own entry

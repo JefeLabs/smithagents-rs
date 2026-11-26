@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
-use gpui_kit::{App, AppContext as _, Context, EventEmitter, RenderImage, Task, Window};
+use gpui_kit::{
+    App, AppContext as _, Context, EventEmitter, PathPromptOptions, RenderImage, Task, Window,
+};
 use image::{ImageError, RgbaImage};
 use smithagents_capture::{
     checked, CaptureError, Capturer, Frame, WindowTarget, WRONG_SIZE_CAPTURE,
@@ -43,6 +45,31 @@ pub type FilePicker =
     Rc<dyn Fn(&mut App) -> LocalBoxFuture<'static, Result<Option<Vec<PathBuf>>, String>>>;
 /// Runs the callback at the start of the next frame (research B3). The default is `window.on_next_frame`.
 pub type FrameHop = Rc<dyn Fn(&mut Window, Box<dyn FnOnce(&mut Window, &mut App)>)>;
+
+/// The system's open-file dialog: files only, several, prompt "Add" (research B5). Used only by lib.rs.
+///
+/// Crate-private, so no test can open the dialog: tests pass their own
+/// [`FilePicker`]. The dialog has no type filter; [`Feedback::add_files`]
+/// checks each file.
+pub(crate) fn native_file_picker() -> FilePicker {
+    Rc::new(|cx: &mut App| {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Add".into()),
+        });
+        async move {
+            match picked.await {
+                Ok(Ok(paths)) => Ok(paths),
+                Ok(Err(e)) => Err(e.to_string()),
+                // The dialog went away without an answer.
+                Err(_) => Ok(None),
+            }
+        }
+        .boxed_local()
+    })
+}
 
 /// What a [`Feedback`] works with. The default reaches nothing: no files, no
 /// capture, no dialog.
