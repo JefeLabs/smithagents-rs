@@ -159,6 +159,17 @@ fn the_right_pane_round_trips() {
         })
         .unwrap();
     assert_eq!(store.load().right_pane, Some(RailEntry::Settings));
+
+    store
+        .save(&AppState {
+            right_pane: Some(RailEntry::Feedback),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(store.load().right_pane, Some(RailEntry::Feedback));
+    let text = std::fs::read_to_string(dir.path().join("app-state.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["right_pane"], "feedback");
 }
 
 #[test]

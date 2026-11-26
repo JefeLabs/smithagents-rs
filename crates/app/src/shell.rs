@@ -51,7 +51,7 @@ use smithagents_theme::tokens::ThemeSet;
 
 use crate::app_state::AppStateStore;
 use crate::appearance::AppearanceRuntime;
-use crate::feedback::state::{Feedback, FeedbackOptions};
+use crate::feedback::state::{Feedback, FeedbackEvent, FeedbackOptions};
 use crate::layout_store::{
     fitted_right_width, left_pane_extent, saved_dock, saved_left_pane, saved_window,
     with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
@@ -67,6 +67,7 @@ use crate::update::{NoUpdater, Updater};
 use crate::view_models::{update_button, LeftPaneMode};
 use crate::views::agents::AgentsPane;
 use crate::views::center::{notify_tab_failure, CenterPanel};
+use crate::views::feedback::{FeedbackPane, HoldButton, HoldEvent};
 use crate::views::intents::IntentsPane;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 use crate::views::settings::SettingsPane;
@@ -82,6 +83,10 @@ gpui_kit::actions!(
         /// switching it from the pane it shows), or close the dock when
         /// Settings is on screen.
         ToggleSettingsPane,
+        /// Show the Feedback view in the right dock (opening the dock, or
+        /// switching it from the pane it shows), or close the dock when
+        /// Feedback is on screen.
+        ToggleFeedbackPane,
         /// Show the Intents view in the right dock (opening the dock, or
         /// switching it from the pane it shows), or close the dock when
         /// Intents is on screen.
@@ -105,6 +110,8 @@ gpui_kit::actions!(
 pub const KEY_CONTEXT: &str = "SmithAgentsShell";
 /// The Settings pane's persisted panel name. Never change it once shipped.
 pub const SETTINGS_PANEL: &str = "Settings";
+/// The Feedback pane's persisted panel name. Never change it once shipped.
+pub const FEEDBACK_PANEL: &str = "Feedback";
 /// The Intents pane's persisted panel name. Never change it once shipped.
 pub const INTENTS_PANEL: &str = "Intents";
 /// Element id of the left pane's frame.
@@ -120,9 +127,9 @@ const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Registers the shell's key bindings and the app-wide [`Quit`]:
 /// - `cmd-q` quits (anywhere, also with no window focused);
 /// - `cmd-b` switches the agents pane between expanded and compact,
-///   `cmd-alt-b` and `cmd-alt-i` show the Settings and the Intents pane, or
-///   hide the right dock when that pane is already on screen (as the rail
-///   does);
+///   `cmd-alt-b`, `cmd-alt-f` and `cmd-alt-i` show the Settings, the Feedback
+///   and the Intents pane, or hide the right dock when that pane is already
+///   on screen (as the rail does);
 /// - `cmd-w` closes the active tab, `ctrl-tab` and `ctrl-shift-tab` cycle
 ///   the tabs;
 ///
@@ -145,6 +152,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-b", ToggleAgentsPane, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-alt-b", ToggleSettingsPane, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-alt-f", ToggleFeedbackPane, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-alt-i", ToggleIntentsPane, None),
         KeyBinding::new("cmd-w", CloseActiveTab, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-tab", NextTab, Some(KEY_CONTEXT)),
@@ -169,6 +177,7 @@ pub fn app_menus() -> Vec<Menu> {
         Menu::new("View").items([
             MenuItem::action("Toggle Agents Pane", ToggleAgentsPane),
             MenuItem::action("Toggle Settings", ToggleSettingsPane),
+            MenuItem::action("Toggle Feedback", ToggleFeedbackPane),
             MenuItem::action("Toggle Intents", ToggleIntentsPane),
         ]),
         Menu::new("Window").items([MenuItem::action("Close Tab", CloseActiveTab)]),
@@ -283,6 +292,9 @@ pub struct Shell {
     /// The left pane's content: the agents pane, in either mode.
     left_pane: Entity<AgentsPane>,
     feedback: Entity<Feedback>,
+    /// The rail's Feedback button: a click toggles the pane, a hold
+    /// captures.
+    hold_button: Entity<HoldButton>,
     layout: Option<LayoutStore>,
     /// The right dock's width the user chose (a drag of its handle, or the
     /// saved layout). It is what the layout file keeps; the width drawn is
@@ -405,8 +417,15 @@ impl Shell {
         let intents = cx.new(|cx| IntentsPane::new(state.clone(), window, cx));
         let left_pane = cx.new(|cx| AgentsPane::new(state.clone(), window, cx));
         let feedback = cx.new(|cx| Feedback::new(feedback.unwrap_or_default(), cx));
+        let feedback_pane =
+            cx.new(|cx| FeedbackPane::new(state.clone(), feedback.clone(), window, cx));
+        let hold_button = cx.new(HoldButton::new);
         let right_panels = vec![
             (RailEntry::Settings, PanelId::from(settings.entity_id())),
+            (
+                RailEntry::Feedback,
+                PanelId::from(feedback_pane.entity_id()),
+            ),
             (RailEntry::Intents, PanelId::from(intents.entity_id())),
         ];
         // The pane the app showed last (Settings at first).
@@ -417,6 +436,7 @@ impl Shell {
             // it is the state's right entry, so the group draws no tab bar.
             let right = DockLayout::tabs()
                 .panel_view(panel_handle(settings), cx)
+                .panel_view(panel_handle(feedback_pane), cx)
                 .panel_view(panel_handle(intents), cx);
             area.set_center(center, window, cx);
             area.set_dock(DockPlacement::Right, right, window, cx);
@@ -481,6 +501,30 @@ impl Shell {
                     ShellEvent::FocusSettings(_) => {}
                 }
             }),
+            cx.subscribe_in(&hold_button, window, |this, _, event: &HoldEvent, window, cx| {
+                match event {
+                    HoldEvent::Clicked => {
+                        tracing::debug!(source = "rail", entry = ?RailEntry::Feedback, "rail select");
+                        this.select_rail_entry(RailEntry::Feedback, window, cx);
+                    }
+                    HoldEvent::Completed => {
+                        tracing::debug!(source = "rail", "feedback capture");
+                        this.feedback
+                            .update(cx, |feedback, cx| feedback.capture(window, cx));
+                    }
+                }
+            }),
+            cx.subscribe_in(&feedback, window, |this, _, event: &FeedbackEvent, window, cx| {
+                match event {
+                    FeedbackEvent::RevealPane => {
+                        tracing::debug!(source = "feedback", "rail show");
+                        this.show_rail_entry(RailEntry::Feedback, window, cx);
+                        cx.notify();
+                    }
+                    // Nothing draws the annotator yet.
+                    FeedbackEvent::OpenAnnotator(_) | FeedbackEvent::CloseAnnotator => {}
+                }
+            }),
             // Toggles made by the dock skin itself; the shell's own entry
             // points log theirs.
             cx.subscribe(&dock, |_, _, event: &DockToggleEvent, _| {
@@ -532,6 +576,7 @@ impl Shell {
             right_panels,
             left_pane,
             feedback,
+            hold_button,
             layout,
             preferred_right,
             applied_right: right_size,
@@ -552,6 +597,11 @@ impl Shell {
     /// The feedback draft and its capture sequence.
     pub fn feedback(&self) -> &Entity<Feedback> {
         &self.feedback
+    }
+
+    /// The rail's Feedback button.
+    pub fn hold_button(&self) -> &Entity<HoldButton> {
+        &self.hold_button
     }
 
     /// Shuts the tab host down (once, whichever of quit and close comes
@@ -799,6 +849,16 @@ impl Shell {
         self.select_rail_entry(RailEntry::Settings, window, cx);
     }
 
+    fn on_toggle_feedback(
+        &mut self,
+        _: &ToggleFeedbackPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::debug!(source = "shortcut", entry = ?RailEntry::Feedback, "rail select");
+        self.select_rail_entry(RailEntry::Feedback, window, cx);
+    }
+
     fn on_toggle_intents(
         &mut self,
         _: &ToggleIntentsPane,
@@ -906,6 +966,13 @@ impl Render for Shell {
         let has_active_tab = self.state.read(cx).model().active_tab().is_some();
         let left_width = self.fitted_left_width(self.state.read(cx).left_pane_layout(), window, cx);
         let native = self.state.read(cx).shared_native_theme();
+        let rail_active = self.rail_active(cx);
+        // The Feedback button is its own view: it draws as the rail does.
+        let (_, rail_foreground) = region_paint(native.as_deref(), Region::Rail, cx);
+        self.hold_button.update(cx, |button, cx| {
+            button.set_selected(rail_active == Some(RailEntry::Feedback), cx);
+            button.set_icon_color(rail_foreground, cx);
+        });
         let theme = cx.theme();
         let (left_surface, _) = region_paint(native.as_deref(), Region::LeftPane, cx);
         let left_pane = div()
@@ -937,13 +1004,20 @@ impl Render for Shell {
             .w_full()
             .child(left_pane)
             .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
-            .child(rail(self.rail_active(cx), on_select, native.as_deref(), cx));
+            .child(rail(
+                rail_active,
+                on_select,
+                self.hold_button.clone().into_any_element(),
+                native.as_deref(),
+                cx,
+            ));
         v_flex()
             .id("shell")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_toggle_agents))
             .on_action(cx.listener(Self::on_toggle_settings))
+            .on_action(cx.listener(Self::on_toggle_feedback))
             .on_action(cx.listener(Self::on_toggle_intents))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_previous_tab))

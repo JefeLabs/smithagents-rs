@@ -89,7 +89,10 @@ fn open(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Shell>) {
 
 #[gpui_kit::test]
 fn the_rail_lists_settings_then_intents(cx: &mut TestAppContext) {
-    assert_eq!(RailEntry::ALL, [RailEntry::Settings, RailEntry::Intents]);
+    assert_eq!(
+        RailEntry::ALL,
+        [RailEntry::Settings, RailEntry::Feedback, RailEntry::Intents]
+    );
     for &entry in RailEntry::ALL {
         assert_eq!(RailEntry::parse(entry.as_str()), Some(entry));
         assert_eq!(entry.placement(), DockPlacement::Right);

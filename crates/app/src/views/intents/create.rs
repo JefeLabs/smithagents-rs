@@ -34,6 +34,7 @@ use crate::intent_vm::{default_repo, KindChoice, KIND_CHOICES};
 use crate::view_models::{
     repo_choices, RepoChoiceVm, SettingsSection, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
 };
+use crate::views::pane_heading;
 
 gpui_kit::actions!(
     smithagents_intents,
@@ -330,19 +331,9 @@ impl IntentsPane {
             .pr_1()
             .py_2()
             .child(
-                div()
-                    .id(CREATE_TITLE_ID)
-                    // A node needs an id and a role to reach assistive
-                    // technology.
-                    .role(Role::Heading)
-                    .test_support()
-                    .aria_label(TITLE)
+                pane_heading(CREATE_TITLE_ID, TITLE, paint.foreground)
                     .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(paint.foreground)
-                    .child(TITLE),
+                    .truncate(),
             )
             .child(
                 Button::new(CREATE_CLOSE_ID)

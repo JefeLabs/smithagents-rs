@@ -50,6 +50,7 @@ use crate::shell::SETTINGS_PANEL;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, token_paint, Region};
 use crate::view_models::SettingsSection;
+use crate::views::pane_heading;
 use crate::views::rail::RailEntry;
 
 pub use agent_defaults::{
@@ -349,21 +350,11 @@ impl Render for SettingsPane {
             .bg(paint.surface)
             .text_color(paint.foreground)
             .child(
-                div()
-                    .id(SETTINGS_TITLE_ID)
-                    // A node needs an id and a role to reach assistive
-                    // technology.
-                    .role(Role::Heading)
-                    .test_support()
-                    .aria_label("Settings")
+                pane_heading(SETTINGS_TITLE_ID, "Settings", paint.foreground)
                     .flex_none()
                     .px_3()
                     .pt_3()
-                    .pb_2()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(paint.foreground)
-                    .child("Settings"),
+                    .pb_2(),
             )
             .child(
                 v_flex()
