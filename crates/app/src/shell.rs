@@ -125,8 +125,9 @@ const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// - `cmd-w` closes the active tab, `ctrl-tab` and `ctrl-shift-tab` cycle
 ///   the tabs;
 ///
-/// plus the agents pane's and the settings view's own
-/// ([`crate::views::agents::init`], [`crate::views::settings::init`]). (v1 is
+/// plus the agents pane's, the settings view's and the intents pane's own
+/// ([`crate::views::agents::init`], [`crate::views::settings::init`],
+/// [`crate::views::intents::init`]). (v1 is
 /// macOS only. `KeyBinding::new` does not resolve the portable `secondary-`
 /// modifier and panics on it.) The menu bar ([`app_menus`]) shows these
 /// keys as its items' key equivalents.
@@ -151,6 +152,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(quit);
     crate::views::agents::init(cx);
     crate::views::settings::init(cx);
+    crate::views::intents::init(cx);
 }
 
 /// The macOS menu bar: the app menu (Quit), View (the pane toggles) and
