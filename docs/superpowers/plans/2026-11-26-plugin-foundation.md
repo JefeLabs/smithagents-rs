@@ -589,7 +589,7 @@ name = "gh"                    # ^[a-z][a-z0-9_-]{0,31}$ ; the executable's name
 label = "GitHub CLI"
 min_version = "2.40.0"         # optional; compared with the first semver in `<name> --version`
 install_url = "https://cli.github.com"
-install = { brew = "gh" }      # optional hints, shown to the user; nothing is run from them in this plan
+install = { mise = "gh", brew = "gh" }   # `mise` is the one installer the daemon can run (on request); the rest are hints shown to the user
 
 [[secrets]]
 key = "token"
@@ -602,7 +602,9 @@ pub struct ToolDecl { pub name: String, pub label: String, pub min_version: Opti
 pub struct ToolSource { pub tool: String, pub args: Vec<String> }        // SecretDecl gains `from_tool: Option<ToolSource>`
 // plugin-host::tools
 pub enum ToolState { Ready { path: PathBuf, version: Option<semver::Version> }, Missing, TooOld { found: semver::Version } }
-pub fn find_tool(name: &str) -> Option<PathBuf>;                         // PATH, then /opt/homebrew/bin, /usr/local/bin, ~/.local/bin
+pub fn find_tool(name: &str) -> Option<PathBuf>;                         // PATH, then mise's shims dir, /opt/homebrew/bin, /usr/local/bin, ~/.local/bin
+pub enum InstallError { NoMiseSpec, MiseMissing { install_url: String }, Failed { status: i32 }, Timeout }
+pub async fn install_tool(decl: &ToolDecl) -> Result<ToolState, InstallError>;   // runs mise; 10 min timeout
 pub async fn check_tool(decl: &ToolDecl) -> ToolState;
 // core: PluginState gains NeedsSetup { tools: Vec<MissingTool>, message: String }
 pub struct MissingTool { pub name: String, pub label: String, pub reason: String, pub install_url: Option<String>, pub install: BTreeMap<String, String> }
@@ -614,9 +616,9 @@ Rules:
 - `[[tools]]` and `from_tool` are honoured only for built-in plugins. An installed plugin that declares them is listed with state `NeedsSetup` and the message "command-line tools need approval, which is not built yet" and is never run (running a program named by a third-party manifest needs the permission prompt of a later plan).
 - Order of secret sources: `secrets.toml`, then `SMITHAGENTS_SECRET_<PLUGIN>__<KEY>`, then `from_tool`.
 - Before a run the manager checks every declared tool; a missing or too-old tool is `NeedsSetup` naming it with its install hints, and the plugin is not called. The check result is cached for 60 s; `sync_now`, enabling and `set_settings` re-check.
-- Installing is not done by the daemon in this plan: the status carries the hints, and the settings UI plan adds the "Install" action with approval.
+- **Installing (owner: "mise maybe is a good cross platform cli tool installer").** mise is the install mechanism because it is one installer for macOS, Linux and Windows. `POST /v1/plugins/{id}/tools/{name}/install` (client: `install_plugin_tool(id, name)`) runs `mise use --global <spec>` for the tool's `install.mise` spec, without a shell, then re-checks the tool and returns the `PluginStatus`. It runs only on that explicit request (the request is the approval; the settings UI plan puts a button on it), only for built-in plugins, and only one install at a time per tool (409 `install_in_progress`). Errors: 409 `mise_missing` with mise's install URL `https://mise.jdx.dev` when mise is not found (the daemon never installs mise itself), 400 `no_installer` when the tool has no `mise` spec, 502 `install_failed` with the exit status only. The implementer confirms the exact mise command and the shims location against mise's own documentation or `mise --help` before writing it, and records what was checked; tests use a fake `mise` executable and never run the real one.
 
-- [ ] **Step 1: Write the tests.** Manifest: the sample parses; unknown tool in `from_tool`, a tool name with `/`, duplicate tool names, a bad `min_version` are each a `ManifestError`. `tools.rs` with fake executables in a temp dir put on a test-only search path: found, missing, too old, version line without a semver (Ready with `version: None` unless `min_version` is set, then TooOld is not claimed: Missing with reason "could not read its version"). Secrets: `from_tool` supplies the value; `secrets.toml` and the env win over it; a failing tool is NeedsAuth and its output appears nowhere. Manager: a built-in plugin with a missing tool is `NeedsSetup` with the hints and is not called; once the fake tool appears and `sync_now` is called it runs; an installed plugin declaring a tool is never run.
+- [ ] **Step 1: Write the tests.** Manifest: the sample parses; unknown tool in `from_tool`, a tool name with `/`, duplicate tool names, a bad `min_version` are each a `ManifestError`. `tools.rs` with fake executables in a temp dir put on a test-only search path: found, missing, too old, version line without a semver (Ready with `version: None` unless `min_version` is set, then TooOld is not claimed: Missing with reason "could not read its version"). Secrets: `from_tool` supplies the value; `secrets.toml` and the env win over it; a failing tool is NeedsAuth and its output appears nowhere. Manager: a built-in plugin with a missing tool is `NeedsSetup` with the hints and is not called; once the fake tool appears and `sync_now` is called it runs; an installed plugin declaring a tool is never run. Install: with a fake `mise` on the test search path that creates the fake tool, the route returns the plugin Ready and the fake saw exactly `use --global gh`; without mise it is `mise_missing`; a failing fake is `install_failed` and its output appears in no response or log; an installed (third-party) plugin's tool is refused.
 - [ ] **Step 2: Run.** Expected: compile errors.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** Expected: PASS. Gate.
