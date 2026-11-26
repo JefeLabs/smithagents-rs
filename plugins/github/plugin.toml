@@ -1,0 +1,42 @@
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+contract = 1
+host = "dylib"
+entry = "libsmithagents_plugin_github.dylib"
+hosts = ["api.github.com"]
+
+# Sign-in only: the daemon asks `gh auth token` for the token when nothing
+# else provides one. All data comes over HTTPS through the host.
+[[tools]]
+name = "gh"
+label = "GitHub CLI"
+install_url = "https://cli.github.com"
+install = { mise = "gh", brew = "gh" }
+
+[[secrets]]
+key = "token"
+label = "GitHub sign-in"
+help = "Run: gh auth login"
+from_tool = { tool = "gh", args = ["auth", "token"] }
+
+[[settings]]
+key = "repositories"
+label = "Repositories (owner/name)"
+kind = "list"
+required = true
+
+[[resources]]
+kind = "repository"
+label = "Repositories"
+interval_secs = 3600
+
+[[resources]]
+kind = "issue"
+label = "Issues"
+interval_secs = 300
+
+[[resources]]
+kind = "pull_request"
+label = "Pull requests"
+interval_secs = 300

@@ -7480,6 +7480,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "smithagents-plugin-github"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "smithagents-plugin-protocol",
+ "url",
+]
+
+[[package]]
 name = "smithagents-plugin-host"
 version = "0.1.0"
 dependencies = [

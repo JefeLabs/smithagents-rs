@@ -1,0 +1,4 @@
+[
+ {"number":1,"title":"Widget does not spin","html_url":"https://github.com/octo-org/widgets/issues/1","state":"closed","state_reason":"completed","user":{"login":"mona"},"labels":[{"name":"bug"},{"name":"help wanted"}],"assignees":[{"login":"hubot"}],"comments":3,"created_at":"2026-01-01T09:00:00Z","updated_at":"2026-01-05T09:00:00Z","closed_at":"2026-01-05T09:00:00Z","body":"secret-looking body text that must never be stored"},
+ {"number":2,"title":"Add a pull request","html_url":"https://github.com/octo-org/widgets/pull/2","state":"open","user":{"login":"hubot"},"labels":[],"assignees":[],"comments":0,"created_at":"2026-01-02T09:00:00Z","updated_at":"2026-01-06T09:00:00Z","closed_at":null,"pull_request":{"url":"https://api.github.com/repos/octo-org/widgets/pulls/2"}}
+]

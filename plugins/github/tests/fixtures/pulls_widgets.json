@@ -1,0 +1,5 @@
+[
+ {"number":9,"title":"Speed up spinning","html_url":"https://github.com/octo-org/widgets/pull/9","state":"closed","draft":false,"merged_at":"2026-03-01T12:00:00Z","user":{"login":"mona"},"labels":[{"name":"perf"}],"assignees":[],"requested_reviewers":[{"login":"hubot"}],"head":{"ref":"spin-fast"},"base":{"ref":"main"},"created_at":"2026-02-27T09:00:00Z","updated_at":"2026-03-01T12:00:00Z","closed_at":"2026-03-01T12:00:00Z"},
+ {"number":8,"title":"Draft: new knob","html_url":"https://github.com/octo-org/widgets/pull/8","state":"open","draft":true,"merged_at":null,"user":{"login":"hubot"},"labels":[],"assignees":[],"requested_reviewers":[],"head":{"ref":"knob"},"base":{"ref":"main"},"created_at":"2026-02-20T09:00:00Z","updated_at":"2026-02-25T09:00:00Z","closed_at":null},
+ {"number":7,"title":"Closed without merge","html_url":"https://github.com/octo-org/widgets/pull/7","state":"closed","draft":false,"merged_at":null,"user":{"login":"mona"},"labels":[],"assignees":[],"requested_reviewers":[],"head":{"ref":"old"},"base":{"ref":"main"},"created_at":"2026-02-01T09:00:00Z","updated_at":"2026-02-10T09:00:00Z","closed_at":"2026-02-10T09:00:00Z"}
+]
