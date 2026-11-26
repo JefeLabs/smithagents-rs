@@ -7,9 +7,15 @@
 //! whole ([`ObjectFit::Contain`]); a drag over it draws a box and opens a
 //! comment under the box. Enter saves the comment (shift-Enter adds a line),
 //! Escape drops a new box or cancels an edit; a box saved with no comment is
-//! dropped. Each saved box has a numbered badge; clicking it opens its
-//! comment again, where "Delete" removes it and the later boxes renumber.
-//! Every change is saved at once through [`Feedback::set_boxes`].
+//! dropped. Each saved box has a numbered badge; clicking it (or Enter or
+//! Space on it: badges are tab stops) opens its comment again, where
+//! "Delete" removes it and the later boxes renumber. Every change is saved
+//! at once through [`Feedback::set_boxes`]. After "Done" the annotator only
+//! waits for the annotated picture to be drawn, then closes.
+//!
+//! The keyboard stays inside: Tab and shift-Tab cycle through the
+//! annotator's own controls (a focus trap), and the shell under it handles
+//! none of its keys while it is open.
 //!
 //! Boxes are fractions of the picture, so they keep their place at any
 //! window size: the pointer is converted through the rectangle the picture
@@ -28,18 +34,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Escape, InputEvent, Textarea, TextareaState};
-use gpui_kit::component::label::Label;
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Sizable as _, WindowExt as _};
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, FocusTrapElement as _, Sizable as _,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     anchored, canvas, deferred, div, fill, img, outline, point, px, relative, size, AnyElement,
     App, AppContext as _, BorderStyle, Bounds, Context, ElementId, Entity, FocusHandle, Focusable,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render,
-    RenderImage, Role, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, Subscription, Task, TestSupportExt as _, WeakEntity, Window,
+    RenderImage, Role, Size, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
+    Subscription, Task, TestSupportExt as _, Window,
 };
 use smithagents_theme::native::NativeTheme;
 
@@ -52,6 +58,8 @@ use crate::feedback::text::{
     MAX_BOXES, TOO_MANY_BOXES_TEXT,
 };
 use crate::theme_adapter::{region_paint, token_paint, Region};
+
+use super::{confirm, Confirmation};
 
 /// Element id of the annotator (the whole window).
 pub const ANNOTATOR_ID: &str = "feedback-annotator";
@@ -83,6 +91,8 @@ const DONE_LABEL: &str = "Done";
 const DISCARD_LABEL: &str = "Discard";
 const DELETE_LABEL: &str = "Delete";
 const COMMENT_LABEL: &str = "Comment";
+/// A badge's accessible name is this and its number.
+const BADGE_LABEL: &str = "Comment";
 /// The comment grows from one line to this many, then scrolls.
 const COMMENT_ROWS: (usize, usize) = (1, 4);
 const PANEL_WIDTH: f32 = 280.;
@@ -136,6 +146,11 @@ pub struct Annotator {
     /// A press was refused because the screenshot has [`MAX_BOXES`]; the
     /// title says so until the next action.
     full: bool,
+    /// Done was pressed: the annotated picture is being drawn, and the
+    /// annotator only waits to close.
+    closing: bool,
+    /// One per badge, so each is a tab stop.
+    badge_focus: Vec<FocusHandle>,
     /// The picture's area as last painted: pointer events convert through it.
     area: Rc<Cell<Option<Bounds<Pixels>>>>,
     native: Option<Rc<NativeTheme>>,
@@ -204,6 +219,8 @@ impl Annotator {
             comment: None,
             drag: None,
             full: false,
+            closing: false,
+            badge_focus: Vec::new(),
             area: Rc::default(),
             native: None,
             _subscriptions: subscriptions,
@@ -252,6 +269,9 @@ impl Annotator {
     }
 
     fn on_press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         self.full = false;
         cx.notify();
         if self.comment.is_some() {
@@ -328,6 +348,9 @@ impl Annotator {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.closing {
+            return;
+        }
         self.comment = Some(Comment {
             target,
             too_long: false,
@@ -426,8 +449,13 @@ impl Annotator {
     }
 
     /// "Done": a comment still open is saved as Enter would; then the
-    /// annotated picture is drawn and the annotator closes.
+    /// annotated picture is drawn and the annotator closes. Until it
+    /// closes, Done is busy and the picture, the badges and Discard do
+    /// nothing, so nothing is drawn that the picture would miss.
     fn done(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         self.full = false;
         cx.notify();
         if self.comment.is_some() {
@@ -437,22 +465,47 @@ impl Annotator {
                 return;
             }
         }
+        self.closing = true;
+        // The buttons are about to be disabled: keep the focus in here.
+        self.focus.focus(window, cx);
         self.feedback
             .update(cx, |feedback, cx| feedback.finish_annotating(cx));
     }
 
     /// "Discard": removes the screenshot, at once when it has no boxes,
-    /// else after asking. An open comment is dropped first.
+    /// else after asking ("Discard this screenshot?", Keep focused). An open
+    /// comment is dropped first.
     fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         self.full = false;
         cx.notify();
         self.close_comment(window, cx);
-        match self.boxes.len() {
-            0 => self
-                .feedback
-                .update(cx, |feedback, cx| feedback.discard_annotated(cx)),
-            comments => confirm_discard(self.feedback.downgrade(), comments, window, cx),
+        let comments = self.boxes.len();
+        if comments == 0 {
+            self.feedback
+                .update(cx, |feedback, cx| feedback.discard_annotated(cx));
+            return;
         }
+        let feedback = self.feedback.downgrade();
+        let ask = Confirmation {
+            title_id: ANNOTATOR_DISCARD_TITLE_ID,
+            title: ANNOTATOR_DISCARD_TITLE,
+            description: annotator_discard_description(comments),
+            cancel_id: ANNOTATOR_KEEP_ID,
+            cancel: ANNOTATOR_DISCARD_KEEP,
+            confirm_id: ANNOTATOR_CONFIRM_DISCARD_ID,
+            confirm: ANNOTATOR_DISCARD_CONFIRM,
+        };
+        confirm(
+            ask,
+            move |_, cx| {
+                let _ = feedback.update(cx, |feedback, cx| feedback.discard_annotated(cx));
+            },
+            window,
+            cx,
+        );
     }
 
     /// "Screenshot n of m · …": n is this screenshot's place among the
@@ -516,6 +569,7 @@ impl Annotator {
                     .label(DISCARD_LABEL)
                     .ghost()
                     .small()
+                    .disabled(self.closing)
                     .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))),
             )
             .child(
@@ -523,6 +577,8 @@ impl Annotator {
                     .label(DONE_LABEL)
                     .primary()
                     .small()
+                    .loading(self.closing)
+                    .disabled(self.closing)
                     .on_click(cx.listener(|this, _, window, cx| this.done(window, cx))),
             )
     }
@@ -601,8 +657,9 @@ impl Annotator {
         let badges = self
             .boxes
             .iter()
+            .zip(&self.badge_focus)
             .enumerate()
-            .map(|(index, saved)| badge(index, saved.rect, paint, cx));
+            .map(|(index, (saved, focus))| badge(index, saved, focus, paint, cx));
         let comment = self.comment.map(|comment| {
             let rect = match comment.target {
                 Commented::New(rect) => Some(rect),
@@ -684,18 +741,29 @@ impl Annotator {
 }
 
 /// Box `index`'s badge at the box's top-left corner: its number in
-/// `background` on a `destructive` fill. A click opens its comment; a press
-/// on it never starts a drag.
-fn badge(index: usize, rect: FracRect, paint: &Paint, cx: &Context<Annotator>) -> AnyElement {
+/// `background` on a `destructive` fill, named "Comment n" for assistive
+/// technology. A click, or Enter or Space while it has the focus (it is a
+/// tab stop), opens its comment; a press on it never starts a drag.
+fn badge(
+    index: usize,
+    saved: &Annotation,
+    focus: &FocusHandle,
+    paint: &Paint,
+    cx: &Context<Annotator>,
+) -> AnyElement {
     let number = index + 1;
+    let ring = paint.ring;
     div()
         .id(badge_id(number))
         .role(Role::Button)
         .test_support()
-        .aria_label(number.to_string())
+        .aria_label(format!("{BADGE_LABEL} {number}"))
+        .aria_description(saved.comment.clone())
+        .track_focus(focus)
+        .focus_visible(move |style| style.border_color(ring))
         .absolute()
-        .left(relative(rect.x))
-        .top(relative(rect.y))
+        .left(relative(saved.rect.x))
+        .top(relative(saved.rect.y))
         .occlude()
         .cursor_pointer()
         .flex()
@@ -705,6 +773,8 @@ fn badge(index: usize, rect: FracRect, paint: &Paint, cx: &Context<Annotator>) -
         .min_w(px(BADGE_SIZE))
         .px_1()
         .rounded_full()
+        .border_2()
+        .border_color(paint.destructive)
         .bg(paint.destructive)
         .text_color(paint.background)
         .text_xs()
@@ -712,63 +782,6 @@ fn badge(index: usize, rect: FracRect, paint: &Paint, cx: &Context<Annotator>) -
         .child(number.to_string())
         .on_click(cx.listener(move |this, _, window, cx| this.edit_box(index, window, cx)))
         .into_any_element()
-}
-
-/// Asks before discarding a screenshot with boxes: "Discard this
-/// screenshot?" with Keep (focused, and what Enter does) and a danger
-/// "Discard", the only way to discard.
-fn confirm_discard(
-    feedback: WeakEntity<Feedback>,
-    comments: usize,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let keep_focus = cx.focus_handle();
-    let description = SharedString::from(annotator_discard_description(comments));
-    // The builder runs again whenever the dialog layer rebuilds; focus only
-    // on the first run, so a rebuild never steals the focus back.
-    let first_build = Rc::new(Cell::new(true));
-    window.open_alert_dialog(cx, move |alert, window, cx| {
-        if first_build.replace(false) {
-            keep_focus.focus(window, cx);
-        }
-        let feedback = feedback.clone();
-        alert
-            .title(
-                div()
-                    .id(ANNOTATOR_DISCARD_TITLE_ID)
-                    .role(Role::Heading)
-                    .test_support()
-                    .aria_label(ANNOTATOR_DISCARD_TITLE)
-                    .text_color(cx.theme().popover_foreground)
-                    .child(ANNOTATOR_DISCARD_TITLE),
-            )
-            // A `Label`, so assistive technology reads it too.
-            .description(Label::new(description.clone()).text_color(cx.theme().muted_foreground))
-            // Enter dispatches the dialog's `Confirm`, which runs this: here it
-            // dismisses, like Keep. Returning `true` closes the dialog.
-            .on_ok(|_, _, _| true)
-            .footer(
-                DialogFooter::new()
-                    .child(
-                        Button::new(ANNOTATOR_KEEP_ID)
-                            .label(ANNOTATOR_DISCARD_KEEP)
-                            .outline()
-                            .track_focus(&keep_focus)
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new(ANNOTATOR_CONFIRM_DISCARD_ID)
-                            .label(ANNOTATOR_DISCARD_CONFIRM)
-                            .danger()
-                            .on_click(move |_, window, cx| {
-                                let _ = feedback
-                                    .update(cx, |feedback, cx| feedback.discard_annotated(cx));
-                                window.close_dialog(cx);
-                            }),
-                    ),
-            )
-    });
 }
 
 /// The window below the bar, where the picture is drawn. The annotator
@@ -841,15 +854,22 @@ impl Render for Annotator {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = Paint::new(self.native.as_deref(), cx);
         let area = image_area(window.viewport_size());
+        let badges = self.boxes.len();
+        self.badge_focus.truncate(badges);
+        while self.badge_focus.len() < badges {
+            self.badge_focus.push(cx.focus_handle().tab_stop(true));
+        }
         v_flex()
             .id(ANNOTATOR_ID)
             .test_support()
-            .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_escape))
             .size_full()
             .bg(paint.background)
             .child(self.bar(&paint, cx))
             .child(self.picture_area(area, &paint, cx))
+            // Tab and shift-Tab cycle in here; the shell under it is out of
+            // reach (it also stops handling its keys while this is open).
+            .focus_trap(ANNOTATOR_ID, &self.focus)
     }
 }
 
@@ -864,6 +884,8 @@ struct Paint {
     destructive: Hsla,
     popover: Hsla,
     popover_foreground: Hsla,
+    /// A badge with the keyboard focus.
+    ring: Hsla,
 }
 
 impl Paint {
@@ -878,6 +900,7 @@ impl Paint {
             destructive: token("destructive"),
             popover: token("popover"),
             popover_foreground: token("popover-foreground"),
+            ring: token("ring"),
         }
     }
 }

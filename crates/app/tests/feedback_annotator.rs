@@ -15,18 +15,26 @@ mod common;
 use std::sync::Arc;
 
 use common::feedback::{act, capture_now, FeedbackSetup};
-use common::ui::{dark_native, open_shell_options, painted_at, token_background};
+use common::ui::{
+    agent, dark_native, fake_connection, open_shell_options, painted_at, token_background,
+};
 use gpui_kit::base::{test_support, Root};
+use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{
-    point, px, size, AppContext as _, Bounds, ElementId, Entity, Pixels, Point, RenderImage, Role,
-    TestAppContext, WindowHandle,
+    point, px, size, Action, AppContext as _, Bounds, ElementId, Entity, Pixels, Point,
+    RenderImage, Role, TestAppContext, WindowHandle,
 };
 use smithagents_app::feedback::annotation::{Annotation, FracRect};
 use smithagents_app::feedback::draft::{AttachmentId, Draft};
 use smithagents_app::feedback::state::Feedback;
-use smithagents_app::shell::Shell;
+use smithagents_app::model::{Action as ModelAction, Connection, ShellModel};
+use smithagents_app::shell::{
+    CloseActiveTab, NextTab, Shell, ToggleAgentsPane, ToggleFeedbackPane, ToggleIntentsPane,
+    ToggleSettingsPane,
+};
+use smithagents_app::view_models::LeftPaneMode;
 use smithagents_app::views::feedback::{
     badge_id, card_id, Annotator, ANNOTATOR_COMMENT_ERROR_ID, ANNOTATOR_COMMENT_ID,
     ANNOTATOR_CONFIRM_DISCARD_ID, ANNOTATOR_DELETE_ID, ANNOTATOR_DISCARD_ID,
@@ -271,7 +279,10 @@ fn dragging_draws_a_box_in_image_fractions_and_enter_saves_it(cx: &mut TestAppCo
     assert_rect(saved[0].rect, [0.25, 0.25, 0.25, 0.25]);
     assert_eq!(saved[0].comment, "the toolbar");
     assert_near(bounds_of(cx, window, badge_id(1)).origin, (300., 233.), 1.);
-    assert_eq!(label_of(cx, window, badge_id(1)).as_deref(), Some("1"));
+    assert_eq!(
+        label_of(cx, window, badge_id(1)).as_deref(),
+        Some("Comment 1")
+    );
     assert!(comment_field(cx, window).is_none(), "the field is gone");
     assert_eq!(setup.store().load().draft.attachments[0].boxes, saved);
 }
@@ -703,4 +714,200 @@ fn the_second_screenshot_says_two_of_two(cx: &mut TestAppContext) {
         Some("Screenshot 1 of 2 · Drag a box over what you mean")
     );
     assert_near(bounds_of(cx, window, badge_id(1)).origin, (300., 233.), 1.);
+}
+
+/// What the shell's shortcuts change: the right dock, the rail's entry, the
+/// left pane's mode, the tabs and the active tab.
+#[derive(Debug, PartialEq)]
+struct ShellLook {
+    dock_open: bool,
+    rail: Option<RailEntry>,
+    left: LeftPaneMode,
+    tabs: usize,
+    active_tab: bool,
+}
+
+fn shell_look(cx: &mut TestAppContext, shell: &Entity<Shell>) -> ShellLook {
+    shell.read_with(cx, |shell, cx| {
+        let state = shell.state().read(cx);
+        ShellLook {
+            dock_open: shell.dock().read(cx).is_dock_open(DockPlacement::Right),
+            rail: shell.rail_active(cx),
+            left: state.left_pane_mode(),
+            tabs: state.model().tabs().len(),
+            active_tab: state.model().active_tab().is_some(),
+        }
+    })
+}
+
+fn available(cx: &mut TestAppContext, window: WindowHandle<Root>, action: &dyn Action) -> bool {
+    with_window(cx, window, |window, cx| {
+        window.is_action_available(action, cx)
+    })
+}
+
+/// A shell on `setup` with two agents' chat tabs open, annotating a capture.
+fn open_with_tabs(
+    cx: &mut TestAppContext,
+    setup: &FeedbackSetup,
+) -> (WindowHandle<Root>, Entity<Shell>, Entity<Feedback>) {
+    let agents = ["Mercury", "Venus"].map(agent);
+    let mut model = ShellModel::new();
+    model.apply(ModelAction::Snapshot {
+        agents: agents.to_vec(),
+        repos: vec![],
+        latest_seq: 1,
+    });
+    model.apply(ModelAction::ConnectionChanged(Connection::Connected));
+    for agent in &agents {
+        model.apply(ModelAction::OpenTab(agent.id));
+    }
+    let mut options = setup.options();
+    options.model = model;
+    options.connection_info = Some(fake_connection());
+    let (window, shell) = open_shell_options(cx, options, (1200., 800.));
+    let feedback = shell.read_with(cx, |shell, _| shell.feedback().clone());
+    frame(cx, window);
+    capture_now(cx, window, &feedback, setup);
+    frame(cx, window);
+    (window, shell, feedback)
+}
+
+#[gpui_kit::test]
+fn the_shell_shortcuts_and_menus_are_off_while_annotating(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell, _) = open_with_tabs(cx, &setup);
+    assert!(annotator(cx, &shell).is_some());
+    let before = shell_look(cx, &shell);
+    assert_eq!(before.tabs, 2);
+
+    for key in [
+        "cmd-alt-f",
+        "cmd-alt-b",
+        "cmd-alt-i",
+        "cmd-b",
+        "cmd-w",
+        "ctrl-tab",
+    ] {
+        press(cx, window, key);
+        assert_eq!(shell_look(cx, &shell), before, "{key} changed the shell");
+        assert!(annotator(cx, &shell).is_some(), "{key}");
+    }
+    // The View and Window menus' items are off.
+    for action in [
+        &ToggleAgentsPane as &dyn Action,
+        &ToggleSettingsPane,
+        &ToggleFeedbackPane,
+        &ToggleIntentsPane,
+        &CloseActiveTab,
+        &NextTab,
+    ] {
+        assert!(!available(cx, window, action), "{}", action.name());
+    }
+
+    click(cx, window, ANNOTATOR_DONE_ID);
+    frame(cx, window);
+    assert!(annotator(cx, &shell).is_none());
+    assert!(available(cx, window, &ToggleSettingsPane));
+    let after = shell_look(cx, &shell);
+    press(cx, window, "cmd-w");
+    assert_eq!(
+        shell_look(cx, &shell).tabs,
+        after.tabs - 1,
+        "cmd-w works again"
+    );
+    press(cx, window, "cmd-b");
+    assert_ne!(shell_look(cx, &shell).left, after.left, "cmd-b works again");
+    press(cx, window, "cmd-alt-b");
+    assert_eq!(shell_look(cx, &shell).rail, Some(RailEntry::Settings));
+}
+
+#[gpui_kit::test]
+fn cmd_q_still_quits_while_annotating(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell, _) = open(cx, &setup);
+    assert!(annotator(cx, &shell).is_some());
+    drop(shell);
+
+    cx.update_window(window.into(), |_, window, cx| window.press("cmd-q", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| cx.windows().len()), 0, "the window closed");
+}
+
+#[gpui_kit::test]
+fn tab_and_shift_tab_stay_inside_the_annotator(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, _) = open(cx, &setup);
+    comment_box(cx, window, (300., 233.), (600., 422.), "the toolbar");
+
+    for key in ["tab", "shift-tab"] {
+        for step in 1..=30 {
+            press(cx, window, key);
+            let inside = with_window(cx, window, |window, _| window.find(ANNOTATOR_ID).focused());
+            assert_eq!(inside, Some(true), "{key} {step} left the annotator");
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn a_badge_is_a_tab_stop_that_opens_its_comment(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, _) = open(cx, &setup);
+    comment_box(cx, window, (300., 233.), (600., 422.), "the toolbar");
+    let badge_focused = |cx: &mut TestAppContext| {
+        with_window(cx, window, |window, _| window.find(badge_id(1)).focused())
+    };
+    let tab_to_badge = |cx: &mut TestAppContext| {
+        for _ in 0..10 {
+            if badge_focused(cx) == Some(true) {
+                return;
+            }
+            press(cx, window, "tab");
+        }
+        panic!("Tab never reached the badge");
+    };
+
+    for key in ["enter", "space"] {
+        tab_to_badge(cx);
+        press(cx, window, key);
+        let field = comment_field(cx, window).expect("the badge opened its comment");
+        assert_eq!(field.value(), Some("the toolbar"), "{key}");
+        press(cx, window, "escape");
+        assert!(comment_field(cx, window).is_none());
+    }
+}
+
+#[gpui_kit::test]
+fn done_waits_for_the_drawing_and_ignores_the_picture_meanwhile(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell, feedback) = open(cx, &setup);
+    comment_box(cx, window, (300., 233.), (600., 422.), "the toolbar");
+
+    // Without parking: the annotated image is still being drawn.
+    with_window(cx, window, |window, cx| window.click(ANNOTATOR_DONE_ID, cx));
+    assert!(
+        annotator(cx, &shell).is_some(),
+        "open until the drawing is done"
+    );
+    with_window(cx, window, |window, _| {
+        assert_eq!(window.find(ANNOTATOR_DONE_ID).disabled(), Some(true));
+        assert_eq!(window.find(ANNOTATOR_DISCARD_ID).disabled(), Some(true));
+    });
+    with_window(cx, window, |window, cx| {
+        window.drag(at(700., 500.), at(900., 650.), cx);
+    });
+    assert!(comment_field(cx, window).is_none(), "a drag draws nothing");
+    with_window(cx, window, |window, cx| window.click(badge_id(1), cx));
+    assert!(comment_field(cx, window).is_none(), "a badge opens nothing");
+    with_window(cx, window, |window, cx| {
+        window.click(ANNOTATOR_DISCARD_ID, cx)
+    });
+    assert!(!dialog_open(cx, window), "Discard asks nothing");
+
+    frame(cx, window);
+    assert!(annotator(cx, &shell).is_none());
+    let shot = &draft(cx, &feedback).attachments[0];
+    assert_eq!(shot.boxes.len(), 1);
+    assert!(shot.rendered);
 }

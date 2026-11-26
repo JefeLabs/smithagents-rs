@@ -1006,6 +1006,7 @@ impl Render for Shell {
         };
         let expanded = self.state.read(cx).left_pane_mode() == LeftPaneMode::Expanded;
         let has_active_tab = self.state.read(cx).model().active_tab().is_some();
+        let annotating = self.annotator.is_some();
         let left_width = self.fitted_left_width(self.state.read(cx).left_pane_layout(), window, cx);
         let native = self.state.read(cx).shared_native_theme();
         let rail_active = self.rail_active(cx);
@@ -1060,15 +1061,20 @@ impl Render for Shell {
             .id("shell")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
-            .on_action(cx.listener(Self::on_toggle_agents))
-            .on_action(cx.listener(Self::on_toggle_settings))
-            .on_action(cx.listener(Self::on_toggle_feedback))
-            .on_action(cx.listener(Self::on_toggle_intents))
-            .on_action(cx.listener(Self::on_next_tab))
-            .on_action(cx.listener(Self::on_previous_tab))
+            // Not while the annotator covers the window: its keys and menu
+            // items would act on what is hidden under it (macOS greys out an
+            // item whose action has no handler). Quit is the app's.
+            .when(!annotating, |this| {
+                this.on_action(cx.listener(Self::on_toggle_agents))
+                    .on_action(cx.listener(Self::on_toggle_settings))
+                    .on_action(cx.listener(Self::on_toggle_feedback))
+                    .on_action(cx.listener(Self::on_toggle_intents))
+                    .on_action(cx.listener(Self::on_next_tab))
+                    .on_action(cx.listener(Self::on_previous_tab))
+            })
             // Only with a tab to close, so the menu's Close Tab is disabled
             // otherwise (macOS asks whether the action is available).
-            .when(has_active_tab, |this| {
+            .when(has_active_tab && !annotating, |this| {
                 this.on_action(cx.listener(Self::on_close_active_tab))
             })
             .on_drag_move(cx.listener(Self::on_left_pane_drag))

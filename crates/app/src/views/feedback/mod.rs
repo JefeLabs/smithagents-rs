@@ -52,7 +52,7 @@ use gpui_kit::{
     div, img, px, AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     RenderImage, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled,
-    Subscription, TestSupportExt as _, WeakEntity, Window,
+    Subscription, TestSupportExt as _, Window,
 };
 
 use crate::feedback::draft::{AttachmentId, AttachmentKind};
@@ -398,21 +398,60 @@ impl FeedbackPane {
         if count == 0 {
             return;
         }
-        confirm_discard(self.feedback.downgrade(), count, window, cx);
+        let feedback = self.feedback.downgrade();
+        let ask = Confirmation {
+            title_id: DISCARD_DIALOG_TITLE_ID,
+            title: DISCARD_TITLE,
+            description: discard_description(count),
+            cancel_id: DISCARD_CANCEL_ID,
+            cancel: DISCARD_CANCEL,
+            confirm_id: DISCARD_CONFIRM_ID,
+            confirm: DISCARD_CONFIRM,
+        };
+        confirm(
+            ask,
+            move |_, cx| {
+                let _ = feedback.update(cx, |feedback, cx| feedback.discard_all(cx));
+            },
+            window,
+            cx,
+        );
     }
 }
 
-/// Asks before discarding the draft: "Discard this feedback?" with Cancel
-/// (focused, and what Enter does) and a danger "Discard", the only way to
-/// discard.
-fn confirm_discard(
-    feedback: WeakEntity<Feedback>,
-    count: usize,
+/// What a confirmation asks, and the element ids of its title and buttons.
+struct Confirmation {
+    title_id: &'static str,
+    title: &'static str,
+    description: String,
+    cancel_id: &'static str,
+    cancel: &'static str,
+    confirm_id: &'static str,
+    confirm: &'static str,
+}
+
+/// Asks before something that cannot be undone: the title and the
+/// description, a cancel button (focused, and what Enter does) and a danger
+/// confirm button, the only way to `on_confirm`. Either button closes the
+/// dialog. Used by the pane's Discard and the annotator's.
+fn confirm(
+    ask: Confirmation,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let Confirmation {
+        title_id,
+        title,
+        description,
+        cancel_id,
+        cancel,
+        confirm_id,
+        confirm,
+    } = ask;
+    let description = SharedString::from(description);
+    let on_confirm = Rc::new(on_confirm);
     let cancel_focus = cx.focus_handle();
-    let description = SharedString::from(discard_description(count));
     // The builder runs again whenever the dialog layer rebuilds; focus only
     // on the first run, so a rebuild never steals the focus back.
     let first_build = Rc::new(Cell::new(true));
@@ -420,41 +459,38 @@ fn confirm_discard(
         if first_build.replace(false) {
             cancel_focus.focus(window, cx);
         }
-        let feedback = feedback.clone();
+        let on_confirm = on_confirm.clone();
         alert
             .title(
                 div()
-                    .id(DISCARD_DIALOG_TITLE_ID)
+                    .id(title_id)
                     .role(Role::Heading)
                     .test_support()
-                    .aria_label(DISCARD_TITLE)
+                    .aria_label(title)
                     .text_color(cx.theme().popover_foreground)
-                    .child(DISCARD_TITLE),
+                    .child(title),
             )
             // A `Label`, so assistive technology reads it too.
             .description(Label::new(description.clone()).text_color(cx.theme().muted_foreground))
             // Enter dispatches the dialog's `Confirm`, which runs this: here it
-            // dismisses, like Cancel. Returning `true` closes the dialog.
+            // dismisses, like the cancel button. Returning `true` closes the
+            // dialog.
             .on_ok(|_, _, _| true)
             .footer(
                 DialogFooter::new()
                     .child(
-                        Button::new(DISCARD_CANCEL_ID)
-                            .label(DISCARD_CANCEL)
+                        Button::new(cancel_id)
+                            .label(cancel)
                             .outline()
                             .track_focus(&cancel_focus)
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
-                    .child(
-                        Button::new(DISCARD_CONFIRM_ID)
-                            .label(DISCARD_CONFIRM)
-                            .danger()
-                            .on_click(move |_, window, cx| {
-                                let _ =
-                                    feedback.update(cx, |feedback, cx| feedback.discard_all(cx));
-                                window.close_dialog(cx);
-                            }),
-                    ),
+                    .child(Button::new(confirm_id).label(confirm).danger().on_click(
+                        move |_, window, cx| {
+                            on_confirm(window, cx);
+                            window.close_dialog(cx);
+                        },
+                    )),
             )
     });
 }
