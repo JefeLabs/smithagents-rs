@@ -460,18 +460,17 @@ fn removing_and_discarding_delete_the_files(cx: &mut TestAppContext) {
     assert_eq!(on_disk.attachments.len(), 1);
     assert_eq!(on_disk.attachments[0].id, image);
     assert!(cx.read(|cx| feedback.read(cx).thumbnail(&shot)).is_none());
-    let retired = act(cx, window, &feedback, |f, _, _| f.take_retired_images());
-    assert_eq!(retired.len(), 1);
-    assert!(Arc::ptr_eq(&retired[0], &shot_thumb));
+    // The shell's Feedback pane takes each retired thumbnail as it is
+    // retired and releases it: nothing but this test holds it any more.
     assert!(act(cx, window, &feedback, |f, _, _| f.take_retired_images()).is_empty());
+    assert_eq!(Arc::strong_count(&shot_thumb), 1);
+    assert_eq!(Arc::strong_count(&image_thumb), 2, "still the image's");
 
     act(cx, window, &feedback, |f, _, cx| f.discard_all(cx));
     assert!(!dir.exists(), "no draft directory is left");
     assert!(draft(cx, &feedback).is_empty());
-    let retired = act(cx, window, &feedback, |f, _, _| f.take_retired_images());
-    assert_eq!(retired.len(), 1);
-    assert!(Arc::ptr_eq(&retired[0], &image_thumb));
     assert!(act(cx, window, &feedback, |f, _, _| f.take_retired_images()).is_empty());
+    assert_eq!(Arc::strong_count(&image_thumb), 1);
     assert!(setup.store().load().draft.is_empty());
 }
 

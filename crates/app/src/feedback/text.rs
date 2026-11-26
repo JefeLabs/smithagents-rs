@@ -14,7 +14,9 @@ pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_VIDEO_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
-pub const PERMISSION_TEXT: &str = "SmithAgents needs Screen Recording permission to capture its window. Allow it in System Settings → Privacy & Security → Screen Recording, then try again.";
+/// macOS keeps reporting the permission as missing until the app restarts
+/// after it is granted, hence "quit and reopen" rather than "try again".
+pub const PERMISSION_TEXT: &str = "SmithAgents needs Screen Recording permission to capture its window. Allow it in System Settings → Privacy & Security → Screen Recording, then quit and reopen SmithAgents.";
 pub const WINDOW_NOT_FOUND_TEXT: &str =
     "Could not find the SmithAgents window to capture. Try again.";
 pub const UNSUPPORTED_TEXT: &str =
