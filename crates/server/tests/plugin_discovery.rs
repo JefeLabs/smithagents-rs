@@ -1,8 +1,7 @@
 //! Which plugin directories may load, and that loading builds the right runtime.
 
-#![cfg(unix)]
-
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -11,8 +10,12 @@ use smithagents_plugin_protocol::HostMode;
 use smithagents_plugins_tool::pack_fixtures_once;
 use smithagents_server::plugins::{discover, load_runtime, Origin};
 
+/// Sets the mode; off Unix there are no modes, so this does nothing.
 fn chmod(path: &Path, mode: u32) {
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    #[cfg(not(unix))]
+    let _ = (path, mode);
 }
 
 /// Copies a packed fixture to `root/<id>`, rewriting its id, with explicit modes.
@@ -205,6 +208,7 @@ fn builtin_id_wins_over_installed() {
     assert_eq!(rejected[0].reason, "a built-in plugin has this id");
 }
 
+#[cfg(unix)]
 #[test]
 fn entry_must_exist_be_a_file_and_stay_inside() {
     let tmp = tempfile::tempdir().unwrap();
@@ -250,6 +254,7 @@ fn entry_must_exist_be_a_file_and_stay_inside() {
     assert_eq!(found.len(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn entry_writable_by_others_is_rejected() {
     for mode in [0o664, 0o646] {
@@ -263,6 +268,7 @@ fn entry_writable_by_others_is_rejected() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn plugin_directory_writable_by_others_is_rejected() {
     for mode in [0o775, 0o757] {
@@ -276,6 +282,7 @@ fn plugin_directory_writable_by_others_is_rejected() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn plugin_directory_symlink_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -291,6 +298,7 @@ fn plugin_directory_symlink_is_rejected() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn manifest_must_be_a_small_regular_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -357,6 +365,7 @@ fn manifest_errors_never_quote_the_file() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn world_writable_builtin_root_rejects_the_builtin_side() {
     let tmp = tempfile::tempdir().unwrap();
@@ -373,6 +382,7 @@ fn world_writable_builtin_root_rejects_the_builtin_side() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn manifest_writable_by_others_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -384,6 +394,7 @@ fn manifest_writable_by_others_is_rejected() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn builtin_directory_between_a_symlinked_entry_and_its_target_must_be_trusted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -423,6 +434,7 @@ async fn a_directory_swapped_after_discovery_is_refused() {
     assert!(matches!(err, LoadError::Refused { .. }), "{err:?}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn an_entry_made_writable_after_discovery_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -468,4 +480,66 @@ fn a_rejected_builtin_still_reserves_its_id() {
     assert!(found.is_empty());
     let r = rejected.iter().find(|r| r.dir == dup).unwrap();
     assert_eq!(r.reason, "a built-in plugin has this id");
+}
+
+#[cfg(unix)]
+#[test]
+fn untrusted_builtin_root_still_reserves_its_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let builtin = tmp.path().join("b");
+    let installed = tmp.path().join("i");
+    install_fixture(&builtin, "fixture-dylib", "fixture-dylib");
+    chmod(&builtin, 0o777);
+    let dup = install_fixture(&installed, "fixture-wasm", "fixture-dylib");
+    let (found, rejected) = discover(Some(&builtin), &installed);
+    assert!(found.is_empty());
+    assert!(rejected.iter().any(|r| r.dir == builtin));
+    let r = rejected.iter().find(|r| r.dir == dup).unwrap();
+    assert_eq!(r.reason, "a built-in plugin has this id");
+}
+
+#[test]
+fn each_manifest_error_has_its_own_plain_sentence() {
+    let cases = [
+        (
+            "hosts = [\"a.example\", \"b.example\"]\n[[secrets]]\nkey = \"tok\"\nlabel = \"T\"\n",
+            "plugin.toml is not valid: a secret must list its hosts when the plugin declares more than one",
+        ),
+        (
+            "hosts = [\"a.example\"]\n[[secrets]]\nkey = \"tok\"\nlabel = \"T\"\n[[secrets]]\nkey = \"tok\"\nlabel = \"T\"\n",
+            "plugin.toml is not valid: a secret key is declared twice",
+        ),
+        (
+            "hosts = [\"not a host\"]\n",
+            "plugin.toml is not valid: a host name is not valid",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = plain_plugin(tmp.path(), "bad-field", extra);
+        assert_eq!(reason_for(tmp.path(), &dir), expected, "{extra}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_plugins_root_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    plain_plugin(&real, "one-plugin", "");
+    let link = tmp.path().join("link");
+    symlink(&real, &link).unwrap();
+    for (builtin, installed) in [
+        (None, link.clone()),
+        (Some(link.clone()), tmp.path().join("none")),
+    ] {
+        let (found, rejected) = discover(builtin.as_deref(), &installed);
+        assert!(found.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].dir, link);
+        assert_eq!(
+            rejected[0].reason,
+            "the plugins directory is a symbolic link"
+        );
+    }
 }

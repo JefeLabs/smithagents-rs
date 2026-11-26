@@ -122,8 +122,9 @@ struct Scan {
     names: Vec<String>,
 }
 
-/// Scans both directories. A built-in plugin, even a broken one, keeps its
-/// id from an installed plugin. Results are sorted by id (rejections by
+/// Scans both directories. A built-in plugin, even a broken one, and every
+/// directory name under an untrusted built-in root, keeps its id from an
+/// installed plugin. Results are sorted by id (rejections by
 /// directory).
 pub fn discover(builtin: Option<&Path>, installed: &Path) -> (Vec<Discovered>, Vec<Rejected>) {
     let mut result = Scan::default();
@@ -169,17 +170,32 @@ fn scan_root(root: &Path, origin: Origin, reserved: &[String], out: &mut Scan) {
             reason,
         })
     };
-    let root_meta = match fs::metadata(root) {
+    let root_meta = match fs::symlink_metadata(root) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(_) => return reject_root(out, "the plugins directory cannot be read".into()),
     };
+    if root_meta.file_type().is_symlink() {
+        return reject_root(out, "the plugins directory is a symbolic link".into());
+    }
     if !root_meta.is_dir() {
         return reject_root(out, "the plugins directory is not a directory".into());
     }
     if origin == Origin::Builtin {
-        // Whoever can write here can add native code to the daemon.
+        // Whoever can write here can add native code to the daemon. Nothing
+        // is loaded, but the names still keep their ids from installed plugins.
         if let Err(reason) = trust(&root_meta, "the built-in plugins directory") {
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    if fs::symlink_metadata(entry.path())
+                        .is_ok_and(|m| m.is_dir() || m.file_type().is_symlink())
+                    {
+                        if let Some(name) = entry.file_name().to_str() {
+                            out.names.push(name.to_string());
+                        }
+                    }
+                }
+            }
             return reject_root(out, reason);
         }
     }
@@ -274,6 +290,11 @@ fn open_plain(path: &Path) -> std::io::Result<fs::File> {
 
 fn read_manifest(path: &Path) -> Result<Manifest, String> {
     let unreadable = || "plugin.toml cannot be read".to_string();
+    // Unix refuses a symlink in `open_plain`; elsewhere check beforehand.
+    #[cfg(not(unix))]
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("plugin.toml is not a regular file".into());
+    }
     // Check and read through one handle, so the file cannot change in between.
     let file = match open_plain(path) {
         Ok(file) => file,
@@ -302,13 +323,36 @@ fn read_manifest(path: &Path) -> Result<Manifest, String> {
     Manifest::parse(&text).map_err(|e| match e {
         // Carries at most a line number.
         ManifestError::Toml { .. } => e.to_string(),
-        // These carry only a number or a mode name.
         ManifestError::UnsupportedContract(_) | ManifestError::EntryRequired(_) => {
             format!("plugin.toml is not valid: {e}")
         }
-        // The rest quote text from the file (keys, hosts, entry names).
-        _ => "plugin.toml is not valid: a field has a value that is not allowed".to_string(),
+        // The rest would quote text from the file, so each has a fixed sentence.
+        other => format!("plugin.toml is not valid: {}", fixed_sentence(&other)),
     })
+}
+
+fn fixed_sentence(e: &ManifestError) -> &'static str {
+    match e {
+        ManifestError::Toml { .. }
+        | ManifestError::UnsupportedContract(_)
+        | ManifestError::EntryRequired(_) => "the manifest is not usable",
+        ManifestError::BadEntry(_) => "the entry must be a plain file name",
+        ManifestError::BadHost(_) => "a host name is not valid",
+        ManifestError::BadSecretKey(_) => "a secret key is not valid",
+        ManifestError::SecretHostsRequired(_) => {
+            "a secret must list its hosts when the plugin declares more than one"
+        }
+        ManifestError::SecretHostNotDeclared { .. } => {
+            "a secret names a host the plugin does not declare"
+        }
+        ManifestError::BadSettingKey(_) => "a setting key is not valid",
+        ManifestError::BadResourceKind(_) => "a resource kind is not valid",
+        ManifestError::DuplicateSecret(_) => "a secret key is declared twice",
+        ManifestError::DuplicateSetting(_) => "a setting key is declared twice",
+        ManifestError::DuplicateResource(_) => "a resource kind is declared twice",
+        ManifestError::BadInterval { .. } => "a resource interval is outside 60 to 86400 seconds",
+        ManifestError::BadDefault(_) => "a setting default does not match its kind",
+    }
 }
 
 /// Resolves the entry file and checks it. Returns its canonical path.
@@ -350,6 +394,7 @@ fn check_entry(
 }
 
 /// Why a file may not be trusted with code, if it may not.
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum Distrust {
     Owner,
