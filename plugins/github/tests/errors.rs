@@ -37,17 +37,24 @@ fn unauthorised_is_an_auth_error() {
 }
 
 #[test]
-fn retry_after_wins_and_is_taken_as_given() {
+fn retry_after_wins_and_is_clamped() {
     assert_eq!(wait(status(429, &[("Retry-After", "120")])), 120);
-    assert_eq!(wait(status(403, &[("retry-after", "7")])), 7);
+    assert_eq!(wait(status(403, &[("retry-after", "7")])), 60, "clamped up");
+    assert_eq!(wait(status(403, &[("retry-after", "0")])), 60);
     assert_eq!(wait(status(403, &[("retry-after", "soon")])), 60);
+    assert_eq!(wait(status(403, &[("retry-after", "-5")])), 60);
     assert_eq!(
-        wait(status(429, &[("retry-after", "99999999999999999999")])),
-        60
+        wait(status(429, &[("retry-after", "86400")])),
+        3600,
+        "clamped down"
     );
     assert_eq!(
         wait(status(429, &[("retry-after", "18446744073709551615")])),
-        u32::MAX
+        3600
+    );
+    assert_eq!(
+        wait(status(429, &[("retry-after", "99999999999999999999")])),
+        60
     );
 }
 
@@ -155,7 +162,7 @@ fn invalid_json_and_unexpected_shapes_are_other_errors() {
         call(&host).unwrap_err(),
         PluginError::Other { .. }
     ));
-    let issues = "https://api.github.com/repos/octo-org/widgets/issues?state=all&sort=updated&direction=asc&per_page=100";
+    let issues = "https://api.github.com/repos/octo-org/widgets/issues?state=all&sort=updated&direction=desc&per_page=100";
     let host = Scripted::new().ok(issues, b"{}".to_vec());
     let r = sync(&host, "issue", None, settings(&["octo-org/widgets"]));
     assert!(matches!(r.unwrap_err(), PluginError::Other { .. }));
@@ -242,4 +249,23 @@ fn an_unknown_resource_is_an_error() {
     )
     .unwrap_err();
     assert!(matches!(err, PluginError::Other { .. }));
+}
+
+#[test]
+fn a_list_whose_cursor_could_not_fit_is_refused_before_any_request() {
+    let long = "a".repeat(100);
+    let names: Vec<String> = (0..50)
+        .map(|i| format!("octo-org/{i:02}{}", &long[..96]))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let host = Scripted::new();
+    for resource in ["repository", "issue", "pull_request"] {
+        match sync(&host, resource, None, settings(&refs)).unwrap_err() {
+            PluginError::Settings { message } => {
+                assert!(message.contains("remove some"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(host.requests().is_empty());
 }

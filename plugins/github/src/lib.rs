@@ -10,14 +10,23 @@ mod issues;
 mod pulls;
 mod repos;
 
-use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
-use smithagents_plugin_protocol::{HostApi, Plugin, PluginError, SyncPage, SyncRequest};
+use std::collections::HashSet;
 
-/// More would not fit a cursor that holds one timestamp each.
+use chrono::{DateTime, Duration, Utc};
+use cursor::Cursor;
+use serde_json::{json, Value};
+use smithagents_plugin_protocol::{HostApi, Item, Plugin, PluginError, SyncPage, SyncRequest};
+
+/// A sanity cap; what a cursor can actually hold (a mark per repository in
+/// 4 KiB) is checked against the configured names by `Cursor::check_fits`.
 const MAX_REPOSITORIES: usize = 50;
 const MAX_TITLE_CHARS: usize = 512;
 const MAX_URL_BYTES: usize = 4 * 1024;
+/// Entries taken from one response, however many it holds.
+pub(crate) const MAX_ENTRIES: usize = 500;
+const MAX_FIELDS_BYTES: usize = 64 * 1024;
+const MAX_TEXT: usize = 1024;
+pub(crate) const MAX_DESCRIPTION: usize = 2048;
 const MAX_LIST: usize = 100;
 
 /// One resource's sync over the validated repositories and the saved cursor.
@@ -62,14 +71,17 @@ fn repositories(settings: &Value) -> Result<Vec<String>, PluginError> {
         }
         out.push(text.to_string());
     }
+    // GitHub names are case-insensitive: keep the first spelling given.
+    let mut seen = HashSet::new();
+    out.retain(|name| seen.insert(name.to_ascii_lowercase()));
     out.sort();
-    out.dedup();
     if out.len() > MAX_REPOSITORIES {
         return Err(settings_error(format!(
             "too many repositories: {} (at most {MAX_REPOSITORIES})",
             out.len()
         )));
     }
+    Cursor::check_fits(&out)?;
     Ok(out)
 }
 
@@ -127,28 +139,90 @@ pub(crate) fn truncate_title(title: &str) -> String {
     title.chars().take(MAX_TITLE_CHARS).collect()
 }
 
+/// `s` cut to at most `max` bytes on a character boundary.
+pub(crate) fn cap(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// `entry[key]` when it is a scalar (strings capped at `max` bytes); any
+/// object or array becomes null, so nothing nested is ever copied.
+pub(crate) fn scalar(entry: &Value, key: &str, max: usize) -> Value {
+    match entry.get(key) {
+        Some(Value::String(s)) => json!(cap(s, max)),
+        Some(v @ (Value::Bool(_) | Value::Number(_))) => v.clone(),
+        _ => Value::Null,
+    }
+}
+
+/// A capped string from `entry[key]`, or null.
+pub(crate) fn text(entry: &Value, key: &str) -> Value {
+    opt_str(entry, key).map_or(Value::Null, |s| json!(cap(s, MAX_TEXT)))
+}
+
 /// Label names; GitHub sends objects, older shapes send plain strings.
 pub(crate) fn labels(entry: &Value) -> Value {
-    let names: Vec<&str> = entry
+    let names: Vec<String> = entry
         .get("labels")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|l| l.as_str().or_else(|| opt_str(l, "name")))
         .take(MAX_LIST)
+        .map(|n| cap(n, MAX_TEXT))
         .collect();
     json!(names)
 }
 
 /// The `login` of each user under `key`.
 pub(crate) fn logins(entry: &Value, key: &str) -> Value {
-    let names: Vec<&str> = entry
+    let names: Vec<String> = entry
         .get(key)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|u| opt_str(u, "login"))
         .take(MAX_LIST)
+        .map(|n| cap(n, MAX_TEXT))
         .collect();
     json!(names)
+}
+
+/// A nested `entry[outer][inner]` string, capped.
+pub(crate) fn nested(entry: &Value, outer: &str, inner: &str) -> Value {
+    entry.get(outer).map_or(Value::Null, |o| text(o, inner))
+}
+
+/// The items of one page: no repeated id, nothing over the contract's size.
+#[derive(Default)]
+pub(crate) struct Upserts {
+    pub items: Vec<Item>,
+    seen: HashSet<String>,
+}
+
+impl Upserts {
+    pub fn push(&mut self, item: Option<Item>) {
+        let Some(item) = item else { return };
+        let size = serde_json::to_vec(&item.fields).map_or(usize::MAX, |v| v.len());
+        if size > MAX_FIELDS_BYTES || !self.seen.insert(item.id.clone()) {
+            return;
+        }
+        self.items.push(item);
+    }
+}
+
+/// Whether a timestamp may move the mark: not more than a day ahead of the
+/// response's own clock. Without a clock there is nothing to compare with.
+pub(crate) fn plausible(ts: &str, now: Option<DateTime<Utc>>) -> bool {
+    match (parse_time(ts), now) {
+        (Some(ts), Some(now)) => ts <= now + Duration::hours(24),
+        (Some(_), None) => true,
+        _ => false,
+    }
 }

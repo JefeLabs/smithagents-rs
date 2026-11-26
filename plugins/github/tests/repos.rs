@@ -79,9 +79,15 @@ fn an_empty_list_is_an_empty_done_page() {
     let host = Scripted::new();
     let page = sync(&host, "repository", None, settings(&[])).unwrap();
     assert!(page.upserts.is_empty() && page.done);
+    assert!(
+        page.snapshot_complete,
+        "the user listed nothing: a complete empty listing"
+    );
     assert!(host.requests().is_empty());
-    let page = sync(&host, "issue", None, settings(&[])).unwrap();
-    assert!(page.done && !page.snapshot_complete);
+    for resource in ["issue", "pull_request"] {
+        let page = sync(&host, resource, None, settings(&[])).unwrap();
+        assert!(page.done && !page.snapshot_complete, "{resource}");
+    }
 }
 
 #[test]
@@ -102,4 +108,17 @@ fn the_manifest_parses() {
         kinds,
         [("repository", 3600), ("issue", 300), ("pull_request", 300)]
     );
+}
+
+#[test]
+fn a_long_description_is_capped_and_nested_values_are_not_copied() {
+    let body = json!({"html_url": "https://github.com/octo-org/widgets",
+                      "description": "d".repeat(5000), "default_branch": {"x": 1},
+                      "stargazers_count": [1], "private": false});
+    let host = Scripted::new().ok_json(WIDGETS, &body);
+    let page = sync(&host, "repository", None, settings(&["octo-org/widgets"])).unwrap();
+    let f = &page.upserts[0].fields;
+    assert_eq!(f["description"].as_str().unwrap().len(), 2048);
+    assert_eq!(f["default_branch"], json!(null));
+    assert_eq!(f["stargazers_count"], json!(null));
 }

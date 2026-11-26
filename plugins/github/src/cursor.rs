@@ -120,6 +120,26 @@ impl Cursor {
         }
     }
 
+    /// Refuse a repository list whose cursor could not fit in 4 KiB in the
+    /// worst case: every repository marked, a pending timestamp and a 1 KiB
+    /// next-page URL.
+    pub fn check_fits(repos: &[String]) -> Result<(), PluginError> {
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let mut worst = Self::fresh(repos);
+        worst.marks = repos.iter().map(|r| (r.clone(), ts.clone())).collect();
+        worst.pending = Some(ts);
+        worst.next = Some("a".repeat(1024));
+        let fits = serde_json::to_string(&worst).is_ok_and(|t| t.len() <= MAX_CURSOR_BYTES);
+        if fits {
+            Ok(())
+        } else {
+            Err(PluginError::Settings {
+                message: "too many or too long repository names for one sync cursor; remove some"
+                    .into(),
+            })
+        }
+    }
+
     pub fn encode(&self) -> Result<String, PluginError> {
         let text = serde_json::to_string(self).map_err(|e| PluginError::Other {
             message: format!("could not write the cursor: {e}"),

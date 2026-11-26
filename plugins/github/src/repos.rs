@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use smithagents_plugin_protocol::{HostApi, Item, PluginError, SyncPage};
 
 use crate::cursor::{normalize_ts, Cursor};
-use crate::{http, opt_str, parse_time, truncate_title, web_url};
+use crate::{http, opt_str, parse_time, scalar, truncate_title, web_url, MAX_DESCRIPTION};
 
 fn item(repo: &str, body: &Value) -> Item {
     let updated = opt_str(body, "updated_at");
@@ -15,13 +15,13 @@ fn item(repo: &str, body: &Value) -> Item {
         updated_at: updated.and_then(parse_time),
         version: updated.and_then(normalize_ts),
         fields: json!({
-            "description": body.get("description").cloned().unwrap_or(Value::Null),
-            "private": body.get("private").cloned().unwrap_or(Value::Null),
-            "default_branch": body.get("default_branch").cloned().unwrap_or(Value::Null),
-            "open_issues_count": body.get("open_issues_count").cloned().unwrap_or(Value::Null),
-            "stargazers_count": body.get("stargazers_count").cloned().unwrap_or(Value::Null),
-            "pushed_at": body.get("pushed_at").cloned().unwrap_or(Value::Null),
-            "archived": body.get("archived").cloned().unwrap_or(Value::Null),
+            "description": scalar(body, "description", MAX_DESCRIPTION),
+            "private": scalar(body, "private", 0),
+            "default_branch": scalar(body, "default_branch", 1024),
+            "open_issues_count": scalar(body, "open_issues_count", 0),
+            "stargazers_count": scalar(body, "stargazers_count", 0),
+            "pushed_at": scalar(body, "pushed_at", 1024),
+            "archived": scalar(body, "archived", 0),
         }),
     }
 }

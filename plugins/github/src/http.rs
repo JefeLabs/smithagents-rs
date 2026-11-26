@@ -1,6 +1,6 @@
 //! One authenticated GET against the GitHub API, and what its answer means.
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use smithagents_plugin_protocol::{
     Auth, HostApi, HttpError, HttpMethod, HttpRequest, HttpResponse, PluginError,
@@ -12,6 +12,8 @@ pub const API_PREFIX: &str = "https://api.github.com/";
 pub struct Fetched {
     pub body: Value,
     pub next: Option<String>,
+    /// The response's `date` header, when it parses.
+    pub now: Option<DateTime<Utc>>,
 }
 
 fn other(message: impl Into<String>) -> PluginError {
@@ -56,8 +58,11 @@ pub fn next_link(header: &str) -> Option<String> {
 
 fn rate_limit_wait(resp: &HttpResponse) -> Option<u32> {
     if let Some(retry) = resp.header("retry-after") {
-        let secs = retry.trim().parse::<u64>().unwrap_or(60);
-        return Some(u32::try_from(secs).unwrap_or(u32::MAX));
+        let secs = retry
+            .trim()
+            .parse::<u64>()
+            .map_or(60, |n| i64::try_from(n).unwrap_or(i64::MAX));
+        return Some(clamp_wait(secs));
     }
     if resp.header("x-ratelimit-remaining").map(str::trim) != Some("0") {
         return None;
@@ -65,15 +70,22 @@ fn rate_limit_wait(resp: &HttpResponse) -> Option<u32> {
     let reset = resp
         .header("x-ratelimit-reset")
         .and_then(|v| v.trim().parse::<i64>().ok());
-    let now = resp
-        .header("date")
-        .and_then(|d| DateTime::parse_from_rfc2822(d.trim()).ok())
-        .map(|d| d.timestamp());
-    let wait = match (reset, now) {
-        (Some(reset), Some(now)) => reset.saturating_sub(now).clamp(60, 3600),
+    let wait = match (reset, response_date(resp)) {
+        (Some(reset), Some(now)) => clamp_wait(reset.saturating_sub(now.timestamp())),
         _ => 60,
     };
-    Some(u32::try_from(wait).unwrap_or(60))
+    Some(wait)
+}
+
+/// Seconds to wait, kept between a minute and an hour.
+fn clamp_wait(secs: i64) -> u32 {
+    u32::try_from(secs.clamp(60, 3600)).unwrap_or(60)
+}
+
+fn response_date(resp: &HttpResponse) -> Option<DateTime<Utc>> {
+    resp.header("date")
+        .and_then(|d| DateTime::parse_from_rfc2822(d.trim()).ok())
+        .map(|d| d.with_timezone(&Utc))
 }
 
 fn shorten(text: &str) -> String {
@@ -155,5 +167,9 @@ pub fn get(host: &dyn HostApi, url: &str, repo: &str) -> Result<Fetched, PluginE
     let body: Value = serde_json::from_slice(&resp.body)
         .map_err(|_| other("GitHub sent a response that is not valid JSON"))?;
     let next = resp.header("link").and_then(next_link);
-    Ok(Fetched { body, next })
+    Ok(Fetched {
+        body,
+        next,
+        now: response_date(&resp),
+    })
 }

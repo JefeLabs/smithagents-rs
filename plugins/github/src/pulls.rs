@@ -4,7 +4,10 @@ use serde_json::{json, Value};
 use smithagents_plugin_protocol::{HostApi, Item, PluginError, SyncPage};
 
 use crate::cursor::{keep_newest, normalize_ts, Cursor};
-use crate::{http, labels, logins, opt_str, parse_time, truncate_title, web_url};
+use crate::{
+    http, labels, logins, nested, opt_str, parse_time, plausible, scalar, truncate_title, web_url,
+    Upserts, MAX_ENTRIES,
+};
 
 fn item(repo: &str, entry: &Value) -> Option<Item> {
     let number = entry.get("number")?.as_u64()?;
@@ -17,17 +20,17 @@ fn item(repo: &str, entry: &Value) -> Option<Item> {
         version: updated.map(str::to_string).filter(|v| v.len() <= 1024),
         fields: json!({
             "number": number,
-            "state": entry.get("state").cloned().unwrap_or(Value::Null),
-            "draft": entry.get("draft").cloned().unwrap_or(Value::Null),
-            "merged_at": entry.get("merged_at").cloned().unwrap_or(Value::Null),
-            "author": entry.get("user").and_then(|u| opt_str(u, "login")),
+            "state": scalar(entry, "state", 1024),
+            "draft": scalar(entry, "draft", 0),
+            "merged_at": scalar(entry, "merged_at", 1024),
+            "author": nested(entry, "user", "login"),
             "labels": labels(entry),
             "assignees": logins(entry, "assignees"),
             "requested_reviewers": logins(entry, "requested_reviewers"),
-            "head_ref": entry.get("head").and_then(|h| opt_str(h, "ref")),
-            "base_ref": entry.get("base").and_then(|b| opt_str(b, "ref")),
-            "created_at": entry.get("created_at").cloned().unwrap_or(Value::Null),
-            "closed_at": entry.get("closed_at").cloned().unwrap_or(Value::Null),
+            "head_ref": nested(entry, "head", "ref"),
+            "base_ref": nested(entry, "base", "ref"),
+            "created_at": scalar(entry, "created_at", 1024),
+            "closed_at": scalar(entry, "closed_at", 1024),
             "repository": repo,
         }),
     })
@@ -52,18 +55,24 @@ pub fn sync(
     })?;
     let mark = cursor.mark(&repo).map(str::to_string);
     let mut newest = cursor.pending.take();
-    let mut upserts = Vec::new();
+    let mut upserts = Upserts::default();
     let mut reached_mark = false;
-    for entry in entries {
-        let Some(ts) = opt_str(entry, "updated_at").and_then(normalize_ts) else {
-            continue;
-        };
-        if mark.as_deref().is_some_and(|m| ts.as_str() <= m) {
-            reached_mark = true;
-            break;
+    for entry in entries.iter().take(MAX_ENTRIES) {
+        let updated = opt_str(entry, "updated_at");
+        if let Some(ts) = updated.and_then(normalize_ts) {
+            // Strictly older than the mark: everything after it is too. Equal
+            // entries are read again, so an update in the mark's own second
+            // is never lost.
+            if mark.as_deref().is_some_and(|m| ts.as_str() < m) {
+                reached_mark = true;
+                break;
+            }
+            if plausible(&ts, fetched.now) {
+                keep_newest(&mut newest, ts);
+            }
         }
-        keep_newest(&mut newest, ts);
-        upserts.extend(item(&repo, entry));
+        // Without a usable timestamp the entry is kept but moves nothing.
+        upserts.push(item(&repo, entry));
     }
     let next = if reached_mark { None } else { fetched.next };
     let done = match next {
@@ -74,7 +83,7 @@ pub fn sync(
         None => cursor.finish_repo(&repo, repos.len(), newest),
     };
     Ok(SyncPage {
-        upserts,
+        upserts: upserts.items,
         deletes: Vec::new(),
         next_cursor: Some(cursor.encode()?),
         done,

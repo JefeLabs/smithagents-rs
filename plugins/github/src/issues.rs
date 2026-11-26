@@ -1,10 +1,20 @@
-//! The `issue` resource: oldest update first, resumable with `since`.
+//! The `issue` resource: newest update first, bounded by `since`.
+//!
+//! Descending order is deliberate. Listing oldest first by page number, an
+//! issue updated mid-walk moves to the end and shifts every later entry up
+//! one place, so the first unread entry of the next page is skipped for good.
+//! Newest first, the same shift only repeats a boundary entry, and the updated
+//! issue shows up at the top of the next run. `since` is inclusive and already
+//! bounds the listing, so the walk follows `next` links to the end.
 
 use serde_json::{json, Value};
 use smithagents_plugin_protocol::{HostApi, Item, PluginError, SyncPage};
 
 use crate::cursor::{keep_newest, normalize_ts, Cursor};
-use crate::{http, labels, logins, opt_str, parse_time, truncate_title, web_url};
+use crate::{
+    http, labels, logins, nested, opt_str, parse_time, plausible, scalar, truncate_title, web_url,
+    Upserts, MAX_ENTRIES,
+};
 
 fn item(repo: &str, entry: &Value) -> Option<Item> {
     let number = entry.get("number")?.as_u64()?;
@@ -17,14 +27,14 @@ fn item(repo: &str, entry: &Value) -> Option<Item> {
         version: updated.map(str::to_string).filter(|v| v.len() <= 1024),
         fields: json!({
             "number": number,
-            "state": entry.get("state").cloned().unwrap_or(Value::Null),
-            "state_reason": entry.get("state_reason").cloned().unwrap_or(Value::Null),
-            "author": entry.get("user").and_then(|u| opt_str(u, "login")),
+            "state": scalar(entry, "state", 1024),
+            "state_reason": scalar(entry, "state_reason", 1024),
+            "author": nested(entry, "user", "login"),
             "labels": labels(entry),
             "assignees": logins(entry, "assignees"),
-            "comments": entry.get("comments").cloned().unwrap_or(Value::Null),
-            "created_at": entry.get("created_at").cloned().unwrap_or(Value::Null),
-            "closed_at": entry.get("closed_at").cloned().unwrap_or(Value::Null),
+            "comments": scalar(entry, "comments", 0),
+            "created_at": scalar(entry, "created_at", 1024),
+            "closed_at": scalar(entry, "closed_at", 1024),
             "repository": repo,
         }),
     })
@@ -41,7 +51,7 @@ pub fn sync(
         Some(next) => next.clone(),
         None => {
             let mut url = format!(
-                "{}repos/{repo}/issues?state=all&sort=updated&direction=asc&per_page=100",
+                "{}repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100",
                 http::API_PREFIX
             );
             if let Some(since) = cursor.mark(&repo) {
@@ -56,16 +66,19 @@ pub fn sync(
         message: format!("{repo}: GitHub sent an unexpected answer"),
     })?;
     let mut newest = cursor.pending.take();
-    let mut upserts = Vec::new();
-    for entry in entries {
-        if let Some(ts) = opt_str(entry, "updated_at").and_then(normalize_ts) {
+    let mut upserts = Upserts::default();
+    for entry in entries.iter().take(MAX_ENTRIES) {
+        if let Some(ts) = opt_str(entry, "updated_at")
+            .filter(|t| plausible(t, fetched.now))
+            .and_then(normalize_ts)
+        {
             keep_newest(&mut newest, ts);
         }
         // The issues endpoint also lists pull requests; they have their own resource.
         if entry.get("pull_request").is_some() {
             continue;
         }
-        upserts.extend(item(&repo, entry));
+        upserts.push(item(&repo, entry));
     }
     let done = match fetched.next {
         Some(next) => {
@@ -75,7 +88,7 @@ pub fn sync(
         None => cursor.finish_repo(&repo, repos.len(), newest),
     };
     Ok(SyncPage {
-        upserts,
+        upserts: upserts.items,
         deletes: Vec::new(),
         next_cursor: Some(cursor.encode()?),
         done,
