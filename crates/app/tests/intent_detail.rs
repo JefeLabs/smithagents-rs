@@ -33,14 +33,10 @@ use smithagents_app::views::intents::{
     intent_card_id, kind_item_id, section_header_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID,
     DETAIL_BODY_ID, DETAIL_KIND_ID, DETAIL_SCROLL_ID, DETAIL_SLUG_ID, DETAIL_STATE_ID,
     DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, INTENT_ERROR_ID, INTENT_LIST_ID, POLISHING_ID,
-    POLISH_FAILED_ID, RETRY_ID,
+    POLISH_FAILED_ID, RETRY_ID, SEND_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_core::intent::{Intent, IntentKind, IntentState, Patch, Phase};
-
-/// The Send button's id (Task 10 draws it), spelled out here so the
-/// polishing test holds once it exists.
-const SEND_ID: &str = "intent-send";
 
 /// The shell with the Intents pane on screen.
 struct Opened {

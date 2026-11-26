@@ -111,19 +111,15 @@ impl IntentsPane {
             .collect()
     }
 
-    /// The bar fixed at the bottom of the detail; Task 10 fills it. `None`
-    /// while the phase is Polishing.
+    /// The start error and the actions bar, fixed at the bottom of the
+    /// detail ([`super::actions`]); a draft has no bar.
     pub(crate) fn detail_actions(
         &self,
         intent: &Intent,
-        _: &Paint,
-        _: &Context<Self>,
+        paint: &Paint,
+        cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        if polishing(intent) {
-            return None;
-        }
-        // Task 10 draws the bar here.
-        None
+        self.actions(intent, paint, cx)
     }
 
     pub(super) fn detail_screen(

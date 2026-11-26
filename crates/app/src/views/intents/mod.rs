@@ -4,9 +4,9 @@
 //!
 //! The pane shows one [`Screen`] at a time: the list ([`list`]), the create
 //! screen ([`create`]) or an intent's detail ([`detail`], with its review
-//! sections in [`sections`]). The filter, the create screen's text and which
-//! detail sections are open live in the pane, so they reset when the app
-//! restarts.
+//! sections in [`sections`] and its actions in [`actions`]). The filter, the
+//! create screen's text and which detail sections are open live in the pane,
+//! so they reset when the app restarts.
 //!
 //! Every daemon command goes through [`IntentsPane::run`]: one at a time, so
 //! while one is in flight the others do nothing. Nothing changes on screen
@@ -26,11 +26,16 @@
 //! `card-foreground`), like Settings; everything else comes from tokens and
 //! the agent accents.
 
+mod actions;
 mod create;
 mod detail;
 mod list;
 mod sections;
 
+pub use actions::{
+    OPEN_CHAT_ID, QUEUED_REASON_ID, RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID, RESOLVE_DESCRIPTION,
+    RESOLVE_DESCRIPTION_ID, RESOLVE_ID, RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
+};
 pub use create::{
     create_repo_item_id, kind_row_id, ChooseBug, ChooseEnhancement, ChooseMaintenance,
     ChooseNewFeature, ChooseRefactor, CREATE_CLOSE_ID, CREATE_INPUT_ID, CREATE_KEY_CONTEXT,
