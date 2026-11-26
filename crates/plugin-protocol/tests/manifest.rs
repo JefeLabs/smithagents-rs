@@ -348,6 +348,80 @@ fn default_of_wrong_kind_is_rejected() {
     Manifest::parse(&ok).unwrap();
 }
 
+// ------------------------------------------------------------- shown text
+
+/// The error for `field` holding text that cannot be shown as it is.
+fn bad_text(field: &str, max: usize) -> ManifestError {
+    ManifestError::BadText {
+        field: field.into(),
+        max,
+    }
+}
+
+#[test]
+fn names_labels_and_help_are_plain_short_text() {
+    let long = "x".repeat(129);
+    let long_help = "x".repeat(513);
+    // (the text replaced in TOOLS_SAMPLE, the field the error names, its cap)
+    let fields = [
+        ("name = \"GitHub\"", "name = \"{}\"", "name", 128),
+        (
+            "label = \"GitHub CLI\"",
+            "label = \"{}\"",
+            "tool \"gh\" label",
+            128,
+        ),
+        (
+            "label = \"GitHub sign-in\"",
+            "label = \"{}\"",
+            "secret \"token\" label",
+            128,
+        ),
+        (
+            "help = \"Run: gh auth login\"",
+            "help = \"{}\"",
+            "secret \"token\" help",
+            512,
+        ),
+    ];
+    for (from, to, field, max) in fields {
+        let too_long = if max == 512 { &long_help } else { &long };
+        for bad in [
+            "",
+            "   ",
+            too_long.as_str(),
+            "two\\nlines",
+            "tab\\there",
+            "esc \\u001b[31m",
+            "bidi \\u202e",
+            "sep \\u2028",
+        ] {
+            let text = TOOLS_SAMPLE.replace(from, &to.replace("{}", bad));
+            assert_eq!(err(&text), bad_text(field, max), "{field}: {bad:?}");
+        }
+        // The cap itself is fine, counted in characters, not bytes.
+        let at_cap = "é".repeat(max);
+        let text = TOOLS_SAMPLE.replace(from, &to.replace("{}", &at_cap));
+        Manifest::parse(&text).unwrap();
+    }
+
+    let setting = SAMPLE.replace("label = \"Repositories (owner/name)\"", "label = \"a\\rb\"");
+    assert_eq!(
+        err(&setting),
+        bad_text("setting \"repositories\" label", 128)
+    );
+    let resource = SAMPLE.replace("label = \"Issues\"", "label = \"\"");
+    assert_eq!(err(&resource), bad_text("resource \"issue\" label", 128));
+}
+
+#[test]
+fn a_bad_text_error_never_quotes_the_text() {
+    let text = TOOLS_SAMPLE.replace("name = \"GitHub\"", "name = \"SECRET-ish\\u0007\"");
+    let e = err(&text);
+    assert!(!e.to_string().contains("SECRET-ish"), "{e}");
+    assert!(!format!("{e:?}").contains("SECRET-ish"), "{e:?}");
+}
+
 // ------------------------------------------------------------------ tools
 
 const TOOLS_SAMPLE: &str = r#"

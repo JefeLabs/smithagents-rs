@@ -294,7 +294,7 @@ async fn the_real_daemon_runs_packed_native_plugins_and_survives_a_panic() {
 /// A server's `Date` header; the plugin trusts timestamps only against it.
 const DATE: &str = "Thu, 26 Nov 2026 10:00:00 GMT";
 const REPO: &str = "octo-org/widgets";
-const TOKEN: &str = "ghp_e2e-token-must-never-leak";
+const TOKEN: &str = "e2e-token-must-never-leak";
 const DAEMON_TOKEN: &str = "daemon-token-123";
 
 const ISSUES: &str =

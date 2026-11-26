@@ -160,13 +160,23 @@ pub(super) fn unapproved(manifest: &Manifest) -> Vec<MissingTool> {
         .collect()
 }
 
-/// Why the plugin needs auth: for each missing secret of a built-in plugin
-/// that a tool provides, `<tool label> is not signed in` and the secret's
-/// help; for the others, that no value is configured.
-pub(super) fn auth_message(plugin: &Managed, missing: &[String]) -> String {
+/// Why the plugin needs auth: for each missing secret that `secrets.toml`
+/// lists, that its entry has no value (the entry alone decides, so no tool
+/// was asked); for each one of a built-in plugin that a tool provides,
+/// `<tool label> is not signed in` and the secret's help; for the others,
+/// that no value is configured.
+pub(super) fn auth_message(
+    secrets: &dyn SecretSource,
+    plugin: &Managed,
+    missing: &[String],
+) -> String {
     let mut parts = Vec::new();
     let mut unconfigured = Vec::new();
     for key in missing {
+        if secrets.is_explicit(&plugin.manifest.id, key) {
+            parts.push(format!("the secrets.toml entry for {key} has no value"));
+            continue;
+        }
         let decl = plugin.manifest.secrets.iter().find(|s| &s.key == key);
         match decl.and_then(|decl| Some((decl, secret_tool(plugin, decl)?))) {
             Some((decl, tool)) => parts.push(match &decl.help {

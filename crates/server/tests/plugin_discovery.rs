@@ -333,7 +333,7 @@ fn results_are_sorted_by_id() {
     assert_eq!(ids, ["alpha-one", "mid-one", "zeta-one"]);
 }
 
-const SECRET: &str = "ghp_DISTINCTIVE_TOKEN_123";
+const SECRET: &str = "DISTINCTIVE_SECRET_TEXT_123";
 
 #[test]
 fn manifest_errors_never_quote_the_file() {
@@ -513,6 +513,10 @@ fn each_manifest_error_has_its_own_plain_sentence() {
             "hosts = [\"not a host\"]\n",
             "plugin.toml is not valid: a host name is not valid",
         ),
+        (
+            "[[resources]]\nkind = \"items\"\nlabel = \"a\\u001b[2Jb\"\ninterval_secs = 60\n",
+            "plugin.toml is not valid: a name, label or help text is empty, too long or holds control characters",
+        ),
     ];
     for (extra, expected) in cases {
         let tmp = tempfile::tempdir().unwrap();
@@ -542,4 +546,33 @@ fn a_symlinked_plugins_root_is_rejected() {
             "the plugins directory is a symbolic link"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_builtin_root_keeps_every_installed_plugin_out() {
+    // The built-in ids behind the link are never read, so none is reserved:
+    // an installed plugin could take one. None loads.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    plain_plugin(&real, "taken-id", "");
+    let link = tmp.path().join("link");
+    symlink(&real, &link).unwrap();
+    let installed = tmp.path().join("i");
+    plain_plugin(&installed, "taken-id", "");
+    plain_plugin(&installed, "other-one", "");
+
+    let (found, rejected) = discover(Some(&link), &installed);
+    assert!(found.is_empty(), "{found:?}");
+    let reasons: Vec<_> = rejected
+        .iter()
+        .map(|r| (r.dir.clone(), r.reason.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (installed.clone(), "the built-in plugins directory is a symbolic link; installed plugins are not loaded"),
+            (link.clone(), "the plugins directory is a symbolic link"),
+        ]
+    );
 }

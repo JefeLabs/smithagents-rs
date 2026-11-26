@@ -226,6 +226,59 @@ async fn the_cache_serves_a_second_read_without_running_the_command() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn forgetting_a_plugin_resolves_its_secrets_again() {
+    let home = tempfile::tempdir().unwrap();
+    let value_file = home.path().join("value");
+    let text = format!(
+        r#"
+        [first-plug]
+        token = {{ command = ["cat", '{0}'] }}
+        [other-plug]
+        token = {{ command = ["cat", '{0}'] }}
+        "#,
+        value_file.display()
+    );
+    write_secrets(home.path(), &text, 0o600);
+    let secrets = ConfiguredSecrets::load(home.path()).unwrap();
+    std::fs::write(&value_file, "old-5ecret\n").unwrap();
+    for plugin in ["first-plug", "other-plug"] {
+        assert_eq!(
+            value(&secrets, plugin, "token").await.as_deref(),
+            Some("old-5ecret")
+        );
+    }
+
+    // A fresh sign-in: the command now prints another value.
+    std::fs::write(&value_file, "new-5ecret\n").unwrap();
+    assert_eq!(
+        value(&secrets, "first-plug", "token").await.as_deref(),
+        Some("old-5ecret"),
+        "cached"
+    );
+    secrets.forget(&id("first-plug"));
+    assert_eq!(
+        value(&secrets, "first-plug", "token").await.as_deref(),
+        Some("new-5ecret")
+    );
+    // Only that plugin's values were dropped.
+    assert_eq!(
+        value(&secrets, "other-plug", "token").await.as_deref(),
+        Some("old-5ecret")
+    );
+    // A source without a cache has nothing to forget.
+    let fixed = StaticSecrets(HashMap::from([(
+        ("first-plug".to_string(), "token".to_string()),
+        "fixed".to_string(),
+    )]));
+    fixed.forget(&id("first-plug"));
+    assert_eq!(
+        value(&fixed, "first-plug", "token").await.as_deref(),
+        Some("fixed")
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn a_group_or_world_writable_file_is_refused() {
     for mode in [0o666, 0o646, 0o620] {

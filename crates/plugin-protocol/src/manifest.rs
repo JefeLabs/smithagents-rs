@@ -104,6 +104,37 @@ fn is_installer(s: &str) -> bool {
     s.len() <= 32 && is_plain_name(s)
 }
 
+/// The most characters of the plugin's `name` and of any `label`.
+const MAX_LABEL_CHARS: usize = 128;
+/// The most characters of a secret's `help`.
+const MAX_HELP_CHARS: usize = 512;
+
+/// Text the daemon shows as the manifest gives it: not blank, at most `max`
+/// characters, and no control character, line or paragraph separator or
+/// bidi mark (which could forge lines or reorder what a reader sees).
+fn is_shown_text(s: &str, max: usize) -> bool {
+    let unsafe_char = |c: char| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+    };
+    !s.trim().is_empty() && s.chars().count() <= max && !s.chars().any(unsafe_char)
+}
+
+/// `Ok` if `text` may be shown; else the error naming `field`.
+fn check_text(text: &str, max: usize, field: impl FnOnce() -> String) -> Result<(), ManifestError> {
+    if is_shown_text(text, max) {
+        Ok(())
+    } else {
+        Err(ManifestError::BadText {
+            field: field(),
+            max,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretDecl {
@@ -319,6 +350,10 @@ pub enum ManifestError {
     BadInstallUrl(String),
     #[error("secret {key:?}: from_tool names {tool:?}, which is not one of the manifest's tools")]
     UnknownTool { key: String, tool: String },
+    /// Names the field only (with keys already checked): the refused text is
+    /// file text.
+    #[error("{field} must be 1 to {max} characters with no control characters")]
+    BadText { field: String, max: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -376,6 +411,7 @@ impl Manifest {
         if !(MIN_CONTRACT_VERSION..=CONTRACT_VERSION).contains(&m.contract) {
             return Err(ManifestError::UnsupportedContract(m.contract));
         }
+        check_text(&m.name, MAX_LABEL_CHARS, || "name".into())?;
         match &m.entry {
             None if matches!(m.host, HostMode::Dylib | HostMode::Wasm) => {
                 return Err(ManifestError::EntryRequired(m.host));
@@ -405,6 +441,9 @@ impl Manifest {
             if !seen.insert(t.name.clone()) {
                 return Err(ManifestError::DuplicateTool(t.name.clone()));
             }
+            check_text(&t.label, MAX_LABEL_CHARS, || {
+                format!("tool {:?} label", t.name)
+            })?;
             // Every entry, not only `mise`: a hint may be shown as a command
             // for the user to copy.
             if !t
@@ -428,6 +467,12 @@ impl Manifest {
             }
             if !seen.insert(s.key.clone()) {
                 return Err(ManifestError::DuplicateSecret(s.key.clone()));
+            }
+            check_text(&s.label, MAX_LABEL_CHARS, || {
+                format!("secret {:?} label", s.key)
+            })?;
+            if let Some(help) = &s.help {
+                check_text(help, MAX_HELP_CHARS, || format!("secret {:?} help", s.key))?;
             }
             if let Some(source) = &s.from_tool {
                 if !m.tools.iter().any(|t| t.name == source.tool) {
@@ -465,6 +510,9 @@ impl Manifest {
             if !seen.insert(s.key.as_str()) {
                 return Err(ManifestError::DuplicateSetting(s.key.clone()));
             }
+            check_text(&s.label, MAX_LABEL_CHARS, || {
+                format!("setting {:?} label", s.key)
+            })?;
             if s.default.as_ref().is_some_and(|d| !s.kind.accepts(d)) {
                 return Err(ManifestError::BadDefault(s.key.clone()));
             }
@@ -477,6 +525,9 @@ impl Manifest {
             if !seen.insert(r.kind.as_str()) {
                 return Err(ManifestError::DuplicateResource(r.kind.clone()));
             }
+            check_text(&r.label, MAX_LABEL_CHARS, || {
+                format!("resource {:?} label", r.kind)
+            })?;
             if !(60..=86_400).contains(&r.interval_secs) {
                 return Err(ManifestError::BadInterval {
                     kind: r.kind.clone(),

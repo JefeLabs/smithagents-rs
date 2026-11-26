@@ -24,8 +24,8 @@ use smithagents_core::event::{Event, EventKind};
 use smithagents_core::plugin::{MissingTool, PluginState, PluginStatus, ResourceStatus};
 use smithagents_plugin_fixture::Fixture;
 use smithagents_plugin_host::{
-    CallError, CallHandle, InstallError, LinkedRuntime, PluginRuntime, Secret, SecretError,
-    SecretSource, StaticSecrets, ToolFinder,
+    CallError, CallHandle, ConfiguredSecrets, InstallError, LinkedRuntime, PluginRuntime, Secret,
+    SecretError, SecretSource, StaticSecrets, ToolFinder,
 };
 use smithagents_plugin_protocol::{
     HostApi, HostMode, Item, Manifest, Plugin, PluginError, PluginId, SyncPage, SyncRequest,
@@ -1295,6 +1295,106 @@ async fn start_creates_the_configuration_with_defaults_and_origin() {
 }
 
 #[tokio::test]
+async fn one_plugins_unreadable_stored_state_fails_only_that_plugin() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+
+    let logs = logs();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("s.db");
+    let store = Store::open(&db).await.unwrap();
+    for id in ["kept-ok", "garbled"] {
+        let config = PluginConfig {
+            enabled: true,
+            settings: json!({}),
+        };
+        store.set_plugin_config(id, &config).await.unwrap();
+    }
+    let raw = || async {
+        SqliteConnectOptions::new()
+            .filename(&db)
+            .connect()
+            .await
+            .unwrap()
+    };
+    let mut conn = raw().await;
+    sqlx::query("UPDATE plugin_config SET settings_json = 'GARBLED{' WHERE plugin_id = 'garbled'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+
+    let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let m = PluginManager::start(
+        store.clone(),
+        EventBus::new(64),
+        no_secrets(),
+        vec![
+            builtin(manifest("kept-ok", &[("items", 60)], ""), rt.runtime()),
+            builtin(manifest("garbled", &[("items", 60)], ""), rt.runtime()),
+        ],
+        ManagerConfig::default(),
+    )
+    .await
+    .expect("startup continues");
+    m.run_due().await;
+
+    let garbled = status(&m, "garbled").await;
+    assert_eq!(
+        garbled.state,
+        PluginState::LoadFailed {
+            message: "this plugin's stored state could not be read".into()
+        }
+    );
+    assert!(!garbled.enabled);
+    assert_eq!(status(&m, "kept-ok").await.state, PluginState::Ready);
+    assert_eq!(store.count_items("kept-ok", "items").await.unwrap(), 6);
+    assert_eq!(rt.calls(), 3, "only kept-ok ran");
+
+    // Nothing writes over what could not be read.
+    for refused in [
+        m.set_enabled("garbled", true).await.err(),
+        m.set_settings("garbled", json!({})).await.err(),
+        m.sync_now("garbled", "items").await.err(),
+    ] {
+        assert!(
+            matches!(refused, Some(ManagerError::Disabled)),
+            "{refused:?}"
+        );
+    }
+    m.shutdown().await;
+    let mut conn = raw().await;
+    let (settings,): (String,) =
+        sqlx::query_as("SELECT settings_json FROM plugin_config WHERE plugin_id = 'garbled'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    conn.close().await.unwrap();
+    assert_eq!(settings, "GARBLED{");
+    let sync_rows: Vec<(String,)> =
+        sqlx::query_as("SELECT resource FROM resource_sync WHERE plugin_id = 'garbled'")
+            .fetch_all(&mut raw().await)
+            .await
+            .unwrap();
+    assert!(sync_rows.is_empty(), "{sync_rows:?}");
+
+    // Logged at error with the plugin id, and nothing of the row. (sqlx's
+    // own debug lines quote this test's raw statements.)
+    let text = logs.text();
+    let ours: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("smithagents_server"))
+        .collect();
+    assert!(
+        ours.iter().any(|l| l.contains("ERROR")
+            && l.contains("plugin=garbled")
+            && l.contains("stored state could not be read")),
+        "{text}"
+    );
+    assert!(ours.iter().all(|l| !l.contains("GARBLED{")), "{ours:?}");
+}
+
+#[tokio::test]
 async fn a_resource_removed_from_the_manifest_loses_its_items_at_the_next_start() {
     let env = env().await;
     let rt = Scripted::new(|_| ok(page(items(0..2), None, true)));
@@ -2399,6 +2499,162 @@ async fn a_tool_that_is_not_signed_in_needs_auth_with_its_help_and_none_of_its_o
         "{text}"
     );
     assert!(!text.contains("5ecret"), "{text}");
+}
+
+/// Resolves every secret and records each `forget`, by plugin.
+#[derive(Default)]
+struct Forgetful(Mutex<Vec<String>>);
+
+#[async_trait]
+impl SecretSource for Forgetful {
+    async fn get(&self, _: &PluginId, _: &str) -> Result<Option<Secret>, SecretError> {
+        Ok(Some(Secret::new("some-value")))
+    }
+
+    fn forget(&self, plugin: &PluginId) {
+        self.0.lock().unwrap().push(plugin.to_string());
+    }
+}
+
+impl Forgetful {
+    fn count(&self, id: &str) -> usize {
+        self.0.lock().unwrap().iter().filter(|p| *p == id).count()
+    }
+}
+
+#[tokio::test]
+async fn an_auth_error_and_each_renewal_drop_the_plugins_cached_secrets() {
+    let env = env().await;
+    let source = Arc::new(Forgetful::default());
+    let secret = "[[secrets]]\nkey = \"token\"\nlabel = \"Token\"\n";
+    let first = Arc::new(AtomicBool::new(true));
+    let rt = Scripted::new(move |req| {
+        if first.swap(false, Ordering::SeqCst) {
+            fail(CallError::Plugin(PluginError::Auth {
+                message: "bad credentials".into(),
+            }))
+        } else {
+            ok(three_pages(req.cursor.as_deref()))
+        }
+    });
+    let calm = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let m = env
+        .start_with(
+            vec![
+                builtin(manifest("refused", &[("items", 60)], secret), rt.runtime()),
+                builtin(manifest("calm", &[("items", 60)], secret), calm.runtime()),
+            ],
+            source.clone(),
+        )
+        .await;
+    m.run_due().await;
+    assert!(matches!(
+        status(&m, "refused").await.state,
+        PluginState::NeedsAuth { .. }
+    ));
+    assert_eq!(source.count("refused"), 1, "after the auth error");
+    assert_eq!(
+        source.count("calm"),
+        0,
+        "a run that succeeds keeps its values"
+    );
+
+    m.sync_now("refused", "items").await.unwrap();
+    assert_eq!(source.count("refused"), 2, "sync_now");
+    m.run_due().await;
+    assert_eq!(status(&m, "refused").await.state, PluginState::Ready);
+    m.set_settings("refused", json!({})).await.unwrap();
+    assert_eq!(source.count("refused"), 3, "new settings");
+    m.set_enabled("refused", true).await.unwrap();
+    assert_eq!(source.count("refused"), 4, "enabling");
+    m.set_enabled("refused", false).await.unwrap();
+    assert_eq!(source.count("refused"), 4, "disabling");
+    assert_eq!(source.count("calm"), 0);
+}
+
+#[tokio::test]
+async fn after_a_fresh_sign_in_the_next_run_asks_the_tool_again() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake_gh(dir.path(), "gh version 2.41.0", "echo old-5ecret");
+    let first = Arc::new(AtomicBool::new(true));
+    let rt = Scripted::new(move |req| {
+        if first.swap(false, Ordering::SeqCst) {
+            fail(CallError::Plugin(PluginError::Auth {
+                message: "GitHub rejected the token".into(),
+            }))
+        } else {
+            ok(three_pages(req.cursor.as_deref()))
+        }
+    });
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("relogin", &[("items", 60)], &format!("{GH_TOOL}{GH_TOKEN}")),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.run_due().await;
+    assert!(matches!(
+        status(&m, "relogin").await.state,
+        PluginState::NeedsAuth { .. }
+    ));
+    assert_eq!(gh_runs(dir.path()), ["--version", "auth token"]);
+
+    // `gh auth login` again: gh now prints another token, and within the
+    // five minutes the old one would have stayed cached.
+    fake_gh(dir.path(), "gh version 2.41.0", "echo new-5ecret");
+    m.sync_now("relogin", "items").await.unwrap();
+    m.run_due().await;
+    assert_eq!(status(&m, "relogin").await.state, PluginState::Ready);
+    assert_eq!(
+        gh_runs(dir.path()),
+        ["--version", "auth token", "--version", "auth token"]
+    );
+}
+
+#[tokio::test]
+async fn a_secrets_toml_entry_without_a_value_is_named_rather_than_the_tool() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake_gh(dir.path(), "gh version 2.41.0", SIGNED_IN);
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("secrets.toml");
+    std::fs::write(
+        &path,
+        "[pinned]\ntoken = { env = \"SMITHAGENTS_TEST_UNSET_PINNED_TOKEN\" }\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let configured = Arc::new(ConfiguredSecrets::load(home.path()).unwrap());
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("pinned", &[("items", 60)], &format!("{GH_TOOL}{GH_TOKEN}")),
+                rt.runtime(),
+            )],
+            configured,
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.run_due().await;
+    assert_eq!(rt.calls(), 0);
+    assert_eq!(
+        status(&m, "pinned").await.state,
+        PluginState::NeedsAuth {
+            missing: vec!["token".into()],
+            message: "the secrets.toml entry for token has no value".into()
+        }
+    );
+    // The entry decides alone: gh was not asked for a token.
+    assert_eq!(gh_runs(dir.path()), ["--version"]);
 }
 
 #[tokio::test]

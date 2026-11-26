@@ -156,7 +156,11 @@ async fn ready<'a>(
     }
     let missing = missing_secrets(inner, plugin).await;
     if !missing.is_empty() {
-        let message = clean_message(&tools::auth_message(plugin, &missing));
+        let message = clean_message(&tools::auth_message(
+            inner.secrets.as_ref(),
+            plugin,
+            &missing,
+        ));
         tracing::warn!(plugin = %plugin.id, "{message}");
         let mut live = plugin.live();
         if live.generation == generation {
@@ -413,6 +417,11 @@ async fn finish(
         Ok(loaded) => loaded.runtime.mode(),
         Err(_) => return,
     };
+    if matches!(&end, End::Call(CallError::Plugin(PluginError::Auth { .. }))) {
+        // The service refused the credentials: after a fresh sign-in the
+        // next run must ask the source again, not reuse what it cached.
+        inner.secrets.forget(&plugin.manifest.id);
+    }
     let effect = effect(end, mode);
     if let Some(error) = &effect.error {
         tracing::warn!(plugin = %plugin.id, resource = %kind, "plugin sync failed: {error}");

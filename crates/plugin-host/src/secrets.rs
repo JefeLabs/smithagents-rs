@@ -72,6 +72,11 @@ pub trait SecretSource: Send + Sync {
     fn is_explicit(&self, _plugin: &PluginId, _key: &str) -> bool {
         false
     }
+
+    /// Drops the values this source remembers for `plugin`, so the next
+    /// `get` resolves them again (after a fresh sign-in, say). Sources that
+    /// remember nothing do nothing.
+    fn forget(&self, _plugin: &PluginId) {}
 }
 
 /// Fixed secrets keyed by `(plugin id, key)`. For tests.
@@ -153,6 +158,10 @@ impl SecretSource for ConfiguredSecrets {
         self.entries
             .contains_key(&(plugin.to_string(), key.to_string()))
     }
+
+    fn forget(&self, plugin: &PluginId) {
+        self.cache.forget(plugin);
+    }
 }
 
 /// Values resolved in the last five minutes. Failures are not kept.
@@ -175,6 +184,12 @@ impl ValueCache {
     fn remember(&self, key: Key, secret: &Secret) {
         let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(key, (Instant::now(), secret.clone()));
+    }
+
+    /// Drops every value of `plugin`.
+    fn forget(&self, plugin: &PluginId) {
+        let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|(id, _), _| id != plugin.as_ref());
     }
 }
 
@@ -242,6 +257,11 @@ impl SecretSource for ToolSecrets {
 
     fn is_explicit(&self, plugin: &PluginId, key: &str) -> bool {
         self.inner.is_explicit(plugin, key)
+    }
+
+    fn forget(&self, plugin: &PluginId) {
+        self.inner.forget(plugin);
+        self.cache.forget(plugin);
     }
 }
 

@@ -124,8 +124,9 @@ struct Scan {
 
 /// Scans both directories. A built-in plugin, even a broken one, and every
 /// directory name under an untrusted built-in root, keeps its id from an
-/// installed plugin. Results are sorted by id (rejections by
-/// directory).
+/// installed plugin. A built-in root that is a symbolic link is not read, so
+/// which ids it reserves is unknown: then no installed plugin loads either.
+/// Results are sorted by id (rejections by directory).
 pub fn discover(builtin: Option<&Path>, installed: &Path) -> (Vec<Discovered>, Vec<Rejected>) {
     let mut result = Scan::default();
     let mut reserved = Vec::new();
@@ -135,7 +136,17 @@ pub fn discover(builtin: Option<&Path>, installed: &Path) -> (Vec<Discovered>, V
         reserved = std::mem::take(&mut scan.names);
         result = scan;
     }
-    if overlaps(builtin, installed) {
+    let builtin_is_link =
+        builtin.is_some_and(|b| fs::symlink_metadata(b).is_ok_and(|m| m.file_type().is_symlink()));
+    if builtin_is_link {
+        // Nothing to say when there is no installed directory either.
+        if fs::symlink_metadata(installed).is_ok() {
+            result.rejected.push(Rejected {
+                dir: installed.to_path_buf(),
+                reason: "the built-in plugins directory is a symbolic link; installed plugins are not loaded".into(),
+            });
+        }
+    } else if overlaps(builtin, installed) {
         result.rejected.push(Rejected {
             dir: installed.to_path_buf(),
             reason: "the installed plugins directory overlaps the built-in one".into(),
@@ -357,6 +368,9 @@ fn fixed_sentence(e: &ManifestError) -> &'static str {
         ManifestError::BadInstall(_) => "a tool's install entry is not valid",
         ManifestError::BadInstallUrl(_) => "a tool's install_url is not an https address",
         ManifestError::UnknownTool { .. } => "a secret names a tool the plugin does not declare",
+        ManifestError::BadText { .. } => {
+            "a name, label or help text is empty, too long or holds control characters"
+        }
     }
 }
 
