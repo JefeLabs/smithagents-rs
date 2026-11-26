@@ -180,10 +180,20 @@ pub struct Manifest {
     pub resources: Vec<ResourceDecl>,
 }
 
+fn line_suffix(line: &Option<usize>) -> String {
+    line.map(|n| format!(" (line {n})")).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ManifestError {
-    #[error("manifest: {0}")]
-    Toml(String),
+    /// The text is not a manifest. Deliberately carries no message from the
+    /// TOML parser: it quotes the offending source line, which may hold a
+    /// secret, and this error reaches logs and API responses.
+    #[error("plugin.toml is not valid TOML for a plugin manifest{}", line_suffix(.line))]
+    Toml {
+        /// 1-based line of the problem, when the parser reports one.
+        line: Option<usize>,
+    },
     #[error("unsupported contract {0} (supported: {min} to {max})", min = MIN_CONTRACT_VERSION, max = CONTRACT_VERSION)]
     UnsupportedContract(u32),
     #[error("host mode {0} needs an entry file")]
@@ -258,8 +268,14 @@ fn normalise_host(raw: &str) -> Result<String, ManifestError> {
 impl Manifest {
     /// Parse and check a `plugin.toml`.
     pub fn parse(toml_text: &str) -> Result<Manifest, ManifestError> {
-        let mut m: Manifest =
-            toml::from_str(toml_text).map_err(|e| ManifestError::Toml(e.to_string()))?;
+        let mut m: Manifest = toml::from_str(toml_text).map_err(|e| ManifestError::Toml {
+            line: e.span().map(|span| {
+                toml_text[..span.start.min(toml_text.len())]
+                    .matches('\n')
+                    .count()
+                    + 1
+            }),
+        })?;
         if !(MIN_CONTRACT_VERSION..=CONTRACT_VERSION).contains(&m.contract) {
             return Err(ManifestError::UnsupportedContract(m.contract));
         }

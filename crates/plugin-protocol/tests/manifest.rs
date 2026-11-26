@@ -75,17 +75,17 @@ fn sample_parses() {
 fn unknown_keys_are_rejected_at_every_level() {
     assert!(matches!(
         err(&with("bogus = 1", "")),
-        ManifestError::Toml(_)
+        ManifestError::Toml { .. }
     ));
     let nested = with("", "[[secrets]]\nkey = \"t\"\nlabel = \"T\"\nbogus = 1\n");
-    assert!(matches!(err(&nested), ManifestError::Toml(_)));
+    assert!(matches!(err(&nested), ManifestError::Toml { .. }));
 }
 
 #[test]
 fn bad_ids() {
     for id in ["GitHub", "a", &"a".repeat(33), "git--hub", "github-"] {
         let text = SAMPLE.replace("id = \"github\"", &format!("id = \"{id}\""));
-        assert!(matches!(err(&text), ManifestError::Toml(_)), "{id}");
+        assert!(matches!(err(&text), ManifestError::Toml { .. }), "{id}");
     }
     assert!("ab".parse::<PluginId>().is_ok());
     assert!("a".repeat(32).parse::<PluginId>().is_ok());
