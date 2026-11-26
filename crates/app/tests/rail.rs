@@ -8,18 +8,20 @@
 
 mod common;
 
-use common::ui::{open_shell, open_shell_options};
+use common::ui::{agent, open_shell, open_shell_options};
 use gpui_kit::base::Root;
 use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
-use gpui_kit::{AppContext as _, Entity, Pixels, Role, TestAppContext, WindowHandle};
+use gpui_kit::{AppContext as _, ElementId, Entity, Pixels, Role, TestAppContext, WindowHandle};
 use smithagents_app::app_state::AppStateStore;
-use smithagents_app::model::ShellModel;
+use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::shell::{Shell, ShellOptions};
 use smithagents_app::view_models::SettingsSection;
+use smithagents_app::views::agents::agent_row_id;
 use smithagents_app::views::intents::INTENTS_TITLE_ID;
 use smithagents_app::views::rail::RailEntry;
-use smithagents_app::views::settings::SETTINGS_TITLE_ID;
+use smithagents_app::views::settings::{REPO_PATH_INPUT_ID, SETTINGS_TITLE_ID};
+use smithagents_core::ids::AgentId;
 
 fn frame(cx: &mut TestAppContext, window: WindowHandle<Root>) {
     cx.run_until_parked();
@@ -201,4 +203,88 @@ fn cmd_alt_i_toggles_intents(cx: &mut TestAppContext) {
     press(cx, window, "cmd-alt-i");
     assert!(!right_dock(cx, &shell).0, "the dock is closed");
     assert_eq!(rail_active(cx, &shell), None);
+
+    // The closed pane had the focus; the key still works without it.
+    press(cx, window, "cmd-alt-i");
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Intents));
+    assert_eq!(headings(cx, window), (false, true));
+}
+
+#[gpui_kit::test]
+fn clicking_intents_after_closing_the_dock_shows_intents_again(cx: &mut TestAppContext) {
+    let (window, shell) = open(cx);
+    click(cx, window, RailEntry::Intents);
+    click(cx, window, RailEntry::Intents);
+    assert!(!right_dock(cx, &shell).0, "the dock is closed");
+
+    click(cx, window, RailEntry::Intents);
+
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Intents));
+    with_window(cx, window, |window, _| {
+        assert!(window.find(INTENTS_TITLE_ID).visible());
+        assert!(window.try_find(SETTINGS_TITLE_ID).is_none());
+    });
+}
+
+/// Opens a connected shell with one agent, so the agents pane has a row to
+/// focus.
+fn open_with_an_agent(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Shell>, AgentId) {
+    let mercury = agent("Mercury");
+    let mut model = ShellModel::new();
+    model.apply(Action::Snapshot {
+        agents: vec![mercury.clone()],
+        repos: vec![],
+        latest_seq: 1,
+    });
+    model.apply(Action::ConnectionChanged(Connection::Connected));
+    let (window, shell) = open_shell(cx, model);
+    frame(cx, window);
+    (window, shell, mercury.id)
+}
+
+/// Clicks `id` and checks that it took the focus.
+fn focus(cx: &mut TestAppContext, window: WindowHandle<Root>, id: ElementId) {
+    with_window(cx, window, |window, cx| window.click(id.clone(), cx));
+    frame(cx, window);
+    with_window(cx, window, |window, _| {
+        assert_eq!(window.find(id.clone()).focused(), Some(true), "{id:?}");
+    });
+}
+
+// A view with its own key context (the agents pane, a text field) sits
+// deeper than the shell's, where a binding without a context ranks too: the
+// shell's keys must still win there.
+
+#[gpui_kit::test]
+fn cmd_alt_i_shows_intents_while_an_agent_row_has_the_focus(cx: &mut TestAppContext) {
+    let (window, shell, agent) = open_with_an_agent(cx);
+    focus(cx, window, agent_row_id(agent));
+
+    press(cx, window, "cmd-alt-i");
+
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Intents));
+}
+
+#[gpui_kit::test]
+fn cmd_alt_i_shows_intents_while_a_text_field_has_the_focus(cx: &mut TestAppContext) {
+    let (window, shell) = open(cx);
+    focus(cx, window, REPO_PATH_INPUT_ID.into());
+
+    press(cx, window, "cmd-alt-i");
+
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Intents));
+}
+
+#[gpui_kit::test]
+fn cmd_alt_b_toggles_settings_while_a_text_field_or_an_agent_row_has_the_focus(
+    cx: &mut TestAppContext,
+) {
+    let (window, shell, agent) = open_with_an_agent(cx);
+    focus(cx, window, REPO_PATH_INPUT_ID.into());
+    press(cx, window, "cmd-alt-b");
+    assert_eq!(rail_active(cx, &shell), None, "Settings was on screen");
+
+    focus(cx, window, agent_row_id(agent));
+    press(cx, window, "cmd-alt-b");
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Settings));
 }

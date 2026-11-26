@@ -77,9 +77,13 @@ gpui_kit::actions!(
     [
         /// Switch the left (agents) pane between expanded and compact.
         ToggleAgentsPane,
-        /// Collapse or expand the right dock with the Settings view.
+        /// Show the Settings view in the right dock (opening the dock, or
+        /// switching it from the pane it shows), or close the dock when
+        /// Settings is on screen.
         ToggleSettingsPane,
-        /// Collapse or expand the right dock with the Intents view.
+        /// Show the Intents view in the right dock (opening the dock, or
+        /// switching it from the pane it shows), or close the dock when
+        /// Intents is on screen.
         ToggleIntentsPane,
         /// Close the active center tab (nothing without one; the window
         /// stays open).
@@ -126,12 +130,20 @@ const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// macOS only. `KeyBinding::new` does not resolve the portable `secondary-`
 /// modifier and panics on it.) The menu bar ([`app_menus`]) shows these
 /// keys as its items' key equivalents.
+///
+/// Call it after `gpui_kit::init`. In debug builds gpui-component binds
+/// `cmd-alt-i` without a context to its inspector. GPUI ranks a binding
+/// without a context as deep as the focus goes, above the shell's context
+/// whenever a view with its own context (the agents pane, a text field) has
+/// the focus, and between equal ranks the later binding wins. So
+/// `cmd-alt-i` is bound without a context too, after the inspector's; its
+/// handler is on the shell, so it acts only while the focus is in the shell.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-b", ToggleAgentsPane, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-alt-b", ToggleSettingsPane, Some(KEY_CONTEXT)),
-        KeyBinding::new("cmd-alt-i", ToggleIntentsPane, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-alt-i", ToggleIntentsPane, None),
         KeyBinding::new("cmd-w", CloseActiveTab, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-tab", NextTab, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(KEY_CONTEXT)),

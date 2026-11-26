@@ -30,8 +30,10 @@ use crate::views::rail::RAIL_WIDTH;
 pub const LAYOUT_FILE_NAME: &str = "app-layout.json";
 pub const WINDOW_FILE_NAME: &str = "app-window.json";
 
-/// The layout schema version written into the file. Bump it when the
-/// shell's dock structure changes; files of another version are ignored.
+/// The layout schema version written into the file. Bump it when what the
+/// loader reads changes (the right dock's size and open state, the left
+/// pane's entry); files of another version are ignored. The panel tree is
+/// never read back, so a pane added to a dock needs no bump.
 pub const LAYOUT_VERSION: usize = 1;
 
 /// Restored dock sizes are clamped into this range, so a corrupt or
