@@ -2,6 +2,7 @@
 //! attached files. Pure code: no GPUI, no disk, no screen.
 
 pub mod annotation;
+pub mod draft;
 pub mod files;
 pub mod render;
 pub mod text;

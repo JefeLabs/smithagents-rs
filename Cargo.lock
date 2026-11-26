@@ -7750,6 +7750,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "url",
+ "uuid",
 ]
 
 [[package]]
