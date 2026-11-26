@@ -187,8 +187,9 @@ example "open this issue in a center tab").
 - **Intents**: filterable states in Intent IDE are Draft and Polishing,
   Complete and Queued, Sent, Resolved; Sent shows a sub-state (e.g. "done").
   Finer transitions are unknown until the Intent IDE source is seen. Intents
-  have a slug, a kind (e.g. Enhancement), title, current-behavior text and an
-  outline. Versioned; the app owns the intent and source tickets are input
+  have a slug, a kind (New feature, Enhancement, Bug, Refactor or Maintenance;
+  Task for intents that were not given one), title, current-behavior text and
+  an outline. Versioned; the app owns the intent and source tickets are input
   references. Intents have dependencies ("Depends on"); an intent starts only
   when all dependencies are Resolved, as in Intent IDE.
 - **Review workflow**: agent-proposed preconditions, acceptance criteria and

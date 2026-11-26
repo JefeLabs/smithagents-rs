@@ -653,6 +653,11 @@ Found while planning:
 - The filter and the open sections are not remembered across restarts.
 - Keyboard shortcuts for question options (the spec mentions them for option chips).
 
+Found during execution:
+- The app does not show agents either when the intent list fails to load at connect: the snapshot, the intents and the agent defaults are one load round, and the round fails as a whole.
+- The agent's last message is not on cards, because neither the daemon nor the app holds it (see above).
+- The ⌥-key shortcuts on the create screen are untested with non-US keyboard layouts and input methods.
+
 ## Self-review notes
 
 - Spec coverage: rail entry and right pane (Task 1); list with state filter and "+" (Task 5); create (Task 6); editor with header, body and polish states (Task 7); question cards with Skip and "n of m answered" (Task 8); accept, edit, skip with "n of m accepted" and Depends on (Task 9); Send, Queued, Sent with the agent's activity and color, Resolved by button (Tasks 4, 5, 10); Agent defaults (Task 11); kinds (Task 2). Option-chip keyboard shortcuts from §4.4 are a Follow-up.
