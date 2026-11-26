@@ -10,6 +10,7 @@ pub mod app_state;
 pub mod appearance;
 pub mod assets;
 mod atomic_file;
+pub mod intent_vm;
 pub mod layout_store;
 pub mod link;
 pub mod model;

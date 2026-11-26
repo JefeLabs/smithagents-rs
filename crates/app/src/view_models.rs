@@ -792,11 +792,11 @@ pub fn repo_matches_sent_path(sent: &Path, sent_canonical: Option<&Path>, repo: 
     sent == repo || sent_canonical.is_some_and(|canonical| canonical.starts_with(repo))
 }
 
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn capitalized(text: &str) -> String {
+pub(crate) fn capitalized(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
