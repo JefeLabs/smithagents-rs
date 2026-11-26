@@ -75,10 +75,14 @@ pub async fn run(
         ["item-1", "item-2", "item-3", "item-4", "item-5", "item-6"]
     );
     assert_eq!(cursors, ["1", "2", "3"]);
+    // From "3" nothing is listed, so no snapshot is claimed: a host must not
+    // read it as "every item is gone".
     let tail = call(&runtime, &services, request("items", Some("3"), json!({})))
         .await
         .unwrap();
     assert!(tail.upserts.is_empty() && tail.done);
+    assert!(!tail.snapshot_complete);
+    assert_eq!(tail.next_cursor.as_deref(), Some("3"));
 
     // http: the body comes back and the server saw the injected bearer header.
     let settings = json!({ "url": server.url("/ok") });

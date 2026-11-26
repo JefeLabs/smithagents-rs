@@ -488,8 +488,7 @@ async fn a_first_run_stores_six_items_and_announces_them() {
 
 #[tokio::test]
 async fn a_run_that_changes_nothing_announces_nothing() {
-    // The fixture's done page keeps cursor "3", from which its next run is an
-    // empty snapshot that removes every item; this plugin starts over instead.
+    // A plugin that lists everything again from no cursor each time.
     let mut env = env().await;
     let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
     let m = env
@@ -512,6 +511,30 @@ async fn a_run_that_changes_nothing_announces_nothing() {
     assert!(synced(&events).is_empty(), "{events:?}");
     assert!(!updates(&events, "again").is_empty());
     assert_eq!(env.store.count_items("again", "items").await.unwrap(), 6);
+}
+
+#[tokio::test]
+async fn the_fixtures_second_run_keeps_its_six_items_and_announces_nothing() {
+    let mut env = env().await;
+    let (fixture, runtime) = fixture();
+    let m = env
+        .start(vec![builtin(
+            manifest("fixture", &[("items", 60)], ""),
+            runtime,
+        )])
+        .await;
+    m.run_due().await;
+    assert_eq!(synced(&env.drain()), [ev("fixture", "items", 6, 0)]);
+
+    env.advance(secs(60)).await;
+    m.run_due().await;
+    assert_eq!(fixture.calls(), 4);
+    let events = env.drain();
+    assert!(synced(&events).is_empty(), "{events:?}");
+    assert_eq!(env.store.count_items("fixture", "items").await.unwrap(), 6);
+    let state = env.store.sync_state("fixture", "items").await.unwrap();
+    assert_eq!(state.cursor.as_deref(), Some("3"));
+    assert_eq!(state.last_error, None);
 }
 
 #[tokio::test]
@@ -821,6 +844,12 @@ async fn a_settings_error_from_the_plugin_needs_settings_until_they_change() {
     env.advance(secs(600)).await;
     m.run_due().await;
     assert_eq!(rt.calls(), 1);
+    match m.sync_now("picky", "items").await {
+        Err(ManagerError::InvalidSettings(message)) => {
+            assert_eq!(message, "repository acme/x not found")
+        }
+        other => panic!("expected InvalidSettings, got {other:?}"),
+    }
     m.set_settings("picky", json!({})).await.unwrap();
     m.run_due().await;
     assert_eq!(rt.calls(), 2);
@@ -828,7 +857,7 @@ async fn a_settings_error_from_the_plugin_needs_settings_until_they_change() {
 
 #[tokio::test]
 async fn a_missing_secret_needs_auth_naming_it_and_the_plugin_is_not_called() {
-    let env = env().await;
+    let mut env = env().await;
     let extra = "[[secrets]]\nkey = \"token\"\nlabel = \"Token\"\n\
                  [[secrets]]\nkey = \"other\"\nlabel = \"Other\"\n";
     let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
@@ -853,6 +882,20 @@ async fn a_missing_secret_needs_auth_naming_it_and_the_plugin_is_not_called() {
         other => panic!("expected NeedsAuth, got {other:?}"),
     }
     assert_eq!(s.secrets, ["token", "other"]);
+    // The last event says so too, and that nothing syncs any more.
+    let events = env.drain();
+    let last = *updates(&events, "signed").last().expect("a PluginUpdated");
+    assert_eq!(last.state, s.state);
+    assert!(!resource(last, "items").syncing, "{last:?}");
+
+    // `sync_now` asks again, and ends the same way.
+    m.sync_now("signed", "items").await.unwrap();
+    m.run_due().await;
+    assert_eq!(rt.calls(), 0);
+    let events = env.drain();
+    let last = *updates(&events, "signed").last().expect("a PluginUpdated");
+    assert!(matches!(last.state, PluginState::NeedsAuth { .. }));
+    assert!(!resource(last, "items").syncing, "{last:?}");
     m.shutdown().await;
 
     // A source that fails counts every key as missing; its error is not shown.
@@ -892,6 +935,37 @@ async fn a_missing_secret_needs_auth_naming_it_and_the_plugin_is_not_called() {
     m.run_due().await;
     assert_eq!(rt.calls(), 3);
     assert_eq!(status(&m, "signed").await.state, PluginState::Ready);
+}
+
+#[tokio::test]
+async fn the_missing_secrets_message_is_capped_too() {
+    let mut env = env().await;
+    let keys: Vec<String> = (0..30)
+        .map(|n| format!("k{n:02}{}", "a".repeat(61)))
+        .collect();
+    let extra: String = keys
+        .iter()
+        .map(|k| format!("[[secrets]]\nkey = \"{k}\"\nlabel = \"Key\"\n"))
+        .collect();
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let m = env
+        .start(vec![builtin(
+            manifest("many", &[("items", 60)], &extra),
+            rt.runtime(),
+        )])
+        .await;
+    m.run_due().await;
+    assert_eq!(rt.calls(), 0);
+    let events = env.drain();
+    let last = *updates(&events, "many").last().expect("a PluginUpdated");
+    for state in [&status(&m, "many").await.state, &last.state] {
+        let PluginState::NeedsAuth { missing, message } = state else {
+            panic!("expected NeedsAuth, got {state:?}");
+        };
+        assert_eq!(missing, &keys);
+        assert!(message.len() <= 1024, "{} bytes", message.len());
+        assert!(message.ends_with('…'), "{message}");
+    }
 }
 
 #[tokio::test]
@@ -999,6 +1073,37 @@ async fn a_timeout_in_dylib_mode_fails_the_plugin_and_stops_its_schedule() {
         status(&m, "stuck").await.state,
         PluginState::Failed { .. }
     ));
+}
+
+#[tokio::test]
+async fn a_linked_timeout_fails_the_plugin_but_a_wasm_timeout_only_backs_off() {
+    let env = env().await;
+    let linked = Scripted::with_mode(HostMode::InProcess, |_| fail(CallError::Timeout));
+    let wasm = Scripted::with_mode(HostMode::Wasm, |_| fail(CallError::Timeout));
+    let m = env
+        .start(vec![
+            builtin(manifest("linked", &[("items", 60)], ""), linked.runtime()),
+            builtin(manifest("sandboxed", &[("items", 60)], ""), wasm.runtime()),
+        ])
+        .await;
+    m.run_due().await;
+
+    let PluginState::Failed { message } = status(&m, "linked").await.state else {
+        panic!("expected Failed");
+    };
+    assert!(
+        message.starts_with("the plugin call timed out"),
+        "{message}"
+    );
+    let s = status(&m, "sandboxed").await;
+    assert_eq!(s.state, PluginState::Ready);
+    let r = resource(&s, "items");
+    assert_eq!(r.last_error.as_deref(), Some("the plugin call timed out"));
+    assert_eq!(r.next_due_at, Some(env.at(30)));
+
+    env.advance(secs(30)).await;
+    m.run_due().await;
+    assert_eq!((linked.calls(), wasm.calls()), (1, 2));
 }
 
 #[tokio::test]
@@ -1262,7 +1367,12 @@ async fn settings_that_no_longer_validate_need_settings_and_nothing_runs() {
 
     env.advance(secs(3600)).await;
     m.run_due().await;
-    m.sync_now("upgraded", "items").await.unwrap();
+    match m.sync_now("upgraded", "items").await {
+        Err(ManagerError::InvalidSettings(message)) => {
+            assert_eq!(message, "unknown setting \"org\"")
+        }
+        other => panic!("expected InvalidSettings, got {other:?}"),
+    }
     m.run_due().await;
     assert_eq!(
         rt.calls(),
@@ -1368,9 +1478,81 @@ async fn a_restarted_manager_resumes_from_the_stored_cursor() {
         .await;
     m.run_due().await;
     assert_eq!(second.cursors(), [Some("1".to_string()), Some("2".into())]);
-    // The last page is a complete snapshot, but this manager did not see the
-    // listing start, so page 1's items stay.
+    // The listing resumed with its stored id: it saw its start, and every
+    // item, so its complete snapshot removes nothing.
     assert_eq!(env.store.count_items("resumes", "items").await.unwrap(), 6);
+}
+
+#[tokio::test]
+async fn a_listing_resumed_after_a_restart_deletes_what_disappeared_upstream() {
+    let mut env = env().await;
+    let gone = Arc::new(AtomicBool::new(false));
+    // Three pages; once `gone` is set, item-3 no longer exists upstream.
+    let listing = {
+        let gone = gone.clone();
+        move |cursor: Option<&str>| {
+            let mut p = three_pages(cursor);
+            if gone.load(Ordering::SeqCst) {
+                p.upserts.retain(|i| i.id != "item-3");
+            }
+            p
+        }
+    };
+    let gate = Arc::new(Semaphore::new(0));
+    let watch = DropWatch::default();
+    let first = {
+        let (gate, watch, gone, listing) =
+            (gate.clone(), watch.clone(), gone.clone(), listing.clone());
+        Scripted::new(move |req| {
+            let p = listing(req.cursor.as_deref());
+            // The second listing stops in page 2's call.
+            if gone.load(Ordering::SeqCst) && req.cursor.as_deref() == Some("1") {
+                gated(&gate, &watch, p)
+            } else {
+                ok(p)
+            }
+        })
+    };
+    let m = env
+        .start(vec![builtin(
+            manifest("resumes", &[("items", 60)], ""),
+            first.runtime(),
+        )])
+        .await;
+    m.run_due().await;
+    assert_eq!(env.store.count_items("resumes", "items").await.unwrap(), 6);
+
+    gone.store(true, Ordering::SeqCst);
+    env.advance(secs(60) + TICK).await;
+    until("page 2 of the second listing is asked for", || {
+        first.calls() == 5
+    })
+    .await;
+    shut_down(&env, &m).await;
+    let state = env.store.sync_state("resumes", "items").await.unwrap();
+    assert_eq!(state.cursor.as_deref(), Some("1"));
+    assert!(state.listing_id.is_some() && state.listing_from_start);
+
+    let second = Scripted::new(move |req| ok(listing(req.cursor.as_deref())));
+    env.drain();
+    let m = env
+        .start(vec![builtin(
+            manifest("resumes", &[("items", 60)], ""),
+            second.runtime(),
+        )])
+        .await;
+    m.run_due().await;
+    assert_eq!(second.cursors(), [Some("1".to_string()), Some("2".into())]);
+    let ids: Vec<String> = m
+        .items("resumes", "items", 50, None, None)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(ids, ["item-1", "item-2", "item-4", "item-5", "item-6"]);
+    assert_eq!(synced(&env.drain()), [ev("resumes", "items", 0, 1)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,6 +1715,106 @@ async fn new_settings_mid_run_stop_its_pages_and_run_again_with_them() {
     assert_eq!(requests[1].settings, json!({"org": "new"}));
     assert_eq!(requests[1].cursor.as_deref(), Some("1"));
     assert!(!watch.dropped());
+}
+
+#[tokio::test]
+async fn a_queued_sync_now_starts_through_the_scheduler_when_the_running_resource_ends() {
+    let env = env().await;
+    // One permit: the first run of `slow` passes, its second waits.
+    let gate = Arc::new(Semaphore::new(1));
+    let watch = DropWatch::default();
+    let rt = {
+        let (gate, watch) = (gate.clone(), watch.clone());
+        Scripted::new(move |req| match req.resource.as_str() {
+            "slow" => gated(&gate, &watch, page(items(0..1), None, true)),
+            _ => ok(page(items(0..1), None, true)),
+        })
+    };
+    let count = |kind: &str| rt.requests().iter().filter(|r| r.resource == kind).count();
+    let m = env
+        .start(vec![builtin(
+            manifest("queued", &[("slow", 60), ("quick", 3600)], ""),
+            rt.runtime(),
+        )])
+        .await;
+    m.run_due().await;
+    assert_eq!((count("slow"), count("quick")), (1, 1));
+
+    // From here on only the scheduler task starts runs.
+    env.advance(secs(60) + TICK).await;
+    until("slow is called again", || count("slow") == 2).await;
+    m.sync_now("queued", "quick").await.unwrap();
+    for _ in 0..1000 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(count("quick"), 1, "waits for the running resource");
+    gate.add_permits(1);
+    let now = Some(env.now());
+    until_status(&m, "queued", "quick ran again", |s| {
+        let r = resource(s, "quick");
+        r.last_ok_at == now && !r.syncing
+    })
+    .await;
+    assert_eq!((count("slow"), count("quick")), (2, 2));
+    assert!(!watch.dropped());
+}
+
+#[tokio::test]
+async fn sync_now_after_shutdown_is_refused() {
+    let env = env().await;
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let m = env
+        .start(vec![builtin(
+            manifest("closing", &[("items", 60)], ""),
+            rt.runtime(),
+        )])
+        .await;
+    m.run_due().await;
+    m.shutdown().await;
+    assert!(matches!(
+        m.sync_now("closing", "items").await,
+        Err(ManagerError::Disabled)
+    ));
+}
+
+#[tokio::test]
+async fn a_run_given_up_while_queued_ends_its_syncing_state() {
+    let mut env = env().await;
+    let gate = Arc::new(Semaphore::new(0));
+    let mut runtimes = vec![];
+    let mut plugins = vec![];
+    for n in 0..5 {
+        let gate = gate.clone();
+        let rt = Scripted::new(move |_| {
+            let gate = gate.clone();
+            Box::pin(async move {
+                gate.acquire().await.unwrap().forget();
+                Ok(page(vec![], None, true))
+            })
+        });
+        plugins.push(builtin(
+            manifest(&format!("queue-{n}"), &[("items", 60)], ""),
+            rt.runtime(),
+        ));
+        runtimes.push(rt);
+    }
+    let m = env.start(plugins).await;
+    until("four calls are in flight", || {
+        runtimes.iter().filter(|rt| rt.calls() == 1).count() == 4
+    })
+    .await;
+    let waiting = runtimes.iter().position(|rt| rt.calls() == 0).unwrap();
+    let id = format!("queue-{waiting}");
+    assert!(resource(&status(&m, &id).await, "items").syncing);
+
+    m.set_enabled(&id, false).await.unwrap();
+    gate.add_permits(5);
+    m.run_due().await;
+    assert_eq!(runtimes[waiting].calls(), 0);
+    let events = env.drain();
+    let last = *updates(&events, &id).last().expect("a PluginUpdated");
+    assert_eq!(last.state, PluginState::Disabled);
+    assert!(!resource(last, "items").syncing, "{last:?}");
 }
 
 #[tokio::test]

@@ -14,7 +14,7 @@ use smithagents_plugin_host::{CallError, CallPurpose};
 use smithagents_plugin_protocol::{HostMode, PluginError, SyncPage, SyncRequest};
 use tokio::time::Instant;
 
-use super::{clean_message, later, wall_after, Inner, Listing, Loaded, Managed, Problem};
+use super::{clean_message, later, wall_after, Inner, Loaded, Managed, Problem};
 use crate::intents::panic_text;
 use crate::plugins::settings;
 
@@ -89,10 +89,10 @@ async fn body(inner: &Inner, plugin: &Managed, kind: &str, token: u64, progress:
     // A slot first: at most `max_concurrent` calls run at once. The
     // semaphore is closed at shutdown.
     let Ok(_permit) = Arc::clone(&inner.permits).acquire_owned().await else {
-        return;
+        return give_up(inner, plugin, token).await;
     };
     let Some(call) = ready(inner, plugin, kind, progress.generation).await else {
-        return;
+        return give_up(inner, plugin, token).await;
     };
     progress.started_at = Some(inner.now());
     inner.publish_status(plugin).await;
@@ -100,12 +100,21 @@ async fn body(inner: &Inner, plugin: &Managed, kind: &str, token: u64, progress:
     finish(inner, plugin, kind, token, progress, end).await;
 }
 
+/// Ends a run that will not call the plugin, and says the resource is not
+/// syncing any more: earlier statuses may have said it was.
+async fn give_up(inner: &Inner, plugin: &Managed, token: u64) {
+    plugin.end_run(token);
+    inner.publish_status(plugin).await;
+}
+
 /// What a run calls the plugin with.
 struct Call<'a> {
     loaded: &'a Loaded,
     settings: Value,
     cursor: Option<String>,
-    listing: Listing,
+    /// The stored listing state: see [`SyncState`](crate::store::SyncState).
+    listing_id: Option<String>,
+    listing_from_start: bool,
     generation: u64,
 }
 
@@ -119,44 +128,34 @@ async fn ready<'a>(
     generation: u64,
 ) -> Option<Call<'a>> {
     let loaded = plugin.loaded.as_ref().ok()?;
-    let (stored, cursor, listing) = {
+    let (stored, sync) = {
         let live = plugin.live();
         if inner.stopping.load(Ordering::SeqCst) || !live.enabled || live.is_failed() {
             return None;
         }
-        let r = live.resource(kind)?;
-        (
-            live.settings.clone(),
-            r.sync.cursor.clone(),
-            r.listing.clone(),
-        )
+        (live.settings.clone(), live.resource(kind)?.sync.clone())
     };
-    let Ok(settings) = settings::effective(&plugin.manifest, &stored) else {
-        // The status already says NeedsSettings; a `sync_now` hears it here.
-        inner.publish_status(plugin).await;
-        return None;
-    };
+    // The status already says NeedsSettings.
+    let settings = settings::effective(&plugin.manifest, &stored).ok()?;
     let missing = missing_secrets(inner, plugin).await;
     if !missing.is_empty() {
-        let message = match missing.as_slice() {
+        let message = clean_message(&match missing.as_slice() {
             [key] => format!("no value is configured for the secret {key}"),
             keys => format!("no value is configured for the secrets {}", keys.join(", ")),
-        };
+        });
         tracing::warn!(plugin = %plugin.id, "{message}");
-        {
-            let mut live = plugin.live();
-            if live.generation == generation {
-                live.problem = Some(Problem::NeedsAuth { missing, message });
-            }
+        let mut live = plugin.live();
+        if live.generation == generation {
+            live.problem = Some(Problem::NeedsAuth { missing, message });
         }
-        inner.publish_status(plugin).await;
         return None;
     }
     Some(Call {
         loaded,
         settings,
-        cursor,
-        listing,
+        cursor: sync.cursor,
+        listing_id: sync.listing_id,
+        listing_from_start: sync.listing_from_start,
         generation,
     })
 }
@@ -194,13 +193,15 @@ async fn fetch(
     progress: &mut Progress,
 ) -> End {
     let mut cursor = call.cursor.clone();
-    // Items carry the id of the listing that saw them last, so a snapshot
-    // that took several runs deletes only what none of its pages had. A
-    // listing whose start this manager did not see deletes nothing.
-    let (listing_id, whole) = match (&call.listing, &cursor) {
-        (_, None) | (Listing::AtStart, Some(_)) => (new_id(), true),
-        (Listing::Continuing { id, whole }, Some(_)) => (id.clone(), *whole),
-        (Listing::Unknown, Some(_)) => (new_id(), false),
+    // A listing of every item may take several runs, and restarts. Its items
+    // carry its id, so its complete snapshot deletes only what none of its
+    // pages had. A listing begins with no cursor, or after the last one ended
+    // (stored as no id, from the start); with neither known, its start was
+    // not seen and its snapshot deletes nothing.
+    let (listing_id, whole) = match (&cursor, &call.listing_id) {
+        (None, _) => (new_id(), true),
+        (Some(_), Some(id)) => (id.clone(), call.listing_from_start),
+        (Some(_), None) => (new_id(), call.listing_from_start),
     };
     for _ in 0..inner.pages_per_run {
         if interrupted(inner, plugin, call.generation) {
@@ -244,8 +245,10 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Stores the page's items and its cursor together, and moves the in-memory
-/// state along under the same lock, so the two never disagree.
+/// Stores the page's items, its cursor and the listing state together, and
+/// moves the in-memory state along under the same lock, so the two never
+/// disagree. After a done page the listing is over and the next one starts
+/// at the beginning.
 async fn store_page(
     inner: &Inner,
     plugin: &Managed,
@@ -255,10 +258,23 @@ async fn store_page(
     page: &SyncPage,
     progress: &mut Progress,
 ) -> Result<(), String> {
+    let (next_id, next_from_start) = if page.done {
+        (None, true)
+    } else {
+        (Some(listing_id), whole)
+    };
     let _writes = plugin.sync_writes.lock().await;
     let (upserted, deleted) = inner
         .store
-        .apply_page(&plugin.id, kind, listing_id, page, inner.now())
+        .apply_page(
+            &plugin.id,
+            kind,
+            listing_id,
+            page,
+            inner.now(),
+            next_id,
+            next_from_start,
+        )
         .await
         .map_err(|e| format!("cannot store the page: {e}"))?;
     progress.upserted = progress.upserted.saturating_add(upserted);
@@ -266,14 +282,8 @@ async fn store_page(
     let mut live = plugin.live();
     if let Some(r) = live.resource_mut(kind) {
         r.sync.cursor = page.next_cursor.clone();
-        r.listing = if page.done {
-            Listing::AtStart
-        } else {
-            Listing::Continuing {
-                id: listing_id.to_string(),
-                whole,
-            }
-        };
+        r.sync.listing_id = next_id.map(str::to_string);
+        r.sync.listing_from_start = next_from_start;
     }
     Ok(())
 }

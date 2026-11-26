@@ -95,6 +95,8 @@ async fn sync_state_defaults_and_round_trips() {
         last_error: Some("boom".into()),
         next_due_at: Some(time("2026-11-26T11:00:00Z")),
         failures: 3,
+        listing_id: Some("listing-1".into()),
+        listing_from_start: true,
     };
     store.save_sync_state("p", "issues", &s).await.unwrap();
     assert_eq!(store.sync_state("p", "issues").await.unwrap(), s);
@@ -125,7 +127,15 @@ async fn three_pages_read_back_in_order_across_two_list_pages() {
     let c = vec![item("e", "E", Some(&t(9)))];
     for (p, cur) in [(a, "1"), (b, "2"), (c, "3")] {
         store
-            .apply_page("p", "r", "run1", &page(p, &[], Some(cur)), time(AT))
+            .apply_page(
+                "p",
+                "r",
+                "run1",
+                &page(p, &[], Some(cur)),
+                time(AT),
+                None,
+                false,
+            )
             .await
             .unwrap();
     }
@@ -175,11 +185,82 @@ async fn three_pages_read_back_in_order_across_two_list_pages() {
 }
 
 #[tokio::test]
+async fn a_page_stores_its_listing_with_its_cursor() {
+    let store = Store::open_in_memory().await.unwrap();
+    let listing = |s: SyncState| (s.cursor, s.listing_id, s.listing_from_start);
+    store
+        .apply_page(
+            "p",
+            "r",
+            "l1",
+            &page(vec![item("a", "A", None)], &[], Some("1")),
+            time(AT),
+            Some("l1"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listing(store.sync_state("p", "r").await.unwrap()),
+        (Some("1".into()), Some("l1".into()), true)
+    );
+    store
+        .apply_page(
+            "p",
+            "r",
+            "l1",
+            &page(vec![], &[], Some("2")),
+            time(AT),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listing(store.sync_state("p", "r").await.unwrap()),
+        (Some("2".into()), None, false)
+    );
+    // The rest of the state is left alone.
+    let saved = SyncState {
+        failures: 2,
+        last_error: Some("e".into()),
+        ..store.sync_state("p", "r").await.unwrap()
+    };
+    store.save_sync_state("p", "r", &saved).await.unwrap();
+    store
+        .apply_page(
+            "p",
+            "r",
+            "l2",
+            &page(vec![], &[], Some("3")),
+            time(AT),
+            Some("l2"),
+            false,
+        )
+        .await
+        .unwrap();
+    let after = store.sync_state("p", "r").await.unwrap();
+    assert_eq!(
+        (after.failures, after.last_error.as_deref()),
+        (2, Some("e"))
+    );
+    assert_eq!(listing(after), (Some("3".into()), Some("l2".into()), false));
+}
+
+#[tokio::test]
 async fn limit_is_clamped() {
     let store = Store::open_in_memory().await.unwrap();
     let items: Vec<_> = (0..3).map(|i| item(&format!("i{i}"), "T", None)).collect();
     store
-        .apply_page("p", "r", "run", &page(items, &[], None), time(AT))
+        .apply_page(
+            "p",
+            "r",
+            "run",
+            &page(items, &[], None),
+            time(AT),
+            None,
+            false,
+        )
         .await
         .unwrap();
     let p = store.list_items("p", "r", 0, None, None).await.unwrap();
@@ -202,14 +283,14 @@ async fn reapplying_an_identical_page_changes_nothing_but_the_run() {
     );
     assert_eq!(
         store
-            .apply_page("p", "r", "run1", &p, time(AT))
+            .apply_page("p", "r", "run1", &p, time(AT), None, false)
             .await
             .unwrap(),
         (2, 0)
     );
     assert_eq!(
         store
-            .apply_page("p", "r", "run2", &p, time(AT))
+            .apply_page("p", "r", "run2", &p, time(AT), None, false)
             .await
             .unwrap(),
         (0, 0)
@@ -230,6 +311,8 @@ async fn each_changed_column_counts_once() {
             "r1",
             &page(vec![base.clone()], &[], None),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -259,7 +342,15 @@ async fn each_changed_column_counts_once() {
         let run = format!("v{i}");
         assert_eq!(
             store
-                .apply_page("p", "r", &run, &page(vec![v], &[], None), time(AT))
+                .apply_page(
+                    "p",
+                    "r",
+                    &run,
+                    &page(vec![v], &[], None),
+                    time(AT),
+                    None,
+                    false
+                )
                 .await
                 .unwrap(),
             (1, 0),
@@ -273,6 +364,8 @@ async fn each_changed_column_counts_once() {
                 &format!("b{i}"),
                 &page(vec![base.clone()], &[], None),
                 time(AT),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -289,6 +382,8 @@ async fn deletes_remove_rows_and_count_only_existing() {
             "r1",
             &page(vec![item("a", "A", None), item("b", "B", None)], &[], None),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -299,6 +394,8 @@ async fn deletes_remove_rows_and_count_only_existing() {
             "r2",
             &page(vec![], &["a", "missing"], None),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -324,6 +421,8 @@ async fn delete_unseen_removes_exactly_the_untouched_rows() {
                 None,
             ),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -335,6 +434,8 @@ async fn delete_unseen_removes_exactly_the_untouched_rows() {
             "new",
             &page(vec![item("a", "A", None), item("b", "B2", None)], &[], None),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -345,6 +446,8 @@ async fn delete_unseen_removes_exactly_the_untouched_rows() {
             "old",
             &page(vec![item("z", "Z", None)], &[], None),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -368,6 +471,8 @@ async fn a_failing_statement_rolls_the_whole_page_back() {
             "r0",
             &page(vec![item("keep", "K", None)], &[], Some("c0")),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -391,7 +496,9 @@ async fn a_failing_statement_rolls_the_whole_page_back() {
         &["keep"],
         Some("c1"),
     );
-    let err = store.apply_page("p", "r", "r1", &bad, time(AT)).await;
+    let err = store
+        .apply_page("p", "r", "r1", &bad, time(AT), None, false)
+        .await;
     assert!(matches!(err, Err(StoreError::Sqlx(_))), "{err:?}");
     assert_eq!(ids(&store, "p", "r").await, ["keep"]);
     assert_eq!(
@@ -415,6 +522,8 @@ async fn a_failing_cursor_write_rolls_back_the_upserts_and_deletes() {
             "r0",
             &page(vec![item("keep", "K", None)], &[], Some("c0")),
             time(AT),
+            Some("r0"),
+            true,
         )
         .await
         .unwrap();
@@ -439,8 +548,13 @@ async fn a_failing_cursor_write_rolls_back_the_upserts_and_deletes() {
         &["keep"],
         Some("c1"),
     );
-    let err = store.apply_page("p", "r", "r1", &bad, time(AT)).await;
+    let before = store.sync_state("p", "r").await.unwrap();
+    let err = store
+        .apply_page("p", "r", "r1", &bad, time(AT), Some("r1"), false)
+        .await;
     assert!(matches!(err, Err(StoreError::Sqlx(_))), "{err:?}");
+    assert_eq!(store.sync_state("p", "r").await.unwrap(), before);
+    assert_eq!(before.listing_id.as_deref(), Some("r0"));
     let page = store.list_items("p", "r", 10, None, None).await.unwrap();
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].id, "keep");
@@ -472,6 +586,8 @@ async fn q_escapes_like_wildcards_and_ignores_case() {
                 None,
             ),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -503,7 +619,15 @@ async fn q_applies_across_pages() {
         .chain((0..3).map(|i| item(&format!("x{i}"), "other", None)))
         .collect();
     store
-        .apply_page("p", "r", "r", &page(items, &[], None), time(AT))
+        .apply_page(
+            "p",
+            "r",
+            "r",
+            &page(items, &[], None),
+            time(AT),
+            None,
+            false,
+        )
         .await
         .unwrap();
     let a = store
@@ -539,6 +663,8 @@ async fn plugins_with_the_same_resource_kind_do_not_mix() {
                 "r",
                 &page(vec![item(id, "T", None)], &[], Some(id)),
                 time(AT),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -573,6 +699,8 @@ async fn delete_resource_clears_items_and_state() {
                 "r",
                 &page(vec![item("a", "A", None)], &[], Some("c")),
                 time(AT),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -602,6 +730,8 @@ async fn known_resources_includes_state_only_and_item_only_kinds_once() {
             "r",
             &page(vec![item("x", "X", None)], &[], None),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -612,6 +742,8 @@ async fn known_resources_includes_state_only_and_item_only_kinds_once() {
             "r",
             &page(vec![item("x", "X", None)], &[], None),
             time(AT),
+            None,
+            false,
         )
         .await
         .unwrap();

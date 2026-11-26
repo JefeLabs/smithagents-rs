@@ -190,27 +190,8 @@ struct ResourceLive {
     /// Mirrors the stored row; written through [`Inner::persist`].
     sync: SyncState,
     due: Instant,
-    /// Asked for by `sync_now`: runs next, even while the plugin is held.
+    /// Asked for by `sync_now`: runs next, even while the plugin needs auth.
     forced: bool,
-    listing: Listing,
-}
-
-/// Where the resource stands in a plugin's listing of all its items, which
-/// may take several runs. Items are stamped with the listing's id, so a
-/// `snapshot_complete` at its end removes only what the whole listing did not
-/// see. Kept in memory only.
-#[derive(Clone)]
-enum Listing {
-    /// The next run starts a new listing.
-    AtStart,
-    /// The next run continues this listing.
-    Continuing {
-        id: String,
-        /// The listing began in this manager, so it saw every page.
-        whole: bool,
-    },
-    /// After a restart, with a stored cursor: the listing's start was not seen.
-    Unknown,
 }
 
 impl Managed {
@@ -239,6 +220,18 @@ impl Live {
 
     fn resource_mut(&mut self, kind: &str) -> Option<&mut ResourceLive> {
         self.resources.iter_mut().find(|r| r.kind == kind)
+    }
+
+    /// Why the plugin needs settings, if it does: its stored settings do not
+    /// validate, or a run was told so by the plugin.
+    fn settings_problem(&self) -> Option<&str> {
+        if let Some(message) = &self.settings_error {
+            return Some(message);
+        }
+        match &self.problem {
+            Some(Problem::NeedsSettings { message }) => Some(message),
+            Some(Problem::NeedsAuth { .. } | Problem::Failed { .. }) | None => None,
+        }
     }
 
     fn is_failed(&self) -> bool {
@@ -434,9 +427,11 @@ impl PluginManager {
         Ok(inner.publish_status(plugin).await)
     }
 
-    /// Queues a run of `resource`, even while the plugin needs auth or
-    /// settings. `Busy` while that resource syncs; a run of another resource
-    /// of the plugin finishes first.
+    /// Queues a run of `resource`, even while the plugin needs auth. `Busy`
+    /// while that resource syncs; a run of another resource of the plugin
+    /// finishes first. Refused while the plugin needs settings (with the
+    /// reason), and when it is disabled, cannot run, or the manager is shut
+    /// down.
     pub async fn sync_now(&self, id: &str, resource: &str) -> Result<(), ManagerError> {
         let plugin = self.inner.plugin(id)?;
         {
@@ -444,8 +439,15 @@ impl PluginManager {
             if live.resource(resource).is_none() {
                 return Err(ManagerError::UnknownResource);
             }
-            if plugin.loaded.is_err() || !live.enabled || live.is_failed() {
+            if plugin.loaded.is_err()
+                || !live.enabled
+                || live.is_failed()
+                || self.inner.stopping.load(Ordering::SeqCst)
+            {
                 return Err(ManagerError::Disabled);
+            }
+            if let Some(message) = live.settings_problem() {
+                return Err(ManagerError::InvalidSettings(message.to_string()));
             }
             if live.running.as_ref().is_some_and(|r| r.kind == resource) {
                 return Err(ManagerError::Busy);
@@ -616,11 +618,6 @@ async fn prepare(
             interval: Duration::from_secs(decl.interval_secs.into()),
             due: due_from(sync.next_due_at, now, wall),
             forced: false,
-            listing: if sync.cursor.is_none() {
-                Listing::AtStart
-            } else {
-                Listing::Unknown
-            },
             sync,
         });
     }

@@ -43,7 +43,29 @@ fn is_separator_or_bidi(c: char) -> bool {
 
 /// The plugin's state: a load failure or a stop first (enabling does not
 /// clear them), then disabled, then invalid settings, then a problem a run met.
+/// Every message goes through [`clean_message`] here as well as where it is
+/// made, so none can reach a response or an event uncapped.
 fn state(plugin: &Managed, live: &Live) -> PluginState {
+    match raw_state(plugin, live) {
+        PluginState::Disabled => PluginState::Disabled,
+        PluginState::Ready => PluginState::Ready,
+        PluginState::NeedsAuth { missing, message } => PluginState::NeedsAuth {
+            missing,
+            message: clean_message(&message),
+        },
+        PluginState::NeedsSettings { message } => PluginState::NeedsSettings {
+            message: clean_message(&message),
+        },
+        PluginState::Failed { message } => PluginState::Failed {
+            message: clean_message(&message),
+        },
+        PluginState::LoadFailed { message } => PluginState::LoadFailed {
+            message: clean_message(&message),
+        },
+    }
+}
+
+fn raw_state(plugin: &Managed, live: &Live) -> PluginState {
     if let Err(message) = &plugin.loaded {
         return PluginState::LoadFailed {
             message: message.clone(),
@@ -111,7 +133,7 @@ pub(super) async fn status(inner: &Inner, plugin: &Managed) -> PluginStatus {
             last_run_at: sync.last_run_at,
             last_ok_at: sync.last_ok_at,
             next_due_at: sync.next_due_at,
-            last_error: sync.last_error,
+            last_error: sync.last_error.as_deref().map(clean_message),
             syncing,
         });
     }

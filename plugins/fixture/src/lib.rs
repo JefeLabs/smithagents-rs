@@ -38,12 +38,20 @@ fn empty_done() -> SyncPage {
 }
 
 /// Three pages of two items; the cursors are "1" and "2", and the last page
-/// carries "3".
+/// carries "3". From "3" nothing is listed: an empty done page that keeps
+/// "3" and claims no snapshot (a complete empty snapshot would tell the host
+/// that every item is gone).
 fn items(cursor: Option<&str>) -> SyncPage {
     let (first, next, done) = match cursor {
         None => (1, "1", false),
         Some("1") => (3, "2", false),
         Some("2") => (5, "3", true),
+        Some("3") => {
+            return SyncPage {
+                snapshot_complete: false,
+                ..page(Vec::new(), Some("3".into()), true)
+            }
+        }
         Some(_) => return empty_done(),
     };
     let upserts = (first..first + 2)

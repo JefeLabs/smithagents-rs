@@ -689,6 +689,13 @@ pub struct SyncState {
     pub last_error: Option<String>,
     pub next_due_at: Option<DateTime<Utc>>,
     pub failures: u32,
+    /// The listing the cursor is part of while one spans pages and runs;
+    /// the plugin manager stamps that listing's items with it.
+    pub listing_id: Option<String>,
+    /// With `listing_id`: that listing began with no cursor, so it saw every
+    /// page. Without: the last listing ended, so the next one starts at the
+    /// beginning. False when not known.
+    pub listing_from_start: bool,
 }
 
 const MAX_ITEMS_LIMIT: u32 = 200;
@@ -791,6 +798,8 @@ impl Store {
                 last_error: r.try_get("last_error")?,
                 next_due_at: opt_ts(&r, "next_due_at")?,
                 failures: u32::try_from(r.try_get::<i64, _>("failures")?).map_err(corrupt)?,
+                listing_id: r.try_get("listing_id")?,
+                listing_from_start: r.try_get::<i64, _>("listing_from_start")? != 0,
             })
         })
         .transpose()
@@ -805,11 +814,13 @@ impl Store {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO resource_sync (plugin_id, resource, cursor, last_run_at, last_ok_at, \
-             last_error, next_due_at, failures) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             last_error, next_due_at, failures, listing_id, listing_from_start) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (plugin_id, resource) DO UPDATE SET cursor = excluded.cursor, \
              last_run_at = excluded.last_run_at, last_ok_at = excluded.last_ok_at, \
              last_error = excluded.last_error, next_due_at = excluded.next_due_at, \
-             failures = excluded.failures",
+             failures = excluded.failures, listing_id = excluded.listing_id, \
+             listing_from_start = excluded.listing_from_start",
         )
         .bind(id)
         .bind(resource)
@@ -819,15 +830,20 @@ impl Store {
         .bind(s.last_error.as_deref())
         .bind(s.next_due_at.map(ts))
         .bind(i64::from(s.failures))
+        .bind(s.listing_id.as_deref())
+        .bind(i64::from(s.listing_from_start))
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// One transaction: upserts, deletes and the new cursor. Returns
-    /// `(upserted, deleted)`, counting only rows that changed. An unchanged
-    /// row still takes the new `run_id` (so `delete_unseen` keeps it) but keeps
-    /// its `synced_at`. The page is assumed validated by the runtime.
+    /// One transaction: upserts, deletes, the new cursor and the listing
+    /// state that goes with it (`listing_id`, `listing_from_start`, stored as
+    /// given). Returns `(upserted, deleted)`, counting only rows that changed.
+    /// An unchanged row still takes the new `run_id` (so `delete_unseen` keeps
+    /// it) but keeps its `synced_at`. The page is assumed validated by the
+    /// runtime.
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_page(
         &self,
         id: &str,
@@ -835,6 +851,8 @@ impl Store {
         run_id: &str,
         page: &SyncPage,
         at: DateTime<Utc>,
+        listing_id: Option<&str>,
+        listing_from_start: bool,
     ) -> Result<(u32, u32), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut upserted = 0u32;
@@ -912,12 +930,16 @@ impl Store {
             deleted += u32::try_from(n).map_err(corrupt)?;
         }
         sqlx::query(
-            "INSERT INTO resource_sync (plugin_id, resource, cursor) VALUES (?, ?, ?) \
-             ON CONFLICT (plugin_id, resource) DO UPDATE SET cursor = excluded.cursor",
+            "INSERT INTO resource_sync (plugin_id, resource, cursor, listing_id, \
+             listing_from_start) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (plugin_id, resource) DO UPDATE SET cursor = excluded.cursor, \
+             listing_id = excluded.listing_id, listing_from_start = excluded.listing_from_start",
         )
         .bind(id)
         .bind(resource)
         .bind(page.next_cursor.as_deref())
+        .bind(listing_id)
+        .bind(i64::from(listing_from_start))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

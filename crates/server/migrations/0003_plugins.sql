@@ -13,6 +13,8 @@ CREATE TABLE resource_sync (
     last_error TEXT,
     next_due_at TEXT,
     failures INTEGER NOT NULL DEFAULT 0,
+    listing_id TEXT,
+    listing_from_start INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (plugin_id, resource)
 );
 
