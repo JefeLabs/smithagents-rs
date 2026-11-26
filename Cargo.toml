@@ -46,3 +46,6 @@ signal-hook = "0.4.6"
 unicode-segmentation = "1.13.3"
 raw-window-handle = "=0.6.2"
 url = "=2.5.9"
+toml = "1.2.3"
+semver = { version = "1.0.28", features = ["serde"] }
+base64 = "0.23.1"
