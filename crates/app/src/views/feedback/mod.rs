@@ -1,5 +1,6 @@
-//! The Feedback view in the right dock, and the rail's Feedback button
-//! ([`hold`]). The pane shares the dock with Settings and Intents and is
+//! The Feedback view in the right dock, the rail's Feedback button
+//! ([`hold`]) and the annotator the shell draws over the window
+//! ([`annotator`]). The pane shares the dock with Settings and Intents and is
 //! drawn only while the rail has it selected ([`ShellState::right_entry`]).
 //!
 //! Top to bottom: the heading; "How to submit feedback", collapsed until
@@ -21,8 +22,15 @@
 //! The pane paints its whole area from `Region::RightPane`, like Settings;
 //! everything else comes from tokens.
 
+mod annotator;
 mod hold;
 
+pub use annotator::{
+    badge_id, Annotator, ANNOTATOR_BAR_HEIGHT, ANNOTATOR_COMMENT_ERROR_ID, ANNOTATOR_COMMENT_ID,
+    ANNOTATOR_CONFIRM_DISCARD_ID, ANNOTATOR_DELETE_ID, ANNOTATOR_DISCARD_ID,
+    ANNOTATOR_DISCARD_TITLE_ID, ANNOTATOR_DONE_ID, ANNOTATOR_ID, ANNOTATOR_KEEP_ID,
+    ANNOTATOR_TITLE_ID,
+};
 pub use hold::{HoldButton, HoldEvent, HOLD_RING_ID};
 
 use std::cell::Cell;

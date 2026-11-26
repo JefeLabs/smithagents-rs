@@ -24,6 +24,9 @@
 //! State lives in a separate [`ShellState`] entity, which the panes observe,
 //! so no view holds a handle back to its owner.
 //!
+//! While a screenshot is annotated, the [`Annotator`] covers the whole
+//! window (title bar, panes, dock and rail) as the root's last child.
+//!
 //! The center tabs' web engine is a [`CenterTabHost`] ([`ShellOptions::tab_host`],
 //! [`PlaceholderHost`] by default). The shell attaches it to the window once;
 //! the state feeds it the center's rectangle and every theme change itself;
@@ -42,7 +45,7 @@ use gpui_kit::component::{h_flex, resize_handle, v_flex, ActiveTheme as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, px, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, FocusHandle,
-    InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
+    Focusable as _, InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
     ParentElement as _, Pixels, Render, Styled as _, Subscription, Task, TestSupportExt as _,
     WeakFocusHandle, Window,
 };
@@ -51,6 +54,7 @@ use smithagents_theme::tokens::ThemeSet;
 
 use crate::app_state::AppStateStore;
 use crate::appearance::AppearanceRuntime;
+use crate::feedback::draft::AttachmentId;
 use crate::feedback::state::{Feedback, FeedbackEvent, FeedbackOptions};
 use crate::layout_store::{
     fitted_right_width, left_pane_extent, saved_dock, saved_left_pane, saved_window,
@@ -67,7 +71,7 @@ use crate::update::{NoUpdater, Updater};
 use crate::view_models::{update_button, LeftPaneMode};
 use crate::views::agents::AgentsPane;
 use crate::views::center::{notify_tab_failure, CenterPanel};
-use crate::views::feedback::{FeedbackPane, HoldButton, HoldEvent};
+use crate::views::feedback::{Annotator, FeedbackPane, HoldButton, HoldEvent};
 use crate::views::intents::IntentsPane;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 use crate::views::settings::SettingsPane;
@@ -295,6 +299,8 @@ pub struct Shell {
     /// The rail's Feedback button: a click toggles the pane, a hold
     /// captures.
     hold_button: Entity<HoldButton>,
+    /// The overlay on the screenshot being annotated.
+    annotator: Option<Entity<Annotator>>,
     layout: Option<LayoutStore>,
     /// The right dock's width the user chose (a drag of its handle, or the
     /// saved layout). It is what the layout file keeps; the width drawn is
@@ -521,8 +527,10 @@ impl Shell {
                         this.show_rail_entry(RailEntry::Feedback, window, cx);
                         cx.notify();
                     }
-                    // Nothing draws the annotator yet.
-                    FeedbackEvent::OpenAnnotator(_) | FeedbackEvent::CloseAnnotator => {}
+                    FeedbackEvent::OpenAnnotator(id) => {
+                        this.open_annotator(id.clone(), window, cx)
+                    }
+                    FeedbackEvent::CloseAnnotator => this.close_annotator(window, cx),
                 }
             }),
             // Toggles made by the dock skin itself; the shell's own entry
@@ -577,6 +585,7 @@ impl Shell {
             left_pane,
             feedback,
             hold_button,
+            annotator: None,
             layout,
             preferred_right,
             applied_right: right_size,
@@ -602,6 +611,32 @@ impl Shell {
     /// The rail's Feedback button.
     pub fn hold_button(&self) -> &Entity<HoldButton> {
         &self.hold_button
+    }
+
+    /// The annotator, while a screenshot is annotated.
+    pub fn annotator(&self) -> Option<&Entity<Annotator>> {
+        self.annotator.as_ref()
+    }
+
+    /// Covers the window with the annotator on screenshot `id`, focused.
+    fn open_annotator(&mut self, id: AttachmentId, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_annotator(window, cx);
+        let feedback = self.feedback.clone();
+        let annotator = cx.new(|cx| Annotator::new(feedback, id, window, cx));
+        annotator.read(cx).focus_handle(cx).focus(window, cx);
+        self.annotator = Some(annotator);
+        cx.notify();
+    }
+
+    /// Takes the annotator away, its picture out of the window's atlas, and
+    /// gives the focus back to the shell.
+    fn close_annotator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(annotator) = self.annotator.take() else {
+            return;
+        };
+        annotator.update(cx, |annotator, cx| annotator.release(window, cx));
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     /// Shuts the tab host down (once, whichever of quit and close comes
@@ -973,6 +1008,9 @@ impl Render for Shell {
             button.set_selected(rail_active == Some(RailEntry::Feedback), cx);
             button.set_icon_color(rail_foreground, cx);
         });
+        if let Some(annotator) = &self.annotator {
+            annotator.update(cx, |annotator, cx| annotator.set_theme(native.clone(), cx));
+        }
         let theme = cx.theme();
         let (left_surface, _) = region_paint(native.as_deref(), Region::LeftPane, cx);
         let left_pane = div()
@@ -1027,6 +1065,7 @@ impl Render for Shell {
                 this.on_action(cx.listener(Self::on_close_active_tab))
             })
             .on_drag_move(cx.listener(Self::on_left_pane_drag))
+            .relative()
             .size_full()
             .child(title_bar(
                 native.as_deref(),
@@ -1040,5 +1079,9 @@ impl Render for Shell {
                 native.as_deref(),
                 cx,
             ))
+            // Last, so it covers everything above.
+            .when_some(self.annotator.clone(), |this, annotator| {
+                this.child(div().absolute().inset_0().occlude().child(annotator))
+            })
     }
 }
