@@ -47,6 +47,7 @@ use chrono::{TimeDelta, Utc};
 use futures::FutureExt;
 use smithagents_core::agent::AgentState;
 use smithagents_core::event::{Event, EventKind};
+use smithagents_core::feedback::FeedbackOrigin;
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     slugify, AgentDefaults, Answer, AnswerInput, Content, CreateIntentRequest, Intent,
@@ -127,6 +128,10 @@ pub enum IntentError {
     DependencyCycle,
     #[error("dependency is in a different repository")]
     DependencyCrossRepo,
+    /// The intent has an origin: the files it was made from are on a branch
+    /// of its repository, so it cannot move to another one (HTTP 409).
+    #[error("This intent's evidence is in its repository, so the repository cannot be changed.")]
+    EvidenceInRepo,
     #[error(transparent)]
     Service(ServiceError),
     #[error(transparent)]
@@ -157,10 +162,24 @@ impl IntentError {
             IntentError::Invalid(_) => "invalid",
             IntentError::DependencyCycle => "dependency_cycle",
             IntentError::DependencyCrossRepo => "dependency_cross_repo",
+            IntentError::EvidenceInRepo => "evidence_in_repo",
             IntentError::Service(_) => "service_error",
             IntentError::Store(_) => "store_error",
         }
     }
+}
+
+/// What [`IntentService::create_with`] adds to a new intent beyond the
+/// request. `fixed_criteria` and `fixed_dependency` are for the idea package
+/// and are not read before it exists.
+#[derive(Debug, Clone, Default)]
+pub struct CreateExtras {
+    /// The branch the intent's agent starts from.
+    pub base_branch: Option<String>,
+    /// Where a Submit-made intent's files are.
+    pub origin: Option<FeedbackOrigin>,
+    pub fixed_criteria: Vec<String>,
+    pub fixed_dependency: Option<IntentId>,
 }
 
 /// Exclusive right to mutate one intent; released on drop.
@@ -381,12 +400,26 @@ impl IntentService {
 
     /// Creates a draft from a chat or text seed and starts polish pass 1.
     pub async fn create(&self, req: CreateIntentRequest) -> Result<Intent, IntentError> {
-        let svc = self.clone();
-        detached(async move { svc.create_now(req).await }).await
+        self.create_with(req, CreateExtras::default()).await
     }
 
-    /// Body of [`Self::create`], run detached from the caller.
-    async fn create_now(&self, req: CreateIntentRequest) -> Result<Intent, IntentError> {
+    /// [`Self::create`], with what the daemon's own callers (Submit) add to
+    /// the new intent: its base branch and origin are stored with it.
+    pub async fn create_with(
+        &self,
+        req: CreateIntentRequest,
+        extras: CreateExtras,
+    ) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.create_now(req, extras).await }).await
+    }
+
+    /// Body of [`Self::create_with`], run detached from the caller.
+    async fn create_now(
+        &self,
+        req: CreateIntentRequest,
+        extras: CreateExtras,
+    ) -> Result<Intent, IntentError> {
         let store = &self.inner.store;
         let (repo_id, seed) = match req.seed {
             SeedInput::Chat {
@@ -478,8 +511,8 @@ impl IntentService {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
-            base_branch: None,
-            origin: None,
+            base_branch: extras.base_branch,
+            origin: extras.origin,
         };
         let first = IntentVersion {
             intent_id: id,
@@ -538,6 +571,12 @@ impl IntentService {
             )));
         }
         let new_repo = patch.repo_id.filter(|r| *r != intent.repo_id);
+        // Its agent starts from a branch of this repository that holds its
+        // files: in another repository that branch is not there, or is not
+        // the same.
+        if new_repo.is_some() && intent.origin.is_some() {
+            return Err(IntentError::EvidenceInRepo);
+        }
         if title.is_none()
             && new_repo.is_none()
             && patch.kind.is_none()

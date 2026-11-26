@@ -1,13 +1,99 @@
 //! Fake `gh` and `agent-browser` for the feedback tests: the scripts in
 //! `tests/bin`, copied into a test's own directory, which is the only place a
 //! [`ToolFinder`] from [`FakeTools::finder`] looks. Nothing installed on the
-//! machine is found or run.
+//! machine is found or run. Also the pieces of a feedback upload: multipart
+//! bodies, file contents and the request part.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use serde_json::{json, Value};
+use smithagents_core::ids::{RepoId, SubmissionId};
 use smithagents_plugin_host::ToolFinder;
+
+/// The boundary of every body [`multipart`] makes; no file the tests send
+/// holds it.
+pub const BOUNDARY: &str = "smithagents-test-boundary-7d1f0c";
+
+/// A `multipart/form-data` body of `parts` (name, contents) in order, and its
+/// content type. Every part but `request` carries its own name as its file
+/// name.
+pub fn multipart(parts: &[(&str, &[u8])]) -> (String, Vec<u8>) {
+    let named: Vec<(&str, Option<&str>, &[u8])> = parts
+        .iter()
+        .map(|(name, data)| (*name, (*name != "request").then_some(*name), *data))
+        .collect();
+    multipart_named(&named)
+}
+
+/// [`multipart`] with each part's file name given (`None`: no file name).
+pub fn multipart_named(parts: &[(&str, Option<&str>, &[u8])]) -> (String, Vec<u8>) {
+    let mut body = Vec::new();
+    for (name, file_name, data) in parts {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        let disposition = match file_name {
+            Some(f) => {
+                format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{f}\"\r\n")
+            }
+            None => format!("Content-Disposition: form-data; name=\"{name}\"\r\n"),
+        };
+        body.extend_from_slice(disposition.as_bytes());
+        let content_type = if *name == "request" {
+            "application/json"
+        } else {
+            "application/octet-stream"
+        };
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={BOUNDARY}"), body)
+}
+
+/// `n` bytes from `seed` onward, never holding the boundary.
+fn filler(n: usize, seed: u8) -> impl Iterator<Item = u8> {
+    (0..n).map(move |i| seed.wrapping_add((i % 251) as u8))
+}
+
+/// A file of `bytes` bytes (at least 16) that starts like a PNG.
+pub fn png(bytes: usize) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    let rest = bytes.saturating_sub(out.len());
+    out.extend(filler(rest, 3));
+    out
+}
+
+/// A small file that starts like a JPEG.
+pub fn jpeg() -> Vec<u8> {
+    let mut out = b"\xff\xd8\xff\xe0\0\x10JFIF\0".to_vec();
+    out.extend(filler(200, 7));
+    out
+}
+
+/// A file of `bytes` bytes (at least 16) that starts like an MP4.
+pub fn mp4(bytes: usize) -> Vec<u8> {
+    let mut out = b"\0\0\0\x18ftypmp42\0\0\0\0".to_vec();
+    let rest = bytes.saturating_sub(out.len());
+    out.extend(filler(rest, 11));
+    out
+}
+
+/// A request part for `repo` with no attachments: main idea "Fix the
+/// zoom\n\nThe page is too big.", kind `bug`, a new submission id.
+pub fn request_json(repo: RepoId, send_as: &str) -> Value {
+    json!({
+        "submission_id": SubmissionId::new(),
+        "main_idea": "Fix the zoom\n\nThe page is too big.",
+        "kind": "bug",
+        "repo_id": repo,
+        "send_as": send_as,
+        "app_version": "0.1.0",
+        "platform": "macos",
+        "attachments": [],
+    })
+}
 
 const FAKE_GH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/bin/fake-gh");
 const FAKE_AGENT_BROWSER: &str =

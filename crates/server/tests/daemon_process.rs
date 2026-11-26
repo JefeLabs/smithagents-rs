@@ -321,6 +321,24 @@ async fn daemon_exits_and_removes_lockfile_on_sigterm() {
 }
 
 #[tokio::test]
+async fn feedback_leftovers_are_removed_when_the_daemon_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let paths = Paths { home: home.clone() };
+    let upload = paths.feedback_tmp_dir().join("x").join("upload");
+    std::fs::create_dir_all(&upload).unwrap();
+    std::fs::write(upload.join("file-1"), b"left by a crashed run").unwrap();
+
+    let mut daemon = Daemon::spawn(tmp.path(), "daemon", &home, &[], None);
+    daemon.wait_for_lockfile(&home).await;
+
+    let left: Vec<_> = std::fs::read_dir(paths.feedback_tmp_dir())
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}; log:\n{}", daemon.log_text());
+}
+
+#[tokio::test]
 async fn unknown_flag_is_a_usage_error() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");

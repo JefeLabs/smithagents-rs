@@ -23,7 +23,7 @@ use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::harness::{
     Harness, HarnessError, HarnessEvent, StructuredRequest, StructuredResult, TurnRequest,
 };
-use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
+use smithagents_server::intents::{CreateExtras, IntentError, IntentService, PolishRunner};
 use smithagents_server::paths::Paths;
 use smithagents_server::polish::MAX_SEED_BYTES;
 use smithagents_server::service::AgentService;
@@ -2400,10 +2400,8 @@ impl Fx {
         (self.agents.add_repo(&dir).await.unwrap(), dir)
     }
 
-    /// A text intent polished by the fake harness and reviewed to
-    /// `Complete`, then given `base_branch` and `origin` as Submit stores
-    /// them. They are written through the store: the call that creates an
-    /// intent with them comes with the submit route.
+    /// A text intent created with `base_branch` and `origin` as Submit
+    /// creates it, polished by the fake harness and reviewed to `Complete`.
     async fn complete_intent(
         &self,
         repo: &Repo,
@@ -2411,7 +2409,25 @@ impl Fx {
         origin: Option<FeedbackOrigin>,
     ) -> Intent {
         self.h.script(vec![pass1("Fix the zoom", 0), pass2(&[])]);
-        let i = self.text_intent(repo).await;
+        let extras = CreateExtras {
+            base_branch: base_branch.map(Into::into),
+            origin: origin.clone(),
+            ..CreateExtras::default()
+        };
+        let i = self
+            .svc
+            .create_with(
+                CreateIntentRequest {
+                    kind: None,
+                    repo_id: Some(repo.id),
+                    seed: SeedInput::Text("make it faster".into()),
+                },
+                extras,
+            )
+            .await
+            .unwrap();
+        assert_eq!(i.base_branch.as_deref(), base_branch);
+        assert_eq!(i.origin, origin);
         let r = self.wait_phase(i.id, Phase::Review).await;
         let c = &r.content;
         let items: Vec<ItemId> = c
@@ -2427,11 +2443,11 @@ impl Fx {
                 .await
                 .unwrap();
         }
-        let mut done = self.svc.get(i.id).await.unwrap();
+        let done = self.svc.get(i.id).await.unwrap();
         assert_eq!(done.state, IntentState::Complete);
-        done.base_branch = base_branch.map(Into::into);
-        done.origin = origin;
-        self.store.save_intent(&done).await.unwrap();
+        // Polish and review kept them.
+        assert_eq!(done.base_branch.as_deref(), base_branch);
+        assert_eq!(done.origin, origin);
         done
     }
 

@@ -15,7 +15,7 @@ use crate::link::LinkError;
 use crate::model::{Connection, ShellModel};
 use crate::view_models::{
     capitalized, one_line, state_dot, state_kind, state_label, DotStyle, DAEMON_UNREACHABLE_TEXT,
-    NOT_CONNECTED_TEXT,
+    FILE_UNREADABLE_TEXT, NOT_CONNECTED_TEXT,
 };
 
 // ---- Kinds -------------------------------------------------------------------
@@ -646,6 +646,7 @@ pub fn intent_error_text(error: &LinkError) -> String {
         LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }
+        LinkError::Client(ClientError::File(_)) => FILE_UNREADABLE_TEXT.to_owned(),
         LinkError::Client(ClientError::Api { code, message, .. }) => match intent_code_text(code) {
             Some(text) => text.to_owned(),
             None => {

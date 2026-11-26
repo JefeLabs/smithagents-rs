@@ -745,6 +745,10 @@ pub fn repo_rows(repos: &[Repo], settings: Option<&FeedbackSettings>) -> Vec<Rep
 /// transport detail.
 pub const DAEMON_UNREACHABLE_TEXT: &str = "Could not reach the daemon";
 
+/// What a failed upload says when a local file to send could not be opened
+/// (nothing was sent).
+pub const FILE_UNREADABLE_TEXT: &str = "A file to upload could not be opened";
+
 /// A failed add as one line under the path field.
 ///
 /// A daemon answer with a known code reads as our own sentence (the daemon's
@@ -764,6 +768,7 @@ pub fn repo_error_text(error: &LinkError) -> String {
         LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }
+        LinkError::Client(ClientError::File(_)) => FILE_UNREADABLE_TEXT.to_owned(),
     }
 }
 

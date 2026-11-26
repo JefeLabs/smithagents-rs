@@ -231,6 +231,9 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
         plugins.clone(),
         paths.clone(),
     );
+    // Uploads and worktrees of submissions a previous daemon did not finish.
+    // Only one daemon runs per home, and none is served yet.
+    feedback.remove_leftovers().await;
     let state = AppState {
         service: service.clone(),
         intents,

@@ -789,6 +789,17 @@ fn transport_errors_are_unreachable() {
 }
 
 #[test]
+fn a_file_that_could_not_be_opened_is_not_a_daemon_error() {
+    let file = LinkError::Client(smithagents_client::ClientError::File(
+        std::io::ErrorKind::NotFound.into(),
+    ));
+    assert_eq!(
+        intent_error_text(&file),
+        "A file to upload could not be opened"
+    );
+}
+
+#[test]
 fn queue_limit_labels() {
     assert_eq!(queue_limit_label(None), "No limit");
     assert_eq!(queue_limit_label(Some(0)), "No limit");

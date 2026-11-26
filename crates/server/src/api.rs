@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
+use axum::extract::multipart::MultipartRejection;
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
 use axum::http::{header, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -27,7 +28,7 @@ use serde::Deserialize;
 use serde_json::json;
 use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo};
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::feedback::FeedbackSettings;
+use smithagents_core::feedback::{FeedbackOutcome, FeedbackSettings, FeedbackTargets};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, MessageId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentState,
@@ -40,7 +41,7 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::events::{BusError, EventBus, Subscription};
-use crate::feedback::{FeedbackError, FeedbackService};
+use crate::feedback::{upload, FeedbackError, FeedbackService};
 use crate::git::GitError;
 use crate::intents::{IntentError, IntentService};
 use crate::plugins::{clean_message, ManagerError, PluginManager};
@@ -98,6 +99,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/settings/feedback",
             get(get_feedback_settings).put(put_feedback_settings),
+        )
+        .route("/v1/feedback/targets", get(feedback_targets))
+        // Inside the router's 1 MiB limit, so it replaces it for this route.
+        .route(
+            "/v1/feedback",
+            post(submit_feedback)
+                .layer(DefaultBodyLimit::max(state.feedback.limits().body_limit())),
         )
         .route("/v1/plugins", get(list_plugins))
         .route("/v1/plugins/{id}", get(get_plugin))
@@ -182,23 +190,49 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The status and code an agent-service error answers with.
+fn service_error_parts(e: &ServiceError) -> (StatusCode, &'static str) {
+    use StatusCode as S;
+    match e {
+        ServiceError::RepoNotFound => (S::NOT_FOUND, "repo_not_found"),
+        ServiceError::AgentNotFound => (S::NOT_FOUND, "agent_not_found"),
+        ServiceError::AgentClosed => (S::CONFLICT, "agent_closed"),
+        ServiceError::TurnInProgress => (S::CONFLICT, "turn_in_progress"),
+        ServiceError::Git(GitError::PathNotFound(_)) => (S::BAD_REQUEST, "path_not_found"),
+        ServiceError::Git(GitError::NotAGitRepo) => (S::BAD_REQUEST, "not_a_git_repo"),
+        ServiceError::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
+        ServiceError::Git(GitError::NoDefaultBranch) => (S::BAD_REQUEST, "no_default_branch"),
+        ServiceError::Git(GitError::BranchExists(_)) => (S::CONFLICT, "branch_exists"),
+        ServiceError::Git(_) => (S::INTERNAL_SERVER_ERROR, "git_error"),
+        ServiceError::Store(StoreError::DuplicateRepoPath) => (S::CONFLICT, "repo_exists"),
+        ServiceError::Store(_) => (S::INTERNAL_SERVER_ERROR, "store_error"),
+    }
+}
+
+/// The status and code an intent error answers with, wherever it is
+/// answered (a wrapped agent-service error keeps that error's own).
+pub(crate) fn intent_error_parts(e: &IntentError) -> (StatusCode, &'static str) {
+    use StatusCode as S;
+    let status = match e {
+        IntentError::Service(inner) => return service_error_parts(inner),
+        IntentError::NotFound | IntentError::RepoNotFound | IntentError::AgentNotFound => {
+            S::NOT_FOUND
+        }
+        IntentError::InvalidState { .. }
+        | IntentError::Polishing
+        | IntentError::AlreadyAnswered
+        | IntentError::DependencyCycle
+        | IntentError::DependencyCrossRepo
+        | IntentError::EvidenceInRepo => S::CONFLICT,
+        IntentError::Invalid(_) => S::BAD_REQUEST,
+        IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
+    };
+    (status, e.code())
+}
+
 impl From<ServiceError> for ApiError {
     fn from(e: ServiceError) -> Self {
-        use StatusCode as S;
-        let (status, code) = match &e {
-            ServiceError::RepoNotFound => (S::NOT_FOUND, "repo_not_found"),
-            ServiceError::AgentNotFound => (S::NOT_FOUND, "agent_not_found"),
-            ServiceError::AgentClosed => (S::CONFLICT, "agent_closed"),
-            ServiceError::TurnInProgress => (S::CONFLICT, "turn_in_progress"),
-            ServiceError::Git(GitError::PathNotFound(_)) => (S::BAD_REQUEST, "path_not_found"),
-            ServiceError::Git(GitError::NotAGitRepo) => (S::BAD_REQUEST, "not_a_git_repo"),
-            ServiceError::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
-            ServiceError::Git(GitError::NoDefaultBranch) => (S::BAD_REQUEST, "no_default_branch"),
-            ServiceError::Git(GitError::BranchExists(_)) => (S::CONFLICT, "branch_exists"),
-            ServiceError::Git(_) => (S::INTERNAL_SERVER_ERROR, "git_error"),
-            ServiceError::Store(StoreError::DuplicateRepoPath) => (S::CONFLICT, "repo_exists"),
-            ServiceError::Store(_) => (S::INTERNAL_SERVER_ERROR, "store_error"),
-        };
+        let (status, code) = service_error_parts(&e);
         if status.is_server_error() {
             tracing::error!("request failed: {e}");
         }
@@ -208,27 +242,11 @@ impl From<ServiceError> for ApiError {
 
 impl From<IntentError> for ApiError {
     fn from(e: IntentError) -> Self {
-        use StatusCode as S;
-        if let IntentError::Service(inner) = e {
-            return inner.into();
-        }
-        let status = match &e {
-            IntentError::NotFound | IntentError::RepoNotFound | IntentError::AgentNotFound => {
-                S::NOT_FOUND
-            }
-            IntentError::InvalidState { .. }
-            | IntentError::Polishing
-            | IntentError::AlreadyAnswered
-            | IntentError::DependencyCycle
-            | IntentError::DependencyCrossRepo => S::CONFLICT,
-            IntentError::Invalid(_) => S::BAD_REQUEST,
-            IntentError::Service(_) => unreachable!("handled above"),
-            IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
-        };
+        let (status, code) = intent_error_parts(&e);
         if status.is_server_error() {
             tracing::error!("request failed: {e}");
         }
-        Self::new(status, e.code(), e.to_string())
+        Self::new(status, code, e.to_string())
     }
 }
 
@@ -1087,6 +1105,26 @@ async fn put_feedback_settings(
         .map(Json)
 }
 
+async fn feedback_targets(State(s): State<AppState>) -> Result<Json<FeedbackTargets>, ApiError> {
+    Ok(Json(s.feedback.targets().await?))
+}
+
+/// The upload is staged here, so a request that ends or is dropped while it
+/// streams takes its files with it; the commit and what follows run
+/// detached, so once they start, a client that goes away cannot stop them
+/// half-way.
+async fn submit_feedback(
+    State(s): State<AppState>,
+    multipart: Result<Multipart, MultipartRejection>,
+) -> Result<Json<FeedbackOutcome>, ApiError> {
+    let multipart = multipart.map_err(|_| upload::not_multipart())?;
+    let svc = s.feedback;
+    let staged = upload::stage(multipart, &svc.staging_root(), &svc.limits()).await?;
+    detached(async move { svc.submit(staged).await })
+        .await
+        .map(Json)
+}
+
 // ------------------------------------------------------------- websocket
 
 #[derive(Deserialize)]
@@ -1207,12 +1245,13 @@ mod tests {
             IntentError::Invalid(_) => "Invalid",
             IntentError::DependencyCycle => "DependencyCycle",
             IntentError::DependencyCrossRepo => "DependencyCrossRepo",
+            IntentError::EvidenceInRepo => "EvidenceInRepo",
             IntentError::Service(_) => "Service",
             IntentError::Store(_) => "Store",
         }
     }
 
-    const VARIANTS: [&str; 11] = [
+    const VARIANTS: [&str; 12] = [
         "NotFound",
         "RepoNotFound",
         "AgentNotFound",
@@ -1222,6 +1261,7 @@ mod tests {
         "Invalid",
         "DependencyCycle",
         "DependencyCrossRepo",
+        "EvidenceInRepo",
         "Service",
         "Store",
     ];
@@ -1272,6 +1312,7 @@ mod tests {
                 S::CONFLICT,
                 "dependency_cross_repo",
             ),
+            (IntentError::EvidenceInRepo, S::CONFLICT, "evidence_in_repo"),
             // A wrapped agent-service error keeps that error's own mapping.
             (
                 IntentError::Service(ServiceError::TurnInProgress),
@@ -1300,6 +1341,140 @@ mod tests {
 
         for (e, status, code) in cases {
             let message = e.to_string();
+            let api = ApiError::from(e);
+            assert_eq!((api.status, api.code), (status, code), "{message}");
+            assert_eq!(api.message, message);
+        }
+    }
+
+    /// Exhaustive on purpose, as [`variant`] is.
+    fn feedback_variant(e: &FeedbackError) -> &'static str {
+        match e {
+            FeedbackError::RepoNotFound => "RepoNotFound",
+            FeedbackError::Store(_) => "Store",
+            FeedbackError::DefaultBranchMissing(_) => "DefaultBranchMissing",
+            FeedbackError::GitIdentityMissing => "GitIdentityMissing",
+            FeedbackError::Git { .. } => "Git",
+            FeedbackError::NoFreeName => "NoFreeName",
+            FeedbackError::NameTaken => "NameTaken",
+            FeedbackError::FolderBlocked(_) => "FolderBlocked",
+            FeedbackError::BranchBlocked(_) => "BranchBlocked",
+            FeedbackError::Io(_) => "Io",
+            FeedbackError::Invalid(_) => "Invalid",
+            FeedbackError::UnsupportedFile(_) => "UnsupportedFile",
+            FeedbackError::TooLarge(_) => "TooLarge",
+            FeedbackError::ToolMissing(_) => "ToolMissing",
+            FeedbackError::Intent(_) => "Intent",
+        }
+    }
+
+    #[test]
+    fn every_feedback_error_maps_to_a_fixed_status_code_and_sentence() {
+        use StatusCode as S;
+        let io = std::io::Error::new(std::io::ErrorKind::InvalidInput, "a name is not safe");
+        let cases = [
+            (FeedbackError::RepoNotFound, S::NOT_FOUND, "repo_not_found", "repo not found"),
+            (
+                FeedbackError::Store(StoreError::Conflict("taken".into())),
+                S::INTERNAL_SERVER_ERROR,
+                "store_error",
+                "conflict: taken",
+            ),
+            (
+                FeedbackError::DefaultBranchMissing("main".into()),
+                S::CONFLICT,
+                "default_branch_missing",
+                "the repository's default branch main does not exist locally",
+            ),
+            (
+                FeedbackError::GitIdentityMissing,
+                S::CONFLICT,
+                "git_identity_missing",
+                "git has no user.name and user.email set for this repository",
+            ),
+            (
+                FeedbackError::Git {
+                    step: "commit the files",
+                    status: Some(1),
+                },
+                S::INTERNAL_SERVER_ERROR,
+                "git_failed",
+                "git could not commit the files (exit status 1)",
+            ),
+            (
+                FeedbackError::NoFreeName,
+                S::CONFLICT,
+                "no_free_name",
+                "99 issue folders with this name already exist",
+            ),
+            (
+                FeedbackError::NameTaken,
+                S::CONFLICT,
+                "name_taken",
+                "an issue folder or branch of this name was created meanwhile; submit again",
+            ),
+            (
+                FeedbackError::FolderBlocked("docs".into()),
+                S::CONFLICT,
+                "folder_blocked",
+                "docs is a file in this repository, so feedback cannot be stored there.",
+            ),
+            (
+                FeedbackError::BranchBlocked("feedback".into()),
+                S::CONFLICT,
+                "branch_blocked",
+                "a branch named feedback exists in this repository, so no branch can be created under feedback/",
+            ),
+            (
+                FeedbackError::Io(io),
+                S::INTERNAL_SERVER_ERROR,
+                "io_error",
+                "could not prepare the issue folder: a name is not safe",
+            ),
+            (
+                FeedbackError::Invalid("the main idea is empty".into()),
+                S::BAD_REQUEST,
+                "invalid",
+                "the main idea is empty",
+            ),
+            (
+                FeedbackError::UnsupportedFile("screenshot 1 is not a png file".into()),
+                S::BAD_REQUEST,
+                "unsupported_file",
+                "screenshot 1 is not a png file",
+            ),
+            (
+                FeedbackError::TooLarge("the submission is larger than 100 MB".into()),
+                S::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "the submission is larger than 100 MB",
+            ),
+            (
+                FeedbackError::ToolMissing("agent-browser is not installed".into()),
+                S::CONFLICT,
+                "tool_missing",
+                "agent-browser is not installed",
+            ),
+            // The intent service's own code and status, also of an error it wraps.
+            (
+                FeedbackError::Intent(IntentError::NotFound),
+                S::NOT_FOUND,
+                "intent_not_found",
+                "intent not found",
+            ),
+            (
+                FeedbackError::Intent(IntentError::Service(ServiceError::TurnInProgress)),
+                S::CONFLICT,
+                "turn_in_progress",
+                &ServiceError::TurnInProgress.to_string(),
+            ),
+        ];
+        let covered: std::collections::BTreeSet<&str> =
+            cases.iter().map(|(e, ..)| feedback_variant(e)).collect();
+        assert_eq!(covered.len(), 15, "{covered:?}");
+
+        for (e, status, code, message) in cases {
+            assert_eq!((e.status(), e.code()), (status, code), "{message}");
             let api = ApiError::from(e);
             assert_eq!((api.status, api.code), (status, code), "{message}");
             assert_eq!(api.message, message);

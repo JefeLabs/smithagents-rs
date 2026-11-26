@@ -7,10 +7,11 @@
 use std::fmt;
 use std::future::ready;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
+use reqwest::multipart::{Form, Part};
 use reqwest::RequestBuilder;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,9 @@ use serde_json::json;
 use smithagents_core::agent::{Agent, ChatMessage, Repo};
 use smithagents_core::daemon::DaemonInfo;
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::feedback::FeedbackSettings;
+use smithagents_core::feedback::{
+    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets,
+};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentVersion, Patch,
@@ -73,6 +76,18 @@ pub enum ClientError {
     /// The events WebSocket could not be opened.
     #[error("event stream failed: {0}")]
     Ws(#[from] tungstenite::Error),
+    /// A local file to upload could not be opened. Nothing was sent.
+    #[error("could not open a file to upload: {0}")]
+    File(#[source] io::Error),
+}
+
+/// A file of a feedback upload: the local file at `path`, sent as the part
+/// `part` (`file-<i>` or `annotated-<i>`, `i` the attachment's 1-based
+/// position). The local file name is never sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackFile {
+    pub part: String,
+    pub path: PathBuf,
 }
 
 /// A client for one daemon, as described by its lockfile. Cheap to clone.
@@ -320,6 +335,36 @@ impl Client {
                 .json(settings),
         )
         .await
+    }
+
+    /// The repositories Submit can choose from, the meta repository and
+    /// whether `gh` and `agent-browser` are ready.
+    pub async fn feedback_targets(&self) -> Result<FeedbackTargets, ClientError> {
+        self.fetch(self.http.get(self.url("/v1/feedback/targets")))
+            .await
+    }
+
+    /// `POST /v1/feedback`: the part `request` (JSON) first, then each file,
+    /// streamed from disk and named by its part (its own name stays here).
+    /// No timeout: an upload of up to 100 MB and a commit can take long.
+    /// Sending the same request again continues it (see the daemon).
+    pub async fn submit_feedback(
+        &self,
+        request: &FeedbackRequest,
+        files: &[FeedbackFile],
+    ) -> Result<FeedbackOutcome, ClientError> {
+        // Strings, numbers (a NaN is `null`), booleans and lists: nothing to fail.
+        let json = serde_json::to_string(request).expect("a feedback request serializes");
+        let mut form = Form::new().part("request", Part::text(json).mime_str("application/json")?);
+        for file in files {
+            let part = Part::file(&file.path)
+                .await
+                .map_err(ClientError::File)?
+                .file_name(file.part.clone());
+            form = form.part(file.part.clone(), part);
+        }
+        self.fetch(self.http.post(self.url("/v1/feedback")).multipart(form))
+            .await
     }
 
     /// `/v1/plugins/<segments>?<params>`, each segment percent-encoded, so an
