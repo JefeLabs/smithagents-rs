@@ -2278,6 +2278,43 @@ async fn create_with_a_kind_survives_pass_one() {
 }
 
 #[tokio::test]
+async fn a_kind_patched_after_a_failed_pass_one_survives_the_retry() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    f.h.script(vec![Err(HarnessError::Timeout)]);
+    let i = f
+        .svc
+        .create(CreateIntentRequest {
+            kind: Some(IntentKind::Bug),
+            repo_id: Some(repo.id),
+            seed: SeedInput::Text("the build breaks".into()),
+        })
+        .await
+        .unwrap();
+    f.wait(i.id, is_failed).await;
+    let patched = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                kind: Some(IntentKind::Refactor),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.content.kind, IntentKind::Refactor);
+    assert_eq!(patched.seed.kind, Some(IntentKind::Refactor));
+
+    f.h.script(vec![pass1("Split the build", 1)]);
+    f.svc.retry_polish(i.id).await.unwrap();
+    let q = f.wait_phase(i.id, Phase::Questions).await;
+    assert_eq!(q.content.kind, IntentKind::Refactor);
+    let prompt = f.h.calls().last().unwrap().prompt.clone();
+    assert!(prompt.contains("the user chose refactor"), "{prompt}");
+}
+
+#[tokio::test]
 async fn create_without_a_kind_takes_the_polished_kind() {
     let f = real_fx().await;
     let repo = f.repo("r1").await;

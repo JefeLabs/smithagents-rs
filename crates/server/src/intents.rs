@@ -558,6 +558,9 @@ impl IntentService {
         }
         if let Some(k) = patch.kind {
             intent.content.kind = k;
+            // Pass 1 (and its retry) keeps the seed's kind, so the user's
+            // choice must land there too.
+            intent.seed.kind = Some(k);
         }
         if let Some(b) = patch.current_behavior {
             intent.content.current_behavior = b;
