@@ -95,19 +95,20 @@ impl IntentsPane {
         model.intent(id).map(|intent| body_text(intent).to_owned())
     }
 
-    /// The detail's parts below the body, in order; Tasks 8 to 10 fill them.
-    /// Empty while the phase is Polishing.
+    /// The detail's parts below the body, in order: the review sections
+    /// ([`super::sections`]). Empty while the phase is Polishing.
     pub(crate) fn detail_sections(
         &self,
         intent: &Intent,
-        _: &Paint,
-        _: &Context<Self>,
+        paint: &Paint,
+        cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         if polishing(intent) {
             return Vec::new();
         }
-        // Tasks 8 and 9 draw the sections here.
-        Vec::new()
+        self.review_sections(intent, paint, cx)
+            .into_iter()
+            .collect()
     }
 
     /// The bar fixed at the bottom of the detail; Task 10 fills it. `None`

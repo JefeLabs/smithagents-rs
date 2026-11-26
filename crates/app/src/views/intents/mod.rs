@@ -3,8 +3,9 @@
 //! ([`ShellState::right_entry`]).
 //!
 //! The pane shows one [`Screen`] at a time: the list ([`list`]), the create
-//! screen ([`create`]) or an intent's detail ([`detail`]). The filter, and
-//! the create screen's text, live in the pane, so they reset when the app
+//! screen ([`create`]) or an intent's detail ([`detail`], with its review
+//! sections in [`sections`]). The filter, the create screen's text and which
+//! detail sections are open live in the pane, so they reset when the app
 //! restarts.
 //!
 //! Every daemon command goes through [`IntentsPane::run`]: one at a time, so
@@ -28,6 +29,7 @@
 mod create;
 mod detail;
 mod list;
+mod sections;
 
 pub use create::{
     create_repo_item_id, kind_row_id, ChooseBug, ChooseEnhancement, ChooseMaintenance,
@@ -39,6 +41,10 @@ pub use detail::{
     kind_item_id, DETAIL_BACK_ID, DETAIL_BODY_ID, DETAIL_KIND_ID, DETAIL_SCROLL_ID, DETAIL_SLUG_ID,
     DETAIL_STATE_ID, DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, POLISHING_ID, POLISH_FAILED_ID,
     RETRY_ID,
+};
+pub use sections::{
+    question_card_id, question_option_id, question_skip_id, section_counter_id, section_header_id,
+    section_status_id, QUESTION_ANSWER_ID,
 };
 
 use std::collections::HashMap;
@@ -55,10 +61,10 @@ use gpui_kit::{
     TestSupportExt as _, Window,
 };
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
-use smithagents_core::intent::{Intent, IntentKind};
+use smithagents_core::intent::{AnswerInput, Intent, IntentKind};
 use smithagents_theme::native::NativeTheme;
 
-use crate::intent_vm::{header_editable, intent_error_text, IntentFilterChoice};
+use crate::intent_vm::{header_editable, intent_error_text, IntentFilterChoice, SectionKind};
 use crate::link::{IntentAnswer, IntentCommands, LinkError};
 use crate::model::Connection;
 use crate::shell::INTENTS_PANEL;
@@ -173,6 +179,12 @@ pub struct IntentsPane {
     title_focus: FocusHandle,
     title_input: Entity<InputState>,
     editing_title: Option<IntentId>,
+    /// The detail's sections the user opened or closed, or answered in (kept
+    /// open); the others follow `SectionVm::starts_open`.
+    section_toggles: HashMap<(IntentId, SectionKind), bool>,
+    /// The answer of the `Busy::Question` in flight, whose button shows the
+    /// spinner.
+    pressed_answer: Option<AnswerInput>,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -230,6 +242,8 @@ impl IntentsPane {
             title_focus: cx.focus_handle().tab_stop(true),
             title_input,
             editing_title: None,
+            section_toggles: HashMap::new(),
+            pressed_answer: None,
             _age_refresh: refresh_ages(cx),
             _subscriptions: subscriptions,
         }

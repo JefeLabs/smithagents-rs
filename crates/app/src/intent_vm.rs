@@ -378,7 +378,7 @@ pub fn list_empty_text(model: &ShellModel, filter: IntentFilterChoice) -> Option
 // ---- Detail ------------------------------------------------------------------
 
 /// The review sections of the detail screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectionKind {
     Questions,
     Preconditions,

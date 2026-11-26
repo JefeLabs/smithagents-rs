@@ -24,30 +24,23 @@ use gpui_kit::base::Root;
 use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{px, AppContext as _, ElementId, Entity, Role, TestAppContext, WindowHandle};
-use smithagents_app::intent_vm::KIND_CHOICES;
+use smithagents_app::intent_vm::{SectionKind, KIND_CHOICES};
 use smithagents_app::model::Action;
 use smithagents_app::shell::{Shell, ShellOptions};
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::view_models::DAEMON_SILENT_TEXT;
 use smithagents_app::views::intents::{
-    intent_card_id, kind_item_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, DETAIL_BODY_ID,
-    DETAIL_KIND_ID, DETAIL_SCROLL_ID, DETAIL_SLUG_ID, DETAIL_STATE_ID, DETAIL_TITLE_ID,
-    DETAIL_TITLE_INPUT_ID, INTENT_ERROR_ID, INTENT_LIST_ID, POLISHING_ID, POLISH_FAILED_ID,
-    RETRY_ID,
+    intent_card_id, kind_item_id, section_header_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID,
+    DETAIL_BODY_ID, DETAIL_KIND_ID, DETAIL_SCROLL_ID, DETAIL_SLUG_ID, DETAIL_STATE_ID,
+    DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, INTENT_ERROR_ID, INTENT_LIST_ID, POLISHING_ID,
+    POLISH_FAILED_ID, RETRY_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_core::intent::{Intent, IntentKind, IntentState, Patch, Phase};
 
-/// The Send button's id (Task 10 draws it) and the section headers' ids
-/// (Task 8), spelled out here so the polishing test holds once they exist.
+/// The Send button's id (Task 10 draws it), spelled out here so the
+/// polishing test holds once it exists.
 const SEND_ID: &str = "intent-send";
-const SECTION_HEADER_IDS: [&str; 5] = [
-    "intent-section-questions",
-    "intent-section-preconditions",
-    "intent-section-criteria",
-    "intent-section-stories",
-    "intent-section-depends_on",
-];
 
 /// The shell with the Intents pane on screen.
 struct Opened {
@@ -752,8 +745,8 @@ fn polishing_shows_the_pass_and_no_review_controls(cx: &mut TestAppContext) {
     );
     assert!(!is_drawn(cx, window, POLISH_FAILED_ID));
     assert!(!is_drawn(cx, window, SEND_ID));
-    for header in SECTION_HEADER_IDS {
-        assert!(!is_drawn(cx, window, header), "{header}");
+    for kind in SectionKind::ALL {
+        assert!(!is_drawn(cx, window, section_header_id(kind)), "{kind:?}");
     }
     assert_eq!(
         body_source(cx, &opened).as_deref(),
@@ -764,6 +757,9 @@ fn polishing_shows_the_pass_and_no_review_controls(cx: &mut TestAppContext) {
     let review = changed(&polishing, |i| i.phase = Phase::Review);
     upsert(cx, &opened, &review);
     assert!(!is_drawn(cx, window, POLISHING_ID));
+    for kind in SectionKind::ALL {
+        assert!(is_drawn(cx, window, section_header_id(kind)), "{kind:?}");
+    }
 }
 
 #[gpui_kit::test]
