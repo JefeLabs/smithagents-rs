@@ -60,3 +60,8 @@ required-features = ["test-util"]
 name = "queue"
 path = "tests/queue.rs"
 required-features = ["test-util"]
+
+[[test]]
+name = "plugin_store"
+path = "tests/plugin_store.rs"
+required-features = ["test-util"]

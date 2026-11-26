@@ -214,7 +214,9 @@ impl ShellModel {
             EventKind::MessageAppended(_)
             | EventKind::TurnDelta { .. }
             | EventKind::IntentCreated(_)
-            | EventKind::IntentUpdated(_) => false,
+            | EventKind::IntentUpdated(_)
+            | EventKind::PluginUpdated(_)
+            | EventKind::ResourceSynced { .. } => false,
         }
     }
 

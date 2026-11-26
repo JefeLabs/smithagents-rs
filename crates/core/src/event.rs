@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{Agent, ChatMessage};
 use crate::ids::AgentId;
 use crate::intent::Intent;
+use crate::plugin::PluginStatus;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -20,18 +21,31 @@ pub struct Event {
 pub enum EventKind {
     AgentCreated(Agent),
     AgentUpdated(Agent),
-    AgentClosed { agent_id: AgentId },
+    AgentClosed {
+        agent_id: AgentId,
+    },
     MessageAppended(ChatMessage),
-    TurnDelta { agent_id: AgentId, text: String },
+    TurnDelta {
+        agent_id: AgentId,
+        text: String,
+    },
     IntentCreated(Intent),
     IntentUpdated(Intent),
+    PluginUpdated(PluginStatus),
+    ResourceSynced {
+        plugin_id: String,
+        resource: String,
+        upserted: u32,
+        deleted: u32,
+        at: DateTime<Utc>,
+    },
 }
 
 impl EventKind {
     /// The `type` of every kind this version knows. A client meeting another
     /// one (sent by a newer daemon) can skip that event. Tests check that it
     /// matches [`EventKind::type_name`] of every kind.
-    pub const TYPES: [&'static str; 7] = [
+    pub const TYPES: [&'static str; 9] = [
         "agent_created",
         "agent_updated",
         "agent_closed",
@@ -39,6 +53,8 @@ impl EventKind {
         "turn_delta",
         "intent_created",
         "intent_updated",
+        "plugin_updated",
+        "resource_synced",
     ];
 
     /// The `type` this kind is sent with.
@@ -51,6 +67,8 @@ impl EventKind {
             EventKind::TurnDelta { .. } => "turn_delta",
             EventKind::IntentCreated(_) => "intent_created",
             EventKind::IntentUpdated(_) => "intent_updated",
+            EventKind::PluginUpdated(_) => "plugin_updated",
+            EventKind::ResourceSynced { .. } => "resource_synced",
         }
     }
 }
@@ -66,6 +84,7 @@ mod tests {
     use crate::ids::{MessageId, RepoId};
     use crate::intent::{Content, IntentKind, IntentState, Phase, Seed, SeedSource};
     use crate::palette::AgentColor;
+    use crate::plugin::{PluginState, ResourceStatus, SettingField};
 
     const AGENT_ID: &str = "6f1d3a52-8c4e-4b7a-9e21-0d5c7f3b9a10";
     const REPO_ID: &str = "2b7e9c41-5d3a-4f68-8a1c-7e4b0d9f2c35";
@@ -132,6 +151,41 @@ mod tests {
 
     const INTENT_JSON: &str = r#"{"id":"4a8d2f60-1b3c-4e57-b9d4-6c0e8a2f7d13","repo_id":"2b7e9c41-5d3a-4f68-8a1c-7e4b0d9f2c35","slug":"t","state":"draft","phase":{"kind":"questions"},"seed":{"source":"text","text":"s"},"content":{"title":"T","kind":"task","current_behavior":"","questions":[],"preconditions":[],"criteria":[],"stories":[],"depends_on":[]},"agent_id":null,"created_at":"2026-11-24T09:00:00Z","updated_at":"2026-11-24T09:00:00Z","queued_at":null,"sent_at":null,"resolved_at":null,"last_start_error":null}"#;
 
+    fn plugin_status() -> PluginStatus {
+        PluginStatus {
+            id: "github".into(),
+            name: "GitHub".into(),
+            version: "1.0.0".into(),
+            host: "wasm".into(),
+            builtin: true,
+            enabled: true,
+            state: PluginState::NeedsAuth {
+                missing: vec!["token".into()],
+                message: "add a token".into(),
+            },
+            hosts: vec!["api.github.com".into()],
+            secrets: vec!["token".into()],
+            settings: vec![SettingField {
+                key: "org".into(),
+                label: "Org".into(),
+                kind: "string".into(),
+                required: false,
+            }],
+            resources: vec![ResourceStatus {
+                kind: "issues".into(),
+                label: "Issues".into(),
+                item_count: 4,
+                last_run_at: Some(time("2026-11-26T08:00:00Z")),
+                last_ok_at: None,
+                next_due_at: None,
+                last_error: None,
+                syncing: false,
+            }],
+        }
+    }
+
+    const PLUGIN_JSON: &str = r#"{"id":"github","name":"GitHub","version":"1.0.0","host":"wasm","builtin":true,"enabled":true,"state":{"kind":"needs_auth","missing":["token"],"message":"add a token"},"hosts":["api.github.com"],"secrets":["token"],"settings":[{"key":"org","label":"Org","kind":"string","required":false}],"resources":[{"kind":"issues","label":"Issues","item_count":4,"last_run_at":"2026-11-26T08:00:00Z","last_ok_at":null,"next_due_at":null,"last_error":null,"syncing":false}]}"#;
+
     /// One event of every kind, with the exact JSON the daemon sends for it.
     fn every_kind() -> Vec<(EventKind, String)> {
         let message = ChatMessage {
@@ -179,6 +233,20 @@ mod tests {
             (
                 EventKind::IntentUpdated(intent()),
                 format!(r#"{{"type":"intent_updated","data":{INTENT_JSON}}}"#),
+            ),
+            (
+                EventKind::PluginUpdated(plugin_status()),
+                format!(r#"{{"type":"plugin_updated","data":{PLUGIN_JSON}}}"#),
+            ),
+            (
+                EventKind::ResourceSynced {
+                    plugin_id: "github".into(),
+                    resource: "issues".into(),
+                    upserted: 2,
+                    deleted: 1,
+                    at: time("2026-11-26T08:00:00Z"),
+                },
+                r#"{"type":"resource_synced","data":{"plugin_id":"github","resource":"issues","upserted":2,"deleted":1,"at":"2026-11-26T08:00:00Z"}}"#.into(),
             ),
         ]
     }

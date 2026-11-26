@@ -1,4 +1,4 @@
-//! SQLite persistence for repos, agents, chat messages, intents and settings.
+//! SQLite persistence for repos, agents, chat messages, intents, settings and plugin data.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -8,6 +8,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo, Role};
 use smithagents_core::ids::{AgentId, IntentId, MessageId, RepoId};
 use smithagents_core::intent::{Intent, IntentFilter, IntentVersion};
+use smithagents_core::plugin::{ItemsPage, ResourceItem};
+use smithagents_plugin_protocol::SyncPage;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
@@ -21,6 +23,8 @@ pub enum StoreError {
     DuplicateRepoPath,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("malformed items cursor")]
+    BadCursor,
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
     #[error("database file: {0}")]
@@ -666,6 +670,379 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(message_from_row).collect()
+    }
+}
+
+/// Plugin settings kept for one plugin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginConfig {
+    pub enabled: bool,
+    pub settings: serde_json::Value,
+}
+
+/// Where one resource's sync stands. The default is "never ran".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SyncState {
+    pub cursor: Option<String>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub failures: u32,
+}
+
+const MAX_ITEMS_LIMIT: u32 = 200;
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || !s.len().is_multiple_of(2) || !s.is_ascii() {
+        return None;
+    }
+    s.as_bytes()
+        .chunks(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
+        .collect()
+}
+
+/// The opaque `next` token: hex of the JSON `[source_updated_at | null, item_id]`
+/// of the last row on the page.
+fn encode_cursor(updated: Option<&str>, item_id: &str) -> Result<String, StoreError> {
+    let json = serde_json::to_vec(&(updated, item_id)).map_err(corrupt)?;
+    Ok(hex(&json))
+}
+
+/// Parses a token from a client. Anything that is not exactly what
+/// `encode_cursor` makes, including a timestamp that does not parse, is
+/// `BadCursor`.
+fn decode_cursor(token: &str) -> Result<(Option<String>, String), StoreError> {
+    let bytes = unhex(token).ok_or(StoreError::BadCursor)?;
+    let (updated, id): (Option<String>, String) =
+        serde_json::from_slice(&bytes).map_err(|_| StoreError::BadCursor)?;
+    if let Some(u) = &updated {
+        // Re-normalise so the stored column's format is what gets compared.
+        let t = parse_ts(u).map_err(|_| StoreError::BadCursor)?;
+        return Ok((Some(ts(t)), id));
+    }
+    Ok((None, id))
+}
+
+fn like_pattern(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() + 2);
+    out.push('%');
+    for c in q.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+impl Store {
+    pub async fn plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, StoreError> {
+        let row =
+            sqlx::query("SELECT enabled, settings_json FROM plugin_config WHERE plugin_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|r| {
+            Ok(PluginConfig {
+                enabled: r.try_get::<i64, _>("enabled")? != 0,
+                settings: serde_json::from_str(r.try_get("settings_json")?).map_err(corrupt)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn set_plugin_config(&self, id: &str, cfg: &PluginConfig) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO plugin_config (plugin_id, enabled, settings_json) VALUES (?, ?, ?) \
+             ON CONFLICT (plugin_id) DO UPDATE SET enabled = excluded.enabled, \
+             settings_json = excluded.settings_json",
+        )
+        .bind(id)
+        .bind(i64::from(cfg.enabled))
+        .bind(serde_json::to_string(&cfg.settings).map_err(corrupt)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The saved state, or the default when the resource never ran.
+    pub async fn sync_state(&self, id: &str, resource: &str) -> Result<SyncState, StoreError> {
+        let row = sqlx::query("SELECT * FROM resource_sync WHERE plugin_id = ? AND resource = ?")
+            .bind(id)
+            .bind(resource)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| {
+            Ok(SyncState {
+                cursor: r.try_get("cursor")?,
+                last_run_at: opt_ts(&r, "last_run_at")?,
+                last_ok_at: opt_ts(&r, "last_ok_at")?,
+                last_error: r.try_get("last_error")?,
+                next_due_at: opt_ts(&r, "next_due_at")?,
+                failures: u32::try_from(r.try_get::<i64, _>("failures")?).map_err(corrupt)?,
+            })
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+    }
+
+    pub async fn save_sync_state(
+        &self,
+        id: &str,
+        resource: &str,
+        s: &SyncState,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO resource_sync (plugin_id, resource, cursor, last_run_at, last_ok_at, \
+             last_error, next_due_at, failures) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (plugin_id, resource) DO UPDATE SET cursor = excluded.cursor, \
+             last_run_at = excluded.last_run_at, last_ok_at = excluded.last_ok_at, \
+             last_error = excluded.last_error, next_due_at = excluded.next_due_at, \
+             failures = excluded.failures",
+        )
+        .bind(id)
+        .bind(resource)
+        .bind(s.cursor.as_deref())
+        .bind(s.last_run_at.map(ts))
+        .bind(s.last_ok_at.map(ts))
+        .bind(s.last_error.as_deref())
+        .bind(s.next_due_at.map(ts))
+        .bind(i64::from(s.failures))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One transaction: upserts, deletes and the new cursor. Returns
+    /// `(upserted, deleted)`, counting only rows that changed. An unchanged
+    /// row still takes the new `run_id` (so `delete_unseen` keeps it) but keeps
+    /// its `synced_at`. The page is assumed validated by the runtime.
+    pub async fn apply_page(
+        &self,
+        id: &str,
+        resource: &str,
+        run_id: &str,
+        page: &SyncPage,
+        at: DateTime<Utc>,
+    ) -> Result<(u32, u32), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut upserted = 0u32;
+        for item in &page.upserts {
+            let updated = item.updated_at.map(ts);
+            let fields = serde_json::to_string(&item.fields).map_err(corrupt)?;
+            let existing = sqlx::query(
+                "SELECT title, url, source_updated_at, version, fields_json FROM resource_items \
+                 WHERE plugin_id = ? AND resource = ? AND item_id = ?",
+            )
+            .bind(id)
+            .bind(resource)
+            .bind(&item.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let unchanged = match &existing {
+                Some(r) => {
+                    r.try_get::<String, _>("title")? == item.title
+                        && r.try_get::<Option<String>, _>("url")? == item.url
+                        && r.try_get::<Option<String>, _>("source_updated_at")? == updated
+                        && r.try_get::<Option<String>, _>("version")? == item.version
+                        && r.try_get::<String, _>("fields_json")? == fields
+                }
+                None => false,
+            };
+            if unchanged {
+                sqlx::query(
+                    "UPDATE resource_items SET run_id = ? \
+                     WHERE plugin_id = ? AND resource = ? AND item_id = ?",
+                )
+                .bind(run_id)
+                .bind(id)
+                .bind(resource)
+                .bind(&item.id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO resource_items (plugin_id, resource, item_id, title, url, \
+                     source_updated_at, version, fields_json, synced_at, run_id) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT (plugin_id, resource, item_id) DO UPDATE SET \
+                     title = excluded.title, url = excluded.url, \
+                     source_updated_at = excluded.source_updated_at, version = excluded.version, \
+                     fields_json = excluded.fields_json, synced_at = excluded.synced_at, \
+                     run_id = excluded.run_id",
+                )
+                .bind(id)
+                .bind(resource)
+                .bind(&item.id)
+                .bind(&item.title)
+                .bind(item.url.as_deref())
+                .bind(updated)
+                .bind(item.version.as_deref())
+                .bind(fields)
+                .bind(ts(at))
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                upserted += 1;
+            }
+        }
+        let mut deleted = 0u32;
+        for item_id in &page.deletes {
+            let n = sqlx::query(
+                "DELETE FROM resource_items WHERE plugin_id = ? AND resource = ? AND item_id = ?",
+            )
+            .bind(id)
+            .bind(resource)
+            .bind(item_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            deleted += u32::try_from(n).map_err(corrupt)?;
+        }
+        sqlx::query(
+            "INSERT INTO resource_sync (plugin_id, resource, cursor) VALUES (?, ?, ?) \
+             ON CONFLICT (plugin_id, resource) DO UPDATE SET cursor = excluded.cursor",
+        )
+        .bind(id)
+        .bind(resource)
+        .bind(page.next_cursor.as_deref())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((upserted, deleted))
+    }
+
+    /// Removes the resource's rows that the run `run_id` did not touch.
+    pub async fn delete_unseen(
+        &self,
+        id: &str,
+        resource: &str,
+        run_id: &str,
+    ) -> Result<u32, StoreError> {
+        let n = sqlx::query(
+            "DELETE FROM resource_items WHERE plugin_id = ? AND resource = ? AND run_id <> ?",
+        )
+        .bind(id)
+        .bind(resource)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        u32::try_from(n).map_err(corrupt)
+    }
+
+    /// Removes the resource's items and its sync state; returns the item count removed.
+    pub async fn delete_resource(&self, id: &str, resource: &str) -> Result<u32, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let n = sqlx::query("DELETE FROM resource_items WHERE plugin_id = ? AND resource = ?")
+            .bind(id)
+            .bind(resource)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query("DELETE FROM resource_sync WHERE plugin_id = ? AND resource = ?")
+            .bind(id)
+            .bind(resource)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        u32::try_from(n).map_err(corrupt)
+    }
+
+    /// Items newest first (`source_updated_at` descending, rows without one
+    /// last, ties by id). `after` is a `next` token from an earlier page of the
+    /// same query; one that this store did not make is `BadCursor`.
+    pub async fn list_items(
+        &self,
+        id: &str,
+        resource: &str,
+        limit: u32,
+        after: Option<&str>,
+        q: Option<&str>,
+    ) -> Result<ItemsPage, StoreError> {
+        let limit = limit.clamp(1, MAX_ITEMS_LIMIT);
+        let after = after.map(decode_cursor).transpose()?;
+        // One static statement for every combination: `?3` says whether there
+        // is a cursor, `?4` whether it sits in the rows without a date.
+        let (has_after, after_null, after_ts, after_id) = match &after {
+            Some((Some(t), i)) => (1_i64, 0_i64, Some(t.as_str()), Some(i.as_str())),
+            Some((None, i)) => (1, 1, None, Some(i.as_str())),
+            None => (0, 0, None, None),
+        };
+        let rows = sqlx::query(
+            "SELECT item_id, title, url, source_updated_at, version, fields_json, synced_at \
+             FROM resource_items WHERE plugin_id = ?1 AND resource = ?2 \
+             AND (?3 = 0 \
+                  OR (?4 = 1 AND source_updated_at IS NULL AND item_id > ?6) \
+                  OR (?4 = 0 AND (source_updated_at IS NULL OR source_updated_at < ?5 \
+                                  OR (source_updated_at = ?5 AND item_id > ?6)))) \
+             AND (?7 IS NULL OR title LIKE ?7 ESCAPE '\\') \
+             ORDER BY source_updated_at DESC NULLS LAST, item_id LIMIT ?8",
+        )
+        .bind(id)
+        .bind(resource)
+        .bind(has_after)
+        .bind(after_null)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(q.map(like_pattern))
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let more = rows.len() > limit as usize;
+        let mut items = Vec::with_capacity(rows.len().min(limit as usize));
+        let mut next = None;
+        for r in rows.iter().take(limit as usize) {
+            let item_id: String = r.try_get("item_id")?;
+            let updated: Option<String> = r.try_get("source_updated_at")?;
+            if more {
+                next = Some(encode_cursor(updated.as_deref(), &item_id)?);
+            }
+            items.push(ResourceItem {
+                id: item_id,
+                title: r.try_get("title")?,
+                url: r.try_get("url")?,
+                updated_at: updated.as_deref().map(parse_ts).transpose()?,
+                version: r.try_get("version")?,
+                fields: serde_json::from_str(r.try_get("fields_json")?).map_err(corrupt)?,
+                synced_at: parse_ts(r.try_get("synced_at")?)?,
+            });
+        }
+        Ok(ItemsPage { items, next })
+    }
+
+    pub async fn count_items(&self, id: &str, resource: &str) -> Result<u64, StoreError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM resource_items WHERE plugin_id = ? AND resource = ?",
+        )
+        .bind(id)
+        .bind(resource)
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(n).map_err(corrupt)
+    }
+
+    /// Resource kinds the store holds items or sync state for, sorted.
+    pub async fn known_resources(&self, id: &str) -> Result<Vec<String>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT resource FROM resource_items WHERE plugin_id = ?1 \
+             UNION SELECT resource FROM resource_sync WHERE plugin_id = ?1 ORDER BY resource",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 }
 
