@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
+use chrono::{DateTime, FixedOffset};
 use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use raw_window_handle::HasWindowHandle;
 use smithagents_center_host::{validated_origin, CenterTabHost, PixelRect};
@@ -32,7 +33,7 @@ use tokio::sync::mpsc;
 use crate::app_state::{AppState, AppStateStore};
 use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
-use crate::link::{AgentCommands, DaemonLink, LinkFailure};
+use crate::link::{AgentCommands, DaemonLink, IntentCommands, LinkFailure};
 use crate::model::{Action, Connection, Effect, ShellModel};
 use crate::tabs::{PlaceholderHost, TabError, TabManager, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::apply_framework_theme;
@@ -80,6 +81,11 @@ pub type ConnectionInfoSource = Rc<dyn Fn() -> Option<(u16, String)>>;
 /// Answers the link's last connect error, or `None`. The shell asks the
 /// [`DaemonLink`]; headless tests inject a fake.
 pub type LinkFailureSource = Rc<dyn Fn() -> Option<LinkFailure>>;
+
+/// Answers the current time, with the offset the views show times in
+/// ([`ShellState::now`]). The app reads the local clock; headless tests
+/// inject a fixed one.
+pub type Clock = Rc<dyn Fn() -> DateTime<FixedOffset>>;
 
 /// An `OpenTab` being carried out: what to put back if its tab fails.
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +135,10 @@ pub struct ShellState {
     connection_info: Option<ConnectionInfoSource>,
     /// Replaces the link for agent commands (headless tests).
     commands: Option<Rc<dyn AgentCommands>>,
+    /// Replaces the link for intent commands (headless tests).
+    intent_commands: Option<Rc<dyn IntentCommands>>,
+    /// Replaces the local clock (headless tests).
+    clock: Option<Clock>,
     command_timeout: Duration,
     /// Where [`AppState`] persists; `None` keeps it in memory.
     app_state_store: Option<AppStateStore>,
@@ -201,6 +211,8 @@ impl ShellState {
             link,
             connection_info: None,
             commands,
+            intent_commands: None,
+            clock: None,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             app_state_store,
             app_state,
@@ -284,6 +296,34 @@ impl ShellState {
             Some(commands) => Some(commands.as_ref()),
             None => self.link.as_ref().map(|link| link as &dyn AgentCommands),
         }
+    }
+
+    /// Where intent commands go: the injected commands if any, else the
+    /// link; `None` when the shell runs offline.
+    pub fn intent_commands(&self) -> Option<&dyn IntentCommands> {
+        match &self.intent_commands {
+            Some(commands) => Some(commands.as_ref()),
+            None => self.link.as_ref().map(|link| link as &dyn IntentCommands),
+        }
+    }
+
+    /// Replaces the link for intent commands.
+    pub(crate) fn set_intent_commands(&mut self, commands: Rc<dyn IntentCommands>) {
+        self.intent_commands = Some(commands);
+    }
+
+    /// The current time as the views show it: the injected clock's, else the
+    /// local clock's, in the local offset.
+    pub fn now(&self) -> DateTime<FixedOffset> {
+        match &self.clock {
+            Some(clock) => clock(),
+            None => chrono::Local::now().fixed_offset(),
+        }
+    }
+
+    /// Replaces the local clock.
+    pub(crate) fn set_clock(&mut self, clock: Clock) {
+        self.clock = Some(clock);
     }
 
     /// How long a command may go unanswered before the views give up on it

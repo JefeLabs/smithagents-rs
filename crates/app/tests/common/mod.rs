@@ -1,8 +1,9 @@
 //! Helpers for the integration tests: the daemon binary, a temporary home
 //! that stops its daemon on drop, and a git fixture (the link tests), plus
-//! [`ui`] for the headless shell tests.
+//! [`ui`] for the headless shell tests and [`intents`] for the intent tests.
 #![allow(dead_code)]
 
+pub mod intents;
 pub mod ui;
 
 use std::path::{Path, PathBuf};

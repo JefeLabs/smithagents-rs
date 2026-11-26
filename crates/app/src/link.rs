@@ -17,7 +17,10 @@ use futures::{FutureExt as _, StreamExt};
 use smithagents_client::{ensure_daemon_with, Client, ClientError, EnsureError, SpawnOptions};
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::daemon::read_lockfile;
-use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
+use smithagents_core::intent::{
+    AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, Patch, ReviewAction,
+};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Notify};
 
@@ -166,8 +169,9 @@ pub struct DaemonLink {
 
 impl DaemonLink {
     /// Starts the link thread. The receiver yields what the UI must apply:
-    /// `Snapshot`, `ConnectionChanged(Connected)`, then daemon events; after
-    /// a loss `ConnectionChanged(Reconnecting)` and a fresh snapshot.
+    /// `Snapshot`, `IntentsLoaded`, `AgentDefaultsLoaded`,
+    /// `ConnectionChanged(Connected)`, then daemon events; after a loss
+    /// `ConnectionChanged(Reconnecting)` and the same loads again.
     pub fn start(config: LinkConfig) -> (DaemonLink, mpsc::Receiver<Action>) {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -286,6 +290,100 @@ impl DaemonLink {
             .clone()
             .run(move |c, _| async move { Ok(c.close_agent(id).await?) })
     }
+
+    pub fn create_intent(
+        &self,
+        req: CreateIntentRequest,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.create_intent(req).await })
+    }
+
+    pub fn update_intent(
+        &self,
+        id: IntentId,
+        patch: Patch,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.update_intent(id, patch).await })
+    }
+
+    pub fn answer_question(
+        &self,
+        id: IntentId,
+        question: QuestionId,
+        answer: AnswerInput,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.answer_question(id, question, answer).await })
+    }
+
+    pub fn retry_polish(
+        &self,
+        id: IntentId,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.retry_polish(id).await })
+    }
+
+    /// Accepts, edits (which also accepts) or drops one item.
+    pub fn review_item(
+        &self,
+        id: IntentId,
+        item: ItemId,
+        action: ReviewAction,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move {
+            match action {
+                ReviewAction::Accept => c.accept_item(id, item).await,
+                ReviewAction::Edit(text) => c.edit_item(id, item, &text).await,
+                ReviewAction::Drop => c.drop_item(id, item).await,
+            }
+        })
+    }
+
+    pub fn send_intent(
+        &self,
+        id: IntentId,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.send_intent(id).await })
+    }
+
+    pub fn resolve_intent(
+        &self,
+        id: IntentId,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.resolve_intent(id).await })
+    }
+
+    /// Stores the defaults and tells the UI with `Action::AgentDefaultsLoaded`
+    /// (settings have no event), sent from the link's runtime like
+    /// [`DaemonLink::add_repo`]'s.
+    pub fn set_agent_defaults(
+        &self,
+        defaults: AgentDefaults,
+    ) -> impl Future<Output = Result<AgentDefaults, LinkError>> + Send + 'static {
+        self.cmd.clone().run(move |c, tx| async move {
+            let stored = c.set_agent_defaults(defaults).await?;
+            let _ = tx.send(Action::AgentDefaultsLoaded(stored.clone())).await;
+            Ok(stored)
+        })
+    }
+
+    /// Runs one intent command and hands its answer to the UI as
+    /// `Action::IntentUpserted` too, from the link's runtime, so the model
+    /// has it even when the caller drops the future (the event of the same
+    /// change may come before or after it; the model keeps the later copy).
+    fn intent_command<F, Fut>(
+        &self,
+        command: F,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Intent, ClientError>> + Send + 'static,
+    {
+        self.cmd.clone().run(move |c, tx| async move {
+            let intent = command(c).await?;
+            let _ = tx.send(Action::IntentUpserted(intent.clone())).await;
+            Ok(intent)
+        })
+    }
 }
 
 /// The commands the shell's views send to the daemon: the agents pane's
@@ -316,6 +414,79 @@ impl AgentCommands for DaemonLink {
 
     fn add_repo(&self, path: &Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         DaemonLink::add_repo(self, path).boxed_local()
+    }
+}
+
+/// The daemon's answer to an intent command: the intent as it now is.
+pub type IntentAnswer = LocalBoxFuture<'static, Result<Intent, LinkError>>;
+
+/// The commands the Intents pane and Settings → Agent defaults send to the
+/// daemon. [`DaemonLink`] is the production implementation; headless tests
+/// inject a fake through `ShellOptions::intent_commands`.
+///
+/// The model learns of each answer through `Action::IntentUpserted` (or
+/// `Action::AgentDefaultsLoaded`), which the link sends itself; a fake leaves
+/// that to the test. The futures are `'static` and need not be `Send`, as for
+/// [`AgentCommands`].
+pub trait IntentCommands {
+    fn create_intent(&self, req: CreateIntentRequest) -> IntentAnswer;
+    fn update_intent(&self, id: IntentId, patch: Patch) -> IntentAnswer;
+    fn answer_question(
+        &self,
+        id: IntentId,
+        question: QuestionId,
+        answer: AnswerInput,
+    ) -> IntentAnswer;
+    fn retry_polish(&self, id: IntentId) -> IntentAnswer;
+    /// Accepts, edits (which also accepts) or drops one item.
+    fn review_item(&self, id: IntentId, item: ItemId, action: ReviewAction) -> IntentAnswer;
+    fn send_intent(&self, id: IntentId) -> IntentAnswer;
+    fn resolve_intent(&self, id: IntentId) -> IntentAnswer;
+    fn set_agent_defaults(
+        &self,
+        defaults: AgentDefaults,
+    ) -> LocalBoxFuture<'static, Result<AgentDefaults, LinkError>>;
+}
+
+impl IntentCommands for DaemonLink {
+    fn create_intent(&self, req: CreateIntentRequest) -> IntentAnswer {
+        DaemonLink::create_intent(self, req).boxed_local()
+    }
+
+    fn update_intent(&self, id: IntentId, patch: Patch) -> IntentAnswer {
+        DaemonLink::update_intent(self, id, patch).boxed_local()
+    }
+
+    fn answer_question(
+        &self,
+        id: IntentId,
+        question: QuestionId,
+        answer: AnswerInput,
+    ) -> IntentAnswer {
+        DaemonLink::answer_question(self, id, question, answer).boxed_local()
+    }
+
+    fn retry_polish(&self, id: IntentId) -> IntentAnswer {
+        DaemonLink::retry_polish(self, id).boxed_local()
+    }
+
+    fn review_item(&self, id: IntentId, item: ItemId, action: ReviewAction) -> IntentAnswer {
+        DaemonLink::review_item(self, id, item, action).boxed_local()
+    }
+
+    fn send_intent(&self, id: IntentId) -> IntentAnswer {
+        DaemonLink::send_intent(self, id).boxed_local()
+    }
+
+    fn resolve_intent(&self, id: IntentId) -> IntentAnswer {
+        DaemonLink::resolve_intent(self, id).boxed_local()
+    }
+
+    fn set_agent_defaults(
+        &self,
+        defaults: AgentDefaults,
+    ) -> LocalBoxFuture<'static, Result<AgentDefaults, LinkError>> {
+        DaemonLink::set_agent_defaults(self, defaults).boxed_local()
     }
 }
 
@@ -448,10 +619,12 @@ async fn connect_and_forward(
         let latest_seq = client.health().await?.latest_seq;
         let repos = client.list_repos().await?;
         let agents = client.list_agents(false).await?;
+        let intents = client.list_intents(IntentFilter::default()).await?;
+        let defaults = client.agent_defaults().await?;
         let events = client.events(Some(latest_seq)).await?;
-        Ok::<_, ClientError>((latest_seq, repos, agents, events))
+        Ok::<_, ClientError>((latest_seq, repos, agents, intents, defaults, events))
     };
-    let (latest_seq, repos, agents, mut events) =
+    let (latest_seq, repos, agents, intents, defaults, mut events) =
         match tokio::time::timeout(config.snapshot_timeout, fetch).await {
             Ok(fetched) => fetched.map_err(unreachable)?,
             Err(_) => return Err(unreachable("the daemon did not answer in time")),
@@ -466,6 +639,8 @@ async fn connect_and_forward(
         },
     )
     .await?;
+    send(tx, Action::IntentsLoaded(intents)).await?;
+    send(tx, Action::AgentDefaultsLoaded(defaults)).await?;
     // Commands work from here on; the UI sees `Connected` after this.
     *lock(&shared.connected) = Some((
         client,

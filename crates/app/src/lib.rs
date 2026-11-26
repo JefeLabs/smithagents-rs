@@ -135,6 +135,8 @@ fn open_main_window(
                     page_origin: Some(page_origin),
                     connection_info: None,
                     link_failure: None,
+                    intent_commands: None,
+                    clock: None,
                 },
                 window,
                 cx,

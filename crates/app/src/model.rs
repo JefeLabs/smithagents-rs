@@ -1,11 +1,14 @@
-//! GPUI-free shell state: the agent list, open tabs, selection and the
-//! connection, driven by [`Action`]s. Applying one returns the [`Effect`]s the
-//! view layer must carry out. Chat content is not kept here; it belongs to the
-//! web tab.
+//! GPUI-free shell state: the agent list, open tabs, selection, the
+//! connection, the intents and the agent defaults, driven by [`Action`]s.
+//! Applying one returns the [`Effect`]s the view layer must carry out. Chat
+//! content is not kept here; it belongs to the web tab.
+
+use std::cmp::Reverse;
 
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::ids::AgentId;
+use smithagents_core::ids::{AgentId, IntentId};
+use smithagents_core::intent::{AgentDefaults, Intent};
 
 /// State of the link to the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,6 +44,13 @@ pub enum Action {
         selected: Option<AgentId>,
     },
     RepoAdded(Repo),
+    /// Every intent, as the link lists them at connect: replaces the list.
+    IntentsLoaded(Vec<Intent>),
+    /// An intent as a command's answer has it (an event carries it too).
+    /// Kept unless the model has a later copy; see [`ShellModel::intents`].
+    IntentUpserted(Intent),
+    /// The agent defaults, as loaded at connect or as a change answers them.
+    AgentDefaultsLoaded(AgentDefaults),
 }
 
 /// Work for the view layer after an action.
@@ -62,6 +72,10 @@ pub struct ShellModel {
     active_tab: Option<AgentId>,
     connection: Connection,
     last_seq: Option<u64>,
+    intents: Vec<Intent>,
+    /// An `IntentsLoaded` was applied.
+    intents_loaded: bool,
+    agent_defaults: Option<AgentDefaults>,
     /// Counts the changes to what the shell draws from the model.
     revision: u64,
 }
@@ -107,10 +121,36 @@ impl ShellModel {
         self.last_seq
     }
 
+    /// Every intent the model has, the most recently changed first (ties
+    /// broken by id). Of two copies of an intent the model keeps the one
+    /// with the later `updated_at`, whatever order they arrive in.
+    pub fn intents(&self) -> Vec<&Intent> {
+        let mut intents: Vec<&Intent> = self.intents.iter().collect();
+        intents.sort_by_key(|i| (Reverse(i.updated_at), i.id.0));
+        intents
+    }
+
+    /// The intent `id`, if the model has it.
+    pub fn intent(&self, id: IntentId) -> Option<&Intent> {
+        self.intents.iter().find(|i| i.id == id)
+    }
+
+    /// Whether the intent list was loaded (an `IntentsLoaded` was applied
+    /// since the app started); before that an empty list means nothing.
+    pub fn intents_loaded(&self) -> bool {
+        self.intents_loaded
+    }
+
+    /// The agent defaults, once loaded.
+    pub fn agent_defaults(&self) -> Option<&AgentDefaults> {
+        self.agent_defaults.as_ref()
+    }
+
     /// Counts the changes to what the shell draws from the model: the agents,
-    /// the repositories, the selection, the tabs and the connection. An
-    /// action that leaves it unchanged (a streamed chunk, a replayed event,
-    /// chat content the web tab shows) needs no redraw.
+    /// the repositories, the selection, the tabs, the connection, the intents
+    /// and the agent defaults. An action that leaves it unchanged (a streamed
+    /// chunk, a replayed event, an older copy of an intent, chat content the
+    /// web tab shows) needs no redraw.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -173,6 +213,18 @@ impl ShellModel {
                 }
                 true
             }
+            Action::IntentsLoaded(intents) => {
+                let changed = !self.intents_loaded || self.intents != intents;
+                self.intents = intents;
+                self.intents_loaded = true;
+                changed
+            }
+            Action::IntentUpserted(intent) => self.upsert_intent(intent),
+            Action::AgentDefaultsLoaded(defaults) => {
+                let changed = self.agent_defaults.as_ref() != Some(&defaults);
+                self.agent_defaults = Some(defaults);
+                changed
+            }
         };
         if changed {
             self.revision += 1;
@@ -210,13 +262,32 @@ impl ShellModel {
                 }
             }
             EventKind::AgentClosed { agent_id } => self.remove_agent(agent_id, effects),
+            EventKind::IntentCreated(intent) | EventKind::IntentUpdated(intent) => {
+                self.upsert_intent(intent)
+            }
             // Chat content belongs to the web tab.
             EventKind::MessageAppended(_)
             | EventKind::TurnDelta { .. }
-            | EventKind::IntentCreated(_)
-            | EventKind::IntentUpdated(_)
             | EventKind::PluginUpdated(_)
             | EventKind::ResourceSynced { .. } => false,
+        }
+    }
+
+    /// Stores `intent`, or replaces the stored copy unless that one changed
+    /// later (a command's answer can land after the event of a later change,
+    /// and events replay after a reconnect). Returns whether the stored copy
+    /// changed: an identical copy changes nothing.
+    fn upsert_intent(&mut self, intent: Intent) -> bool {
+        match self.intents.iter_mut().find(|i| i.id == intent.id) {
+            Some(stored) if stored.updated_at > intent.updated_at || *stored == intent => false,
+            Some(stored) => {
+                *stored = intent;
+                true
+            }
+            None => {
+                self.intents.push(intent);
+                true
+            }
         }
     }
 

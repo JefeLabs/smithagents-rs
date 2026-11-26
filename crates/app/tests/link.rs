@@ -6,13 +6,17 @@ use std::future::Future;
 use std::time::Duration;
 
 use common::{daemon_bin, fake_claude, init_repo, TestHome};
-use smithagents_app::link::{DaemonLink, LinkConfig, LinkError, LinkErrorKind};
+use smithagents_app::link::{DaemonLink, IntentCommands, LinkConfig, LinkError, LinkErrorKind};
 use smithagents_app::model::{Action, Connection};
 use smithagents_app::view_models::repo_error_text;
 use smithagents_client::{Client, ClientError, SpawnOptions};
-use smithagents_core::agent::AgentState;
+use smithagents_core::agent::{AgentState, Repo};
 use smithagents_core::daemon::read_lockfile;
 use smithagents_core::event::EventKind;
+use smithagents_core::ids::IntentId;
+use smithagents_core::intent::{
+    AgentDefaults, CreateIntentRequest, Intent, IntentKind, IntentState, SeedInput,
+};
 use tokio::sync::mpsc::Receiver;
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -70,16 +74,31 @@ fn client_for(home: &TestHome) -> Client {
     Client::new(&read_lockfile(home.path()).unwrap().expect("lockfile"))
 }
 
+/// What follows a snapshot: the intent list, the agent defaults, then
+/// `Connected`. Returns the two loads.
+async fn loads_then_connected(rx: &mut Receiver<Action>) -> (Vec<Intent>, AgentDefaults) {
+    let intents = match next(rx, "intents").await {
+        Action::IntentsLoaded(intents) => intents,
+        other => panic!("expected the intents, got {other:?}"),
+    };
+    let defaults = match next(rx, "agent defaults").await {
+        Action::AgentDefaultsLoaded(defaults) => defaults,
+        other => panic!("expected the agent defaults, got {other:?}"),
+    };
+    assert_eq!(
+        next(rx, "connected").await,
+        Action::ConnectionChanged(Connection::Connected)
+    );
+    (intents, defaults)
+}
+
 async fn connected(home: &TestHome) -> (DaemonLink, Receiver<Action>) {
     let (link, mut rx) = DaemonLink::start(config(home));
     assert!(matches!(
         next(&mut rx, "snapshot").await,
         Action::Snapshot { .. }
     ));
-    assert_eq!(
-        next(&mut rx, "connected").await,
-        Action::ConnectionChanged(Connection::Connected)
-    );
+    loads_then_connected(&mut rx).await;
     (link, rx)
 }
 
@@ -93,10 +112,9 @@ async fn snapshot_then_connected() {
         }
         other => panic!("expected a snapshot, got {other:?}"),
     }
-    assert_eq!(
-        next(&mut rx, "connected").await,
-        Action::ConnectionChanged(Connection::Connected)
-    );
+    let (intents, defaults) = loads_then_connected(&mut rx).await;
+    assert!(intents.is_empty());
+    assert_eq!(defaults, AgentDefaults::default());
     let info = link.connection_info().expect("connection info");
     let lock = read_lockfile(home.path()).unwrap().unwrap();
     assert_eq!(info, (lock.port, lock.token));
@@ -156,13 +174,101 @@ async fn killed_daemon_reconnects_with_a_fresh_snapshot() {
     })
     .await;
     assert!(agents.iter().any(|a| a.id == agent.id), "{agents:?}");
-    assert_eq!(
-        next(&mut rx, "connected").await,
-        Action::ConnectionChanged(Connection::Connected)
-    );
+    loads_then_connected(&mut rx).await;
     let new = read_lockfile(home.path()).unwrap().unwrap();
     assert_ne!(new.pid, old.pid, "a new daemon was started");
     assert_eq!(link.connection_info(), Some((new.port, new.token)));
+}
+
+fn text_seed(repo: &Repo, text: &str) -> CreateIntentRequest {
+    CreateIntentRequest {
+        repo_id: Some(repo.id),
+        kind: Some(IntentKind::Bug),
+        seed: SeedInput::Text(text.into()),
+    }
+}
+
+#[tokio::test]
+async fn intents_and_defaults_arrive_before_connected() {
+    let home = TestHome::new();
+    let repo_dir = home.scratch().join("repo");
+    init_repo(&repo_dir);
+    let (first, _first_rx) = connected(&home).await;
+    let other = client_for(&home);
+    let repo = other.add_repo(&repo_dir).await.unwrap();
+    let created = other
+        .create_intent(text_seed(&repo, "The zoom is wrong"))
+        .await
+        .unwrap();
+    let defaults = AgentDefaults {
+        queue_limit: Some(2),
+    };
+    other.set_agent_defaults(defaults.clone()).await.unwrap();
+    drop(first);
+
+    let (_link, mut rx) = DaemonLink::start(config(&home));
+    assert!(matches!(
+        next(&mut rx, "snapshot").await,
+        Action::Snapshot { .. }
+    ));
+    let (intents, loaded) = loads_then_connected(&mut rx).await;
+    let ids: Vec<IntentId> = intents.iter().map(|i| i.id).collect();
+    assert_eq!(ids, [created.id]);
+    assert_eq!(loaded, defaults);
+}
+
+#[tokio::test]
+async fn an_intent_command_answers_and_upserts() {
+    let home = TestHome::new();
+    let repo_dir = home.scratch().join("repo");
+    init_repo(&repo_dir);
+    let (link, mut rx) = connected(&home).await;
+    let repo = link.add_repo(&repo_dir).await.unwrap();
+    let intent = link
+        .create_intent(text_seed(&repo, "The zoom is wrong"))
+        .await
+        .unwrap();
+    assert_eq!(intent.state, IntentState::Draft);
+    assert_eq!(intent.repo_id, repo.id);
+    let upserted = until(&mut rx, "IntentUpserted", |a| match a {
+        Action::IntentUpserted(upserted) => Some(upserted.id),
+        _ => None,
+    })
+    .await;
+    assert_eq!(upserted, intent.id);
+}
+
+#[tokio::test]
+async fn setting_agent_defaults_answers_and_loads_them() {
+    let home = TestHome::new();
+    let (link, mut rx) = connected(&home).await;
+    let defaults = AgentDefaults {
+        queue_limit: Some(4),
+    };
+    let answer = link.set_agent_defaults(defaults.clone()).await.unwrap();
+    assert_eq!(answer, defaults);
+    let loaded = until(&mut rx, "AgentDefaultsLoaded", |a| match a {
+        Action::AgentDefaultsLoaded(loaded) => Some(loaded.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(loaded, defaults);
+}
+
+#[tokio::test]
+async fn intent_commands_need_a_connection() {
+    let home = TestHome::new();
+    let mut cfg = config(&home);
+    cfg.daemon_bin = home.scratch().join("no-such-daemon");
+    let (link, _rx) = DaemonLink::start(cfg);
+    assert!(matches!(
+        IntentCommands::send_intent(&link, IntentId::new()).await,
+        Err(LinkError::NotConnected)
+    ));
+    assert!(matches!(
+        link.send_intent(IntentId::new()).await,
+        Err(LinkError::NotConnected)
+    ));
 }
 
 /// Adds `path` expecting the daemon to refuse it with `code`; returns the
@@ -369,10 +475,7 @@ async fn a_working_agent_is_dead_in_the_snapshot_after_the_daemon_is_killed() {
         .find(|a| a.id == agent.id)
         .expect("agent listed");
     assert_eq!(after.state, AgentState::Dead, "{after:?}");
-    assert_eq!(
-        next(&mut rx, "connected").await,
-        Action::ConnectionChanged(Connection::Connected)
-    );
+    loads_then_connected(&mut rx).await;
 }
 
 #[tokio::test]

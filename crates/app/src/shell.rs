@@ -56,10 +56,10 @@ use crate::layout_store::{
     with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
     DEFAULT_RIGHT_DOCK_SIZE, LAYOUT_VERSION, MIN_DOCK_SIZE,
 };
-use crate::link::{AgentCommands, DaemonLink, LinkConfig};
+use crate::link::{AgentCommands, DaemonLink, IntentCommands, LinkConfig};
 use crate::model::{Action, ShellModel};
 use crate::settings::AppSettingsStore;
-use crate::shell_state::{ConnectionInfoSource, LinkFailureSource, ShellEvent, ShellState};
+use crate::shell_state::{Clock, ConnectionInfoSource, LinkFailureSource, ShellEvent, ShellState};
 use crate::tabs::{PlaceholderHost, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::{region_paint, OsAppearance, Region, SystemAppearanceSource};
 use crate::update::{NoUpdater, Updater};
@@ -236,6 +236,13 @@ pub struct ShellOptions {
     /// bar's wording); `None` asks the daemon link. Headless tests inject a
     /// fake.
     pub link_failure: Option<LinkFailureSource>,
+    /// Replaces the daemon link for the intent commands (the Intents pane,
+    /// Settings → Agent defaults), so headless tests need no daemon; `None`
+    /// sends them through the link.
+    pub intent_commands: Option<Rc<dyn IntentCommands>>,
+    /// The clock the views read ([`ShellState::now`]); `None` is the local
+    /// clock. Headless tests inject a fixed one.
+    pub clock: Option<Clock>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -295,6 +302,8 @@ impl Shell {
             page_origin,
             connection_info,
             link_failure,
+            intent_commands,
+            clock,
         } = options;
         let link = link.map(DaemonLink::start);
         let tab_host = match tab_host {
@@ -345,6 +354,12 @@ impl Shell {
             }
             if let Some(source) = link_failure {
                 state.set_link_failure_source(source, cx);
+            }
+            if let Some(commands) = intent_commands {
+                state.set_intent_commands(commands);
+            }
+            if let Some(clock) = clock {
+                state.set_clock(clock);
             }
             state.set_tab_host(
                 tab_host,
