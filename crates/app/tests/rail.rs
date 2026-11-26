@@ -288,3 +288,68 @@ fn cmd_alt_b_toggles_settings_while_a_text_field_or_an_agent_row_has_the_focus(
     press(cx, window, "cmd-alt-b");
     assert_eq!(rail_active(cx, &shell), Some(RailEntry::Settings));
 }
+
+fn is_focused(cx: &mut TestAppContext, window: WindowHandle<Root>, id: ElementId) -> bool {
+    with_window(cx, window, |window, _| {
+        window.find(id).focused() == Some(true)
+    })
+}
+
+#[gpui_kit::test]
+fn closing_a_pane_gives_the_focus_back(cx: &mut TestAppContext) {
+    let (window, shell, agent) = open_with_an_agent(cx);
+    let row = agent_row_id(agent);
+    // Settings is on screen at first: close it.
+    press(cx, window, "cmd-alt-b");
+    assert_eq!(rail_active(cx, &shell), None);
+
+    for key in ["cmd-alt-b", "cmd-alt-i"] {
+        focus(cx, window, row.clone());
+        press(cx, window, key);
+        assert!(rail_active(cx, &shell).is_some(), "{key} shows its pane");
+        assert!(
+            !is_focused(cx, window, row.clone()),
+            "the pane took the focus"
+        );
+        press(cx, window, key);
+        assert_eq!(rail_active(cx, &shell), None, "{key} closes it");
+        assert!(is_focused(cx, window, row.clone()), "{key}: the row again");
+    }
+
+    // Switching panes first: closing the second still returns to the row.
+    focus(cx, window, row.clone());
+    press(cx, window, "cmd-alt-b");
+    press(cx, window, "cmd-alt-i");
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Intents));
+    press(cx, window, "cmd-alt-i");
+    assert_eq!(rail_active(cx, &shell), None);
+    assert!(is_focused(cx, window, row), "back on the row");
+}
+
+#[gpui_kit::test]
+fn closing_a_pane_after_its_focus_source_left_focuses_the_shell(cx: &mut TestAppContext) {
+    let (window, shell, agent) = open_with_an_agent(cx);
+    let state = shell.read_with(cx, |shell, _| shell.state().clone());
+    press(cx, window, "cmd-alt-b");
+    focus(cx, window, agent_row_id(agent));
+    press(cx, window, "cmd-alt-i");
+
+    // The row goes while the pane is open.
+    state.update(cx, |state, cx| {
+        state.dispatch(
+            Action::Snapshot {
+                agents: vec![],
+                repos: vec![],
+                latest_seq: 2,
+            },
+            cx,
+        )
+    });
+    frame(cx, window);
+    press(cx, window, "cmd-alt-i");
+    assert_eq!(rail_active(cx, &shell), None);
+
+    // The shell has the focus, so its keys still work.
+    press(cx, window, "cmd-alt-i");
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Intents));
+}

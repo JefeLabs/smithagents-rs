@@ -44,7 +44,7 @@ use gpui_kit::{
     div, px, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, FocusHandle,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
     ParentElement as _, Pixels, Render, Styled as _, Subscription, Task, TestSupportExt as _,
-    Window,
+    WeakFocusHandle, Window,
 };
 use smithagents_center_host::CenterTabHost;
 use smithagents_theme::tokens::ThemeSet;
@@ -295,6 +295,9 @@ pub struct Shell {
     last_saved_window: Option<SavedWindow>,
     pending_save: Option<Task<()>>,
     focus: FocusHandle,
+    /// Where the focus was, outside the right panes, when one of them took
+    /// it ([`Shell::show_rail_entry`]): closing the dock gives it back.
+    focus_before_right: Option<WeakFocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -529,6 +532,7 @@ impl Shell {
             last_saved_window: None,
             pending_save: None,
             focus,
+            focus_before_right: None,
             _subscriptions: subscriptions,
         }
     }
@@ -558,25 +562,63 @@ impl Shell {
     }
 
     /// The rail's click: selecting the entry on screen closes its dock;
-    /// selecting another shows it ([`Shell::show_rail_entry`]).
+    /// selecting another shows it ([`Shell::show_rail_entry`]). A closed
+    /// pane that held the focus gives it back to where it was before the
+    /// pane took it, or to the shell when that is no longer drawn.
     pub fn select_rail_entry(&mut self, entry: RailEntry, window: &mut Window, cx: &mut App) {
         if self.rail_active(cx) == Some(entry) {
+            let had_focus = self.right_pane_has_focus(window, cx);
             self.dock.update(cx, |area, cx| {
                 area.toggle_dock(entry.placement(), window, cx)
             });
+            if had_focus {
+                self.restore_focus_after_right_pane(window, cx);
+            }
         } else {
             self.show_rail_entry(entry, window, cx);
         }
     }
 
+    /// Whether the focus is inside one of the right panes.
+    fn right_pane_has_focus(&self, window: &Window, cx: &App) -> bool {
+        let dock = self.dock.read(cx);
+        self.right_panels.iter().any(|(_, panel)| {
+            dock.panel(*panel)
+                .is_some_and(|pane| pane.focus_handle(cx).contains_focused(window, cx))
+        })
+    }
+
+    /// Puts the focus back where it was before a right pane took it; on the
+    /// shell when that element is gone or no longer drawn.
+    fn restore_focus_after_right_pane(&mut self, window: &mut Window, cx: &mut App) {
+        let before = self
+            .focus_before_right
+            .take()
+            .and_then(|weak| weak.upgrade())
+            .filter(|focus| focus.is_rendered(window));
+        tracing::debug!(
+            restored = before.is_some(),
+            "the right pane closed with the focus"
+        );
+        before
+            .unwrap_or_else(|| self.focus.clone())
+            .focus(window, cx);
+    }
+
     /// Shows `entry`'s pane: makes it the state's right entry, displays its
     /// panel in the dock's group, opens the dock if it is closed, fits the
-    /// dock to the window and focuses the pane. Never closes the dock.
+    /// dock to the window and focuses the pane (remembering where the focus
+    /// was, when that is outside the right panes). Never closes the dock.
     pub fn show_rail_entry(&mut self, entry: RailEntry, window: &mut Window, cx: &mut App) {
         let Some(panel) = panel_of(&self.right_panels, entry) else {
             tracing::error!(?entry, "no pane for this rail entry");
             return;
         };
+        // Switching from one right pane to another keeps what was
+        // remembered when the first took the focus.
+        if !self.right_pane_has_focus(window, cx) {
+            self.focus_before_right = window.focused(cx).map(|focus| focus.downgrade());
+        }
         let placement = entry.placement();
         self.state
             .update(cx, |state, cx| state.set_right_entry(entry, cx));
