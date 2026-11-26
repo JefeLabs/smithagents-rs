@@ -320,7 +320,9 @@ pub struct Shell {
     pending_save: Option<Task<()>>,
     focus: FocusHandle,
     /// Where the focus was, outside the right panes, when one of them took
-    /// it ([`Shell::show_rail_entry`]): closing the dock gives it back.
+    /// it ([`Shell::show_rail_entry`]), or when the annotator, which ends on
+    /// the Feedback pane, took it ([`Shell::open_annotator`]): closing the
+    /// dock gives it back.
     focus_before_right: Option<WeakFocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
@@ -532,10 +534,15 @@ impl Shell {
                         this.open_annotator(id.clone(), window, cx)
                     }
                     FeedbackEvent::CloseAnnotator => {
+                        // What the pane gives the focus back to is where it
+                        // was before the annotator, not the shell, which only
+                        // holds it on the way.
+                        let before = this.focus_before_right.take();
                         this.close_annotator(window, cx);
                         // Back to the pane, where the screenshot's card is.
                         tracing::debug!(source = "feedback", "rail show");
                         this.show_rail_entry(RailEntry::Feedback, window, cx);
+                        this.focus_before_right = before;
                         cx.notify();
                     }
                 }
@@ -625,8 +632,14 @@ impl Shell {
         self.annotator.as_ref()
     }
 
-    /// Covers the window with the annotator on screenshot `id`, focused.
+    /// Covers the window with the annotator on screenshot `id`, focused. It
+    /// ends on the Feedback pane, so where the focus was, when that is
+    /// outside the right panes, is remembered as [`Shell::show_rail_entry`]
+    /// does: closing the pane afterwards gives it back.
     fn open_annotator(&mut self, id: AttachmentId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.annotator.is_none() && !self.right_pane_has_focus(window, cx) {
+            self.focus_before_right = window.focused(cx).map(|focus| focus.downgrade());
+        }
         self.close_annotator(window, cx);
         let feedback = self.feedback.clone();
         let annotator = cx.new(|cx| Annotator::new(feedback, id, window, cx));

@@ -306,7 +306,7 @@ fn closing_a_pane_gives_the_focus_back(cx: &mut TestAppContext) {
     press(cx, window, "cmd-alt-b");
     assert_eq!(rail_active(cx, &shell), None);
 
-    for key in ["cmd-alt-b", "cmd-alt-i"] {
+    for key in ["cmd-alt-b", "cmd-alt-f", "cmd-alt-i"] {
         focus(cx, window, row.clone());
         press(cx, window, key);
         assert!(rail_active(cx, &shell).is_some(), "{key} shows its pane");

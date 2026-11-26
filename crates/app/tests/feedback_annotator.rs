@@ -35,6 +35,7 @@ use smithagents_app::shell::{
     ToggleSettingsPane,
 };
 use smithagents_app::view_models::LeftPaneMode;
+use smithagents_app::views::agents::agent_row_id;
 use smithagents_app::views::feedback::{
     badge_id, card_id, Annotator, ANNOTATOR_COMMENT_ERROR_ID, ANNOTATOR_COMMENT_ID,
     ANNOTATOR_CONFIRM_DISCARD_ID, ANNOTATOR_DELETE_ID, ANNOTATOR_DISCARD_ID,
@@ -910,4 +911,57 @@ fn done_waits_for_the_drawing_and_ignores_the_picture_meanwhile(cx: &mut TestApp
     let shot = &draft(cx, &feedback).attachments[0];
     assert_eq!(shot.boxes.len(), 1);
     assert!(shot.rendered);
+}
+
+/// The Feedback pane gives the focus back when it closes, as the other right
+/// panes do, also when a screenshot was annotated while it was open (Capture
+/// in the pane) or before it opened (the hold).
+#[gpui_kit::test]
+fn closing_the_pane_after_annotating_gives_the_focus_back(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let mercury = agent("Mercury");
+    let row = agent_row_id(mercury.id);
+    let mut model = ShellModel::new();
+    model.apply(ModelAction::Snapshot {
+        agents: vec![mercury],
+        repos: vec![],
+        latest_seq: 1,
+    });
+    model.apply(ModelAction::ConnectionChanged(Connection::Connected));
+    let mut options = setup.options();
+    options.model = model;
+    options.connection_info = Some(fake_connection());
+    let (window, shell) = open_shell_options(cx, options, (1200., 800.));
+    let feedback = shell.read_with(cx, |shell, _| shell.feedback().clone());
+    frame(cx, window);
+    let row_focused = |cx: &mut TestAppContext| {
+        with_window(cx, window, |window, _| window.find(row.clone()).focused()) == Some(true)
+    };
+
+    for from_pane in [true, false] {
+        click(cx, window, row.clone());
+        assert!(
+            row_focused(cx),
+            "from_pane {from_pane}: the row has the focus"
+        );
+        if from_pane {
+            press(cx, window, "cmd-alt-f");
+            assert_eq!(rail_active(cx, &shell), Some(RailEntry::Feedback));
+        }
+        capture_now(cx, window, &feedback, &setup);
+        frame(cx, window);
+        assert!(annotator(cx, &shell).is_some(), "from_pane {from_pane}");
+        click(cx, window, ANNOTATOR_DONE_ID);
+        frame(cx, window);
+        assert!(annotator(cx, &shell).is_none(), "from_pane {from_pane}");
+        assert_eq!(rail_active(cx, &shell), Some(RailEntry::Feedback));
+        assert!(
+            !row_focused(cx),
+            "from_pane {from_pane}: the pane took the focus"
+        );
+
+        press(cx, window, "cmd-alt-f");
+        assert_eq!(rail_active(cx, &shell), None, "from_pane {from_pane}");
+        assert!(row_focused(cx), "from_pane {from_pane}: back on the row");
+    }
 }
