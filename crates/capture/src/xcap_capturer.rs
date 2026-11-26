@@ -31,20 +31,33 @@ impl Capturer for XcapCapturer {
             return Err(CaptureError::PermissionDenied);
         }
 
-        let (windows, infos): (Vec<xcap::Window>, Vec<WindowInfo>) = xcap::Window::all()
-            .map_err(from_xcap)?
-            .into_iter()
-            .filter_map(|window| {
-                let info = WindowInfo {
-                    pid: window.pid().ok()?,
-                    width: window.width().ok()?,
-                    height: window.height().ok()?,
-                    minimized: window.is_minimized().ok()?,
-                };
-                Some((window, info))
-            })
-            .unzip();
-        let index = pick_window(&infos, target).ok_or(CaptureError::WindowNotFound)?;
+        let mut windows = Vec::new();
+        let mut infos = Vec::new();
+        for window in xcap::Window::all().map_err(from_xcap)? {
+            // The process first: another process's window is skipped before
+            // anything else is read from it. One whose process cannot be read
+            // is not known to be ours.
+            let Ok(pid) = window.pid() else {
+                continue;
+            };
+            if pid != target.pid {
+                continue;
+            }
+            // Ours: a value that cannot be read is a failure, not a skip.
+            let info = our_window(&window, pid)
+                .map_err(|error| CaptureError::Failed(error.to_string()))?;
+            windows.push(window);
+            infos.push(info);
+        }
+        let index = pick_window(&infos, target).ok_or_else(|| {
+            tracing::debug!(frame = ?target.frame, windows = ?infos, "feedback capture: no window matches");
+            CaptureError::WindowNotFound
+        })?;
+        tracing::debug!(
+            frame = ?target.frame,
+            window = ?infos[index],
+            "feedback capture: the window to capture"
+        );
         let image = windows[index].capture_image().map_err(from_xcap)?;
         Ok(Screenshot {
             width: image.width(),
@@ -52,6 +65,22 @@ impl Capturer for XcapCapturer {
             rgba: image.into_raw(),
         })
     }
+}
+
+/// What [`pick_window`] needs of one of this process's windows.
+fn our_window(window: &xcap::Window, pid: u32) -> Result<WindowInfo, xcap::XCapError> {
+    Ok(WindowInfo {
+        pid,
+        x: window.x()?,
+        y: window.y()?,
+        width: window.width()?,
+        height: window.height()?,
+        // macOS lists on-screen windows only: a minimized one is never listed.
+        #[cfg(target_os = "macos")]
+        minimized: false,
+        #[cfg(not(target_os = "macos"))]
+        minimized: window.is_minimized()?,
+    })
 }
 
 fn from_xcap(error: xcap::XCapError) -> CaptureError {

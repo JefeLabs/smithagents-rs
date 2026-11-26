@@ -7761,6 +7761,7 @@ dependencies = [
  "objc2-core-graphics",
  "tempfile",
  "thiserror 2.0.21",
+ "tracing",
  "xcap",
 ]
 

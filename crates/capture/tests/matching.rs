@@ -26,10 +26,36 @@ fn app_window() -> WindowTarget {
 fn window(pid: u32, width: u32, height: u32) -> WindowInfo {
     WindowInfo {
         pid,
+        x: 100,
+        y: 50,
         width,
         height,
         minimized: false,
     }
+}
+
+fn window_at(pid: u32, x: i32, y: i32, width: u32, height: u32) -> WindowInfo {
+    WindowInfo {
+        x,
+        y,
+        ..window(pid, width, height)
+    }
+}
+
+/// A width x height picture of one color whose four corners are fully
+/// transparent, as a real window capture's rounded corners are.
+fn with_transparent_corners(mut shot: Screenshot) -> Screenshot {
+    let (width, height) = (shot.width as usize, shot.height as usize);
+    for (x, y) in [
+        (0, 0),
+        (width - 1, 0),
+        (0, height - 1),
+        (width - 1, height - 1),
+    ] {
+        let at = (y * width + x) * 4;
+        shot.rgba[at..at + 4].copy_from_slice(&[0, 0, 0, 0]);
+    }
+    shot
 }
 
 fn gray(width: u32, height: u32) -> Screenshot {
@@ -74,6 +100,40 @@ fn two_points_off_matches_and_three_does_not() {
 }
 
 #[test]
+fn position_orders_windows_that_match_but_never_excludes_one() {
+    // Two of our windows with the same size: the one at the target's place wins,
+    // wherever it is listed.
+    let windows = [
+        window_at(42, 900, 400, 1200, 760),
+        window_at(42, 100, 50, 1200, 760),
+    ];
+    assert_eq!(pick_window(&windows, &app_window()), Some(1));
+    let windows = [
+        window_at(42, 100, 50, 1200, 760),
+        window_at(42, 900, 400, 1200, 760),
+    ];
+    assert_eq!(pick_window(&windows, &app_window()), Some(0));
+
+    // On a second display GPUI's origin is not the system's: a window far from
+    // the target's place still matches by process and size.
+    let far = [window_at(42, 3000, -900, 1200, 760)];
+    assert_eq!(pick_window(&far, &app_window()), Some(0));
+
+    // The size still comes first: a closer size beats a closer place.
+    let windows = [
+        window_at(42, 100, 50, 1202, 760),
+        window_at(42, 900, 400, 1200, 760),
+    ];
+    assert_eq!(pick_window(&windows, &app_window()), Some(1));
+
+    // And another process's window at the very place never matches.
+    assert_eq!(
+        pick_window(&[window_at(7, 100, 50, 1200, 760)], &app_window()),
+        None
+    );
+}
+
+#[test]
 fn a_minimized_window_never_matches() {
     let minimized = WindowInfo {
         minimized: true,
@@ -97,6 +157,26 @@ fn an_empty_or_single_color_capture_is_refused() {
     let mut one_pixel_changed = gray(4, 4);
     one_pixel_changed.rgba[4 * 9] = 127;
     assert_eq!(checked(one_pixel_changed.clone()), Ok(one_pixel_changed));
+}
+
+#[test]
+fn transparent_corners_do_not_make_a_single_color_capture_usable() {
+    assert_eq!(checked(with_transparent_corners(gray(8, 6))), empty());
+
+    let clear = Screenshot {
+        width: 4,
+        height: 4,
+        rgba: [10, 20, 30, 0].repeat(16),
+    };
+    assert_eq!(checked(clear), empty(), "nothing opaque at all");
+
+    // A faint pixel still counts: only alpha 0 is left out.
+    let mut faint = with_transparent_corners(gray(8, 6));
+    faint.rgba[4 * 9..4 * 10].copy_from_slice(&[200, 10, 10, 1]);
+    assert_eq!(checked(faint.clone()), Ok(faint));
+
+    let varied = with_transparent_corners(test_pattern(8, 6));
+    assert_eq!(checked(varied.clone()), Ok(varied));
 }
 
 #[test]
