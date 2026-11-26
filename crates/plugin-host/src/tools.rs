@@ -79,7 +79,17 @@ fn exit_text(status: &Option<i32>) -> String {
 /// tokio's clock.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolRun<'a> {
+    /// Each one reaches the tool as one argument, as it is (no shell). An
+    /// argument that starts with `-` is read as an option, so a value that
+    /// comes from a user must be joined to its option (`--title=<value>`)
+    /// or follow `--`, never stand alone.
     pub args: &'a [String],
+    /// Where it runs: an absolute path (a relative or empty one is refused
+    /// with [`ToolRunError::NotStarted`] before anything starts, since it
+    /// would depend on the daemon's own working directory). A tool found
+    /// through mise's shims picks its version from the mise configuration of
+    /// this directory and its parents: when the tool does not need a
+    /// repository, prefer a neutral directory.
     pub cwd: &'a Path,
     pub env: &'a [(&'a str, &'a str)],
     pub timeout: Duration,
@@ -92,7 +102,8 @@ pub enum ToolRunError {
     /// No usable executable of that name in the search path.
     #[error("the tool is not installed")]
     NotFound,
-    /// It could not be started (or its output read, or its end awaited).
+    /// It could not be started (its directory is not absolute, or the
+    /// system refused), or its output could not be read or its end awaited.
     #[error("the tool could not be started")]
     NotStarted,
     #[error("the tool did not finish in time")]
@@ -253,13 +264,19 @@ impl ToolFinder {
         }
     }
 
-    /// Runs `<name> <args>` in `run.cwd` as [`run_command`] runs every
-    /// command, with `run.env` added; the answer is the first line it
-    /// printed, trimmed (`None` when that is empty). `name` is found as
-    /// [`ToolFinder::find`] finds it. The caller decides which tools may run:
-    /// the daemon allows only those a built-in plugin declares.
+    /// Runs `<name> <args>` in `run.cwd` (absolute; see [`ToolRun`]) as
+    /// [`run_command`] runs every command, with `run.env` added; the answer
+    /// is the first line it printed, trimmed (`None` when that is empty).
+    /// `name` is found as [`ToolFinder::find`] finds it. The caller decides
+    /// which tools may run: the daemon allows only those a built-in plugin
+    /// declares.
     pub async fn run(&self, name: &str, run: ToolRun<'_>) -> Result<Option<String>, ToolRunError> {
         let path = self.find(name).ok_or(ToolRunError::NotFound)?;
+        if !run.cwd.is_absolute() {
+            // `name` is a bare tool name now. The directory is not logged.
+            tracing::warn!(tool = %name, "a tool was asked to run in a relative directory");
+            return Err(ToolRunError::NotStarted);
+        }
         let mut cmd = tokio::process::Command::new(&path);
         cmd.args(run.args).current_dir(run.cwd);
         for (key, value) in run.env {

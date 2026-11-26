@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use smithagents_plugin_host::{LoadError, WasmEngine};
 use smithagents_plugin_protocol::HostMode;
 use smithagents_plugins_tool::pack_fixtures_once;
-use smithagents_server::plugins::{discover, load_runtime, Origin};
+use smithagents_server::plugins::{discover, load_runtime, Origin, FEEDBACK_PLUGIN_ID};
 
 /// Sets the mode; off Unix there are no modes, so this does nothing.
 fn chmod(path: &Path, mode: u32) {
@@ -191,6 +191,36 @@ fn invalid_manifest_rejects_only_its_directory() {
         "plugin.toml is not valid TOML for a plugin manifest (line 1)"
     );
     assert_eq!(by_dir(&noman), "plugin.toml cannot be read");
+}
+
+/// A plugin compiled into the daemon keeps its id from a directory in either
+/// folder, which is refused before its runtime could be loaded.
+#[test]
+fn an_id_compiled_into_the_daemon_is_refused_in_both_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (builtin, installed) = (tmp.path().join("b"), tmp.path().join("i"));
+    let empty = tmp.path().join("none");
+    // Real, loadable plugins under the reserved name.
+    let in_builtin = install_fixture(&builtin, "fixture-dylib", FEEDBACK_PLUGIN_ID);
+    let in_installed = install_fixture(&installed, "fixture-wasm", FEEDBACK_PLUGIN_ID);
+
+    for (builtin, installed, dir) in [
+        (Some(builtin.as_path()), empty.as_path(), &in_builtin),
+        (None, installed.as_path(), &in_installed),
+    ] {
+        let (found, rejected) = discover(builtin, installed);
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(rejected.len(), 1, "{rejected:?}");
+        assert_eq!(&rejected[0].dir, dir);
+        assert_eq!(rejected[0].reason, "a built-in plugin has this id");
+    }
+
+    // Other ids in the same folders still load.
+    install_fixture(&builtin, "fixture-dylib", "fixture-dylib");
+    install_fixture(&installed, "fixture-wasm", "fixture-wasm");
+    let (found, _) = discover(Some(&builtin), &installed);
+    let ids: Vec<&str> = found.iter().map(|d| d.manifest().id.as_ref()).collect();
+    assert_eq!(ids, ["fixture-dylib", "fixture-wasm"]);
 }
 
 #[test]

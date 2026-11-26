@@ -863,11 +863,45 @@ async fn run_passes_each_argument_as_it_is_without_a_shell() {
     );
 }
 
+#[tokio::test]
+async fn run_refuses_a_directory_that_is_not_absolute() {
+    let tools = TempDir::new().unwrap();
+    let ran = tools.path().join("ran");
+    script(tools.path(), "mark", &format!("touch '{}'", ran.display()));
+    let f = finder(&tools);
+
+    for cwd in ["", ".", "work", "./work", "../work"] {
+        assert_eq!(
+            f.run("mark", run_in(&[], Path::new(cwd), &[])).await,
+            Err(ToolRunError::NotStarted),
+            "{cwd:?}"
+        );
+    }
+    assert!(!ran.exists(), "the tool ran");
+}
+
+/// An environment variable set for one test's length, under a name no
+/// other test uses.
+struct EnvVar(&'static str);
+
+impl EnvVar {
+    fn set(name: &'static str, value: &str) -> EnvVar {
+        std::env::set_var(name, value);
+        EnvVar(name)
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
 // Review Focus 3: a tool the daemon runs never sees a `SMITHAGENTS_*`
 // variable, neither the daemon's own nor one a caller passes.
 #[tokio::test]
 async fn run_strips_smithagents_variables_and_passes_the_given_ones() {
-    std::env::set_var("SMITHAGENTS_SECRET_RUN_TEST__X", "LEAK-secret");
+    let _secret = EnvVar::set("SMITHAGENTS_SECRET_TOOL_RUN_TEST_Q7__LEAK", "LEAK-secret");
     let (tools, work) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let out = work.path().join("env.txt");
     script(tools.path(), "dump", &format!("env > '{}'", out.display()));

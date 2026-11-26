@@ -22,6 +22,8 @@ use smithagents_plugin_host::{
 };
 use smithagents_plugin_protocol::{HostMode, Manifest, ManifestError};
 
+use super::embedded::embedded_ids;
+
 /// The longest a single call into a loaded plugin may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Larger manifests are refused.
@@ -122,18 +124,19 @@ struct Scan {
     names: Vec<String>,
 }
 
-/// Scans both directories. A built-in plugin, even a broken one, and every
+/// Scans both directories. The id of a plugin compiled into the daemon is
+/// refused in both. A built-in plugin, even a broken one, and every
 /// directory name under an untrusted built-in root, keeps its id from an
 /// installed plugin. A built-in root that is a symbolic link is not read, so
 /// which ids it reserves is unknown: then no installed plugin loads either.
 /// Results are sorted by id (rejections by directory).
 pub fn discover(builtin: Option<&Path>, installed: &Path) -> (Vec<Discovered>, Vec<Rejected>) {
     let mut result = Scan::default();
-    let mut reserved = Vec::new();
+    let mut reserved: Vec<String> = embedded_ids().map(str::to_string).collect();
     if let Some(dir) = builtin {
         let mut scan = Scan::default();
-        scan_root(dir, Origin::Builtin, &[], &mut scan);
-        reserved = std::mem::take(&mut scan.names);
+        scan_root(dir, Origin::Builtin, &reserved, &mut scan);
+        reserved.append(&mut scan.names);
         result = scan;
     }
     let builtin_is_link =
@@ -263,7 +266,9 @@ fn check_dir(
             manifest.id
         ));
     }
-    if origin == Origin::Installed && reserved.iter().any(|n| n == manifest.id.as_ref()) {
+    // For a built-in directory, the ids compiled into the daemon; for an
+    // installed one, those and every built-in directory's name.
+    if reserved.iter().any(|n| n == manifest.id.as_ref()) {
         return Err("a built-in plugin has this id".into());
     }
     match manifest.host {

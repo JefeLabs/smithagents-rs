@@ -582,11 +582,14 @@ impl PluginManager {
 
     /// A fresh check of the tool `tool` that the built-in plugin `id`
     /// declares (the status's cached check is neither read nor replaced).
-    /// Refused for an installed plugin (`NotAllowed`) and a tool the plugin
-    /// does not declare (`UnknownTool`).
+    /// Refused for an installed plugin (`NotAllowed`), a tool the plugin
+    /// does not declare (`UnknownTool`), and, as [`Self::run_tool`] is, while
+    /// the plugin is disabled or cannot run (`Disabled`): a tool that may
+    /// not run is not reported ready.
     pub async fn tool_state(&self, id: &str, tool: &str) -> Result<ToolState, ManagerError> {
         let plugin = self.inner.plugin(id)?;
         let decl = tools::builtin_tool(plugin, tool)?;
+        self.inner.tools_usable(plugin)?;
         Ok(self.inner.tools.check(decl).await)
     }
 
@@ -594,7 +597,8 @@ impl PluginManager {
     /// daemon's own code: `<tool> <args>` in `run.cwd`, found and run as
     /// every tool is (no shell, no `SMITHAGENTS_*` variable, a timeout, at
     /// most 64 KiB of output). The answer is the first line it printed. The
-    /// same refusals as [`Self::tool_state`]; a run that fails is
+    /// same refusals as [`Self::tool_state`]: disabling the plugin is the
+    /// user's off switch for its tools. A run that fails is
     /// `ManagerError::Tool`, which carries nothing the tool printed.
     pub async fn run_tool(
         &self,
@@ -604,6 +608,7 @@ impl PluginManager {
     ) -> Result<Option<String>, ManagerError> {
         let plugin = self.inner.plugin(id)?;
         let decl = tools::builtin_tool(plugin, tool)?;
+        self.inner.tools_usable(plugin)?;
         self.inner
             .tools
             .run(&decl.name, run)
@@ -680,6 +685,22 @@ impl PluginManager {
 impl Inner {
     fn plugin(&self, id: &str) -> Result<&Managed, ManagerError> {
         self.plugins.get(id).ok_or(ManagerError::UnknownPlugin)
+    }
+
+    /// `Disabled` unless the plugin's tools may be checked or run for the
+    /// daemon's code now: as for `sync_now`, it must be loaded and allowed to
+    /// run, enabled, not stopped, and the manager not shut down. Installing
+    /// a tool, which the user asks for, does not ask this.
+    fn tools_usable(&self, plugin: &Managed) -> Result<(), ManagerError> {
+        let live = plugin.live();
+        if !plugin.can_run()
+            || !live.enabled
+            || live.is_failed()
+            || self.stopping.load(Ordering::SeqCst)
+        {
+            return Err(ManagerError::Disabled);
+        }
+        Ok(())
     }
 
     /// Replaces the rows of a plugin whose stored state could not be read:

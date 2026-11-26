@@ -25,8 +25,8 @@ use smithagents_plugin_host::{
 use smithagents_plugin_protocol::{HostMode, Manifest, SyncPage, SyncRequest};
 use smithagents_server::events::EventBus;
 use smithagents_server::plugins::{
-    embedded_plugins, LoadedPlugin, ManagerConfig, ManagerError, Origin, PluginManager,
-    FEEDBACK_PLUGIN_ID,
+    embedded_first, embedded_plugins, LoadedPlugin, ManagerConfig, ManagerError, Origin,
+    PluginManager, FEEDBACK_PLUGIN_ID,
 };
 use smithagents_server::store::Store;
 use tempfile::TempDir;
@@ -431,13 +431,22 @@ async fn installing_a_tool_checks_again_at_once_and_leaves_no_problem_behind() {
 async fn an_embedded_id_wins_over_a_directory_plugin() {
     let root = TempDir::new().unwrap();
     let fake = FakeTools::new(root.path(), true, true);
+    // Nothing else, the embedded plugins come first.
+    let ids = |plugins: &[LoadedPlugin]| -> Vec<String> {
+        plugins.iter().map(|p| p.manifest.id.to_string()).collect()
+    };
+    assert_eq!(ids(&embedded_first(Vec::new())), ["feedback"]);
+
+    // Discovery refuses a directory with an embedded id; should one get
+    // through, the order the daemon starts with keeps the embedded plugin.
     let impostor = Arc::new(Quiet::default());
-    let mut plugins = embedded_plugins();
-    plugins.push(plugin(
+    let plugins = embedded_first(vec![plugin(
         manifest("feedback", ""),
         Origin::Installed,
         impostor.clone(),
-    ));
+    )]);
+    assert_eq!(ids(&plugins), ["feedback", "feedback"]);
+    assert_eq!(plugins[0].origin, Origin::Builtin);
     let store = Store::open_in_memory().await.unwrap();
     let m = start(store, plugins, &fake).await;
 
@@ -455,6 +464,69 @@ async fn an_embedded_id_wins_over_a_directory_plugin() {
 
 // ---------------------------------------------------------------------------
 // Running a declared tool
+
+/// Disabling the plugin is the user's off switch for its tools: none is run
+/// or reported ready. Installing one still works.
+#[tokio::test]
+async fn a_disabled_plugin_runs_and_reports_no_tool() {
+    let root = TempDir::new().unwrap();
+    let fake = FakeTools::new(root.path(), true, true);
+    let installs = root.path().join("mise.log");
+    script(
+        &fake.bin,
+        "mise",
+        &format!("printf '%s\\n' \"$@\" >> '{}'", installs.display()),
+    );
+    let m = embedded_only(&fake).await;
+    let work = TempDir::new().unwrap();
+    let auth = args(&["auth", "status"]);
+
+    m.set_enabled(FEEDBACK_PLUGIN_ID, false).await.unwrap();
+
+    let answer = m
+        .run_tool(FEEDBACK_PLUGIN_ID, "gh", run(&auth, work.path()))
+        .await;
+    assert!(matches!(answer, Err(ManagerError::Disabled)), "{answer:?}");
+    let state = m.tool_state(FEEDBACK_PLUGIN_ID, "gh").await;
+    assert!(matches!(state, Err(ManagerError::Disabled)), "{state:?}");
+    // What is never allowed is still refused as such.
+    assert!(matches!(
+        m.run_tool(FEEDBACK_PLUGIN_ID, "mise", run(&auth, work.path()))
+            .await,
+        Err(ManagerError::UnknownTool)
+    ));
+    assert_eq!(fake.calls(), Vec::<String>::new());
+    // An install is the user's own request: it runs while disabled.
+    let s = m.install_tool(FEEDBACK_PLUGIN_ID, "gh").await.unwrap();
+    assert_eq!(s.state, PluginState::Disabled);
+    assert_eq!(
+        std::fs::read_to_string(&installs).unwrap(),
+        "use\n--global\ngh\n"
+    );
+
+    // Enabled again, both work.
+    m.set_enabled(FEEDBACK_PLUGIN_ID, true).await.unwrap();
+    m.run_tool(FEEDBACK_PLUGIN_ID, "gh", run(&auth, work.path()))
+        .await
+        .unwrap();
+    assert_eq!(
+        m.tool_state(FEEDBACK_PLUGIN_ID, "gh").await.unwrap(),
+        ToolState::Ready {
+            path: fake.bin.join("gh"),
+            version: None
+        }
+    );
+    assert_eq!(fake.calls(), ["auth status"]);
+
+    // After shutdown nothing runs either.
+    m.shutdown().await;
+    assert!(matches!(
+        m.run_tool(FEEDBACK_PLUGIN_ID, "gh", run(&auth, work.path()))
+            .await,
+        Err(ManagerError::Disabled)
+    ));
+    assert_eq!(fake.calls(), ["auth status"]);
+}
 
 #[tokio::test]
 async fn run_tool_runs_only_declared_tools_of_built_in_plugins() {

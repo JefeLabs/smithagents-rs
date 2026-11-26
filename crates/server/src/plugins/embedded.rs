@@ -5,9 +5,10 @@
 //! state says whether they are there.
 //!
 //! No directory can ask for this: discovery refuses the `in-process` host
-//! mode. The daemon lists these before the plugins it discovers, so a
-//! directory with the same id cannot replace one (the manager keeps the
-//! first of two equal ids).
+//! mode, and refuses a directory in either plugin folder that uses one of
+//! these ids, before anything in it is loaded. The daemon also lists these
+//! before the plugins it discovers ([`embedded_first`]), and the manager
+//! keeps the first of two equal ids.
 
 use std::sync::Arc;
 
@@ -21,26 +22,47 @@ use super::{LoadedPlugin, Origin};
 /// `agent-browser` for an idea's demo video.
 pub const FEEDBACK_PLUGIN_ID: &str = "feedback";
 
-const FEEDBACK_MANIFEST: &str = include_str!("embedded/feedback.toml");
+/// Each embedded plugin's id and manifest text. The id is written here as
+/// well, so discovery reserves it without parsing the manifest.
+const EMBEDDED: [(&str, &str); 1] = [(FEEDBACK_PLUGIN_ID, include_str!("embedded/feedback.toml"))];
+
+/// The ids of the embedded plugins: no plugin directory may use one.
+pub(super) fn embedded_ids() -> impl Iterator<Item = &'static str> {
+    EMBEDDED.iter().map(|(id, _)| *id)
+}
 
 /// Every embedded plugin, built in and enabled when first seen. Today only
 /// [`FEEDBACK_PLUGIN_ID`].
 pub fn embedded_plugins() -> Vec<LoadedPlugin> {
-    [FEEDBACK_MANIFEST]
-        .into_iter()
-        .filter_map(|text| match Manifest::parse(text) {
-            Ok(manifest) => Some(LoadedPlugin {
+    EMBEDDED
+        .iter()
+        .filter_map(|(id, text)| match Manifest::parse(text) {
+            Ok(manifest) if manifest.id.as_ref() == *id => Some(LoadedPlugin {
                 manifest,
                 origin: Origin::Builtin,
                 runtime: Ok(Arc::new(NothingToSync)),
             }),
-            // A test parses every embedded manifest; this cannot ship.
+            // A test parses every embedded manifest; neither can ship.
+            Ok(_) => {
+                tracing::error!(plugin = %id, "an embedded plugin manifest has another id");
+                None
+            }
             Err(e) => {
-                tracing::error!("an embedded plugin manifest is not valid: {e}");
+                tracing::error!(plugin = %id, "an embedded plugin manifest is not valid: {e}");
                 None
             }
         })
         .collect()
+}
+
+/// The plugins the daemon starts with: the embedded ones, then
+/// `discovered`. Listed first, an embedded plugin keeps its id even from a
+/// directory that discovery let through, since the manager keeps the first
+/// of two equal ids.
+pub fn embedded_first(discovered: Vec<LoadedPlugin>) -> Vec<LoadedPlugin> {
+    let mut plugins = embedded_plugins();
+    plugins.extend(discovered);
+    plugins
 }
 
 /// The runtime of a plugin with no resources: the manager never calls it,
