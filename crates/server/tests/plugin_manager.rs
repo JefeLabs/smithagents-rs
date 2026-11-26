@@ -11,6 +11,7 @@
 
 use std::future::Future;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,11 +21,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::json;
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::plugin::{PluginState, PluginStatus, ResourceStatus};
+use smithagents_core::plugin::{MissingTool, PluginState, PluginStatus, ResourceStatus};
 use smithagents_plugin_fixture::Fixture;
 use smithagents_plugin_host::{
-    CallError, CallHandle, LinkedRuntime, PluginRuntime, Secret, SecretError, SecretSource,
-    StaticSecrets,
+    CallError, CallHandle, InstallError, LinkedRuntime, PluginRuntime, Secret, SecretError,
+    SecretSource, StaticSecrets, ToolFinder,
 };
 use smithagents_plugin_protocol::{
     HostApi, HostMode, Item, Manifest, Plugin, PluginError, PluginId, SyncPage, SyncRequest,
@@ -114,12 +115,22 @@ impl Env {
         plugins: Vec<LoadedPlugin>,
         secrets: Arc<dyn SecretSource>,
     ) -> PluginManager {
+        self.start_cfg(plugins, secrets, ManagerConfig::default())
+            .await
+    }
+
+    async fn start_cfg(
+        &self,
+        plugins: Vec<LoadedPlugin>,
+        secrets: Arc<dyn SecretSource>,
+        cfg: ManagerConfig,
+    ) -> PluginManager {
         PluginManager::start_with_clock(
             self.store.clone(),
             self.bus.clone(),
             secrets,
             plugins,
-            ManagerConfig::default(),
+            cfg,
             self.clock(),
         )
         .await
@@ -1955,4 +1966,596 @@ async fn items_are_read_through_the_manager() {
         m.items("fixture", "nope", 4, None, None).await,
         Err(ManagerError::UnknownResource)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Command-line tools
+//
+// Every tool is a shell script the test writes into its own directory, which
+// is the manager's only search path: nothing installed on the machine is
+// found or run. Real processes run while the clock is frozen, so their 10 s
+// timeout cannot fire early.
+
+const GH_TOOL: &str = "[[tools]]\nname = \"gh\"\nlabel = \"GitHub CLI\"\n\
+                       min_version = \"2.40.0\"\ninstall_url = \"https://cli.github.com\"\n\
+                       install = { mise = \"gh\", brew = \"gh\" }\n";
+const GH_TOKEN: &str = "[[secrets]]\nkey = \"token\"\nlabel = \"GitHub sign-in\"\n\
+                        help = \"Run: gh auth login\"\n\
+                        from_tool = { tool = \"gh\", args = [\"auth\", \"token\"] }\n";
+
+fn tools_cfg(dir: &Path) -> ManagerConfig {
+    ManagerConfig {
+        tools: ToolFinder::new(vec![dir.to_path_buf()]),
+        ..ManagerConfig::default()
+    }
+}
+
+/// Writes an executable shell script `name` into `dir`.
+fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A fake `gh` that logs each run's arguments to `<dir>/gh.log`, prints
+/// `version_line` for `--version` and runs `auth` for `auth token`.
+fn fake_gh(dir: &Path, version_line: &str, auth: &str) {
+    let log = dir.join("gh.log");
+    script(
+        dir,
+        "gh",
+        &format!(
+            "echo \"$*\" >> '{}'\ncase \"$1\" in\n--version) echo '{version_line}' ;;\nauth) {auth} ;;\nesac",
+            log.display()
+        ),
+    );
+}
+
+const SIGNED_IN: &str = "echo tool-5ecret";
+
+/// Every run of the fake `gh`, as its arguments.
+fn gh_runs(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("gh.log"))
+        .map(|s| s.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// A fake `mise` that logs its arguments, one per line, to `<dir>/mise.log`
+/// and then runs `then`.
+fn fake_mise(dir: &Path, then: &str) {
+    let log = dir.join("mise.log");
+    script(
+        dir,
+        "mise",
+        &format!(
+            "for a in \"$@\"; do echo \"$a\" >> '{}'; done\n{then}",
+            log.display()
+        ),
+    );
+}
+
+/// What the fake `mise` runs to install a fake `gh` that is signed in.
+fn installs_gh(dir: &Path) -> String {
+    let gh = dir.join("gh");
+    format!(
+        "printf '#!/bin/sh\\ncase \"$1\" in --version) echo gh version 2.41.0 ;; *) echo tool-5ecret ;; esac\\n' > '{0}'; chmod 755 '{0}'",
+        gh.display()
+    )
+}
+
+fn gh_hints() -> std::collections::BTreeMap<String, String> {
+    [("brew", "gh"), ("mise", "gh")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn missing_gh(reason: &str) -> MissingTool {
+    MissingTool {
+        name: "gh".into(),
+        label: "GitHub CLI".into(),
+        reason: reason.into(),
+        install_url: Some("https://cli.github.com".into()),
+        install: gh_hints(),
+    }
+}
+
+/// The tools of a `NeedsSetup` state, and its message.
+fn needs_setup(state: &PluginState) -> (&[MissingTool], &str) {
+    match state {
+        PluginState::NeedsSetup { tools, message } => (tools, message),
+        other => panic!("expected NeedsSetup, got {other:?}"),
+    }
+}
+
+/// Everything statuses and events said, as text.
+fn said(statuses: &[PluginStatus], events: &[EventKind]) -> String {
+    let mut text = serde_json::to_string(statuses).unwrap();
+    for e in events {
+        text.push_str(&serde_json::to_string(e).unwrap());
+    }
+    text
+}
+
+#[tokio::test]
+async fn a_builtin_plugin_with_a_missing_tool_needs_setup_and_is_not_called() {
+    let mut env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("tooled", &[("items", 60)], GH_TOOL),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.run_due().await;
+
+    assert_eq!(rt.calls(), 0);
+    let s = status(&m, "tooled").await;
+    let (tools, message) = needs_setup(&s.state);
+    assert_eq!(tools, [missing_gh("not installed")]);
+    assert!(message.contains("GitHub CLI (gh)"), "{message}");
+    assert!(message.contains("not installed"), "{message}");
+    // The last event says so, and that nothing syncs.
+    let events = env.drain();
+    let last = *updates(&events, "tooled").last().expect("a PluginUpdated");
+    assert_eq!(last.state, s.state);
+    assert!(!resource(last, "items").syncing, "{last:?}");
+
+    // Held: time passing does not run it.
+    env.advance(secs(3600)).await;
+    m.run_due().await;
+    assert_eq!(rt.calls(), 0);
+
+    // Once the tool is there, `sync_now` checks again and the plugin runs.
+    fake_gh(dir.path(), "gh version 2.41.0 (2024-01-09)", SIGNED_IN);
+    m.sync_now("tooled", "items").await.unwrap();
+    m.run_due().await;
+    assert_eq!(rt.calls(), 3);
+    assert_eq!(status(&m, "tooled").await.state, PluginState::Ready);
+}
+
+#[tokio::test]
+async fn a_tool_too_old_or_without_a_readable_version_needs_setup_saying_why() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    fake_gh(dir.path(), "gh version 2.30.1 (2023-05-01)", SIGNED_IN);
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("aged", &[("items", 60)], GH_TOOL),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.run_due().await;
+    let s = status(&m, "aged").await;
+    let (tools, message) = needs_setup(&s.state);
+    assert_eq!(
+        tools,
+        [missing_gh("older than the required version 2.40.0")]
+    );
+    // What the tool printed is never repeated, not even its version.
+    assert!(!message.contains("2.30.1"), "{message}");
+
+    fake_gh(dir.path(), "gh development build", SIGNED_IN);
+    m.set_settings("aged", json!({})).await.unwrap();
+    m.run_due().await;
+    let s = status(&m, "aged").await;
+    let (tools, message) = needs_setup(&s.state);
+    assert_eq!(tools, [missing_gh("could not read its version")]);
+    assert!(!message.contains("development"), "{message}");
+    assert_eq!(rt.calls(), 0);
+}
+
+#[tokio::test]
+async fn the_tool_check_is_kept_for_60_s_and_sync_now_settings_and_enabling_check_again() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake_gh(dir.path(), "gh version 2.41.0", SIGNED_IN);
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("cached", &[("a", 60), ("b", 60)], GH_TOOL),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    let checks = || gh_runs(dir.path()).len();
+
+    // t=0: both resources run; the second uses the first's check.
+    m.run_due().await;
+    assert_eq!((rt.calls(), checks()), (2, 1));
+
+    // t=30: sync_now checks again.
+    env.advance(secs(30)).await;
+    m.sync_now("cached", "a").await.unwrap();
+    m.run_due().await;
+    assert_eq!((rt.calls(), checks()), (3, 2));
+
+    // t=61: `b` is due; the check from t=30 still holds.
+    env.advance(secs(31)).await;
+    m.run_due().await;
+    assert_eq!((rt.calls(), checks()), (4, 2));
+
+    // t=91: `a` is due; the check from t=30 is 61 s old.
+    env.advance(secs(30)).await;
+    m.run_due().await;
+    assert_eq!((rt.calls(), checks()), (5, 3));
+
+    // New settings and enabling check again, once for both runs.
+    m.set_settings("cached", json!({})).await.unwrap();
+    m.run_due().await;
+    assert_eq!((rt.calls(), checks()), (7, 4));
+    m.set_enabled("cached", true).await.unwrap();
+    m.run_due().await;
+    assert_eq!((rt.calls(), checks()), (9, 5));
+    assert!(gh_runs(dir.path()).iter().all(|r| r == "--version"));
+}
+
+#[tokio::test]
+async fn an_installed_plugin_declaring_a_tool_is_never_run() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    // The tool is there, signed in, and new enough.
+    fake_gh(dir.path(), "gh version 2.41.0", SIGNED_IN);
+    let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let m = env
+        .start_cfg(
+            vec![installed(
+                manifest("third", &[("items", 60)], &format!("{GH_TOOL}{GH_TOKEN}")),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    let want = PluginState::NeedsSetup {
+        tools: vec![MissingTool {
+            name: "gh".into(),
+            label: "GitHub CLI".into(),
+            reason: "needs approval".into(),
+            install_url: None,
+            install: Default::default(),
+        }],
+        message: "command-line tools need approval, which is not built yet".into(),
+    };
+
+    // Listed so even while disabled, and enabling does not change it.
+    let s = status(&m, "third").await;
+    assert!(!s.enabled);
+    assert_eq!(s.state, want);
+    let s = m.set_enabled("third", true).await.unwrap();
+    assert_eq!(s.state, want);
+    m.run_due().await;
+    assert!(matches!(
+        m.sync_now("third", "items").await,
+        Err(ManagerError::Disabled)
+    ));
+    env.advance(secs(3600)).await;
+    m.run_due().await;
+    m.set_settings("third", json!({})).await.unwrap();
+    m.run_due().await;
+
+    assert_eq!(rt.calls(), 0);
+    assert_eq!(status(&m, "third").await.state, want);
+    assert!(matches!(
+        m.install_tool("third", "gh").await,
+        Err(ManagerError::NotAllowed)
+    ));
+    // Its tool was neither checked nor asked for a secret.
+    assert_eq!(gh_runs(dir.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_tool_backed_secret_signs_a_builtin_plugin_in_after_the_configured_sources() {
+    let mut env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake_gh(dir.path(), "gh version 2.41.0", SIGNED_IN);
+    let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let extra = format!("{GH_TOOL}{GH_TOKEN}");
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("signed", &[("items", 60)], &extra),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.run_due().await;
+    assert_eq!(rt.calls(), 3);
+    assert_eq!(status(&m, "signed").await.state, PluginState::Ready);
+    assert_eq!(gh_runs(dir.path()), ["--version", "auth token"]);
+    let text = said(&m.list().await, &env.drain());
+    assert!(!text.contains("tool-5ecret"), "{text}");
+    m.shutdown().await;
+
+    // A configured value wins: the tool is not asked.
+    std::fs::remove_file(dir.path().join("gh.log")).unwrap();
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("signed", &[("items", 60)], &extra),
+                rt.runtime(),
+            )],
+            secrets(&[("signed", "token", "s3cr3t-value")]),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.set_settings("signed", json!({})).await.unwrap();
+    m.run_due().await;
+    assert_eq!(status(&m, "signed").await.state, PluginState::Ready);
+    assert_eq!(gh_runs(dir.path()), ["--version"]);
+}
+
+/// Captured log output.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// Everything this test binary logs, from every test. Global on purpose: a
+/// subscriber set for one thread misses events whose call site another
+/// test's thread reached first (tracing caches the interest per call site).
+fn logs() -> &'static Logs {
+    static LOGS: std::sync::OnceLock<Logs> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let logs = Logs::default();
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the only global subscriber");
+        logs
+    })
+}
+
+#[tokio::test]
+async fn a_tool_that_is_not_signed_in_needs_auth_with_its_help_and_none_of_its_output() {
+    let logs = logs();
+    let mut env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake_gh(
+        dir.path(),
+        "gh version 2.41.0",
+        "echo out-5ecret; echo err-5ecret >&2; exit 1",
+    );
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let without_help = GH_TOKEN.replace("help = \"Run: gh auth login\"\n", "");
+    let m = env
+        .start_cfg(
+            vec![
+                builtin(
+                    manifest("helped", &[("items", 60)], &format!("{GH_TOOL}{GH_TOKEN}")),
+                    rt.runtime(),
+                ),
+                builtin(
+                    manifest(
+                        "unhelped",
+                        &[("items", 60)],
+                        &format!("{GH_TOOL}{without_help}"),
+                    ),
+                    rt.runtime(),
+                ),
+            ],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.run_due().await;
+
+    assert_eq!(rt.calls(), 0);
+    assert_eq!(
+        status(&m, "helped").await.state,
+        PluginState::NeedsAuth {
+            missing: vec!["token".into()],
+            message: "GitHub CLI is not signed in. Run: gh auth login".into()
+        }
+    );
+    assert_eq!(
+        status(&m, "unhelped").await.state,
+        PluginState::NeedsAuth {
+            missing: vec!["token".into()],
+            message: "GitHub CLI is not signed in".into()
+        }
+    );
+    let text = said(&m.list().await, &env.drain()) + &logs.text();
+    assert!(
+        text.contains(
+            "cannot resolve a plugin secret plugin=helped key=token \
+             error=secret command failed: exit status: 1"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("5ecret"), "{text}");
+}
+
+#[tokio::test]
+async fn installing_a_tool_runs_mise_and_the_plugin_runs_at_once() {
+    let mut env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake_mise(dir.path(), &installs_gh(dir.path()));
+    let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let m = env
+        .start_cfg(
+            vec![builtin(
+                manifest("tooled", &[("items", 60)], &format!("{GH_TOOL}{GH_TOKEN}")),
+                rt.runtime(),
+            )],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    m.run_due().await;
+    needs_setup(&status(&m, "tooled").await.state);
+    env.drain();
+
+    let s = m.install_tool("tooled", "gh").await.unwrap();
+
+    assert_eq!(s.state, PluginState::Ready);
+    let log = std::fs::read_to_string(dir.path().join("mise.log")).unwrap();
+    assert_eq!(log, "use\n--global\ngh\n");
+    let events = env.drain();
+    assert_eq!(
+        updates(&events, "tooled").last().unwrap().state,
+        PluginState::Ready
+    );
+    // Due now, without a sync_now.
+    m.run_due().await;
+    assert_eq!(rt.calls(), 3);
+    assert_eq!(status(&m, "tooled").await.state, PluginState::Ready);
+}
+
+#[tokio::test]
+async fn install_refusals() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let hinted = "[[tools]]\nname = \"jq\"\nlabel = \"jq\"\ninstall = { brew = \"jq\" }\n";
+    let m = env
+        .start_cfg(
+            vec![
+                builtin(manifest("tooled", &[("items", 60)], GH_TOOL), rt.runtime()),
+                builtin(manifest("hinted", &[("items", 60)], hinted), rt.runtime()),
+            ],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    assert!(matches!(
+        m.install_tool("nope", "gh").await,
+        Err(ManagerError::UnknownPlugin)
+    ));
+    assert!(matches!(
+        m.install_tool("tooled", "jq").await,
+        Err(ManagerError::UnknownTool)
+    ));
+    assert!(matches!(
+        m.install_tool("hinted", "jq").await,
+        Err(ManagerError::Install(InstallError::NoMiseSpec))
+    ));
+    // No mise in the search path.
+    match m.install_tool("tooled", "gh").await {
+        Err(ManagerError::Install(InstallError::MiseMissing { install_url })) => {
+            assert_eq!(install_url, "https://mise.jdx.dev")
+        }
+        other => panic!("expected MiseMissing, got {other:?}"),
+    }
+    fake_mise(dir.path(), "echo out-5ecret; echo err-5ecret >&2; exit 3");
+    let err = m.install_tool("tooled", "gh").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ManagerError::Install(InstallError::Failed { status: Some(3) })
+        ),
+        "{err:?}"
+    );
+    assert!(!format!("{err:?} {err}").contains("5ecret"), "{err:?}");
+}
+
+/// Waits, on a blocking thread so the clock stays still, until `path` exists.
+async fn file_appears(path: PathBuf) {
+    let found = tokio::task::spawn_blocking(move || {
+        for _ in 0..2000 {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    })
+    .await
+    .unwrap();
+    assert!(found, "gave up waiting for a file");
+}
+
+#[tokio::test]
+async fn one_install_per_tool_at_a_time_released_after_a_timeout_and_a_failure() {
+    let env = env().await;
+    let dir = tempfile::tempdir().unwrap();
+    let started = dir.path().join("started");
+    fake_mise(
+        dir.path(),
+        &format!("touch '{}'; exec sleep 600", started.display()),
+    );
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let both = format!(
+        "{GH_TOOL}[[tools]]\nname = \"jq\"\nlabel = \"jq\"\ninstall = {{ mise = \"jq\" }}\n"
+    );
+    let m = env
+        .start_cfg(
+            vec![
+                builtin(manifest("tooled", &[("items", 60)], &both), rt.runtime()),
+                builtin(manifest("also", &[("items", 60)], GH_TOOL), rt.runtime()),
+            ],
+            no_secrets(),
+            tools_cfg(dir.path()),
+        )
+        .await;
+    let first = {
+        let m = m.clone();
+        tokio::spawn(async move { m.install_tool("tooled", "gh").await })
+    };
+    file_appears(started.clone()).await;
+
+    // The same tool, even for another plugin, waits its turn.
+    for id in ["tooled", "also"] {
+        assert!(matches!(
+            m.install_tool(id, "gh").await,
+            Err(ManagerError::InstallInProgress)
+        ));
+    }
+
+    // Ten minutes later the first install is stopped.
+    env.advance(secs(600) + TICK).await;
+    let result = first.await.unwrap();
+    assert!(
+        matches!(result, Err(ManagerError::Install(InstallError::Timeout))),
+        "{result:?}"
+    );
+
+    // Released: the next install runs, fails, and releases too.
+    fake_mise(dir.path(), "exit 3");
+    for _ in 0..2 {
+        assert!(matches!(
+            m.install_tool("tooled", "gh").await,
+            Err(ManagerError::Install(InstallError::Failed {
+                status: Some(3)
+            }))
+        ));
+    }
+    fake_mise(dir.path(), &installs_gh(dir.path()));
+    let s = m.install_tool("also", "gh").await.unwrap();
+    assert_eq!(s.state, PluginState::Ready);
 }

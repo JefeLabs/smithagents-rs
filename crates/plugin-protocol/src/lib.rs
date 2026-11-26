@@ -16,7 +16,7 @@ pub mod wasm_guest;
 pub use envelope::{HostCall, HostReply, PluginCall, PluginReply};
 pub use manifest::{
     HostMode, Manifest, ManifestError, PluginId, PluginIdError, ResourceDecl, SecretDecl,
-    SettingDecl, SettingKind, SettingsError,
+    SettingDecl, SettingKind, SettingsError, ToolDecl, ToolSource,
 };
 pub use types::{
     Auth, ContractError, HostApi, HttpError, HttpMethod, HttpRequest, HttpResponse, Item, LogLevel,

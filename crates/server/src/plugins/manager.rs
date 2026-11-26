@@ -3,8 +3,11 @@
 //!
 //! - [`schedule`]: one task wakes at the earliest due time and starts runs, at
 //!   most one per plugin; a semaphore keeps `max_concurrent` calls at once.
-//! - [`run`]: one run of one resource: secrets check, pages, outcome.
+//! - [`run`]: one run of one resource: settings, tools and secrets checks,
+//!   pages, outcome.
 //! - [`status`]: the [`PluginStatus`] the API and events carry.
+//! - [`tools`]: the command-line tools a built-in plugin depends on: checks
+//!   before runs, installs on request, and secrets a tool prints.
 //!
 //! Scheduling uses tokio's clock; the times it stores come from a wall clock,
 //! which tests replace. A call into a plugin is never cancelled: a native
@@ -15,10 +18,11 @@
 mod run;
 mod schedule;
 mod status;
+mod tools;
 
 pub(crate) use status::clean_message;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -26,9 +30,9 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use smithagents_core::event::EventKind;
-use smithagents_core::plugin::{ItemsPage, PluginStatus};
+use smithagents_core::plugin::{ItemsPage, MissingTool, PluginStatus};
 use smithagents_plugin_host::{
-    HostServices, HttpPolicy, PluginRuntime, SecretSource, ServicesError,
+    HostServices, HttpPolicy, InstallError, PluginRuntime, SecretSource, ServicesError, ToolFinder,
 };
 use smithagents_plugin_protocol::Manifest;
 use tokio::sync::{watch, Notify, Semaphore};
@@ -55,6 +59,8 @@ pub struct ManagerConfig {
     pub backoff_min: Duration,
     pub backoff_max: Duration,
     pub http: HttpPolicy,
+    /// Where built-in plugins' command-line tools are looked for.
+    pub tools: ToolFinder,
 }
 
 impl Default for ManagerConfig {
@@ -65,6 +71,7 @@ impl Default for ManagerConfig {
             backoff_min: Duration::from_secs(30),
             backoff_max: Duration::from_secs(30 * 60),
             http: HttpPolicy::default(),
+            tools: ToolFinder::default(),
         }
     }
 }
@@ -89,6 +96,15 @@ pub enum ManagerError {
     Busy,
     #[error("invalid settings: {0}")]
     InvalidSettings(String),
+    /// Only a built-in plugin's tools are installed.
+    #[error("the tools of an installed plugin are not installed by the daemon")]
+    NotAllowed,
+    #[error("the plugin declares no such tool")]
+    UnknownTool,
+    #[error("this tool is being installed now")]
+    InstallInProgress,
+    #[error(transparent)]
+    Install(InstallError),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -118,6 +134,9 @@ struct Inner {
     wake: Arc<Notify>,
     /// Runs started and not yet ended.
     active: watch::Sender<usize>,
+    tools: ToolFinder,
+    /// The names of the tools being installed now.
+    installing: Mutex<HashSet<String>>,
     next_token: AtomicU64,
     stopping: AtomicBool,
     scheduler: Mutex<Option<JoinHandle<()>>>,
@@ -136,6 +155,10 @@ struct Managed {
     manifest: Manifest,
     origin: Origin,
     loaded: Result<Loaded, String>,
+    /// An installed plugin that declares command-line tools: running a
+    /// program a third-party manifest names needs an approval that does not
+    /// exist yet, so it never runs.
+    unapproved_tools: bool,
     live: Mutex<Live>,
     /// Serialises writes of the plugin's configuration.
     config_writes: tokio::sync::Mutex<()>,
@@ -163,6 +186,8 @@ struct Live {
     running: Option<Running>,
     /// In manifest order.
     resources: Vec<ResourceLive>,
+    /// The last check of the plugin's tools; see [`tools::missing_tools`].
+    tool_check: Option<tools::ToolCheck>,
 }
 
 /// What stops a plugin from syncing on schedule.
@@ -174,6 +199,12 @@ enum Problem {
     },
     /// Until the settings change, it is enabled again, or `sync_now`.
     NeedsSettings { message: String },
+    /// A tool is missing or too old. Until the settings change, it is
+    /// enabled again, `sync_now`, or a tool is installed.
+    NeedsSetup {
+        tools: Vec<MissingTool>,
+        message: String,
+    },
     /// Until the daemon restarts: a native call is stuck or crashed.
     Failed { message: String },
 }
@@ -198,6 +229,11 @@ impl Managed {
     fn live(&self) -> MutexGuard<'_, Live> {
         // No code holding the lock leaves `Live` inconsistent if it panics.
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Loaded, and allowed to run.
+    fn can_run(&self) -> bool {
+        self.loaded.is_ok() && !self.unapproved_tools
     }
 
     fn has_resource(&self, kind: &str) -> bool {
@@ -230,24 +266,34 @@ impl Live {
         }
         match &self.problem {
             Some(Problem::NeedsSettings { message }) => Some(message),
-            Some(Problem::NeedsAuth { .. } | Problem::Failed { .. }) | None => None,
+            Some(
+                Problem::NeedsAuth { .. } | Problem::NeedsSetup { .. } | Problem::Failed { .. },
+            )
+            | None => None,
         }
     }
 
     fn is_failed(&self) -> bool {
         match &self.problem {
             Some(Problem::Failed { .. }) => true,
-            Some(Problem::NeedsAuth { .. } | Problem::NeedsSettings { .. }) | None => false,
+            Some(
+                Problem::NeedsAuth { .. }
+                | Problem::NeedsSettings { .. }
+                | Problem::NeedsSetup { .. },
+            )
+            | None => false,
         }
     }
 
-    /// New settings or enabling: forget failures and auth or settings
-    /// problems (a stopped plugin stays stopped), and make everything due now.
+    /// New settings or enabling: forget failures, auth, settings and setup
+    /// problems and the last tool check (a stopped plugin stays stopped),
+    /// and make everything due now.
     fn reset(&mut self, now: Instant, wall: DateTime<Utc>) {
         self.generation += 1;
         if !self.is_failed() {
             self.problem = None;
         }
+        self.tool_check = None;
         for r in &mut self.resources {
             r.sync.failures = 0;
             r.sync.next_due_at = Some(wall);
@@ -320,13 +366,21 @@ impl PluginManager {
         cfg: ManagerConfig,
         clock: WallClock,
     ) -> Result<PluginManager, ManagerError> {
+        let mut ids = HashSet::new();
+        let plugins: Vec<LoadedPlugin> = plugins
+            .into_iter()
+            .filter(|plugin| {
+                let first = ids.insert(plugin.manifest.id.to_string());
+                if !first {
+                    tracing::warn!(plugin = %plugin.manifest.id, "a plugin id is listed twice; the first is kept");
+                }
+                first
+            })
+            .collect();
+        let secrets = tools::with_tool_secrets(secrets, &plugins, &cfg.tools);
         let mut managed = BTreeMap::new();
         for plugin in plugins {
             let id = plugin.manifest.id.to_string();
-            if managed.contains_key(&id) {
-                tracing::warn!(plugin = %id, "a plugin id is listed twice; the first is kept");
-                continue;
-            }
             let plugin = prepare(&store, &secrets, &cfg.http, &clock, plugin).await?;
             managed.insert(id, plugin);
         }
@@ -343,6 +397,8 @@ impl PluginManager {
             permits: Arc::new(Semaphore::new(cfg.max_concurrent.max(1))),
             wake: Arc::new(Notify::new()),
             active,
+            tools: cfg.tools,
+            installing: Mutex::new(HashSet::new()),
             next_token: AtomicU64::new(1),
             stopping: AtomicBool::new(false),
             scheduler: Mutex::new(None),
@@ -427,11 +483,11 @@ impl PluginManager {
         Ok(inner.publish_status(plugin).await)
     }
 
-    /// Queues a run of `resource`, even while the plugin needs auth. `Busy`
-    /// while that resource syncs; a run of another resource of the plugin
-    /// finishes first. Refused while the plugin needs settings (with the
-    /// reason), and when it is disabled, cannot run, or the manager is shut
-    /// down.
+    /// Queues a run of `resource`, even while the plugin needs auth or
+    /// setup; the run checks the plugin's tools again. `Busy` while that
+    /// resource syncs; a run of another resource of the plugin finishes
+    /// first. Refused while the plugin needs settings (with the reason), and
+    /// when it is disabled, cannot run, or the manager is shut down.
     pub async fn sync_now(&self, id: &str, resource: &str) -> Result<(), ManagerError> {
         let plugin = self.inner.plugin(id)?;
         {
@@ -439,7 +495,7 @@ impl PluginManager {
             if live.resource(resource).is_none() {
                 return Err(ManagerError::UnknownResource);
             }
-            if plugin.loaded.is_err()
+            if !plugin.can_run()
                 || !live.enabled
                 || live.is_failed()
                 || self.inner.stopping.load(Ordering::SeqCst)
@@ -455,9 +511,21 @@ impl PluginManager {
             if let Some(r) = live.resource_mut(resource) {
                 r.forced = true;
             }
+            live.tool_check = None;
         }
         self.inner.wake.notify_one();
         Ok(())
+    }
+
+    /// Installs one of a built-in plugin's tools with `mise use --global`,
+    /// then checks the plugin's tools again; when none is missing any more
+    /// the plugin is renewed as by enabling. Asking is the approval: nothing
+    /// is installed otherwise. One install at a time per tool. Refused for
+    /// an installed plugin.
+    pub async fn install_tool(&self, id: &str, tool: &str) -> Result<PluginStatus, ManagerError> {
+        let plugin = self.inner.plugin(id)?;
+        tools::install(&self.inner, plugin, tool).await?;
+        Ok(self.inner.publish_status(plugin).await)
     }
 
     pub async fn items(
@@ -622,10 +690,15 @@ async fn prepare(
         });
     }
     let settings_error = settings::effective(&manifest, &config.settings).err();
+    let unapproved_tools = match origin {
+        Origin::Builtin => false,
+        Origin::Installed => !manifest.tools.is_empty(),
+    };
     Ok(Managed {
         id,
         origin,
         loaded,
+        unapproved_tools,
         live: Mutex::new(Live {
             enabled: config.enabled,
             settings: config.settings,
@@ -634,6 +707,7 @@ async fn prepare(
             generation: 0,
             running: None,
             resources,
+            tool_check: None,
         }),
         config_writes: tokio::sync::Mutex::new(()),
         sync_writes: tokio::sync::Mutex::new(()),

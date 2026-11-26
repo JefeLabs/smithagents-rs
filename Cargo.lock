@@ -7488,6 +7488,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "reqwest",
+ "semver",
  "serde_json",
  "smithagents-plugin-fixture",
  "smithagents-plugin-loader",

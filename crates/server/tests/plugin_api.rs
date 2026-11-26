@@ -1,8 +1,9 @@
 //! The plugin routes of the daemon API, over a manager running the linked
 //! fixture plugin in real time: success shapes, every error code, the token
-//! check, events, paging, and that no secret value reaches a response or an
-//! event.
+//! check, events, paging, installing command-line tools, and that no secret
+//! value reaches a response or an event.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,7 @@ use serde_json::{json, Value};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::plugin::PluginState;
 use smithagents_plugin_fixture::Fixture;
-use smithagents_plugin_host::{LinkedRuntime, PluginRuntime, StaticSecrets};
+use smithagents_plugin_host::{LinkedRuntime, PluginRuntime, StaticSecrets, ToolFinder};
 use smithagents_plugin_protocol::{HostApi, Manifest, Plugin, PluginError, SyncPage, SyncRequest};
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
@@ -68,6 +69,13 @@ fn loaded(manifest: Manifest, plugin: Arc<dyn Plugin>) -> LoadedPlugin {
     }
 }
 
+fn builtin(manifest: Manifest, plugin: Arc<dyn Plugin>) -> LoadedPlugin {
+    LoadedPlugin {
+        origin: Origin::Builtin,
+        ..loaded(manifest, plugin)
+    }
+}
+
 struct Fx {
     _tmp: TempDir,
     state: AppState,
@@ -80,6 +88,52 @@ struct Fx {
 }
 
 async fn fixture() -> Fx {
+    let secrets = StaticSecrets(
+        [(
+            ("fixture".to_owned(), "token".to_owned()),
+            SECRET.to_owned(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    app(
+        |gate| {
+            vec![
+                loaded(
+                    manifest(
+                        "fixture",
+                        "[[secrets]]\nkey = \"token\"\nlabel = \"Token\"\nhosts = [\"api.example.com\"]\n\
+                         [[settings]]\nkey = \"note\"\nlabel = \"Note\"\nkind = \"text\"\n",
+                    ),
+                    Arc::new(Fixture),
+                ),
+                loaded(
+                    manifest(
+                        "needy",
+                        "[[settings]]\nkey = \"repos\"\nlabel = \"Repos\"\nkind = \"list\"\nrequired = true\n",
+                    ),
+                    Arc::new(Fixture),
+                ),
+                loaded(manifest("gated", ""), Arc::new(gate)),
+                LoadedPlugin {
+                    manifest: manifest("broken", ""),
+                    origin: Origin::Installed,
+                    runtime: Err("the entry file is not a component".into()),
+                },
+            ]
+        },
+        secrets,
+        ManagerConfig::default(),
+    )
+    .await
+}
+
+/// A daemon state whose manager runs `plugins(gate)`.
+async fn app(
+    plugins: impl FnOnce(Gate) -> Vec<LoadedPlugin>,
+    secrets: StaticSecrets,
+    cfg: ManagerConfig,
+) -> Fx {
     let tmp = TempDir::new().unwrap();
     let store = Store::open_in_memory().await.unwrap();
     let bus = EventBus::new(1024);
@@ -111,43 +165,12 @@ async fn fixture() -> Fx {
         started: Mutex::new(started_tx),
         release: Mutex::new(release_rx),
     };
-    let secrets = StaticSecrets(
-        [(
-            ("fixture".to_owned(), "token".to_owned()),
-            SECRET.to_owned(),
-        )]
-        .into_iter()
-        .collect(),
-    );
-    let plugins = vec![
-        loaded(
-            manifest(
-                "fixture",
-                "[[secrets]]\nkey = \"token\"\nlabel = \"Token\"\nhosts = [\"api.example.com\"]\n\
-                 [[settings]]\nkey = \"note\"\nlabel = \"Note\"\nkind = \"text\"\n",
-            ),
-            Arc::new(Fixture),
-        ),
-        loaded(
-            manifest(
-                "needy",
-                "[[settings]]\nkey = \"repos\"\nlabel = \"Repos\"\nkind = \"list\"\nrequired = true\n",
-            ),
-            Arc::new(Fixture),
-        ),
-        loaded(manifest("gated", ""), Arc::new(gate)),
-        LoadedPlugin {
-            manifest: manifest("broken", ""),
-            origin: Origin::Installed,
-            runtime: Err("the entry file is not a component".into()),
-        },
-    ];
     let manager = PluginManager::start(
         store.clone(),
         bus.clone(),
         Arc::new(secrets),
-        plugins,
-        ManagerConfig::default(),
+        plugins(gate),
+        cfg,
     )
     .await
     .unwrap();
@@ -538,6 +561,7 @@ async fn every_plugin_route_needs_the_token() {
         (Method::PUT, "/v1/plugins/fixture/settings"),
         (Method::POST, "/v1/plugins/fixture/resources/items/sync"),
         (Method::GET, "/v1/plugins/fixture/resources/items/items"),
+        (Method::POST, "/v1/plugins/fixture/tools/gh/install"),
     ];
     for (method, uri) in routes {
         for auth in [None, Some("Bearer wrong")] {
@@ -606,4 +630,263 @@ async fn a_client_that_drops_an_enable_request_does_not_cancel_it() {
         .drain()
         .iter()
         .any(|e| matches!(e, EventKind::PluginUpdated(s) if s.id == "fixture" && s.enabled)));
+}
+
+// ------------------------------------------------------------------ tools
+//
+// The manager's only search path is the test's own directory, holding a
+// fake `mise` the test writes: nothing installed on the machine is found or
+// run.
+
+/// A tool named `name` whose mise spec is its name.
+fn tool(name: &str) -> String {
+    format!(
+        "[[tools]]\nname = \"{name}\"\nlabel = \"Tool {name}\"\n\
+         install_url = \"https://tools.example.com\"\n\
+         install = {{ mise = \"{name}\", brew = \"{name}\" }}\n"
+    )
+}
+
+/// A fake `mise` that logs its arguments, one per line, to
+/// `<dir>/mise-<spec>.log`, then acts on the spec: `fail` prints and exits
+/// 3; `slow` creates `<dir>/started-slow` and waits for `<dir>/go`; any
+/// other spec creates an executable of that name in `<dir>`.
+fn fake_mise(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let d = dir.display();
+    let body = format!(
+        "#!/bin/sh\n\
+         for a in \"$@\"; do echo \"$a\" >> '{d}/mise-'\"$3\"'.log'; done\n\
+         case \"$3\" in\n\
+         fail) echo out-5ecret; echo err-5ecret >&2; exit 3 ;;\n\
+         slow) touch '{d}/started-slow'; while [ ! -f '{d}/go' ]; do sleep 0.02; done ;;\n\
+         esac\n\
+         printf '#!/bin/sh\\n' > '{d}/'\"$3\"; chmod 755 '{d}/'\"$3\"\n"
+    );
+    let path = dir.join("mise");
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn mise_log(dir: &Path, spec: &str) -> String {
+    std::fs::read_to_string(dir.join(format!("mise-{spec}.log"))).unwrap_or_default()
+}
+
+/// Built-in plugins each needing one tool, a built-in one with install hints
+/// but no mise spec, and an installed one declaring a tool.
+async fn tool_app(dir: &Path) -> Fx {
+    let hinted = "[[tools]]\nname = \"jq\"\nlabel = \"jq\"\ninstall = { brew = \"jq\" }\n";
+    app(
+        |_gate| {
+            vec![
+                builtin(manifest("tooled", &tool("gh")), Arc::new(Fixture)),
+                builtin(manifest("failing", &tool("fail")), Arc::new(Fixture)),
+                builtin(manifest("waiting", &tool("slow")), Arc::new(Fixture)),
+                builtin(manifest("hinted", hinted), Arc::new(Fixture)),
+                loaded(manifest("third", &tool("gh")), Arc::new(Fixture)),
+            ]
+        },
+        StaticSecrets(Default::default()),
+        ManagerConfig {
+            tools: ToolFinder::new(vec![dir.to_path_buf()]),
+            ..ManagerConfig::default()
+        },
+    )
+    .await
+}
+
+fn install_request(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Waits until `path` exists.
+async fn file_appears(path: PathBuf) {
+    let deadline = Instant::now() + PATIENCE;
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "no {}", path.display());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Captured log output.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Logs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// Everything this test binary logs, from every test. Global on purpose: a
+/// subscriber set for one thread misses events whose call site another
+/// test's thread reached first (tracing caches the interest per call site).
+fn logs() -> &'static Logs {
+    static LOGS: std::sync::OnceLock<Logs> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        let logs = Logs::default();
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the only global subscriber");
+        logs
+    })
+}
+
+#[tokio::test]
+async fn installing_a_tool_runs_mise_use_global_and_the_plugin_becomes_ready() {
+    let dir = TempDir::new().unwrap();
+    fake_mise(dir.path());
+    let fx = tool_app(dir.path()).await;
+    let before = fx
+        .until("tooled", "needs setup", |p| {
+            p["state"]["kind"] == "needs_setup"
+        })
+        .await;
+    assert_eq!(
+        before["state"]["tools"],
+        json!([{
+            "name": "gh",
+            "label": "Tool gh",
+            "reason": "not installed",
+            "install_url": "https://tools.example.com",
+            "install": {"brew": "gh", "mise": "gh"},
+        }]),
+        "{before}"
+    );
+    assert_eq!(item_count(&before), 0);
+
+    let (status, body) = fx.post("/v1/plugins/tooled/tools/gh/install").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], "tooled");
+    assert_eq!(body["state"], json!({"kind": "ready"}), "{body}");
+    assert_eq!(mise_log(dir.path(), "gh"), "use\n--global\ngh\n");
+    fx.until("tooled", "its six items", |p| item_count(p) == 6)
+        .await;
+}
+
+#[tokio::test]
+async fn a_failing_install_answers_with_its_exit_status_and_nothing_mise_printed() {
+    let logs = logs();
+    let dir = TempDir::new().unwrap();
+    fake_mise(dir.path());
+    let fx = tool_app(dir.path()).await;
+
+    let (status, body) = fx.post("/v1/plugins/failing/tools/fail/install").await;
+
+    assert_error(status, &body, StatusCode::BAD_GATEWAY, "install_failed");
+    assert_eq!(body["message"], "mise failed with exit status 3", "{body}");
+    assert_eq!(mise_log(dir.path(), "fail"), "use\n--global\nfail\n");
+    let (_, plugin) = fx.get("/v1/plugins/failing").await;
+    assert_eq!(plugin["state"]["kind"], "needs_setup", "{plugin}");
+    fx.drain();
+    let logged = logs.text();
+    assert!(
+        logged.contains("the tool was not installed: mise failed (exit status 3) plugin=failing"),
+        "{logged}"
+    );
+    for text in fx.seen.lock().unwrap().iter().chain([&logged]) {
+        assert!(!text.contains("5ecret"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn install_refusals_say_why() {
+    // No mise in the search path.
+    let dir = TempDir::new().unwrap();
+    let fx = tool_app(dir.path()).await;
+    let install = |id: &str, tool: &str| format!("/v1/plugins/{id}/tools/{tool}/install");
+
+    let (status, body) = fx.post(&install("tooled", "gh")).await;
+    assert_error(status, &body, StatusCode::CONFLICT, "mise_missing");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("https://mise.jdx.dev"),
+        "{body}"
+    );
+    let (status, body) = fx.post(&install("hinted", "jq")).await;
+    assert_error(status, &body, StatusCode::BAD_REQUEST, "no_installer");
+    let (status, body) = fx.post(&install("third", "gh")).await;
+    assert_error(status, &body, StatusCode::FORBIDDEN, "not_allowed");
+    let (status, body) = fx.post(&install("third", "nope")).await;
+    assert_error(status, &body, StatusCode::FORBIDDEN, "not_allowed");
+    let (status, body) = fx.post(&install("nope", "gh")).await;
+    assert_error(status, &body, StatusCode::NOT_FOUND, "plugin_not_found");
+    let (status, body) = fx.post(&install("tooled", "jq")).await;
+    assert_error(status, &body, StatusCode::NOT_FOUND, "tool_not_found");
+
+    // The installed plugin is listed as needing approval and never ran.
+    let (status, body) = fx.post("/v1/plugins/third/enable").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = fx.post("/v1/plugins/third/resources/items/sync").await;
+    assert_error(status, &body, StatusCode::CONFLICT, "plugin_not_ready");
+    assert_eq!(
+        body["message"],
+        "command-line tools need approval, which is not built yet"
+    );
+    let (_, third) = fx.get("/v1/plugins/third").await;
+    assert_eq!(third["state"]["kind"], "needs_setup", "{third}");
+    assert_eq!(third["state"]["tools"][0]["install"], json!({}), "{third}");
+    assert_eq!(item_count(&third), 0);
+}
+
+#[tokio::test]
+async fn a_second_install_of_a_tool_waits_for_the_first_to_end() {
+    let dir = TempDir::new().unwrap();
+    fake_mise(dir.path());
+    let fx = tool_app(dir.path()).await;
+    let uri = "/v1/plugins/waiting/tools/slow/install";
+    let first = tokio::spawn(router(fx.state.clone()).oneshot(install_request(uri)));
+    file_appears(dir.path().join("started-slow")).await;
+
+    let (status, body) = fx.post(uri).await;
+    assert_error(status, &body, StatusCode::CONFLICT, "install_in_progress");
+
+    std::fs::write(dir.path().join("go"), "").unwrap();
+    let response = first.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Released: the next one runs.
+    let (status, body) = fx.post(uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(mise_log(dir.path(), "slow").lines().count(), 6);
+}
+
+#[tokio::test]
+async fn a_client_that_drops_an_install_request_does_not_cancel_it() {
+    use futures::FutureExt;
+
+    let dir = TempDir::new().unwrap();
+    fake_mise(dir.path());
+    let fx = tool_app(dir.path()).await;
+    let pending =
+        router(fx.state.clone()).oneshot(install_request("/v1/plugins/tooled/tools/gh/install"));
+    let _ = pending.now_or_never();
+
+    fx.until("tooled", "six items after a dropped install", |p| {
+        item_count(p) == 6
+    })
+    .await;
+    assert_eq!(mise_log(dir.path(), "gh"), "use\n--global\ngh\n");
 }

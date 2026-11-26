@@ -12,10 +12,10 @@ use tokio::time::Instant;
 use super::{run, Inner, Live, Managed, Problem, Running};
 use crate::intents::panic_text;
 
-/// Whether the plugin can start a run now: loaded, enabled, not stopped, and
-/// not running one already.
+/// Whether the plugin can start a run now: loaded and allowed to run,
+/// enabled, not stopped, and not running one already.
 fn can_start(plugin: &Managed, live: &Live) -> bool {
-    plugin.loaded.is_ok() && live.enabled && !live.is_failed() && live.running.is_none()
+    plugin.can_run() && live.enabled && !live.is_failed() && live.running.is_none()
 }
 
 /// Held plugins run only what `sync_now` asked for.
@@ -24,7 +24,10 @@ fn held(live: &Live) -> bool {
         || match &live.problem {
             None => false,
             Some(
-                Problem::NeedsAuth { .. } | Problem::NeedsSettings { .. } | Problem::Failed { .. },
+                Problem::NeedsAuth { .. }
+                | Problem::NeedsSettings { .. }
+                | Problem::NeedsSetup { .. }
+                | Problem::Failed { .. },
             ) => true,
         }
 }

@@ -352,6 +352,11 @@ fn fixed_sentence(e: &ManifestError) -> &'static str {
         ManifestError::DuplicateResource(_) => "a resource kind is declared twice",
         ManifestError::BadInterval { .. } => "a resource interval is outside 60 to 86400 seconds",
         ManifestError::BadDefault(_) => "a setting default does not match its kind",
+        ManifestError::BadToolName(_) => "a tool name is not a plain executable name",
+        ManifestError::DuplicateTool(_) => "a tool is declared twice",
+        ManifestError::BadInstall(_) => "a tool's install entry is not valid",
+        ManifestError::BadInstallUrl(_) => "a tool's install_url is not an https address",
+        ManifestError::UnknownTool { .. } => "a secret names a tool the plugin does not declare",
     }
 }
 

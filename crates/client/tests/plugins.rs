@@ -111,6 +111,29 @@ async fn a_client_lists_enables_syncs_and_reads_a_wasm_plugin() {
             "{odd:?}: {err:?}"
         );
     }
+    // An installed plugin's tools are never installed, whatever the name (an
+    // encoded `/` stays in the name); `.` and `..` reach no route.
+    for name in ["gh", "a/b"] {
+        let refused = client
+            .install_plugin_tool("fixture-wasm", name)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, ClientError::Api { status: 403, code, .. } if code == "not_allowed"),
+            "{name:?}: {refused:?}"
+        );
+    }
+    for odd in ["..", "."] {
+        let err = client
+            .install_plugin_tool("fixture-wasm", odd)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Api { status: 404, .. }),
+            "{odd:?}: {err:?}"
+        );
+    }
+
     let refused = client
         .sync_plugin_resource("fixture-wasm", "items")
         .await

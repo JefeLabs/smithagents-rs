@@ -1,5 +1,6 @@
-//! One run of one resource: check the settings and secrets, fetch pages until
-//! the plugin is done or the page budget is spent, then record the outcome.
+//! One run of one resource: check the settings, tools and secrets, fetch
+//! pages until the plugin is done or the page budget is spent, then record
+//! the outcome.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,7 @@ use smithagents_plugin_host::{CallError, CallPurpose};
 use smithagents_plugin_protocol::{HostMode, PluginError, SyncPage, SyncRequest};
 use tokio::time::Instant;
 
-use super::{clean_message, later, wall_after, Inner, Loaded, Managed, Problem};
+use super::{clean_message, later, tools, wall_after, Inner, Loaded, Managed, Problem};
 use crate::intents::panic_text;
 use crate::plugins::settings;
 
@@ -118,15 +119,18 @@ struct Call<'a> {
     generation: u64,
 }
 
-/// Checks that the run may call the plugin. Settings that do not validate
-/// and missing secrets stop it before any call (the plugin would only see a
-/// missing secret as an HTTP error).
+/// Checks that the run may call the plugin. Settings that do not validate,
+/// missing or too old tools and missing secrets stop it before any call (the
+/// plugin would only see a missing secret as an HTTP error).
 async fn ready<'a>(
     inner: &Inner,
     plugin: &'a Managed,
     kind: &str,
     generation: u64,
 ) -> Option<Call<'a>> {
+    if !plugin.can_run() {
+        return None;
+    }
     let loaded = plugin.loaded.as_ref().ok()?;
     let (stored, sync) = {
         let live = plugin.live();
@@ -137,12 +141,22 @@ async fn ready<'a>(
     };
     // The status already says NeedsSettings.
     let settings = settings::effective(&plugin.manifest, &stored).ok()?;
+    let missing_tools = tools::missing_tools(inner, plugin).await;
+    if !missing_tools.is_empty() {
+        let message = clean_message(&tools::setup_message(&missing_tools));
+        tracing::warn!(plugin = %plugin.id, "{message}");
+        let mut live = plugin.live();
+        if live.generation == generation {
+            live.problem = Some(Problem::NeedsSetup {
+                tools: missing_tools,
+                message,
+            });
+        }
+        return None;
+    }
     let missing = missing_secrets(inner, plugin).await;
     if !missing.is_empty() {
-        let message = clean_message(&match missing.as_slice() {
-            [key] => format!("no value is configured for the secret {key}"),
-            keys => format!("no value is configured for the secrets {}", keys.join(", ")),
-        });
+        let message = clean_message(&tools::auth_message(plugin, &missing));
         tracing::warn!(plugin = %plugin.id, "{message}");
         let mut live = plugin.live();
         if live.generation == generation {
@@ -442,7 +456,11 @@ async fn finish(
         }
         match effect.problem {
             Some(stop @ Problem::Failed { .. }) => live.problem = Some(stop),
-            Some(held @ (Problem::NeedsAuth { .. } | Problem::NeedsSettings { .. })) => {
+            Some(
+                held @ (Problem::NeedsAuth { .. }
+                | Problem::NeedsSettings { .. }
+                | Problem::NeedsSetup { .. }),
+            ) => {
                 if !renewed {
                     live.problem = Some(held);
                 }

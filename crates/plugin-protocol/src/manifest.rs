@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -99,6 +99,11 @@ fn is_plain_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
+/// An installer's name in a tool's `install` table, such as `mise` or `brew`.
+fn is_installer(s: &str) -> bool {
+    s.len() <= 32 && is_plain_name(s)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretDecl {
@@ -111,6 +116,11 @@ pub struct SecretDecl {
     /// after [`Manifest::parse`] it is never empty.
     #[serde(default)]
     pub hosts: Vec<String>,
+    /// A declared tool that prints the value, used when neither
+    /// `secrets.toml` nor the environment provides one. Honoured only for
+    /// built-in plugins; the daemon runs the tool, never the plugin.
+    #[serde(default)]
+    pub from_tool: Option<ToolSource>,
 }
 
 impl SecretDecl {
@@ -118,6 +128,65 @@ impl SecretDecl {
     pub fn is_valid_key(key: &str) -> bool {
         key.len() <= 64 && is_dashed_name(key)
     }
+}
+
+/// `<tool> <args>`, run by the daemon without a shell; the first line it
+/// prints is the secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSource {
+    /// The `name` of one of the manifest's `[[tools]]`.
+    pub tool: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// A command-line program the plugin depends on. Honoured only for built-in
+/// plugins; the daemon runs it, never the plugin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDecl {
+    /// The executable's name, never a path: `^[a-z][a-z0-9_-]{0,31}$`.
+    pub name: String,
+    pub label: String,
+    /// Compared with the first version `<name> --version` prints.
+    #[serde(default)]
+    pub min_version: Option<semver::Version>,
+    /// An `https` page that explains how to install the tool.
+    #[serde(default)]
+    pub install_url: Option<String>,
+    /// Installer name to package spec, such as `mise = "gh"`. The daemon runs
+    /// only `mise`, and only when asked to; the rest are hints for the user.
+    #[serde(default)]
+    pub install: BTreeMap<String, String>,
+}
+
+impl ToolDecl {
+    /// `^[a-z][a-z0-9_-]{0,31}$`: a bare executable name, which can never
+    /// name a path.
+    pub fn is_valid_name(name: &str) -> bool {
+        name.len() <= 32 && is_plain_name(name)
+    }
+
+    /// `^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,127}$`: a package name, possibly with
+    /// a backend prefix and a version, that becomes a process argument (so
+    /// it never starts with `-`) and may be shown as a command to copy.
+    pub fn is_valid_spec(spec: &str) -> bool {
+        let b = spec.as_bytes();
+        b.len() <= 128
+            && b.first().is_some_and(u8::is_ascii_alphanumeric)
+            && b.iter()
+                .all(|c| c.is_ascii_alphanumeric() || b"_.:/@-".contains(c))
+    }
+}
+
+/// The longest `install_url` a manifest may give.
+const MAX_INSTALL_URL_BYTES: usize = 2048;
+
+fn is_install_url(raw: &str) -> bool {
+    raw.len() <= MAX_INSTALL_URL_BYTES
+        && url::Url::parse(raw)
+            .is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some_and(|h| !h.is_empty()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +242,8 @@ pub struct Manifest {
     #[serde(default)]
     pub hosts: Vec<String>,
     #[serde(default)]
+    pub tools: Vec<ToolDecl>,
+    #[serde(default)]
     pub secrets: Vec<SecretDecl>,
     #[serde(default)]
     pub settings: Vec<SettingDecl>,
@@ -222,6 +293,20 @@ pub enum ManifestError {
     BadInterval { kind: String, secs: u32 },
     #[error("setting {0:?}: default does not match its kind")]
     BadDefault(String),
+    #[error("tool name {0:?}: use a lower-case letter, then up to 31 lower-case letters, digits, '-' or '_'")]
+    BadToolName(String),
+    #[error("duplicate tool name {0:?}")]
+    DuplicateTool(String),
+    /// Names the tool only: the refused entry is file text.
+    #[error(
+        "tool {0:?}: an install entry is not a lower-case installer name with a plain package name"
+    )]
+    BadInstall(String),
+    /// Names the tool only: the refused address is file text.
+    #[error("tool {0:?}: install_url must be an https address of at most 2048 bytes")]
+    BadInstallUrl(String),
+    #[error("secret {key:?}: from_tool names {tool:?}, which is not one of the manifest's tools")]
+    UnknownTool { key: String, tool: String },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -301,12 +386,42 @@ impl Manifest {
             .collect::<Result<_, _>>()?;
 
         let mut seen = HashSet::new();
+        for t in &m.tools {
+            if !ToolDecl::is_valid_name(&t.name) {
+                return Err(ManifestError::BadToolName(t.name.clone()));
+            }
+            if !seen.insert(t.name.as_str()) {
+                return Err(ManifestError::DuplicateTool(t.name.clone()));
+            }
+            // Every entry, not only `mise`: a hint may be shown as a command
+            // for the user to copy.
+            if !t
+                .install
+                .iter()
+                .all(|(installer, spec)| is_installer(installer) && ToolDecl::is_valid_spec(spec))
+            {
+                return Err(ManifestError::BadInstall(t.name.clone()));
+            }
+            if t.install_url.as_deref().is_some_and(|u| !is_install_url(u)) {
+                return Err(ManifestError::BadInstallUrl(t.name.clone()));
+            }
+        }
+
+        let mut seen = HashSet::new();
         for s in m.secrets.iter_mut() {
             if !SecretDecl::is_valid_key(&s.key) {
                 return Err(ManifestError::BadSecretKey(s.key.clone()));
             }
             if !seen.insert(s.key.clone()) {
                 return Err(ManifestError::DuplicateSecret(s.key.clone()));
+            }
+            if let Some(source) = &s.from_tool {
+                if !m.tools.iter().any(|t| t.name == source.tool) {
+                    return Err(ManifestError::UnknownTool {
+                        key: s.key.clone(),
+                        tool: source.tool.clone(),
+                    });
+                }
             }
             if s.hosts.is_empty() {
                 // Bound to the only host, or the manifest must say where it may go.

@@ -389,6 +389,21 @@ impl Client {
         self.send(self.http.post(url)).await.map(drop)
     }
 
+    /// Installs one of a built-in plugin's command-line tools with mise and
+    /// returns the plugin's status after its tools are checked again. It may
+    /// take minutes. Fails with code `not_allowed` (an installed plugin),
+    /// `tool_not_found`, `install_in_progress`, `no_installer` (the tool has
+    /// no mise package), `mise_missing` (the message names mise's install
+    /// page) or `install_failed`.
+    pub async fn install_plugin_tool(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<PluginStatus, ClientError> {
+        let url = self.plugin_url(&[id, "tools", name, "install"], &[])?;
+        self.fetch(self.http.post(url)).await
+    }
+
     /// One page of a resource's items, in the daemon's order. `after` is the
     /// `next` of the previous page; `q` filters by text.
     pub async fn plugin_items(

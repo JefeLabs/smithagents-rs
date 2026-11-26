@@ -1,5 +1,7 @@
 //! Plugin status and resource item types served by the API and carried by events.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -16,12 +18,33 @@ pub enum PluginState {
     NeedsSettings {
         message: String,
     },
+    /// A command-line tool the plugin depends on is missing or too old, or
+    /// (for an installed plugin) its tools are not approved.
+    NeedsSetup {
+        tools: Vec<MissingTool>,
+        message: String,
+    },
     Failed {
         message: String,
     },
     LoadFailed {
         message: String,
     },
+}
+
+/// A tool a plugin needs, and how the user can get it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissingTool {
+    /// The executable's name, such as `gh`.
+    pub name: String,
+    pub label: String,
+    /// Why it cannot be used, such as `not installed`.
+    pub reason: String,
+    /// A page that explains how to install it.
+    pub install_url: Option<String>,
+    /// Installer name to package spec, such as `brew` to `gh`. The daemon can
+    /// install a tool with a `mise` entry when asked to.
+    pub install: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,4 +97,26 @@ pub struct ResourceItem {
 pub struct ItemsPage {
     pub items: Vec<ResourceItem>,
     pub next: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_setup_on_the_wire() {
+        let state = PluginState::NeedsSetup {
+            tools: vec![MissingTool {
+                name: "gh".into(),
+                label: "GitHub CLI".into(),
+                reason: "not installed".into(),
+                install_url: Some("https://cli.github.com".into()),
+                install: [("brew".to_string(), "gh".to_string())].into(),
+            }],
+            message: "needs GitHub CLI (gh): not installed".into(),
+        };
+        let json = r#"{"kind":"needs_setup","tools":[{"name":"gh","label":"GitHub CLI","reason":"not installed","install_url":"https://cli.github.com","install":{"brew":"gh"}}],"message":"needs GitHub CLI (gh): not installed"}"#;
+        assert_eq!(serde_json::to_string(&state).unwrap(), json);
+        assert_eq!(serde_json::from_str::<PluginState>(json).unwrap(), state);
+    }
 }

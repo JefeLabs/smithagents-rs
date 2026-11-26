@@ -56,6 +56,7 @@ fn sample_parses() {
             label: "Personal access token".into(),
             help: None,
             hosts: vec!["api.github.com".into()],
+            from_tool: None,
         }]
     );
     assert_eq!(m.settings.len(), 1);
@@ -345,6 +346,246 @@ fn default_of_wrong_kind_is_rejected() {
     assert_eq!(err(&text), ManifestError::BadDefault("repositories".into()));
     let ok = SAMPLE.replace("required = true", "required = true\ndefault = [\"a/b\"]");
     Manifest::parse(&ok).unwrap();
+}
+
+// ------------------------------------------------------------------ tools
+
+const TOOLS_SAMPLE: &str = r#"
+id = "github"
+name = "GitHub"
+version = "0.1.0"
+contract = 1
+host = "dylib"
+entry = "libsmithagents_plugin_github.dylib"
+hosts = ["api.github.com"]
+
+[[tools]]
+name = "gh"
+label = "GitHub CLI"
+min_version = "2.40.0"
+install_url = "https://cli.github.com"
+install = { mise = "gh", brew = "gh" }
+
+[[secrets]]
+key = "token"
+label = "GitHub sign-in"
+help = "Run: gh auth login"
+from_tool = { tool = "gh", args = ["auth", "token"] }
+"#;
+
+#[test]
+fn the_tools_sample_parses() {
+    let m = Manifest::parse(TOOLS_SAMPLE).unwrap();
+    assert_eq!(
+        m.tools,
+        vec![ToolDecl {
+            name: "gh".into(),
+            label: "GitHub CLI".into(),
+            min_version: Some(semver::Version::new(2, 40, 0)),
+            install_url: Some("https://cli.github.com".into()),
+            install: [("brew", "gh"), ("mise", "gh")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }]
+    );
+    assert_eq!(
+        m.secrets[0].from_tool,
+        Some(ToolSource {
+            tool: "gh".into(),
+            args: vec!["auth".into(), "token".into()],
+        })
+    );
+    assert_eq!(m.secrets[0].help.as_deref(), Some("Run: gh auth login"));
+}
+
+#[test]
+fn tools_are_optional_and_so_are_their_details() {
+    let m = Manifest::parse(SAMPLE).unwrap();
+    assert!(m.tools.is_empty());
+    assert_eq!(m.secrets[0].from_tool, None);
+
+    let bare = with("", "[[tools]]\nname = \"jq\"\nlabel = \"jq\"\n");
+    let m = Manifest::parse(&bare).unwrap();
+    assert_eq!(m.tools[0].min_version, None);
+    assert_eq!(m.tools[0].install_url, None);
+    assert!(m.tools[0].install.is_empty());
+
+    let no_args = TOOLS_SAMPLE.replace(", args = [\"auth\", \"token\"]", "");
+    let m = Manifest::parse(&no_args).unwrap();
+    assert_eq!(
+        m.secrets[0].from_tool.as_ref().unwrap().args,
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn from_tool_must_name_a_declared_tool() {
+    let text = TOOLS_SAMPLE.replace("tool = \"gh\"", "tool = \"hub\"");
+    assert_eq!(
+        err(&text),
+        ManifestError::UnknownTool {
+            key: "token".into(),
+            tool: "hub".into()
+        }
+    );
+    let undeclared = TOOLS_SAMPLE.replace("[[tools]]\nname = \"gh\"", "[[tools]]\nname = \"jq\"");
+    assert!(matches!(
+        err(&undeclared),
+        ManifestError::UnknownTool { .. }
+    ));
+}
+
+#[test]
+fn a_tool_name_is_a_bare_executable_name() {
+    let long = "g".repeat(33);
+    for name in [
+        "bin/gh",
+        "/usr/bin/gh",
+        "../gh",
+        "gh.exe",
+        "GH",
+        "1gh",
+        "-gh",
+        "g h",
+        "",
+        &long,
+    ] {
+        let text = TOOLS_SAMPLE
+            .replace("name = \"gh\"", &format!("name = {name:?}"))
+            .replace("tool = \"gh\"", &format!("tool = {name:?}"));
+        assert_eq!(
+            err(&text),
+            ManifestError::BadToolName(name.into()),
+            "{name:?}"
+        );
+    }
+    let longest = "g".repeat(32);
+    for name in ["g", "gh", "my_tool-2", "a-", "a__b", &longest] {
+        let text = TOOLS_SAMPLE
+            .replace("name = \"gh\"", &format!("name = {name:?}"))
+            .replace("tool = \"gh\"", &format!("tool = {name:?}"));
+        assert_eq!(Manifest::parse(&text).unwrap().tools[0].name, name);
+    }
+}
+
+#[test]
+fn tool_names_are_unique() {
+    let text = format!("{TOOLS_SAMPLE}\n[[tools]]\nname = \"gh\"\nlabel = \"Again\"\n");
+    assert_eq!(err(&text), ManifestError::DuplicateTool("gh".into()));
+}
+
+#[test]
+fn a_bad_min_version_is_refused() {
+    for v in ["2.40", "latest", "v2.40.0", ""] {
+        let text =
+            TOOLS_SAMPLE.replace("min_version = \"2.40.0\"", &format!("min_version = {v:?}"));
+        assert!(matches!(err(&text), ManifestError::Toml { .. }), "{v:?}");
+    }
+}
+
+#[test]
+fn install_specs_are_plain_package_names() {
+    let long = "a".repeat(129);
+    for spec in [
+        "-g",
+        "--global",
+        "gh; rm -rf ~",
+        "gh rm",
+        " gh",
+        "gh\n",
+        "$(id)",
+        "`id`",
+        "",
+        "@gh",
+        &long,
+    ] {
+        for installer in ["mise", "brew"] {
+            let text = TOOLS_SAMPLE.replace(
+                "install = { mise = \"gh\", brew = \"gh\" }",
+                &format!("install = {{ {installer} = {spec:?} }}"),
+            );
+            let e = err(&text);
+            assert_eq!(
+                e,
+                ManifestError::BadInstall("gh".into()),
+                "{installer} {spec:?}"
+            );
+            // The refused value is not repeated: it is file text.
+            if !spec.is_empty() {
+                assert!(!e.to_string().contains(spec), "{e}");
+            }
+        }
+    }
+    let longest = "a".repeat(128);
+    for spec in [
+        "gh",
+        "github-cli@2.40.1",
+        "aqua:cli/cli",
+        "cargo:ripgrep@latest",
+        "npm:prettier@3",
+        "GitHub.cli",
+        "A1._:/@-",
+        &longest,
+    ] {
+        let text = TOOLS_SAMPLE.replace(
+            "install = { mise = \"gh\", brew = \"gh\" }",
+            &format!("install = {{ mise = {spec:?} }}"),
+        );
+        assert_eq!(
+            Manifest::parse(&text).unwrap().tools[0].install["mise"],
+            spec,
+            "{spec:?}"
+        );
+    }
+    for installer in ["Brew", "1brew", "br ew", "\"\""] {
+        let text = TOOLS_SAMPLE.replace("brew = \"gh\"", &format!("{installer} = \"gh\""));
+        assert!(
+            matches!(
+                Manifest::parse(&text),
+                Err(ManifestError::BadInstall(_) | ManifestError::Toml { .. })
+            ),
+            "{installer}"
+        );
+    }
+}
+
+#[test]
+fn an_install_url_is_an_https_url() {
+    for url in [
+        "http://cli.github.com",
+        "javascript:alert(1)",
+        "cli.github.com",
+        "https://",
+        "file:///etc/passwd",
+        "",
+    ] {
+        let text = TOOLS_SAMPLE.replace("https://cli.github.com", url);
+        assert_eq!(
+            err(&text),
+            ManifestError::BadInstallUrl("gh".into()),
+            "{url:?}"
+        );
+    }
+    let long = format!("https://cli.github.com/{}", "a".repeat(2048));
+    let text = TOOLS_SAMPLE.replace("https://cli.github.com", &long);
+    assert_eq!(err(&text), ManifestError::BadInstallUrl("gh".into()));
+    let ok = TOOLS_SAMPLE.replace(
+        "https://cli.github.com",
+        "https://cli.github.com/manual/installation",
+    );
+    Manifest::parse(&ok).unwrap();
+}
+
+#[test]
+fn unknown_keys_are_rejected_in_tools_and_from_tool() {
+    let tool = TOOLS_SAMPLE.replace(
+        "label = \"GitHub CLI\"",
+        "label = \"GitHub CLI\"\npath = \"/bin/gh\"",
+    );
+    assert!(matches!(err(&tool), ManifestError::Toml { .. }));
+    let source = TOOLS_SAMPLE.replace("tool = \"gh\",", "tool = \"gh\", shell = true,");
+    assert!(matches!(err(&source), ManifestError::Toml { .. }));
 }
 
 fn settings_manifest() -> Manifest {

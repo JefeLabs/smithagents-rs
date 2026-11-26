@@ -1,8 +1,8 @@
 //! What the API and events say about a plugin.
 
-use smithagents_core::plugin::{PluginState, PluginStatus, ResourceStatus};
+use smithagents_core::plugin::{MissingTool, PluginState, PluginStatus, ResourceStatus};
 
-use super::{Inner, Live, Managed, Problem};
+use super::{tools, Inner, Live, Managed, Problem};
 use crate::plugins::{settings, Origin};
 
 /// Messages shown to users are at most this long.
@@ -41,8 +41,9 @@ fn is_separator_or_bidi(c: char) -> bool {
     )
 }
 
-/// The plugin's state: a load failure or a stop first (enabling does not
-/// clear them), then disabled, then invalid settings, then a problem a run met.
+/// The plugin's state: a load failure, unapproved tools or a stop first
+/// (enabling does not clear them), then disabled, then invalid settings, then
+/// a problem a run met.
 /// Every message goes through [`clean_message`] here as well as where it is
 /// made, so none can reach a response or an event uncapped.
 fn state(plugin: &Managed, live: &Live) -> PluginState {
@@ -54,6 +55,17 @@ fn state(plugin: &Managed, live: &Live) -> PluginState {
             message: clean_message(&message),
         },
         PluginState::NeedsSettings { message } => PluginState::NeedsSettings {
+            message: clean_message(&message),
+        },
+        PluginState::NeedsSetup { tools, message } => PluginState::NeedsSetup {
+            tools: tools
+                .into_iter()
+                .map(|t| MissingTool {
+                    label: clean_message(&t.label),
+                    reason: clean_message(&t.reason),
+                    ..t
+                })
+                .collect(),
             message: clean_message(&message),
         },
         PluginState::Failed { message } => PluginState::Failed {
@@ -69,6 +81,12 @@ fn raw_state(plugin: &Managed, live: &Live) -> PluginState {
     if let Err(message) = &plugin.loaded {
         return PluginState::LoadFailed {
             message: message.clone(),
+        };
+    }
+    if plugin.unapproved_tools {
+        return PluginState::NeedsSetup {
+            tools: tools::unapproved(&plugin.manifest),
+            message: tools::UNAPPROVED.to_string(),
         };
     }
     if let Some(Problem::Failed { message }) = &live.problem {
@@ -91,6 +109,10 @@ fn raw_state(plugin: &Managed, live: &Live) -> PluginState {
             message: message.clone(),
         },
         Some(Problem::NeedsSettings { message }) => PluginState::NeedsSettings {
+            message: message.clone(),
+        },
+        Some(Problem::NeedsSetup { tools, message }) => PluginState::NeedsSetup {
+            tools: tools.clone(),
             message: message.clone(),
         },
         Some(Problem::Failed { message }) => PluginState::Failed {

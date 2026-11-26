@@ -33,6 +33,7 @@ use smithagents_core::intent::{
     IntentVersion, Patch, ReviewAction,
 };
 use smithagents_core::plugin::{ItemsPage, PluginState, PluginStatus};
+use smithagents_plugin_host::InstallError;
 use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tower_http::cors::{Any, CorsLayer};
@@ -40,7 +41,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::events::{BusError, EventBus, Subscription};
 use crate::git::GitError;
 use crate::intents::{IntentError, IntentService};
-use crate::plugins::{ManagerError, PluginManager};
+use crate::plugins::{clean_message, ManagerError, PluginManager};
 use crate::service::{AgentService, ServiceError};
 use crate::store::{Store, StoreError};
 use crate::ui_stream::{Chunk, DONE_SSE, STREAM_HEADER};
@@ -104,6 +105,10 @@ pub fn router(state: AppState) -> Router {
             post(sync_plugin_resource),
         )
         .route("/v1/plugins/{id}/resources/{kind}/items", get(plugin_items))
+        .route(
+            "/v1/plugins/{id}/tools/{name}/install",
+            post(install_plugin_tool),
+        )
         .route("/v1/events", get(events))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -273,6 +278,22 @@ impl From<ManagerError> for ApiError {
             ManagerError::InvalidSettings(message) => {
                 Self::new(S::BAD_REQUEST, "invalid_settings", message)
             }
+            ManagerError::NotAllowed => Self::new(
+                S::FORBIDDEN,
+                "not_allowed",
+                "only a built-in plugin's command-line tools can be installed",
+            ),
+            ManagerError::UnknownTool => Self::new(
+                S::NOT_FOUND,
+                "tool_not_found",
+                "the plugin declares no such tool",
+            ),
+            ManagerError::InstallInProgress => Self::new(
+                S::CONFLICT,
+                "install_in_progress",
+                "this tool is being installed now",
+            ),
+            ManagerError::Install(e) => install_error(e),
             ManagerError::Store(StoreError::BadCursor) => {
                 Self::new(S::BAD_REQUEST, "bad_cursor", "malformed items cursor")
             }
@@ -282,6 +303,40 @@ impl From<ManagerError> for ApiError {
             }
         }
     }
+}
+
+/// The answer to an install mise did not complete. Messages carry mise's
+/// exit status at most, never its output.
+fn install_error(e: InstallError) -> ApiError {
+    use StatusCode as S;
+    let (status, code, message) = match e {
+        InstallError::NoMiseSpec => (
+            S::BAD_REQUEST,
+            "no_installer",
+            "the tool has no mise package to install; see its install hints".to_owned(),
+        ),
+        InstallError::MiseMissing { install_url } => (
+            S::CONFLICT,
+            "mise_missing",
+            format!("mise is not installed; install it from {install_url}, then try again"),
+        ),
+        InstallError::Failed { status: Some(code) } => (
+            S::BAD_GATEWAY,
+            "install_failed",
+            format!("mise failed with exit status {code}"),
+        ),
+        InstallError::Failed { status: None } => (
+            S::BAD_GATEWAY,
+            "install_failed",
+            "mise failed without an exit status".to_owned(),
+        ),
+        InstallError::Timeout => (
+            S::BAD_GATEWAY,
+            "install_failed",
+            "mise did not finish within 10 minutes".to_owned(),
+        ),
+    };
+    ApiError::new(status, code, clean_message(&message))
 }
 
 // ------------------------------------------------------------------ auth
@@ -409,6 +464,7 @@ fn not_ready_message(state: &PluginState) -> String {
         PluginState::Ready => "the plugin cannot run now".to_owned(),
         PluginState::NeedsAuth { message, .. }
         | PluginState::NeedsSettings { message }
+        | PluginState::NeedsSetup { message, .. }
         | PluginState::Failed { message }
         | PluginState::LoadFailed { message } => message.clone(),
     }
@@ -447,9 +503,26 @@ async fn sync_plugin_resource(
             e @ (ManagerError::UnknownPlugin
             | ManagerError::UnknownResource
             | ManagerError::Busy
+            | ManagerError::NotAllowed
+            | ManagerError::UnknownTool
+            | ManagerError::InstallInProgress
+            | ManagerError::Install(_)
             | ManagerError::Store(_)),
         ) => Err(e.into()),
     }
+}
+
+/// Installs a built-in plugin's tool with mise: the request is the user's
+/// approval. Detached: an install that lost its client still finishes, and
+/// its result still updates the plugin.
+async fn install_plugin_tool(
+    State(s): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<PluginStatus>, ApiError> {
+    let plugins = s.plugins;
+    detached(async move { plugins.install_tool(&id, &name).await })
+        .await
+        .map(Json)
 }
 
 #[derive(Deserialize, Default)]

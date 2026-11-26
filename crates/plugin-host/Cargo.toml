@@ -17,6 +17,7 @@ chrono.workspace = true
 # Plugins reach public HTTPS APIs, so this crate adds a rustls backend; the
 # workspace entry stays TLS-free for the loopback-only client.
 reqwest = { workspace = true, features = ["rustls"] }
+semver.workspace = true
 serde_json.workspace = true
 stabby.workspace = true
 thiserror.workspace = true
@@ -32,4 +33,5 @@ smithagents-plugin-fixture = { path = "../../plugins/fixture" }
 smithagents-plugins-tool = { path = "../../tools/plugins" }
 axum.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

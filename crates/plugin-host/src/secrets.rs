@@ -5,13 +5,16 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use smithagents_plugin_protocol::{PluginId, SecretDecl};
+use smithagents_plugin_protocol::{PluginId, SecretDecl, ToolSource};
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::tools::{tool_command, ToolFinder};
+
+/// How long a command that prints a secret, or a tool's version, may run.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// A secret value. Its `Debug` output is `Secret(..)`; it has no `Display` and no `Serialize`.
@@ -92,7 +95,7 @@ type Key = (String, String);
 #[derive(Default)]
 pub struct ConfiguredSecrets {
     entries: HashMap<Key, Entry>,
-    cache: Mutex<HashMap<Key, (Instant, Secret)>>,
+    cache: ValueCache,
 }
 
 impl ConfiguredSecrets {
@@ -109,25 +112,8 @@ impl ConfiguredSecrets {
         };
         Ok(ConfiguredSecrets {
             entries,
-            cache: Mutex::new(HashMap::new()),
+            cache: ValueCache::default(),
         })
-    }
-
-    fn cached(&self, key: &Key) -> Option<Secret> {
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        match cache.get(key) {
-            Some((at, secret)) if at.elapsed() < CACHE_TTL => Some(secret.clone()),
-            Some(_) => {
-                cache.remove(key);
-                None
-            }
-            None => None,
-        }
-    }
-
-    fn remember(&self, key: Key, secret: &Secret) {
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(key, (Instant::now(), secret.clone()));
     }
 }
 
@@ -135,7 +121,7 @@ impl ConfiguredSecrets {
 impl SecretSource for ConfiguredSecrets {
     async fn get(&self, plugin: &PluginId, key: &str) -> Result<Option<Secret>, SecretError> {
         let id = (plugin.to_string(), key.to_string());
-        if let Some(secret) = self.cached(&id) {
+        if let Some(secret) = self.cache.get(&id) {
             return Ok(Some(secret));
         }
         let resolved = match self.entries.get(&id) {
@@ -147,7 +133,88 @@ impl SecretSource for ConfiguredSecrets {
             },
         };
         if let Some(secret) = &resolved {
-            self.remember(id, secret);
+            self.cache.remember(id, secret);
+        }
+        Ok(resolved)
+    }
+}
+
+/// Values resolved in the last five minutes. Failures are not kept.
+#[derive(Default)]
+struct ValueCache(Mutex<HashMap<Key, (Instant, Secret)>>);
+
+impl ValueCache {
+    fn get(&self, key: &Key) -> Option<Secret> {
+        let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get(key) {
+            Some((at, secret)) if at.elapsed() < CACHE_TTL => Some(secret.clone()),
+            Some(_) => {
+                cache.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn remember(&self, key: Key, secret: &Secret) {
+        let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(key, (Instant::now(), secret.clone()));
+    }
+}
+
+/// Secrets from `inner` (the daemon passes [`ConfiguredSecrets`]: the file,
+/// then the environment) and, for the plugin and key pairs registered here
+/// when `inner` has no value, from a command-line tool: `<tool> <args>` found
+/// by the [`ToolFinder`] and run like a `secrets.toml` command. An error of
+/// `inner` is returned as it is; the tool does not paper over it.
+///
+/// Only the daemon registers anything: a plugin's manifest asks for a tool
+/// with `from_tool`, and the daemon honours that for built-in plugins only.
+/// Values the tool printed are cached for five minutes.
+pub struct ToolSecrets {
+    inner: Arc<dyn SecretSource>,
+    finder: ToolFinder,
+    sources: HashMap<Key, ToolSource>,
+    cache: ValueCache,
+}
+
+impl ToolSecrets {
+    pub fn new(inner: Arc<dyn SecretSource>, finder: ToolFinder) -> ToolSecrets {
+        ToolSecrets {
+            inner,
+            finder,
+            sources: HashMap::new(),
+            cache: ValueCache::default(),
+        }
+    }
+
+    /// `source` provides `plugin`'s secret `key` when `inner` has none.
+    pub fn register(&mut self, plugin: &PluginId, key: &str, source: ToolSource) {
+        self.sources
+            .insert((plugin.to_string(), key.to_string()), source);
+    }
+}
+
+#[async_trait]
+impl SecretSource for ToolSecrets {
+    async fn get(&self, plugin: &PluginId, key: &str) -> Result<Option<Secret>, SecretError> {
+        if let Some(secret) = self.inner.get(plugin, key).await? {
+            return Ok(Some(secret));
+        }
+        let id = (plugin.to_string(), key.to_string());
+        let Some(source) = self.sources.get(&id) else {
+            return Ok(None);
+        };
+        if let Some(secret) = self.cache.get(&id) {
+            return Ok(Some(secret));
+        }
+        // A tool that is not installed provides nothing.
+        let Some(path) = self.finder.find(&source.tool) else {
+            return Ok(None);
+        };
+        let resolved = command_secret(tool_command(&path, &source.args), &source.tool).await?;
+        if let Some(secret) = &resolved {
+            self.cache.remember(id, secret);
         }
         Ok(resolved)
     }
@@ -181,38 +248,84 @@ fn from_env(name: &str) -> Result<Option<Secret>, SecretError> {
     }
 }
 
-/// Runs `argv` without a shell, stdin closed and stderr discarded; the first line
-/// of stdout, trimmed, is the secret. Empty output counts as unset.
+/// Runs `argv` as [`run_command`] does; the first line of its output is the
+/// secret.
 async fn from_command(argv: &[String]) -> Result<Option<Secret>, SecretError> {
-    let program = argv[0].clone();
-    let mut cmd = tokio::process::Command::new(&program);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    command_secret(cmd, &argv[0]).await
+}
+
+/// The first line `cmd` prints, as a secret; empty output counts as unset.
+/// `program` names the command in errors, which never carry its output.
+async fn command_secret(
+    cmd: tokio::process::Command,
+    program: &str,
+) -> Result<Option<Secret>, SecretError> {
+    match run_command(cmd, COMMAND_TIMEOUT, Stdout::FirstLine).await {
+        Ok(line) => Ok(line.map(Secret)),
+        Err(RunError::Spawn(message)) => Err(SecretError::Spawn {
+            program: program.to_string(),
+            message,
+        }),
+        Err(RunError::Timeout) => Err(SecretError::CommandTimeout {
+            program: program.to_string(),
+        }),
+        Err(RunError::Status(status)) => Err(SecretError::Command { status }),
+    }
+}
+
+/// What [`run_command`] does with the command's standard output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stdout {
+    /// Returns the first line, trimmed; `None` when it is empty.
+    FirstLine,
+    /// Never reads it.
+    Discard,
+}
+
+/// Why a command the host ran did not succeed. Never carries its output.
+#[derive(Debug)]
+pub(crate) enum RunError {
+    /// It could not be started or waited for; the system's message.
+    Spawn(String),
+    Timeout,
+    Status(ExitStatus),
+}
+
+/// The one way the host runs a program: `cmd` as given (a program and its
+/// arguments, never through a shell), stdin closed, stderr discarded, and
+/// killed once `timeout` passes on tokio's clock.
+pub(crate) async fn run_command(
+    mut cmd: tokio::process::Command,
+    timeout: Duration,
+    stdout: Stdout,
+) -> Result<Option<String>, RunError> {
+    cmd.stdin(Stdio::null())
+        .stdout(match stdout {
+            Stdout::FirstLine => Stdio::piped(),
+            Stdout::Discard => Stdio::null(),
+        })
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let child = cmd.spawn().map_err(|e| SecretError::Spawn {
-        program: program.clone(),
-        message: e.to_string(),
-    })?;
-    let output = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output()).await {
+    let child = cmd.spawn().map_err(|e| RunError::Spawn(e.to_string()))?;
+    // Dropping the child on a timeout kills it.
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
-        Ok(Err(e)) => {
-            return Err(SecretError::Spawn {
-                program,
-                message: e.to_string(),
-            })
-        }
-        Err(_) => return Err(SecretError::CommandTimeout { program }),
+        Ok(Err(e)) => return Err(RunError::Spawn(e.to_string())),
+        Err(_) => return Err(RunError::Timeout),
     };
     if !output.status.success() {
-        return Err(SecretError::Command {
-            status: output.status,
-        });
+        return Err(RunError::Status(output.status));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first = stdout.lines().next().unwrap_or("").trim();
-    Ok((!first.is_empty()).then(|| Secret(first.to_string())))
+    Ok(match stdout {
+        Stdout::FirstLine => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let first = text.lines().next().unwrap_or("").trim();
+            (!first.is_empty()).then(|| first.to_string())
+        }
+        Stdout::Discard => None,
+    })
 }
 
 /// The file's text, or `None` when it does not exist. Checks the mode on the

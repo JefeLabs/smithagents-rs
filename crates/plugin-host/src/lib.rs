@@ -11,12 +11,19 @@ mod linked;
 mod runtime;
 mod secrets;
 mod services;
+mod tools;
 mod wasm;
 
 pub use dylib::DylibRuntime;
 pub use http::HttpPolicy;
 pub use linked::LinkedRuntime;
 pub use runtime::{CallError, LoadError, PluginRuntime};
-pub use secrets::{ConfiguredSecrets, Secret, SecretError, SecretSource, StaticSecrets};
+pub use secrets::{
+    ConfiguredSecrets, Secret, SecretError, SecretSource, StaticSecrets, ToolSecrets,
+};
 pub use services::{CallHandle, CallPurpose, HostServices, ServicesError};
+pub use tools::{
+    check_tool, find_tool, install_tool, InstallError, MissingReason, ToolFinder, ToolState,
+    MISE_INSTALL_URL,
+};
 pub use wasm::{WasmEngine, WasmLimits, WasmRuntime};
