@@ -576,6 +576,29 @@ pub fn queued_reason(model: &ShellModel, intent: &Intent) -> String {
     }
 }
 
+/// The daemon's own start of a start error, which the sentence already says.
+const DAEMON_START_PREFIX: &str = "could not start the agent: ";
+/// How many characters of a start error the detail shows.
+const START_ERROR_CHARS: usize = 300;
+
+/// Why the daemon could not start an intent's agent, from its
+/// `last_start_error`: "The agent could not start: <message>". The message
+/// (stored as the daemon got it: any length, any lines) is put on one line,
+/// loses the daemon's "could not start the agent: " (once, in any case), and
+/// is cut to [`START_ERROR_CHARS`] characters, with "…" when cut.
+pub fn start_error_text(message: &str) -> String {
+    let message = one_line(message);
+    let message = message
+        .get(..DAEMON_START_PREFIX.len())
+        .filter(|start| start.eq_ignore_ascii_case(DAEMON_START_PREFIX))
+        .map_or(message.as_str(), |start| &message[start.len()..]);
+    let mut kept: String = message.chars().take(START_ERROR_CHARS).collect();
+    if kept.len() < message.len() {
+        kept.push('…');
+    }
+    format!("The agent could not start: {kept}")
+}
+
 // ---- Create and settings -----------------------------------------------------
 
 /// The repository the create screen starts with: `last_used` while it still

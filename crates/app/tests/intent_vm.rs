@@ -641,6 +641,56 @@ fn error_sentences() {
     );
 }
 
+const START_PREFIX: &str = "The agent could not start: ";
+
+#[test]
+fn a_long_start_error_is_one_line_and_cut() {
+    // 13 + 1 + 600 characters over two lines, non-ASCII where the cut falls.
+    let message = format!("no directory\n\tat /moved/{}", "é".repeat(600));
+    let text = start_error_text(&message);
+    assert!(!text.contains(['\n', '\t']), "{text:?}");
+    let rest = text
+        .strip_prefix(START_PREFIX)
+        .expect("the sentence's start");
+    let cut = rest
+        .strip_suffix('…')
+        .expect("an ellipsis where it was cut");
+    assert_eq!(cut.chars().count(), 300);
+    assert!(
+        format!("no directory at /moved/{}", "é".repeat(600)).starts_with(cut),
+        "the first 300 characters of the message on one line"
+    );
+
+    // Exactly 300 characters are kept whole.
+    let fits = "a".repeat(300);
+    assert_eq!(start_error_text(&fits), format!("{START_PREFIX}{fits}"));
+}
+
+#[test]
+fn the_daemons_own_prefix_is_not_repeated() {
+    assert_eq!(
+        start_error_text("could not start the agent: no directory at /moved/repo"),
+        "The agent could not start: no directory at /moved/repo"
+    );
+    assert_eq!(
+        start_error_text("Could Not Start The Agent:  git\nfailed"),
+        "The agent could not start: git failed"
+    );
+    // Once only.
+    assert_eq!(
+        start_error_text("could not start the agent: could not start the agent: x"),
+        "The agent could not start: could not start the agent: x"
+    );
+}
+
+#[test]
+fn a_short_start_error_is_unchanged() {
+    assert_eq!(
+        start_error_text("no directory at /moved/repo"),
+        "The agent could not start: no directory at /moved/repo"
+    );
+}
+
 #[test]
 fn transport_errors_are_unreachable() {
     let http = reqwest::Client::new()

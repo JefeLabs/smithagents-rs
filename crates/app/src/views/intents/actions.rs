@@ -41,7 +41,7 @@ use smithagents_core::ids::{AgentId, IntentId};
 use smithagents_core::intent::{Intent, IntentState};
 
 use super::{Busy, IntentsPane, Paint};
-use crate::intent_vm::queued_reason;
+use crate::intent_vm::{queued_reason, start_error_text};
 use crate::model::Action;
 
 /// Element id of the Send button.
@@ -199,15 +199,20 @@ impl IntentsPane {
     }
 }
 
-/// "The agent could not start: …", a status in `destructive`.
+/// "The agent could not start: …" ([`start_error_text`]), a status in
+/// `destructive`.
 fn start_error_line(error: &str, paint: &Paint) -> impl IntoElement {
-    let text = format!("The agent could not start: {error}");
+    let text = start_error_text(error);
     div()
         .id(START_ERROR_ID)
         .role(Role::Status)
         .test_support()
         .aria_label(text.clone())
         .w_full()
+        // A long path has no space to break at: it wraps where it reaches
+        // the edge instead of widening the pane.
+        .min_w_0()
+        .whitespace_normal()
         .px_3()
         .pb_2()
         .text_xs()

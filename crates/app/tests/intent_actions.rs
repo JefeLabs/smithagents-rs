@@ -18,10 +18,10 @@ use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{ElementSnapshot, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
-    AppContext as _, ElementId, Entity, Focusable as _, Role, TestAppContext, WindowHandle,
+    px, AppContext as _, ElementId, Entity, Focusable as _, Role, TestAppContext, WindowHandle,
 };
 use smithagents_app::model::Action;
-use smithagents_app::shell::{Shell, ShellOptions};
+use smithagents_app::shell::{Shell, ShellOptions, INTENTS_PANEL};
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::views::intents::{
     intent_card_id, item_confirm_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, DETAIL_STATE_ID,
@@ -694,4 +694,39 @@ fn a_start_error_is_shown_above_the_bar(cx: &mut TestAppContext) {
     let cleared = changed(&current, |i| i.last_start_error = None);
     upsert(cx, &opened, &cleared);
     assert!(!is_drawn(cx, window, START_ERROR_ID));
+}
+
+#[gpui_kit::test]
+fn a_long_start_error_stays_inside_the_pane(cx: &mut TestAppContext) {
+    // A path with no space to break at, 2,000 characters long.
+    let long = format!("/moved/{}", "a".repeat(1993));
+    let mut complete = complete();
+    complete.last_start_error = Some(long);
+    let opened = open_detail(cx, vec![complete], vec![]);
+    with_window(cx, opened.window, |window, _| {
+        let pane = window.find(INTENTS_PANEL).bounds();
+        let line = window.find(START_ERROR_ID);
+        let label = line.label().unwrap();
+        assert!(label.starts_with("The agent could not start: /moved/aaa"));
+        assert!(label.ends_with('…'), "cut");
+        for (what, bounds) in [
+            ("line", line.bounds()),
+            ("Send", window.find(SEND_ID).bounds()),
+        ] {
+            assert!(
+                bounds.left() >= pane.left()
+                    && bounds.right() <= pane.right()
+                    && bounds.bottom() <= pane.bottom(),
+                "the {what} {bounds:?} is inside the pane {pane:?}"
+            );
+        }
+        // The text breaks inside the path onto several lines (the line's
+        // bounds keep the pane's width either way; text that does not wrap
+        // runs past them on one line).
+        assert!(
+            line.bounds().size.height > px(48.),
+            "the text wraps: {:?}",
+            line.bounds()
+        );
+    });
 }
