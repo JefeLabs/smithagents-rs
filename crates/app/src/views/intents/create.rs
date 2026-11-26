@@ -191,7 +191,7 @@ impl IntentsPane {
         let request = CreateIntentRequest {
             repo_id: Some(repo),
             kind: Some(kind),
-            seed: SeedInput::Text(text),
+            seed: SeedInput::Text(text.clone()),
         };
         let Some(command) = self
             .state
@@ -208,26 +208,43 @@ impl IntentsPane {
         self.run(
             Busy::Create,
             command,
-            move |this, intent, window, cx| this.created(repo, intent, window, cx),
+            move |this, intent, window, cx| this.created(repo, &text, intent, window, cx),
             window,
             cx,
         );
     }
 
+    /// The create of `sent` in `repo` succeeded. The repository becomes the
+    /// last used. The box (and the repository picked) is cleared only while
+    /// it still holds the text sent: text typed since then is kept for the
+    /// next intent. The detail opens only while the create screen is on
+    /// screen: a user who left it is not pulled away.
     fn created(
         &mut self,
         repo: RepoId,
+        sent: &str,
         intent: Intent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.state
             .update(cx, |state, _| state.set_last_repo_id(repo));
-        self.picked_repo = None;
-        // Unlike `set_value`, `clean` leaves the focus where it is.
-        self.text_box
-            .update(cx, |text_box, cx| text_box.clean(window, cx));
-        self.open_screen(Screen::Detail(intent.id), window, cx);
+        if self.text_box.read(cx).value() == sent {
+            self.picked_repo = None;
+            // Unlike `set_value`, `clean` leaves the focus where it is.
+            self.text_box
+                .update(cx, |text_box, cx| text_box.clean(window, cx));
+        }
+        if self.screen == Screen::Create {
+            self.open_screen(Screen::Detail(intent.id), window, cx);
+        } else {
+            tracing::debug!(
+                intent = %intent.id,
+                screen = ?self.screen,
+                "created after the create screen was left"
+            );
+            cx.notify();
+        }
     }
 
     pub(super) fn create_screen(&self, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {

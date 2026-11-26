@@ -372,7 +372,8 @@ fn a_card_shows_slug_title_meta_and_preview(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn a_card_leaves_out_what_it_lacks(cx: &mut TestAppContext) {
-    // No agent, so no accent; a blank body, so no preview.
+    // No agent, so no accent; a blank body, so the seed's text (as the
+    // detail shows it), which has no heading.
     let draft = intent("fix-zoom", IntentState::Draft, Phase::Review);
     let opened = Setup::new(vec![draft.clone()], vec![]).open(cx);
     let window = opened.window;
@@ -382,7 +383,10 @@ fn a_card_leaves_out_what_it_lacks(cx: &mut TestAppContext) {
         Some("Fix zoom")
     );
     assert_eq!(card_part(cx, window, draft.id, CARD_HEADING_ID), None);
-    assert_eq!(card_part(cx, window, draft.id, CARD_LINE_ID), None);
+    assert_eq!(
+        card_part(cx, window, draft.id, CARD_LINE_ID).as_deref(),
+        Some("Seed of fix-zoom")
+    );
     let native = dark_native();
     with_window(cx, window, |window, _| {
         let bar = window

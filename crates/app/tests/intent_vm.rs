@@ -286,6 +286,55 @@ fn body_preview_survives_odd_markdown() {
 }
 
 #[test]
+fn a_line_of_brackets_is_cut_before_its_links_are_stripped() {
+    // Each `[` without a link used to scan the rest of the line again.
+    let brackets = "[".repeat(50_000);
+    let preview = body_preview(&brackets);
+    assert_eq!(preview.line, Some("[".repeat(200)));
+    // A link that starts inside the kept part and ends past it stays text.
+    let late_link = format!("[{}](https://example.com)", "a".repeat(2_500));
+    let line = body_preview(&late_link).line.unwrap();
+    assert_eq!(line, format!("[{}", "a".repeat(199)));
+}
+
+#[test]
+fn a_polishing_drafts_card_previews_its_seed() {
+    let now = DateTime::parse_from_rfc3339("2026-11-26T10:15:00-08:00").unwrap();
+    let mut zoom = draft("untitled-intent", Phase::Polishing { pass: 1 });
+    zoom.content.title = "Untitled intent".into();
+    zoom.seed.text = "Make the zoom remember each site".into();
+    let mut crash = draft("untitled-intent-2", Phase::Polishing { pass: 1 });
+    crash.content.title = "Untitled intent".into();
+    crash.seed.text = "## Crash\nThe app quits when a tab closes".into();
+    let mut polished = draft("polished", Phase::Review);
+    polished.content.current_behavior = "Today the zoom resets".into();
+    // Newest first.
+    zoom.updated_at = utc("2026-11-26T15:00:00Z");
+    crash.updated_at = utc("2026-11-26T14:00:00Z");
+    polished.updated_at = utc("2026-11-26T13:00:00Z");
+    let model = model_with(vec![zoom, crash, polished], vec![], vec![]);
+
+    let cards = intent_cards(&model, IntentFilterChoice::All, now);
+    let previews: Vec<_> = cards
+        .iter()
+        .map(|card| {
+            (
+                card.preview.heading.as_deref(),
+                card.preview.line.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        previews,
+        [
+            (None, Some("Make the zoom remember each site")),
+            (Some("Crash"), Some("The app quits when a tab closes")),
+            (None, Some("Today the zoom resets")),
+        ]
+    );
+}
+
+#[test]
 fn dots_by_state() {
     let dots: Vec<_> = one_of_each()
         .iter()
@@ -681,6 +730,23 @@ fn the_daemons_own_prefix_is_not_repeated() {
         start_error_text("could not start the agent: could not start the agent: x"),
         "The agent could not start: could not start the agent: x"
     );
+}
+
+#[test]
+fn an_empty_start_error_is_a_plain_sentence() {
+    for empty in [
+        "",
+        "  \n\t ",
+        "could not start the agent: ",
+        "could not start the agent:",
+        "  Could not start the agent:  \n",
+    ] {
+        assert_eq!(
+            start_error_text(empty),
+            "The agent could not start.",
+            "{empty:?}"
+        );
+    }
 }
 
 #[test]

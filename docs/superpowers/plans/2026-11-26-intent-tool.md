@@ -654,7 +654,9 @@ Found while planning:
 - Keyboard shortcuts for question options (the spec mentions them for option chips).
 
 Found during execution:
-- The app does not show agents either when the intent list fails to load at connect: the snapshot, the intents and the agent defaults are one load round, and the round fails as a whole.
+- The app does not show agents either when the intent list or the agent defaults fail to load at connect: the snapshot, the intents and the agent defaults are one load round, and the round fails as a whole.
+- The focus is not put back into the pane when the focused button disappears after the daemon answers (a question's option or Skip, an item's Confirm or Skip, Send, Mark resolved): it falls to the shell.
+- A create the daemon did not answer in time ("The daemon did not answer") may still have been made: pressing the kind again can create a second intent from the same text.
 - The agent's last message is not on cards, because neither the daemon nor the app holds it (see above).
 - The ⌥-key shortcuts on the create screen are untested with non-US keyboard layouts and input methods.
 

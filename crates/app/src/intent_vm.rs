@@ -159,6 +159,10 @@ impl IntentFilterChoice {
 
 /// How many characters a preview line keeps.
 const PREVIEW_CHARS: usize = 200;
+/// How many characters of a line [`plain`] strips marks from: plenty for a
+/// [`PREVIEW_CHARS`] preview, and a bound on [`without_links`], which scans
+/// the rest of the line again for each `[` that opens no link.
+const STRIPPED_CHARS: usize = 2_000;
 
 /// The first heading and the first line of text of a Markdown body, as plain
 /// text for a card.
@@ -206,8 +210,12 @@ fn without_links(text: &str) -> String {
 
 /// A line as plain text: no list or quote marker, links reduced to their
 /// text, no emphasis or code marks, trimmed, and cut to [`PREVIEW_CHARS`]
-/// characters.
+/// characters. Only its first [`STRIPPED_CHARS`] characters are read.
 fn plain(line: &str) -> String {
+    let line = match line.char_indices().nth(STRIPPED_CHARS) {
+        Some((end, _)) => &line[..end],
+        None => line,
+    };
     let line = line.trim();
     let line = ["- ", "* ", "> "]
         .iter()
@@ -339,7 +347,8 @@ fn card(model: &ShellModel, intent: &Intent, now: DateTime<FixedOffset>) -> Inte
         slug: intent.slug.clone(),
         title: intent.content.title.clone(),
         meta: meta.join(" | "),
-        preview: body_preview(&intent.content.current_behavior),
+        // As the detail draws it: a draft still in pass 1 shows its seed.
+        preview: body_preview(body_text(intent)),
         dot: intent_dot(intent, agent.map(|a| a.state)),
         accent_hue: agent.map(|a| a.color.h),
         a11y_label: format!("{}, {state}", intent.content.title),
@@ -577,21 +586,27 @@ pub fn queued_reason(model: &ShellModel, intent: &Intent) -> String {
 }
 
 /// The daemon's own start of a start error, which the sentence already says.
-const DAEMON_START_PREFIX: &str = "could not start the agent: ";
+const DAEMON_START_PREFIX: &str = "could not start the agent:";
 /// How many characters of a start error the detail shows.
 const START_ERROR_CHARS: usize = 300;
 
 /// Why the daemon could not start an intent's agent, from its
 /// `last_start_error`: "The agent could not start: <message>". The message
 /// (stored as the daemon got it: any length, any lines) is put on one line,
-/// loses the daemon's "could not start the agent: " (once, in any case), and
-/// is cut to [`START_ERROR_CHARS`] characters, with "…" when cut.
+/// loses the daemon's "could not start the agent:" (once, in any case), and
+/// is cut to [`START_ERROR_CHARS`] characters, with "…" when cut. With
+/// nothing left, the sentence is "The agent could not start."
 pub fn start_error_text(message: &str) -> String {
     let message = one_line(message);
     let message = message
         .get(..DAEMON_START_PREFIX.len())
         .filter(|start| start.eq_ignore_ascii_case(DAEMON_START_PREFIX))
-        .map_or(message.as_str(), |start| &message[start.len()..]);
+        .map_or(message.as_str(), |start| {
+            message[start.len()..].trim_start()
+        });
+    if message.is_empty() {
+        return "The agent could not start.".to_owned();
+    }
     let mut kept: String = message.chars().take(START_ERROR_CHARS).collect();
     if kept.len() < message.len() {
         kept.push('…');

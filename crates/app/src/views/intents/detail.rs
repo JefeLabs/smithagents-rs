@@ -12,10 +12,13 @@
 //! the daemon answers, and stays (with the error line) when it refuses.
 //!
 //! The body is the intent's current behavior, or its seed text while that is
-//! blank ([`body_text`]), drawn read-only as Markdown. While the daemon
+//! blank ([`body_text`]), drawn read-only as Markdown, without its images
+//! (it is model output, so it loads nothing: [`no_image`]). While the daemon
 //! polishes the draft the screen says which pass it is on and draws no
 //! sections or actions; when a pass failed it says why and offers "Try
 //! again".
+
+use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -29,8 +32,9 @@ use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Ic
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, rems, AnyElement, App, AppContext as _, Context, ElementId, Entity, Focusable as _,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Role,
-    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, WeakEntity, Window,
+    FontWeight, ImageCacheError, ImageSource, InteractiveElement as _, IntoElement,
+    ParentElement as _, Role, SharedUri, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, WeakEntity, Window,
 };
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentKind, IntentState, Patch, Phase};
@@ -160,7 +164,11 @@ impl IntentsPane {
                     .child(body(intent, paint))
                     .children(self.detail_sections(intent, paint, cx)),
             )
-            .children(self.error_line(paint))
+            // A refused Send whose start error says the same: that line only.
+            .children(
+                self.error_line(paint)
+                    .filter(|_| !self.error_line_repeats_start_error(intent)),
+            )
             .children(self.detail_actions(intent, paint, cx))
             .into_any_element()
     }
@@ -221,6 +229,7 @@ impl IntentsPane {
             .child(
                 div()
                     .w_full()
+                    .min_w_0()
                     .px_2()
                     .child(self.title_element(intent, editable, paint, cx)),
             )
@@ -256,7 +265,8 @@ impl IntentsPane {
     }
 
     /// With `editable`, a button that opens the title input (or the input,
-    /// while open); otherwise a label.
+    /// while open); otherwise a label. Either is one line, cut with "…" (a
+    /// long title has its whole text in the input, and in the button's name).
     fn title_element(
         &self,
         intent: &Intent,
@@ -268,10 +278,12 @@ impl IntentsPane {
         if !editable {
             return Label::new(title)
                 .id(DETAIL_TITLE_ID)
+                .min_w_0()
                 .px_1()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(paint.foreground)
+                .truncate()
                 .into_any_element();
         }
         if self.editing_title == Some(intent.id) {
@@ -303,6 +315,8 @@ impl IntentsPane {
             .track_focus(&self.title_focus)
             .aria_label(format!("Edit title: {title}"))
             .w_full()
+            .min_w_0()
+            .truncate()
             .px_1()
             .rounded_sm()
             .border_1()
@@ -417,8 +431,12 @@ impl IntentsPane {
         );
     }
 
-    /// Opens the title input, holding the title, with the focus.
+    /// Opens the title input, holding the title, with the focus. Nothing
+    /// while a command is in flight.
     fn edit_title(&mut self, id: IntentId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
         let title = self
             .state
             .read(cx)
@@ -509,7 +527,8 @@ fn back_button(paint: &Paint, cx: &Context<IntentsPane>) -> impl IntoElement {
         .on_click(cx.listener(|this, _, window, cx| this.open_screen(Screen::List, window, cx)))
 }
 
-/// The body as Markdown, read-only, in a frame the tests can find.
+/// The body as Markdown, read-only, in a frame the tests can find. Its
+/// images are not drawn ([`no_image`]).
 fn body(intent: &Intent, paint: &Paint) -> impl IntoElement {
     div()
         .id(DETAIL_BODY_ID)
@@ -520,8 +539,21 @@ fn body(intent: &Intent, paint: &Paint) -> impl IntoElement {
         .child(
             TextView::markdown(DETAIL_BODY_ID, body_text(intent).to_owned())
                 .selectable(true)
+                .image_source(no_image)
                 .text_color(paint.foreground),
         )
+}
+
+/// The source of every image in the body: one that fails at once, so the
+/// image draws nothing. The body is model output, and the Markdown view
+/// would otherwise fetch each image's URL (Markdown `![…](…)` and HTML
+/// `<img>` alike) through the app's HTTP client.
+fn no_image(_: &SharedUri) -> ImageSource {
+    ImageSource::Custom(Arc::new(|_, _| {
+        Some(Err(ImageCacheError::Asset(
+            "the intent body loads no images".into(),
+        )))
+    }))
 }
 
 /// The kind menu: the five kinds the create screen offers, the current one

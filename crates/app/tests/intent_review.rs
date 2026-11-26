@@ -1090,6 +1090,61 @@ fn edit_saves_on_enter_as_edit_and_accept(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn enter_on_unchanged_text_confirms_instead_of_editing(cx: &mut TestAppContext) {
+    let draft = in_review();
+    let opened = open_detail(cx, vec![draft.clone()]);
+    let window = opened.window;
+    let pending = draft.content.criteria[0].id;
+
+    // The text as it is, with spaces around it: the daemon accepts it and
+    // does not mark it edited.
+    edit(cx, window, pending, &format!("  {PENDING_TEXT} "));
+    press(cx, window, "enter");
+    assert_eq!(
+        calls(&opened),
+        [review(&draft, pending, ReviewAction::Accept)]
+    );
+    assert_eq!(busy(cx, &opened), Some(Busy::Item(pending)));
+
+    let accepted = criterion(&draft, 0, |i| i.status = ItemStatus::Accepted);
+    opened.fake.answer(Ok(accepted.clone()));
+    frame(cx, window);
+    assert_eq!(
+        item_input(cx, window, pending),
+        None,
+        "the answer closes it"
+    );
+    upsert(cx, &opened, &accepted);
+    assert_eq!(
+        item_text(cx, window, pending).as_deref(),
+        Some(PENDING_TEXT)
+    );
+    assert!(item_buttons(cx, window, pending).is_empty());
+}
+
+#[gpui_kit::test]
+fn an_open_edit_closes_when_someone_else_confirms_the_item(cx: &mut TestAppContext) {
+    // A second pending criterion keeps the section open.
+    let mut draft = in_review();
+    draft.content.criteria[1].status = ItemStatus::Pending;
+    let opened = open_detail(cx, vec![draft.clone()]);
+    let window = opened.window;
+    let pending = draft.content.criteria[0].id;
+
+    edit(cx, window, pending, "Half typed");
+    let accepted = criterion(&draft, 0, |i| i.status = ItemStatus::Accepted);
+    upsert(cx, &opened, &accepted);
+    assert!(expanded(cx, window, SectionKind::Criteria));
+    assert_eq!(item_input(cx, window, pending), None);
+    assert_eq!(
+        item_text(cx, window, pending).as_deref(),
+        Some(PENDING_TEXT)
+    );
+    assert!(item_buttons(cx, window, pending).is_empty());
+    assert!(calls(&opened).is_empty());
+}
+
+#[gpui_kit::test]
 fn a_refused_edit_keeps_the_text(cx: &mut TestAppContext) {
     // A failed save never loses what the user typed.
     let draft = in_review();

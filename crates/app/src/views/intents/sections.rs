@@ -24,12 +24,13 @@
 //! in `status-ok`. While the intent is a draft in review or is complete (the
 //! states the daemon takes a review in) a pending card offers Confirm, Edit
 //! and Skip. Edit puts the text in a one-line input, for one item at a time:
-//! Enter sends the trimmed text, which the daemon saves and accepts, and the
-//! input closes when it answers (it stays, with what was typed, when it
-//! refuses); Escape, or Enter on blank text, closes it unchanged. Depends on
-//! is drawn alike, but a card names the other intent (its slug and title, or
-//! the item's own text while that intent is not in the model) and offers no
-//! Edit.
+//! Enter sends the trimmed text, which the daemon saves and accepts (the
+//! text unchanged is sent as Confirm), and the input closes when it answers
+//! (it stays, with what was typed, when it refuses), or once the item is no
+//! longer pending; Escape, or Enter on blank text, closes it unchanged.
+//! Depends on is drawn alike, but a card names the other intent (its slug and
+//! title, or the item's own text while that intent is not in the model) and
+//! offers no Edit.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -629,9 +630,9 @@ impl IntentsPane {
     }
 
     /// Sends `action` for `item`, of section `kind`; nothing while another
-    /// command is in flight. The section stays open from here on. An edit's
-    /// input closes when the daemon answers; when it refuses, the input
-    /// keeps what was typed.
+    /// command is in flight. The section stays open from here on. The item
+    /// input that sent it closes when the daemon answers; when it refuses,
+    /// the input keeps what was typed.
     fn review_item(
         &mut self,
         intent: IntentId,
@@ -644,7 +645,8 @@ impl IntentsPane {
         if self.busy.is_some() {
             return;
         }
-        let edit = matches!(action, ReviewAction::Edit(_));
+        // Sent from the item input (an edit, or its unchanged text).
+        let from_input = self.item_edit.is_some_and(|open| open.item == item);
         // The edited text is the user's; the log names the action only.
         let what = match &action {
             ReviewAction::Accept => "accept",
@@ -658,7 +660,7 @@ impl IntentsPane {
             Busy::Item(item),
             move |commands| commands.review_item(intent, item, action),
             move |this, _, window, cx| {
-                if edit && this.item_edit.is_some_and(|open| open.item == item) {
+                if from_input && this.item_edit.is_some_and(|open| open.item == item) {
                     this.close_item_edit(window, cx);
                 }
             },
@@ -706,8 +708,9 @@ impl IntentsPane {
     }
 
     /// Enter in the item input: non-blank text (trimmed) is sent as an edit,
-    /// which the daemon also accepts; blank text just closes the input.
-    /// Nothing while a command is in flight.
+    /// which the daemon also accepts; the item's own text unchanged is sent
+    /// as a confirm, so the daemon does not mark it edited; blank text just
+    /// closes the input. Nothing while a command is in flight.
     pub(super) fn save_item_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(edit) = self.item_edit else {
             return;
@@ -720,7 +723,22 @@ impl IntentsPane {
             self.close_item_edit(window, cx);
             return;
         }
-        let action = ReviewAction::Edit(text);
+        let unchanged = self
+            .state
+            .read(cx)
+            .model()
+            .intent(edit.intent)
+            .and_then(|intent| {
+                section_items(&intent.content, edit.kind)
+                    .iter()
+                    .find(|item| item.id == edit.item)
+            })
+            .is_some_and(|item| item.text == text);
+        let action = if unchanged {
+            ReviewAction::Accept
+        } else {
+            ReviewAction::Edit(text)
+        };
         self.review_item(edit.intent, edit.kind, edit.item, action, window, cx);
     }
 
@@ -738,7 +756,8 @@ impl IntentsPane {
 
     /// Closes the item input once its item can no longer be edited: the
     /// intent left the states the daemon takes a review in, or the item is
-    /// gone or dropped. A keyboard user stays in the pane.
+    /// gone or no longer pending (accepted or dropped, here or elsewhere). A
+    /// keyboard user stays in the pane.
     pub(super) fn close_stale_item_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(edit) = self.item_edit else {
             return;
@@ -752,7 +771,7 @@ impl IntentsPane {
                 reviewable(intent)
                     && section_items(&intent.content, edit.kind)
                         .iter()
-                        .any(|item| item.id == edit.item && item.status != ItemStatus::Dropped)
+                        .any(|item| item.id == edit.item && item.status == ItemStatus::Pending)
             });
         if editable {
             return;

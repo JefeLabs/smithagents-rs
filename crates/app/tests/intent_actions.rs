@@ -697,6 +697,64 @@ fn a_start_error_is_shown_above_the_bar(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_send_refused_with_a_start_error_shows_one_line(cx: &mut TestAppContext) {
+    // The daemon refuses the Send with its error and records the same error
+    // as the intent's start error: the start-error line says it once.
+    const MESSAGE: &str = "git worktree add failed: no such directory";
+    let complete = complete();
+    let opened = open_detail(cx, vec![complete.clone()], vec![]);
+    let window = opened.window;
+    let start_error = format!("could not start the agent: {MESSAGE}");
+    let line = format!("The agent could not start: {MESSAGE}");
+    let failed = changed(&complete, |i| {
+        i.last_start_error = Some(start_error.clone())
+    });
+
+    // The daemon's answer first, then its copy.
+    opened
+        .fake
+        .queue(Err(FakeIntents::api_error(500, "git_error", MESSAGE)));
+    click(cx, window, SEND_ID);
+    assert_eq!(busy(cx, &opened), None);
+    upsert(cx, &opened, &failed);
+    assert_eq!(
+        label_of(cx, window, START_ERROR_ID).as_deref(),
+        Some(line.as_str())
+    );
+    assert_eq!(error_line(cx, window), None, "not said twice");
+
+    // The copy first, then the answer (here the agent already attached,
+    // whose message is the start error itself).
+    let attached = "agent Mercury is already attached to this intent; close it to start again";
+    let again = changed(&failed, |i| i.last_start_error = Some(attached.to_owned()));
+    click(cx, window, SEND_ID);
+    upsert(cx, &opened, &again);
+    opened
+        .fake
+        .answer(Err(FakeIntents::api_error(400, "invalid", attached)));
+    frame(cx, window);
+    assert_eq!(busy(cx, &opened), None);
+    assert_eq!(
+        label_of(cx, window, START_ERROR_ID).as_deref(),
+        Some(format!("The agent could not start: {attached}").as_str())
+    );
+    assert_eq!(error_line(cx, window), None, "not said twice");
+
+    // A refusal the start error does not explain still has its own line.
+    opened.fake.queue(Err(FakeIntents::api_error(
+        409,
+        "invalid_state",
+        "intent is queued, expected complete",
+    )));
+    click(cx, window, SEND_ID);
+    assert_eq!(
+        error_line(cx, window).as_deref(),
+        Some("The intent changed, so this is no longer possible.")
+    );
+    assert!(is_drawn(cx, window, START_ERROR_ID));
+}
+
+#[gpui_kit::test]
 fn a_long_start_error_stays_inside_the_pane(cx: &mut TestAppContext) {
     // A path with no space to break at, 2,000 characters long.
     let long = format!("/moved/{}", "a".repeat(1993));

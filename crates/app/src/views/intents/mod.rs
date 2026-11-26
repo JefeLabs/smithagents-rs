@@ -66,6 +66,7 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
     TestSupportExt as _, Window,
 };
+use smithagents_client::ClientError;
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{AnswerInput, Intent, IntentKind, ReviewAction};
 use smithagents_theme::native::NativeTheme;
@@ -162,6 +163,10 @@ pub struct IntentsPane {
     filter: IntentFilterChoice,
     /// The screen's error line.
     error: Option<String>,
+    /// A refused Send: the error line it set and the daemon's own message,
+    /// which the daemon also records as the intent's start error. The detail
+    /// then leaves the error line out ([`IntentsPane::error_line_repeats_start_error`]).
+    send_refusal: Option<(String, String)>,
     /// The command in flight, and its task; dropping the task gives it up.
     busy: Option<Busy>,
     command: Option<Task<()>>,
@@ -259,6 +264,7 @@ impl IntentsPane {
             detail_seen: false,
             filter: IntentFilterChoice::default(),
             error: None,
+            send_refusal: None,
             busy: None,
             command: None,
             command_screen: None,
@@ -309,6 +315,7 @@ impl IntentsPane {
         tracing::debug!(?screen, "intents screen");
         let previous = std::mem::replace(&mut self.screen, screen);
         self.error = None;
+        self.send_refusal = None;
         self.editing_title = None;
         self.item_edit = None;
         self.detail_seen = match screen {
@@ -354,6 +361,7 @@ impl IntentsPane {
         }
         tracing::debug!(?key, "sending an intent command");
         self.error = None;
+        self.send_refusal = None;
         self.busy = Some(key);
         self.command_screen = Some(self.screen);
         let timer = cx
@@ -391,7 +399,12 @@ impl IntentsPane {
             }
             Some(Err(e)) => {
                 tracing::warn!(?key, "intent command failed: {e}");
-                self.show_failure(sent_from, intent_error_text(&e));
+                let text = intent_error_text(&e);
+                if let (Busy::Send, LinkError::Client(ClientError::Api { message, .. })) = (key, &e)
+                {
+                    self.send_refusal = Some((text.clone(), message.clone()));
+                }
+                self.show_failure(sent_from, text);
             }
         }
         cx.notify();

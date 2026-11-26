@@ -453,6 +453,58 @@ fn choosing_a_kind_creates_and_opens_the_detail(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_create_answered_after_the_screen_was_left_stays_on_the_list(cx: &mut TestAppContext) {
+    let only = repo("/work/alpha", "20");
+    let opened = open(cx, vec![only.clone()]);
+    let window = opened.window;
+    type_text(cx, window, "Tidy the store");
+    click(cx, window, kind_row_id(IntentKind::Refactor));
+    press(cx, window, "escape");
+    assert_eq!(screen(cx, &opened), Screen::List);
+
+    let created = intent(
+        "tidy-the-store",
+        IntentState::Draft,
+        Phase::Polishing { pass: 1 },
+    );
+    opened.fake.answer(Ok(created));
+    frame(cx, window);
+    assert_eq!(screen(cx, &opened), Screen::List, "no jump to the detail");
+    assert_eq!(
+        opened.state.read_with(cx, |state, _| state.last_repo_id()),
+        Some(only.id)
+    );
+    // The text was sent as it is: the box is empty for the next one.
+    click(cx, window, INTENTS_NEW_ID);
+    assert_eq!(text(cx, window), "");
+}
+
+#[gpui_kit::test]
+fn text_typed_while_a_create_is_on_its_way_survives_the_answer(cx: &mut TestAppContext) {
+    let opened = open(cx, vec![repo("/work/alpha", "20")]);
+    let window = opened.window;
+    type_text(cx, window, "Fix the zoom");
+    click(cx, window, kind_row_id(IntentKind::Bug));
+    press(cx, window, "escape");
+    click(cx, window, INTENTS_NEW_ID);
+    type_text(cx, window, " and the pan");
+    assert_eq!(text(cx, window), "Fix the zoom and the pan");
+
+    let created = intent(
+        "fix-the-zoom",
+        IntentState::Draft,
+        Phase::Polishing { pass: 1 },
+    );
+    opened.fake.answer(Ok(created.clone()));
+    frame(cx, window);
+    // The create screen is on screen again, so the detail opens as usual.
+    assert_eq!(screen(cx, &opened), Screen::Detail(created.id));
+    click(cx, window, DETAIL_BACK_ID);
+    click(cx, window, INTENTS_NEW_ID);
+    assert_eq!(text(cx, window), "Fix the zoom and the pan");
+}
+
+#[gpui_kit::test]
 fn the_row_shows_the_spinner_while_creating(cx: &mut TestAppContext) {
     let opened = open(cx, vec![repo("/work/alpha", "20")]);
     let window = opened.window;

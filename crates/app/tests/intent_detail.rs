@@ -369,6 +369,33 @@ fn bodies_nobody_designed_for_draw(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_body_fetches_no_remote_images(cx: &mut TestAppContext) {
+    // The body is model output: neither Markdown's image syntax nor an HTML
+    // `<img>` in it may make the app fetch anything.
+    use gpui_kit::http_client::{FakeHttpClient, Response};
+    use std::sync::{Arc, Mutex};
+    let requested = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = requested.clone();
+    let client = FakeHttpClient::create(move |request| {
+        seen.lock().unwrap().push(request.uri().to_string());
+        async move { Ok(Response::builder().status(404).body(Default::default())?) }
+    });
+    cx.update(|cx| cx.set_http_client(client));
+
+    let markdown = "## Look\n\n![chart](https://example.com/chart.png)\n\n\
+                    Inline ![dot](http://example.com/dot.png) image.\n\n\
+                    <img src=\"https://example.com/pixel.gif\" alt=\"pixel\">\n";
+    let mut draft = intent("fix-zoom", IntentState::Draft, Phase::Review);
+    draft.content.current_behavior = markdown.into();
+    let opened = open_detail(cx, &draft);
+    for _ in 0..3 {
+        frame(cx, opened.window);
+    }
+    assert_eq!(body_source(cx, &opened).as_deref(), Some(markdown));
+    assert_eq!(*requested.lock().unwrap(), Vec::<String>::new());
+}
+
+#[gpui_kit::test]
 fn a_very_long_body_scrolls(cx: &mut TestAppContext) {
     // Review Focus 4: one 10,000-character line wraps inside the pane, and
     // the column scrolls instead of growing the pane.
@@ -666,6 +693,82 @@ fn a_refused_title_keeps_the_input(cx: &mut TestAppContext) {
         Some("A better title"),
         "the text stays to try again"
     );
+}
+
+#[gpui_kit::test]
+fn the_title_does_not_open_while_a_command_is_in_flight(cx: &mut TestAppContext) {
+    let draft = intent("fix-zoom", IntentState::Draft, Phase::Review);
+    let opened = open_detail(cx, &draft);
+    let window = opened.window;
+    choose_kind(cx, window, IntentKind::Maintenance);
+    assert_eq!(busy(cx, &opened), Some(Busy::Kind));
+
+    click(cx, window, DETAIL_TITLE_ID);
+    assert!(title_input(cx, window).is_none(), "one command at a time");
+
+    let maintenance = changed(&draft, |i| i.content.kind = IntentKind::Maintenance);
+    opened.fake.answer(Ok(maintenance));
+    frame(cx, window);
+    click(cx, window, DETAIL_TITLE_ID);
+    assert_eq!(
+        title_input(cx, window),
+        Some(("Fix zoom".to_owned(), true)),
+        "free again once the daemon answered"
+    );
+}
+
+#[gpui_kit::test]
+fn a_long_unbroken_title_stays_inside_the_pane(cx: &mut TestAppContext) {
+    // A fixed title (sent) and an editable one (in review), 300 characters
+    // with no space to break at.
+    let long = "W".repeat(300);
+    let mut sent = intent("long-title", IntentState::Sent, Phase::Review);
+    sent.content.title = long.clone();
+    let opened = open_detail(cx, &sent);
+    let window = opened.window;
+    let dock = opened.shell.read_with(cx, |shell, _| shell.dock().clone());
+    let dock_width = dock
+        .read_with(cx, |dock, _| dock.dock_size(DockPlacement::Right))
+        .expect("the right dock is open");
+    let review = changed(&sent, |i| i.state = IntentState::Draft);
+    let short = |intent: &Intent| changed(intent, |i| i.content.title = "Short".into());
+    let title_height = |cx: &mut TestAppContext| {
+        with_window(cx, window, |window, _| {
+            window.find(DETAIL_TITLE_ID).bounds().size.height
+        })
+    };
+    for (current, editable) in [(sent, false), (review, true)] {
+        // One line high, as a short title is.
+        let one_line = short(&current);
+        upsert(cx, &opened, &one_line);
+        let one_line_height = title_height(cx);
+        let current = changed(&one_line, |i| i.content.title = long.clone());
+        upsert(cx, &opened, &current);
+        assert_eq!(
+            role_of(cx, window, DETAIL_TITLE_ID) == Some(Role::Button),
+            editable
+        );
+        assert_eq!(
+            title_height(cx),
+            one_line_height,
+            "the title is cut to one line (editable: {editable})"
+        );
+        with_window(cx, window, |window, _| {
+            let pane = window.find(smithagents_app::shell::INTENTS_PANEL).bounds();
+            assert!(
+                pane.size.width <= dock_width,
+                "the pane ({:?}) is no wider than the dock ({dock_width:?})",
+                pane.size.width
+            );
+            for id in [DETAIL_TITLE_ID, DETAIL_SLUG_ID, DETAIL_STATE_ID] {
+                let bounds = window.find(id).bounds();
+                assert!(
+                    bounds.left() >= pane.left() && bounds.right() <= pane.right(),
+                    "{id} {bounds:?} is inside the pane {pane:?} (editable: {editable})"
+                );
+            }
+        });
+    }
 }
 
 #[gpui_kit::test]

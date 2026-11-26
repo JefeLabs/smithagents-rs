@@ -11,7 +11,9 @@
 //! - A draft, or a resolved intent: no bar.
 //!
 //! The start error ("The agent could not start: …") is drawn in every state
-//! while the daemon keeps it. Send and Mark resolved run through
+//! while the daemon keeps it. A Send the daemon refuses with that same error
+//! shows only this line, not the screen's error line too. The bar's parts sit
+//! in one row that wraps. Send and Mark resolved run through
 //! [`IntentsPane::run`], so nothing changes on screen before the daemon's
 //! copy reaches the model, and a second press while one is in flight sends
 //! nothing.
@@ -98,51 +100,57 @@ impl IntentsPane {
     }
 
     /// What the intent's state offers; `None` for a draft or a resolved
-    /// intent.
+    /// intent. The bar's parts sit in one row that wraps, so more of them
+    /// fit a narrow pane.
     fn action_bar(&self, intent: &Intent, paint: &Paint, cx: &Context<Self>) -> Option<AnyElement> {
         let id = intent.id;
         let busy = self.busy.is_some();
-        let content = match intent.state {
-            IntentState::Draft | IntentState::Resolved => return None,
-            IntentState::Complete => Button::new(SEND_ID)
+        let parts: Vec<AnyElement> = match intent.state {
+            IntentState::Draft => return None,
+            // Nothing to offer yet.
+            IntentState::Resolved => return None,
+            IntentState::Complete => vec![Button::new(SEND_ID)
                 .label(SEND_LABEL)
                 .primary()
                 .small()
                 .disabled(busy)
                 .loading(self.busy == Some(Busy::Send))
                 .on_click(cx.listener(move |this, _, window, cx| this.send(id, window, cx)))
-                .into_any_element(),
-            IntentState::Queued => Label::new(queued_reason(self.state.read(cx).model(), intent))
-                .id(QUEUED_REASON_ID)
-                .w_full()
-                .min_w_0()
-                .text_sm()
-                .text_color(paint.muted_foreground)
-                .into_any_element(),
+                .into_any_element()],
+            IntentState::Queued => {
+                vec![
+                    Label::new(queued_reason(self.state.read(cx).model(), intent))
+                        .id(QUEUED_REASON_ID)
+                        .w_full()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(paint.muted_foreground)
+                        .into_any_element(),
+                ]
+            }
             IntentState::Sent => {
                 let agent = intent
                     .agent_id
                     .filter(|agent| self.state.read(cx).model().agent(*agent).is_some());
-                h_flex()
-                    .gap_2()
-                    .child(open_chat_button(agent, cx))
-                    .child(
-                        Button::new(RESOLVE_ID)
-                            .label(RESOLVE_LABEL)
-                            .outline()
-                            .small()
-                            .disabled(busy)
-                            .loading(self.busy == Some(Busy::Resolve))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.ask_to_resolve(id, window, cx)
-                            })),
-                    )
-                    .into_any_element()
+                vec![
+                    open_chat_button(agent, cx).into_any_element(),
+                    Button::new(RESOLVE_ID)
+                        .label(RESOLVE_LABEL)
+                        .outline()
+                        .small()
+                        .disabled(busy)
+                        .loading(self.busy == Some(Busy::Resolve))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.ask_to_resolve(id, window, cx)
+                        }))
+                        .into_any_element(),
+                ]
             }
         };
         Some(
             h_flex()
                 .flex_none()
+                .flex_wrap()
                 .w_full()
                 .min_w_0()
                 .items_center()
@@ -152,9 +160,25 @@ impl IntentsPane {
                 .py_2()
                 .border_t_1()
                 .border_color(paint.border)
-                .child(content)
+                .children(parts)
                 .into_any_element(),
         )
+    }
+
+    /// Whether the error line only repeats the start-error line: it shows
+    /// the daemon's refusal of a Send, and `intent`'s start error, which the
+    /// daemon records with the same message, ends with that message. (The
+    /// refusal and the intent's copy arrive in either order.)
+    pub(super) fn error_line_repeats_start_error(&self, intent: &Intent) -> bool {
+        let (Some(error), Some((line, message)), Some(start_error)) = (
+            self.error.as_deref(),
+            self.send_refusal.as_ref(),
+            intent.last_start_error.as_deref(),
+        ) else {
+            return false;
+        };
+        let message = message.trim();
+        error == line && !message.is_empty() && start_error.trim_end().ends_with(message)
     }
 
     /// Asks the daemon to send the intent; nothing while another command is
