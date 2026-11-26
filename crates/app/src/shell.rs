@@ -51,6 +51,7 @@ use smithagents_theme::tokens::ThemeSet;
 
 use crate::app_state::AppStateStore;
 use crate::appearance::AppearanceRuntime;
+use crate::feedback::state::{Feedback, FeedbackOptions};
 use crate::layout_store::{
     fitted_right_width, left_pane_extent, saved_dock, saved_left_pane, saved_window,
     with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
@@ -257,6 +258,9 @@ pub struct ShellOptions {
     /// The clock the views read ([`ShellState::now`]); `None` is the local
     /// clock. Headless tests inject a fixed one.
     pub clock: Option<Clock>,
+    /// The feedback draft's directory, capturer, file picker and frame hop;
+    /// `None` is [`FeedbackOptions::default`], which reaches none of them.
+    pub feedback: Option<FeedbackOptions>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -278,6 +282,7 @@ pub struct Shell {
     right_panels: Vec<(RailEntry, PanelId)>,
     /// The left pane's content: the agents pane, in either mode.
     left_pane: Entity<AgentsPane>,
+    feedback: Entity<Feedback>,
     layout: Option<LayoutStore>,
     /// The right dock's width the user chose (a drag of its handle, or the
     /// saved layout). It is what the layout file keeps; the width drawn is
@@ -321,6 +326,7 @@ impl Shell {
             link_failure,
             intent_commands,
             clock,
+            feedback,
         } = options;
         let link = link.map(DaemonLink::start);
         let tab_host = match tab_host {
@@ -398,6 +404,7 @@ impl Shell {
         let settings = cx.new(|cx| SettingsPane::new(state.clone(), window, cx));
         let intents = cx.new(|cx| IntentsPane::new(state.clone(), window, cx));
         let left_pane = cx.new(|cx| AgentsPane::new(state.clone(), window, cx));
+        let feedback = cx.new(|cx| Feedback::new(feedback.unwrap_or_default(), cx));
         let right_panels = vec![
             (RailEntry::Settings, PanelId::from(settings.entity_id())),
             (RailEntry::Intents, PanelId::from(intents.entity_id())),
@@ -524,6 +531,7 @@ impl Shell {
             dock,
             right_panels,
             left_pane,
+            feedback,
             layout,
             preferred_right,
             applied_right: right_size,
@@ -539,6 +547,11 @@ impl Shell {
 
     pub fn state(&self) -> &Entity<ShellState> {
         &self.state
+    }
+
+    /// The feedback draft and its capture sequence.
+    pub fn feedback(&self) -> &Entity<Feedback> {
+        &self.feedback
     }
 
     /// Shuts the tab host down (once, whichever of quit and close comes

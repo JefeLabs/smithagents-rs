@@ -139,6 +139,7 @@ fn open_main_window(
                     link_failure: None,
                     intent_commands: None,
                     clock: None,
+                    feedback: None,
                 },
                 window,
                 cx,
