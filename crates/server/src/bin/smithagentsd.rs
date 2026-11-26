@@ -27,7 +27,7 @@ use smithagents_server::lifecycle::{
     acquire_instance_lock, generate_instance_id, generate_token, remove_lockfile, write_lockfile,
     IdleMonitor, LockError,
 };
-use smithagents_server::paths::Paths;
+use smithagents_server::paths::{ensure_private_real_dir, Paths};
 use smithagents_server::plugins::{
     builtin_plugins_dir, discover, load_runtime, LoadedPlugin, ManagerConfig, PluginManager,
 };
@@ -281,10 +281,10 @@ async fn start_plugins(
     let engine = start_wasm_engine(paths);
     let mut plugins = Vec::with_capacity(found.len());
     for d in &found {
-        let runtime = match &engine {
-            Some(engine) => load_runtime(d, engine).await.map_err(|e| e.to_string()),
-            None => Err("the WebAssembly engine could not start".to_owned()),
-        };
+        // Without an engine only wasm plugins fail (inside `load_runtime`).
+        let runtime = load_runtime(d, engine.as_deref())
+            .await
+            .map_err(|e| e.to_string());
         if let Err(message) = &runtime {
             tracing::warn!(plugin = %d.manifest().id, %message, "plugin failed to load");
         }
@@ -324,7 +324,7 @@ async fn start_plugins(
 /// directory the engine runs uncached; `None` if it cannot start at all.
 fn start_wasm_engine(paths: &Paths) -> Option<Arc<WasmEngine>> {
     let cache = paths.wasm_cache_dir();
-    let cache = match private_cache_dir(&cache) {
+    let cache = match ensure_private_real_dir(&cache) {
         Ok(()) => Some(cache),
         Err(e) => {
             tracing::warn!(dir = %cache.display(), "running without a compile cache: {e}");
@@ -342,31 +342,6 @@ fn start_wasm_engine(paths: &Paths) -> Option<Arc<WasmEngine>> {
             None
         }
     }
-}
-
-/// Creates `dir` with mode 0700, or tightens an existing one to it.
-fn private_cache_dir(dir: &std::path::Path) -> io::Result<()> {
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    match builder.create(dir) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-        _ => {}
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        // A symlink or a directory owned by someone else is not ours to use.
-        let meta = std::fs::symlink_metadata(dir)?;
-        if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
-            return Err(io::Error::other("not a private directory"));
-        }
-    }
-    Ok(())
 }
 
 /// Serves until `stop` resolves, then lets open requests finish for at most

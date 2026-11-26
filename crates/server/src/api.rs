@@ -347,14 +347,26 @@ async fn enable_plugin(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<PluginStatus>, ApiError> {
-    Ok(Json(s.plugins.set_enabled(&id, true).await?))
+    set_plugin_enabled(s.plugins, id, true).await
 }
 
 async fn disable_plugin(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<PluginStatus>, ApiError> {
-    Ok(Json(s.plugins.set_enabled(&id, false).await?))
+    set_plugin_enabled(s.plugins, id, false).await
+}
+
+/// Detached: a client that disconnects must not leave the stored flag changed
+/// while the live state, the scheduler wake and the event never follow.
+async fn set_plugin_enabled(
+    plugins: PluginManager,
+    id: String,
+    enabled: bool,
+) -> Result<Json<PluginStatus>, ApiError> {
+    detached(async move { plugins.set_enabled(&id, enabled).await })
+        .await
+        .map(Json)
 }
 
 async fn get_plugin_settings(
@@ -431,7 +443,12 @@ async fn sync_plugin_resource(
             }
         }
         Err(ManagerError::InvalidSettings(message)) => Err(conflict("plugin_not_ready", message)),
-        Err(e) => Err(e.into()),
+        Err(
+            e @ (ManagerError::UnknownPlugin
+            | ManagerError::UnknownResource
+            | ManagerError::Busy
+            | ManagerError::Store(_)),
+        ) => Err(e.into()),
     }
 }
 

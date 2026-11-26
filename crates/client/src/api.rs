@@ -304,6 +304,35 @@ impl Client {
         .await
     }
 
+    /// `/v1/plugins/<segments>?<params>`, each segment percent-encoded, so an
+    /// id with `/`, `..`, `?` or `#` names no other route.
+    ///
+    /// A URL cannot carry an empty, `.` or `..` segment (they would be
+    /// resolved away), so such a name is answered here as not found.
+    fn plugin_url(
+        &self,
+        segments: &[&str],
+        params: &[(&str, &str)],
+    ) -> Result<reqwest::Url, ClientError> {
+        if segments.iter().any(|s| matches!(*s, "" | "." | "..")) {
+            return Err(ClientError::Api {
+                status: 404,
+                code: "not_found".into(),
+                message: "no such plugin or resource".into(),
+            });
+        }
+        // An address of the form `http://127.0.0.1:<port>/<path>` always parses.
+        let mut url =
+            reqwest::Url::parse(&self.url("/v1/plugins")).expect("the daemon's URL parses");
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.extend(segments);
+        }
+        if !params.is_empty() {
+            url.query_pairs_mut().extend_pairs(params);
+        }
+        Ok(url)
+    }
+
     // ------------------------------------------------------------ plugins
 
     pub async fn plugins(&self) -> Result<Vec<PluginStatus>, ClientError> {
@@ -311,7 +340,7 @@ impl Client {
     }
 
     pub async fn plugin(&self, id: &str) -> Result<PluginStatus, ClientError> {
-        self.fetch(self.http.get(self.url(&format!("/v1/plugins/{id}"))))
+        self.fetch(self.http.get(self.plugin_url(&[id], &[])?))
             .await
     }
 
@@ -346,7 +375,7 @@ impl Client {
     ) -> Result<PluginStatus, ClientError> {
         self.fetch(
             self.http
-                .put(self.url(&format!("/v1/plugins/{id}/settings")))
+                .put(self.plugin_url(&[id, "settings"], &[])?)
                 .json(value),
         )
         .await
@@ -356,7 +385,7 @@ impl Client {
     /// through the events. Fails with code `sync_in_progress`,
     /// `plugin_disabled` or `plugin_not_ready` when it cannot be queued.
     pub async fn sync_plugin_resource(&self, id: &str, kind: &str) -> Result<(), ClientError> {
-        let url = self.url(&format!("/v1/plugins/{id}/resources/{kind}/sync"));
+        let url = self.plugin_url(&[id, "resources", kind, "sync"], &[])?;
         self.send(self.http.post(url)).await.map(drop)
     }
 
@@ -373,13 +402,9 @@ impl Client {
         let limit = limit.map(|n| n.to_string());
         let params = [("limit", limit.as_deref()), ("after", after), ("q", q)]
             .into_iter()
-            .filter_map(|(key, value)| Some((key, value?)));
-        let url = reqwest::Url::parse_with_params(
-            &self.url(&format!("/v1/plugins/{id}/resources/{kind}/items")),
-            params,
-        )
-        // An address of the form `http://127.0.0.1:<port>/<path>` always parses.
-        .expect("the daemon's URL parses");
+            .filter_map(|(key, value)| Some((key, value?)))
+            .collect::<Vec<_>>();
+        let url = self.plugin_url(&[id, "resources", kind, "items"], &params)?;
         self.fetch(self.http.get(url)).await
     }
 

@@ -581,3 +581,29 @@ async fn no_response_or_event_holds_a_secret_value() {
         assert!(!text.contains(TOKEN), "{text}");
     }
 }
+
+#[tokio::test]
+async fn a_client_that_drops_an_enable_request_does_not_cancel_it() {
+    use futures::FutureExt;
+
+    let fx = fixture().await;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/plugins/fixture/enable")
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    // Poll the request once, then drop it, as hyper does on a disconnect.
+    let pending = router(fx.state.clone()).oneshot(req);
+    let _ = pending.now_or_never();
+
+    // The change still completes: the live state, the run it starts and the event.
+    fx.until("fixture", "six items after a dropped enable", |p| {
+        p["enabled"] == true && item_count(p) == 6
+    })
+    .await;
+    assert!(fx
+        .drain()
+        .iter()
+        .any(|e| matches!(e, EventKind::PluginUpdated(s) if s.id == "fixture" && s.enabled)));
+}

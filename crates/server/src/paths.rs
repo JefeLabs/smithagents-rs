@@ -89,6 +89,40 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Creates `dir` (a real directory owned by the current user) with mode 0700,
+/// or tightens an existing one to it. A symlink, a non-directory or a
+/// directory owned by someone else is refused before any permission changes,
+/// since `chmod` follows symlinks.
+pub fn ensure_private_real_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                return Err(io::Error::other("not a real directory"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if meta.uid() != rustix::process::geteuid().as_raw() {
+                    return Err(io::Error::other("owned by another user"));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir)?;
+        }
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +177,39 @@ mod tests {
         std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o755)).unwrap();
         paths.ensure_dirs().unwrap();
         assert_eq!(mode(&paths.home), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_private_dir_is_refused_and_its_target_left_alone() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert!(ensure_private_real_dir(&link).is_err());
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(ensure_private_real_dir(&file).is_err());
+
+        let loose = tmp.path().join("a").join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
+        ensure_private_real_dir(&loose).unwrap();
+        assert_eq!(
+            std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let fresh = tmp.path().join("b").join("c");
+        ensure_private_real_dir(&fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

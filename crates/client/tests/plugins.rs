@@ -95,6 +95,22 @@ async fn a_client_lists_enables_syncs_and_reads_a_wasm_plugin() {
         matches!(&missing, ClientError::Api { status: 404, code, .. } if code == "plugin_not_found"),
         "{missing:?}"
     );
+    // An id never reaches another route: these name no plugin.
+    for odd in ["a/b", "..", ".", "a?b", "a#b", "%2e%2e", ""] {
+        let err = client.plugin(odd).await.unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Api { status: 404, .. }),
+            "{odd:?}: {err:?}"
+        );
+        let err = client
+            .plugin_items("fixture-wasm", odd, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Api { status: 404, .. }),
+            "{odd:?}: {err:?}"
+        );
+    }
     let refused = client
         .sync_plugin_resource("fixture-wasm", "items")
         .await

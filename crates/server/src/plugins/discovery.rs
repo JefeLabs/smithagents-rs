@@ -435,10 +435,11 @@ fn trust(meta: &fs::Metadata, what: &str) -> Result<(), String> {
 
 /// Builds the runtime for a discovered plugin. Refuses a native plugin that
 /// is not built in, and re-checks the directory and entry file it is about
-/// to load, since time has passed since `discover`.
+/// to load, since time has passed since `discover`. Without an `engine` only
+/// native plugins can load.
 pub async fn load_runtime(
     d: &Discovered,
-    engine: &WasmEngine,
+    engine: Option<&WasmEngine>,
 ) -> Result<Arc<dyn PluginRuntime>, LoadError> {
     if d.manifest.host == HostMode::Dylib && d.origin != Origin::Builtin {
         return Err(LoadError::Refused {
@@ -448,9 +449,14 @@ pub async fn load_runtime(
     recheck(d).map_err(|message| LoadError::Refused { message })?;
     match d.manifest.host {
         HostMode::Dylib => Ok(Arc::new(DylibRuntime::load(&d.entry_path, CALL_TIMEOUT)?)),
-        HostMode::Wasm => Ok(Arc::new(
-            WasmRuntime::load(engine, &d.entry_path, WasmLimits::default()).await?,
-        )),
+        HostMode::Wasm => {
+            let engine = engine.ok_or_else(|| LoadError::Refused {
+                message: "the WebAssembly engine could not start".into(),
+            })?;
+            Ok(Arc::new(
+                WasmRuntime::load(engine, &d.entry_path, WasmLimits::default()).await?,
+            ))
+        }
         mode @ (HostMode::Process | HostMode::InProcess) => Err(LoadError::Refused {
             message: format!("host mode {mode} is not supported yet"),
         }),

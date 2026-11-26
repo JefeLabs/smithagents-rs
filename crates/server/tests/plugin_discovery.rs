@@ -97,9 +97,9 @@ async fn builtin_dylib_and_installed_wasm_are_discovered_and_load() {
     assert_eq!(found[1].origin(), Origin::Installed);
 
     let engine = WasmEngine::new(None).unwrap();
-    let dylib = load_runtime(&found[0], &engine).await.unwrap();
+    let dylib = load_runtime(&found[0], Some(&engine)).await.unwrap();
     assert_eq!(dylib.mode(), HostMode::Dylib);
-    let wasm = load_runtime(&found[1], &engine).await.unwrap();
+    let wasm = load_runtime(&found[1], Some(&engine)).await.unwrap();
     assert_eq!(wasm.mode(), HostMode::Wasm);
 }
 
@@ -111,7 +111,7 @@ async fn load_runtime_refuses_an_installed_dylib_even_if_discover_was_bypassed()
     let (found, _) = discover(Some(tmp.path()), Path::new("/nonexistent"));
     let d = found[0].forged_origin_for_test(Origin::Installed);
     let engine = WasmEngine::new(None).unwrap();
-    let err = load_runtime(&d, &engine).await.err().unwrap();
+    let err = load_runtime(&d, Some(&engine)).await.err().unwrap();
     assert!(matches!(err, LoadError::Refused { .. }), "{err:?}");
 }
 
@@ -430,7 +430,7 @@ async fn a_directory_swapped_after_discovery_is_refused() {
     .unwrap();
     install_fixture(tmp.path(), "fixture-wasm", "fixture-wasm");
     let engine = WasmEngine::new(None).unwrap();
-    let err = load_runtime(&found[0], &engine).await.err().unwrap();
+    let err = load_runtime(&found[0], Some(&engine)).await.err().unwrap();
     assert!(matches!(err, LoadError::Refused { .. }), "{err:?}");
 }
 
@@ -443,7 +443,7 @@ async fn an_entry_made_writable_after_discovery_is_refused() {
     let entry = found[0].manifest().entry.clone().unwrap();
     chmod(&dir.join(entry), 0o666);
     let engine = WasmEngine::new(None).unwrap();
-    let err = load_runtime(&found[0], &engine).await.err().unwrap();
+    let err = load_runtime(&found[0], Some(&engine)).await.err().unwrap();
     assert!(matches!(err, LoadError::Refused { .. }), "{err:?}");
 }
 
