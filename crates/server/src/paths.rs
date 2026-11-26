@@ -51,6 +51,12 @@ impl Paths {
         self.home.join("cache").join("wasm")
     }
 
+    /// A feedback submission's uploads and temporary worktree live in a
+    /// directory of their own under this one; nothing here outlives a run.
+    pub fn feedback_tmp_dir(&self) -> PathBuf {
+        self.home.join("tmp").join("feedback")
+    }
+
     /// Creates the home with owner-only permissions (0700), tightening an
     /// existing one: it holds the chat transcripts and the token's lockfile.
     pub fn ensure_home(&self) -> io::Result<()> {
@@ -141,6 +147,10 @@ mod tests {
         assert_eq!(custom.run_dir(), PathBuf::from("/state/run"));
         assert_eq!(custom.db_path(), PathBuf::from("/state/smithagents.db"));
         assert_eq!(custom.worktrees_dir(), PathBuf::from("/state/worktrees"));
+        assert_eq!(
+            custom.feedback_tmp_dir(),
+            PathBuf::from("/state/tmp/feedback")
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod issue;
+pub mod repo;
 
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ use axum::http::StatusCode;
 use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::RepoId;
 
+use crate::git::exit_status_text;
 use crate::intents::IntentService;
 use crate::paths::Paths;
 use crate::plugins::PluginManager;
@@ -15,12 +17,29 @@ use crate::store::{Store, StoreError};
 /// Settings key of [`FeedbackSettings`].
 const FEEDBACK_KEY: &str = "feedback";
 
+/// Every message is a fixed sentence: nothing git prints is in one.
 #[derive(Debug, thiserror::Error)]
 pub enum FeedbackError {
     #[error("repo not found")]
     RepoNotFound,
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("the repository's default branch {0} does not exist locally")]
+    DefaultBranchMissing(String),
+    #[error("git has no user.name and user.email set for this repository")]
+    GitIdentityMissing,
+    /// `step` is `create the worktree` or `commit the files`.
+    #[error("git could not {step} ({})", exit_status_text(.status))]
+    Git {
+        step: &'static str,
+        status: Option<i32>,
+    },
+    #[error("99 issue folders with this name already exist")]
+    NoFreeName,
+    /// A file of the issue folder could not be read or written, or a name in
+    /// it was not safe to use (`InvalidInput`).
+    #[error("could not prepare the issue folder: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl FeedbackError {
@@ -28,13 +47,21 @@ impl FeedbackError {
         match self {
             Self::RepoNotFound => "repo_not_found",
             Self::Store(_) => "store_error",
+            Self::DefaultBranchMissing(_) => "default_branch_missing",
+            Self::GitIdentityMissing => "git_identity_missing",
+            Self::Git { .. } => "git_failed",
+            Self::NoFreeName => "no_free_name",
+            Self::Io(_) => "io_error",
         }
     }
 
     pub fn status(&self) -> StatusCode {
         match self {
             Self::RepoNotFound => StatusCode::NOT_FOUND,
-            Self::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::DefaultBranchMissing(_) | Self::GitIdentityMissing | Self::NoFreeName => {
+                StatusCode::CONFLICT
+            }
+            Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
