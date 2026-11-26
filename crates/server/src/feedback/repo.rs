@@ -132,11 +132,16 @@ pub async fn place_and_commit(
 ///
 /// `NameTaken` when the branch or the folder appeared since `place` chose
 /// them (see [`place_and_commit`]). On every failure the worktree is removed
-/// and no branch is created; `Staged` files stay where they were. When the
-/// future is dropped, the git command running is killed with its process
-/// group and `Drop` removes the worktree's directory, its registration and a
-/// branch lock file the killed git left; a commit object may stay behind,
-/// unreferenced, for git's garbage collection.
+/// and no branch is created; `Staged` files stay where they were.
+///
+/// When the future is dropped, the git command running is killed with its
+/// process group and `Drop` removes the worktree's directory, its
+/// registration and a branch lock file the killed git left. What else
+/// remains depends on when: dropped before `git branch` finished, at most an
+/// unreferenced commit object (for git's garbage collection); dropped after
+/// it finished, the branch stays in place with its commit, and the caller,
+/// which never got the commit id, does not know of it (a later `place` takes
+/// the next suffix).
 ///
 /// `scratch` must be a directory of its own directly under
 /// [`Paths::feedback_tmp_dir`]: it is made owner-only (a symbolic link or a

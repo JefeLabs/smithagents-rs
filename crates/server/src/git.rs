@@ -336,8 +336,17 @@ const ISOLATED_CONFIG: [&str; 14] = [
 ];
 
 /// Variables the daemon may have inherited that would point git at other
-/// objects or refs, or put another identity or date on a commit.
-const UNWANTED_ENV: [&str; 12] = [
+/// objects or refs, put another identity or date on a commit, or add or
+/// replace configuration (the numbered `GIT_CONFIG_KEY_<n>` and
+/// `GIT_CONFIG_VALUE_<n>` are removed as well, see
+/// [`INHERITED_CONFIG_PREFIXES`]).
+const UNWANTED_ENV: [&str; 18] = [
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG",
     "GIT_COMMON_DIR",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -351,6 +360,10 @@ const UNWANTED_ENV: [&str; 12] = [
     "GIT_COMMITTER_DATE",
     "SSH_ASKPASS",
 ];
+
+/// The numbered configuration variables (`GIT_CONFIG_KEY_0`, …), found by
+/// looking through the daemon's environment.
+const INHERITED_CONFIG_PREFIXES: [&[u8]; 2] = [b"GIT_CONFIG_KEY_", b"GIT_CONFIG_VALUE_"];
 
 /// [`git_command`] with [`ISOLATED_CONFIG`] and without [`UNWANTED_ENV`]; no
 /// editor (`GIT_EDITOR=:` is git's "start none"); paths are never patterns
@@ -366,6 +379,15 @@ fn isolated_command(cwd: &Path, args: &[&str]) -> Command {
         .env("GIT_LITERAL_PATHSPECS", "1");
     for name in UNWANTED_ENV {
         cmd.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        let bytes = name.as_encoded_bytes();
+        if INHERITED_CONFIG_PREFIXES
+            .iter()
+            .any(|prefix| bytes.starts_with(prefix))
+        {
+            cmd.env_remove(&name);
+        }
     }
     cmd
 }
@@ -554,13 +576,33 @@ pub async fn path_in_branch(repo_root: &Path, branch: &str, path: &str) -> Resul
 
 /// What `path` is at `rev` (a local branch or a commit id, see
 /// [`show_file`]): `blob` (a file or a link), `tree` (a folder) or `commit`
-/// (a submodule); `None` when nothing is there.
+/// (a submodule, mode 160000); `None` when nothing is there or `rev` names
+/// nothing. Read from the tree entry (`git ls-tree -z --full-tree <rev> --
+/// <path>`), not from the object, which a submodule's commit is not in this
+/// repository to have.
 pub async fn path_kind(
     repo_root: &Path,
     rev: &str,
     path: &str,
 ) -> Result<Option<String>, GitError> {
-    object_type(repo_root, &format!("{}:{path}", branch_or_commit(rev)?)).await
+    let rev = branch_or_commit(rev)?;
+    let ran = isolated(
+        repo_root,
+        &["ls-tree", "-z", "--full-tree", &rev, "--", path],
+    )
+    .await?;
+    if !ran.status.success() {
+        return Ok(None);
+    }
+    // Each entry: `<mode> SP <type> SP <id> TAB <path>`, ended by NUL.
+    Ok(ran.stdout.split(|b| *b == 0).find_map(|entry| {
+        let tab = entry.iter().position(|b| *b == b'\t')?;
+        if entry[tab + 1..] != *path.as_bytes() {
+            return None;
+        }
+        let kind = entry[..tab].split(|b| *b == b' ').nth(1)?;
+        Some(String::from_utf8_lossy(kind).into_owned())
+    }))
 }
 
 /// The URL pushes to `origin` go to, as configured: `remote.origin.pushurl`
@@ -606,10 +648,11 @@ pub(crate) fn without_userinfo(url: &str) -> String {
     }
 }
 
-/// The id of the commit `rev` names; `None` when it names no commit.
+/// The id of the commit `rev` names; `None` when it names no commit. `rev`
+/// is a full commit id or a local branch (`refs/heads/<name>` or `<name>`,
+/// never a tag of that name), as in [`show_file`].
 pub async fn rev_parse(repo_root: &Path, rev: &str) -> Result<Option<String>, GitError> {
-    refuse_option_like(rev)?;
-    let commit = format!("{rev}^{{commit}}");
+    let commit = format!("{}^{{commit}}", branch_or_commit(rev)?);
     let ran = isolated(repo_root, &["rev-parse", "--verify", "--quiet", &commit]).await?;
     match ran.status.code() {
         Some(0) => Ok(Some(ran.stdout_text()).filter(|id| !id.is_empty())),
@@ -739,10 +782,10 @@ pub async fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, GitE
 /// What git prints, in the C locale, when it knows no identity to commit as.
 const IDENTITY_MISSING: &str = "Please tell me who you are";
 
-/// Configuration for adding and committing feedback files: Git LFS is named
-/// and turned off (a second line behind `GIT_ATTR_SOURCE`, which keeps every
-/// in-tree attribute away), the global attributes file is not read, and line
-/// endings are never converted.
+/// Configuration for storing and committing feedback files: Git LFS is named
+/// and turned off, the global attributes file is not read, and line endings
+/// are never converted. (The files themselves are stored without any
+/// attribute; this covers the commit's own reading of the index.)
 const NO_ATTRIBUTES_CONFIG: [&str; 14] = [
     "-c",
     "filter.lfs.clean=",
@@ -760,72 +803,27 @@ const NO_ATTRIBUTES_CONFIG: [&str; 14] = [
     "core.safecrlf=false",
 ];
 
-/// `git add -- <paths>` and `git commit --no-verify` with `message` in
-/// `worktree`, then the new commit's id.
+/// Stores `paths` (files in `worktree`) and commits them with `message`,
+/// then returns the new commit's id.
 ///
-/// The files are committed byte for byte as plain blobs: no attribute of the
-/// repository applies, so no filter (Git LFS, git-crypt, …), `ident`,
-/// `working-tree-encoding` or line-ending conversion runs or changes them.
-/// With git 2.40 or later attributes are read from the empty tree
-/// (`GIT_ATTR_SOURCE`); with an older git each file is stored with `git
-/// hash-object --no-filters` and `git update-index --cacheinfo`, and its
-/// working copy is removed so the commit never reads it again.
+/// The files are committed byte for byte as plain blobs, whatever the
+/// repository's attributes say (in-tree `.gitattributes`, `info/attributes`,
+/// global or system): each is stored with `git hash-object -w --no-filters`
+/// and put in the index with `git update-index --add --cacheinfo 100644,…`,
+/// so no filter (Git LFS, git-crypt, …), `ident`, `working-tree-encoding` or
+/// line-ending conversion runs or changes it, and ignore rules do not apply.
+/// Its working copy is then removed, so `git commit --no-verify` never reads
+/// it again through a filter.
 ///
-/// Ignore rules do not drop a path; a path is never a pattern. The author is
-/// the identity configured for the repository, never one git guesses from
-/// the user and host names (`user.useConfigOnly`). The commit is never
-/// signed: a signing program could wait for a passphrase no one is there to
-/// type. The message goes on stdin, and `--cleanup=whitespace` keeps a
-/// configured comment character from eating it.
+/// The author is the identity configured for the repository, never one git
+/// guesses from the user and host names (`user.useConfigOnly`). The commit is
+/// never signed: a signing program could wait for a passphrase no one is
+/// there to type. The message goes on stdin, and `--cleanup=whitespace` keeps
+/// a configured comment character from eating it.
 pub async fn commit_paths(
     worktree: &Path,
     paths: &[&str],
     message: &str,
-) -> Result<String, CommitError> {
-    let attr_source = attr_source_supported(worktree).await;
-    commit_paths_with(worktree, paths, message, attr_source).await
-}
-
-/// Whether the installed git reads `GIT_ATTR_SOURCE` (2.40 or later). Asked
-/// once.
-async fn attr_source_supported(cwd: &Path) -> bool {
-    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-    *SUPPORTED
-        .get_or_init(|| async {
-            match isolated(cwd, &["--version"]).await {
-                Ok(ran) if ran.status.success() => version_at_least(&ran.stdout_text(), 2, 40),
-                _ => false,
-            }
-        })
-        .await
-}
-
-/// Whether `git --version`'s answer (`git version 2.40.1 (Apple Git-…)`) is
-/// at least `major.minor`.
-fn version_at_least(answer: &str, major: u32, minor: u32) -> bool {
-    let Some(version) = answer.strip_prefix("git version ") else {
-        return false;
-    };
-    let mut parts = version.split('.').map(|part| {
-        part.chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse::<u32>()
-            .ok()
-    });
-    match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(have_major), Some(have_minor)) => (have_major, have_minor) >= (major, minor),
-        _ => false,
-    }
-}
-
-/// [`commit_paths`], with `GIT_ATTR_SOURCE` or with the fallback for an
-/// older git.
-pub(crate) async fn commit_paths_with(
-    worktree: &Path,
-    paths: &[&str],
-    message: &str,
-    attr_source: bool,
 ) -> Result<String, CommitError> {
     if paths.is_empty() || paths.iter().any(|p| p.is_empty() || p.starts_with('-')) {
         return Err(CommitError::Io(std::io::Error::new(
@@ -833,53 +831,26 @@ pub(crate) async fn commit_paths_with(
             "a path to commit is empty or starts with -",
         )));
     }
-    let empty_tree = if attr_source {
-        let ran = isolated(worktree, &["hash-object", "-t", "tree", "/dev/null"])
-            .await
-            .map_err(commit_io)?;
-        ran.ok().map_err(commit_io)?;
-        Some(ran.stdout_text())
-    } else {
-        None
-    };
-    let mut env = vec![("GIT_ATTR_NOSYSTEM", "1")];
-    if let Some(tree) = &empty_tree {
-        env.push(("GIT_ATTR_SOURCE", tree.as_str()));
-    }
     let command = |args: &[&str]| {
         let mut all: Vec<&str> = NO_ATTRIBUTES_CONFIG.to_vec();
         all.extend_from_slice(args);
-        let mut cmd = isolated_command(worktree, &all);
-        for (name, value) in &env {
-            cmd.env(name, value);
-        }
-        cmd
+        isolated_command(worktree, &all)
     };
-
-    if attr_source {
-        let mut add = vec!["add", "--force", "--"];
-        add.extend_from_slice(paths);
-        run(command(&add), local_timeout(), None, OUTPUT_MAX)
+    for path in paths {
+        let hash = ["hash-object", "-w", "--no-filters", "--", path];
+        let ran = run(command(&hash), local_timeout(), None, OUTPUT_MAX)
+            .await
+            .map_err(commit_io)?;
+        ran.ok().map_err(commit_io)?;
+        let entry = format!("100644,{},{path}", ran.stdout_text());
+        let update = ["update-index", "--add", "--cacheinfo", &entry];
+        run(command(&update), local_timeout(), None, OUTPUT_MAX)
             .await
             .and_then(|ran| ran.ok())
             .map_err(commit_io)?;
-    } else {
-        for path in paths {
-            let hash = ["hash-object", "-w", "--no-filters", "--", path];
-            let ran = run(command(&hash), local_timeout(), None, OUTPUT_MAX)
-                .await
-                .map_err(commit_io)?;
-            ran.ok().map_err(commit_io)?;
-            let entry = format!("100644,{},{path}", ran.stdout_text());
-            let update = ["update-index", "--add", "--cacheinfo", &entry];
-            run(command(&update), local_timeout(), None, OUTPUT_MAX)
-                .await
-                .and_then(|ran| ran.ok())
-                .map_err(commit_io)?;
-            tokio::fs::remove_file(worktree.join(path))
-                .await
-                .map_err(CommitError::Io)?;
-        }
+        tokio::fs::remove_file(worktree.join(path))
+            .await
+            .map_err(CommitError::Io)?;
     }
 
     let commit = [
@@ -1223,22 +1194,28 @@ mod tests {
     }
 
     #[test]
-    fn the_git_version_is_read_from_its_answer() {
-        assert!(version_at_least("git version 2.40.0", 2, 40));
-        assert!(version_at_least("git version 2.56.1", 2, 40));
-        assert!(version_at_least("git version 3.0.0", 2, 40));
-        assert!(version_at_least(
-            "git version 2.54.0 (Apple Git-157)",
-            2,
-            40
-        ));
-        assert!(!version_at_least(
-            "git version 2.39.5 (Apple Git-154)",
-            2,
-            40
-        ));
-        assert!(!version_at_least("git version 2.40", 2, 41));
-        assert!(!version_at_least("not git", 2, 40));
+    fn isolated_commands_inherit_no_configuration_from_the_environment() {
+        // Set once and never removed: names no other test uses, and without
+        // `GIT_CONFIG_COUNT` git ignores them.
+        std::env::set_var("GIT_CONFIG_KEY_93", "user.name");
+        std::env::set_var("GIT_CONFIG_VALUE_93", "Injected");
+        let cmd = isolated_command(Path::new("."), &["commit"]);
+        let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+        for name in [
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_93",
+            "GIT_CONFIG_VALUE_93",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(name)).copied(),
+                Some(None),
+                "{name} is removed"
+            );
+        }
     }
 
     #[test]
@@ -1284,9 +1261,8 @@ mod tests {
         ));
     }
 
-    /// The commit path for a git older than 2.40 (no `GIT_ATTR_SOURCE`).
     #[tokio::test]
-    async fn without_attr_source_files_are_still_committed_byte_for_byte() {
+    async fn files_are_committed_byte_for_byte_whatever_the_attributes() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo, "main");
@@ -1306,7 +1282,8 @@ mod tests {
         .unwrap();
         g(&repo, &["add", ".gitattributes"]);
         g(&repo, &["commit", "-q", "-m", "attributes"]);
-        for driver in ["lfs", "custom"] {
+        std::fs::write(repo.join(".git/info/attributes"), "* filter=info ident\n").unwrap();
+        for driver in ["lfs", "custom", "info"] {
             for key in ["clean", "smudge", "process"] {
                 g(
                     &repo,
@@ -1333,7 +1310,7 @@ mod tests {
         let text = "a $Id: 0 $\r\nb\n";
         std::fs::write(dir.join("d/i.md"), text).unwrap();
         std::fs::write(dir.join("d/s.png"), b"\x89PNG\r\n").unwrap();
-        let commit = commit_paths_with(&dir, &["d/i.md", "d/s.png"], "m", false)
+        let commit = commit_paths(&dir, &["d/i.md", "d/s.png"], "m")
             .await
             .unwrap();
         assert_eq!(

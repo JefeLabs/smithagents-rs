@@ -47,9 +47,17 @@ const INHERITED_IDENTITY: [(&str, &str); 6] = [
     ("GIT_COMMITTER_DATE", "2001-02-03T04:05:06Z"),
 ];
 
+/// Configuration a daemon may inherit through the environment (it overrides
+/// the repository's own) and must not pass on to the git it runs.
+const INHERITED_CONFIG: [(&str, &str); 3] = [
+    ("GIT_CONFIG_COUNT", "1"),
+    ("GIT_CONFIG_KEY_0", "user.name"),
+    ("GIT_CONFIG_VALUE_0", "Injected"),
+];
+
 /// Points `HOME` and `XDG_CONFIG_HOME` at an empty directory, turns the
-/// system configuration off and sets [`INHERITED_IDENTITY`], once, before any
-/// test of this binary runs git.
+/// system configuration off and sets [`INHERITED_IDENTITY`] and
+/// [`INHERITED_CONFIG`], once, before any test of this binary runs git.
 fn isolate_git_config() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -58,7 +66,7 @@ fn isolate_git_config() {
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", &home);
         std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-        for (name, value) in INHERITED_IDENTITY {
+        for (name, value) in INHERITED_IDENTITY.iter().chain(&INHERITED_CONFIG) {
             std::env::set_var(name, value);
         }
     });
@@ -83,7 +91,7 @@ fn git_cmd(cwd: &Path, args: &[&str]) -> Command {
     .env_remove("GIT_DIR")
     .env_remove("GIT_WORK_TREE")
     .env_remove("GIT_INDEX_FILE");
-    for (name, _) in INHERITED_IDENTITY {
+    for (name, _) in INHERITED_IDENTITY.iter().chain(&INHERITED_CONFIG) {
         cmd.env_remove(name);
     }
     cmd
@@ -1459,6 +1467,18 @@ async fn repository_attributes_and_filters_do_not_shape_the_commit() {
         }
     }
     git(fx.root(), &["config", "core.autocrlf", "true"]);
+    // `info/attributes` outranks every other attribute source.
+    std::fs::write(
+        fx.root().join(".git/info/attributes"),
+        "* filter=infofilter ident\n",
+    )
+    .unwrap();
+    for (key, value) in [("clean", filter), ("required", "true")] {
+        git(
+            fx.root(),
+            &["config", &format!("filter.infofilter.{key}"), value],
+        );
+    }
 
     let issue = "# Fix\r\nid: $Id: 0123 $\nna\u{ef}ve\n";
     let jpeg: &[u8] = b"\xff\xd8\xff\xe0 a jpeg \r\n";
@@ -1752,6 +1772,14 @@ async fn a_tag_named_like_a_branch_does_not_win() {
     git(fx.root(), &["checkout", "-q", "main"]);
     let root = fx.root();
     assert_eq!(
+        git::rev_parse(root, "fix").await.unwrap(),
+        Some(git(root, &["rev-parse", "refs/heads/fix"]))
+    );
+    assert_ne!(
+        git(root, &["rev-parse", "refs/tags/fix"]),
+        git(root, &["rev-parse", "refs/heads/fix"])
+    );
+    assert_eq!(
         git::show_file(root, "fix", "docs/x/a.md", 100)
             .await
             .unwrap()
@@ -1914,4 +1942,84 @@ async fn a_branch_named_like_the_prefix_is_refused() {
         matches!(&err, FeedbackError::BranchBlocked(b) if b == "idea"),
         "{err:?}"
     );
+}
+
+// ---- Fix round 2 ----
+
+/// A commit id that is not in the test repositories: a submodule's commit
+/// lives in the submodule, so `git cat-file` cannot read it.
+const ABSENT_COMMIT: &str = "1234567890123456789012345678901234567890";
+
+/// Commits a submodule entry (a gitlink, mode 160000) at `path` on `main`.
+fn commit_submodule(fx: &Fixture, path: &str) {
+    git(
+        fx.root(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{ABSENT_COMMIT},{path}"),
+        ],
+    );
+    git(fx.root(), &["commit", "-q", "-m", "a submodule"]);
+}
+
+/// Item 2: a submodule where the folders go gets the fixed sentence.
+#[tokio::test]
+async fn a_submodule_where_the_folders_go_is_refused() {
+    for path in ["docs", "docs/issues"] {
+        let fx = Fixture::new();
+        commit_submodule(&fx, path);
+        let err = place(&fx.repo, "Fix the zoom", date(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FeedbackError::FolderBlocked(p) if p == path),
+            "{path}: {err:?}"
+        );
+        let placement = Placement {
+            slug: "fix-the-zoom".into(),
+            folder: FOLDER.into(),
+            branch: BRANCH.into(),
+        };
+        let scratch = fx.scratch("s");
+        let files = fx.files(&scratch);
+        let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FeedbackError::FolderBlocked(p) if p == path),
+            "{path}: {err:?}"
+        );
+        assert_eq!(fx.feedback_branches(), "");
+        assert_eq!(fx.worktree_lines(), 1);
+    }
+}
+
+/// Item 2: a submodule at the folder itself takes the name.
+#[tokio::test]
+async fn a_submodule_at_the_folder_itself_takes_the_name() {
+    let fx = Fixture::new();
+    let stale = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    commit_submodule(&fx, FOLDER);
+    let placement = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    assert_eq!(placement.slug, "fix-the-zoom-2");
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+    let err = commit_folder(&fx.repo, &stale, &files, "Fix the zoom", &scratch)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FeedbackError::NameTaken), "{err:?}");
+    assert_eq!(
+        git::path_kind(fx.root(), "main", FOLDER)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("commit")
+    );
+    assert_eq!(fx.feedback_branches(), "");
 }
