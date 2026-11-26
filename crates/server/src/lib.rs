@@ -1,5 +1,6 @@
 pub mod api;
 pub mod brief;
+mod child_env;
 pub mod events;
 pub mod git;
 pub mod harness;

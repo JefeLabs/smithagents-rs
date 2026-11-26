@@ -49,6 +49,13 @@ const MAX_FIELDS_BYTES: usize = 64 * 1024;
 const MAX_INSTANCES: usize = 64;
 const MAX_MEMORIES: usize = 16;
 const MAX_TABLES: usize = 64;
+/// Host memory a guest can make the host hold, which the memory budget does
+/// not see: entries in the store's resource table (streams, pollables), and
+/// the bytes one `wasi:random` call may ask for.
+const MAX_RESOURCES: usize = 1024;
+const MAX_RANDOM_BYTES: u64 = 1 << 20;
+/// Larger component files are refused before they are read.
+const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The one Wasmtime engine of a daemon, with its epoch ticker thread. The
 /// ticker stops once the engine and every runtime built on it are dropped.
@@ -147,7 +154,7 @@ impl WasmRuntime {
         component: &Path,
         limits: WasmLimits,
     ) -> Result<WasmRuntime, LoadError> {
-        let bytes = tokio::fs::read(component).await?;
+        let bytes = read_component(component).await?;
         let engine = engine.engine.clone();
         let compiler = engine.clone();
         // Compiling is CPU-bound and can take seconds.
@@ -183,21 +190,7 @@ impl WasmRuntime {
 
     /// A fresh store for one call: the memory limit and the CPU budget.
     fn store(&self, call: Option<CallHandle>) -> Store<State> {
-        let state = State {
-            // No environment, arguments or preopens (the builder adds none);
-            // stdin reads as closed and stdout and stderr discard.
-            wasi: WasiCtx::builder()
-                .stdin(tokio::io::empty())
-                .stdout(tokio::io::empty())
-                .stderr(tokio::io::empty())
-                .build(),
-            table: ResourceTable::new(),
-            limiter: Limiter {
-                left: self.limits.memory_bytes,
-            },
-            call,
-        };
-        let mut store = Store::new(&self.engine, state);
+        let mut store = Store::new(&self.engine, State::new(&self.limits, call));
         store.limiter(|s| &mut s.limiter);
         // One tick of budget each time the deadline passes while guest code
         // runs; then yield, so a busy guest does not hold an async worker.
@@ -219,6 +212,27 @@ impl WasmRuntime {
 
 fn invalid(message: String) -> LoadError {
     LoadError::Invalid { message }
+}
+
+/// The component file's bytes. A file over 64 MiB is refused before it is
+/// read, and so is one that grew past it since.
+async fn read_component(path: &Path) -> Result<Vec<u8>, LoadError> {
+    use tokio::io::AsyncReadExt;
+    let too_large = || LoadError::Refused {
+        message: "the component file is larger than 64 MiB".into(),
+    };
+    let file = tokio::fs::File::open(path).await?;
+    if file.metadata().await?.len() > MAX_COMPONENT_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_COMPONENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_COMPONENT_BYTES {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 #[async_trait]
@@ -276,6 +290,28 @@ struct State {
     limiter: Limiter,
     /// `None` only for the trial instantiation at load, when no call runs.
     call: Option<CallHandle>,
+}
+
+impl State {
+    fn new(limits: &WasmLimits, call: Option<CallHandle>) -> State {
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(MAX_RESOURCES);
+        State {
+            // No environment, arguments or preopens (the builder adds none);
+            // stdin reads as closed and stdout and stderr discard.
+            wasi: WasiCtx::builder()
+                .stdin(tokio::io::empty())
+                .stdout(tokio::io::empty())
+                .stderr(tokio::io::empty())
+                .max_random_size(MAX_RANDOM_BYTES)
+                .build(),
+            table,
+            limiter: Limiter {
+                left: limits.memory_bytes,
+            },
+            call,
+        }
+    }
 }
 
 impl WasiView for State {
@@ -611,6 +647,14 @@ mod tests {
         assert!(err.downcast_ref::<MemoryLimit>().is_some());
         // Past a memory's own maximum, growth fails without a trap.
         assert!(!limiter.memory_growing(0, 10, Some(5)).unwrap());
+    }
+
+    #[test]
+    fn a_calls_resource_table_is_capped() {
+        let state = State::new(&WasmLimits::default(), None);
+        assert_eq!(state.table.max_capacity(), MAX_RESOURCES);
+        assert_eq!(MAX_RESOURCES, 1024);
+        assert_eq!(MAX_RANDOM_BYTES, 1024 * 1024);
     }
 
     #[test]

@@ -764,3 +764,43 @@ fn log_names_the_plugin_and_truncates_the_message_to_2_kib() {
         "escaped text not cut"
     );
 }
+
+#[test]
+fn a_call_logs_at_most_100_lines_then_says_once_that_it_dropped_the_rest() {
+    let captured = Captured::default();
+    let sink = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let services = services(HttpPolicy::default());
+    let call = services.begin_call(CallPurpose::Sync);
+    let clone = call.clone();
+
+    tracing::subscriber::with_default(subscriber, || {
+        // Clones share the count, like the request budget.
+        for n in 0..150 {
+            let handle = if n % 2 == 0 { &call } else { &clone };
+            handle.log(LogLevel::Info, &format!("line {n}"));
+        }
+        // A new call starts at zero.
+        services
+            .begin_call(CallPurpose::Sync)
+            .log(LogLevel::Info, "next call");
+    });
+
+    let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 102, "{out}");
+    assert!(lines[99].contains("line 99 "), "{}", lines[99]);
+    assert!(!out.contains("line 100"), "{out}");
+    assert!(lines[100].contains("WARN"), "{}", lines[100]);
+    assert!(lines[100].contains("test-plug"), "{}", lines[100]);
+    assert!(
+        lines[100].contains("further log lines from this call were dropped"),
+        "{}",
+        lines[100]
+    );
+    assert!(lines[101].contains("next call"), "{}", lines[101]);
+}

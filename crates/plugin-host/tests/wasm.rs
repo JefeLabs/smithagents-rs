@@ -88,6 +88,27 @@ async fn a_spinning_guest_hits_the_cpu_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_spinning_guest_is_stopped_at_the_call_timeout_before_its_cpu_budget() {
+    let engine = WasmEngine::new(None).unwrap();
+    let limits = WasmLimits {
+        cpu: Duration::from_secs(10),
+        call_timeout: Duration::from_millis(300),
+        ..WasmLimits::default()
+    };
+    let runtime = load(&engine, limits).await;
+    let started = Instant::now();
+    assert_eq!(
+        call(&runtime, "spin", json!({})).await,
+        Err(CallError::Timeout)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn waiting_on_the_host_does_not_use_the_cpu_budget() {
     // The guest sleeps through a host clock for longer than its CPU budget.
     let engine = WasmEngine::new(None).unwrap();
@@ -162,6 +183,24 @@ async fn a_missing_file_is_an_io_error() {
         Err(LoadError::Io(_)) => {}
         Err(other) => panic!("expected Io, got {other:?}"),
         Ok(_) => panic!("a missing file was loaded"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_component_over_64_mib_is_refused_before_it_is_read() {
+    let engine = WasmEngine::new(None).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.wasm");
+    // Sparse: no 64 MiB is written to disk.
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+    drop(file);
+    match WasmRuntime::load(&engine, &path, WasmLimits::default()).await {
+        Err(LoadError::Refused { message }) => {
+            assert_eq!(message, "the component file is larger than 64 MiB");
+        }
+        Err(other) => panic!("expected Refused, got {other:?}"),
+        Ok(_) => panic!("an oversized file was loaded"),
     }
 }
 

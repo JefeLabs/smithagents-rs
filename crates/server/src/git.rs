@@ -8,6 +8,8 @@ use std::process::Output;
 
 use tokio::process::Command;
 
+use crate::child_env::remove_plugin_secrets;
+
 /// A validated repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoInfo {
@@ -35,7 +37,8 @@ pub enum GitError {
 }
 
 /// Builds a git command with a sanitized environment. `LC_ALL`/`LANGUAGE` are
-/// pinned to `C` so the stderr patterns we match are never localized.
+/// pinned to `C` so the stderr patterns we match are never localized, and no
+/// plugin secret is passed on.
 fn git_command(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(args)
@@ -47,6 +50,7 @@ fn git_command(cwd: &Path, args: &[&str]) -> Command {
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .kill_on_drop(true);
+    remove_plugin_secrets(&mut cmd);
     cmd
 }
 
@@ -239,6 +243,16 @@ mod tests {
         assert_eq!(val("LANGUAGE"), Some(Some(std::ffi::OsStr::new("C"))));
         assert_eq!(val("GIT_DIR"), Some(None));
         assert_eq!(val("GIT_WORK_TREE"), Some(None));
+    }
+
+    #[test]
+    fn git_command_does_not_inherit_plugin_secrets() {
+        // Set once and never removed: a name no other test uses.
+        std::env::set_var("SMITHAGENTS_SECRET_GIT_TEST__TOKEN", "not-for-git");
+        let cmd = git_command(Path::new("."), &["status"]);
+        let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+        let name = std::ffi::OsStr::new("SMITHAGENTS_SECRET_GIT_TEST__TOKEN");
+        assert_eq!(envs.get(name).copied(), Some(None));
     }
 
     #[tokio::test]

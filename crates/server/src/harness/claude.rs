@@ -1,7 +1,7 @@
 //! Harness that drives the `claude` CLI as a child process.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +20,7 @@ use super::structured::parse_cli_result;
 use super::{
     Harness, HarnessError, HarnessEvent, StructuredRequest, StructuredResult, TurnRequest,
 };
+use crate::child_env::remove_plugin_secrets;
 
 const STDERR_MAX_LINES: usize = 20;
 const STDERR_MAX_BYTES: usize = 4096;
@@ -162,20 +163,29 @@ fn build_structured_args(req: &StructuredRequest) -> Vec<String> {
     args
 }
 
+impl ClaudeCodeHarness {
+    /// claude with `args` in `cwd`, its stdio piped, killed when dropped, and
+    /// without any plugin secret in its environment.
+    fn command(&self, args: Vec<String>, cwd: &Path) -> Command {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        remove_plugin_secrets(&mut cmd);
+        cmd
+    }
+}
+
 #[async_trait]
 impl Harness for ClaudeCodeHarness {
     async fn run_turn(
         &self,
         req: TurnRequest,
     ) -> Result<BoxStream<'static, HarnessEvent>, HarnessError> {
-        let mut child = Command::new(&self.bin)
-            .args(build_args(&req))
-            .current_dir(&req.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        let mut child = self.command(build_args(&req), &req.cwd).spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -287,14 +297,9 @@ impl Harness for ClaudeCodeHarness {
         req: StructuredRequest,
     ) -> Result<StructuredResult, HarnessError> {
         // Own process group, so a timeout can take down whatever claude started.
-        let mut child = Command::new(&self.bin)
-            .args(build_structured_args(&req))
-            .current_dir(&req.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let mut child = self
+            .command(build_structured_args(&req), &req.cwd)
             .process_group(0)
-            .kill_on_drop(true)
             .spawn()?;
         let pgid = child
             .id()
@@ -356,5 +361,23 @@ impl Harness for ClaudeCodeHarness {
             message.push_str(&format!("; stderr: {tail}"));
         }
         Err(HarnessError::Failed(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_does_not_inherit_plugin_secrets() {
+        // Set once and never removed: a name no other test uses.
+        std::env::set_var("SMITHAGENTS_SECRET_HARNESS_TEST__TOKEN", "not-for-agents");
+        let harness = ClaudeCodeHarness {
+            bin: PathBuf::from("claude"),
+        };
+        let cmd = harness.command(vec!["-p".into()], Path::new("."));
+        let envs: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();
+        let name = std::ffi::OsStr::new("SMITHAGENTS_SECRET_HARNESS_TEST__TOKEN");
+        assert_eq!(envs.get(name).copied(), Some(None));
     }
 }

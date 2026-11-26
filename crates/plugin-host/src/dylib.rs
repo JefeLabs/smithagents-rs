@@ -6,6 +6,11 @@
 //! native call cannot be stopped: after a timeout the runtime refuses every
 //! further call until the daemon restarts, so stuck threads do not pile up.
 
+// Catching a panic needs it to unwind; under `panic = "abort"` a plugin's
+// panic would take the daemon down.
+#[cfg(panic = "abort")]
+compile_error!("smithagents plugins rely on unwinding to contain panics");
+
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;

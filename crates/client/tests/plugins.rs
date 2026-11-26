@@ -95,21 +95,49 @@ async fn a_client_lists_enables_syncs_and_reads_a_wasm_plugin() {
         matches!(&missing, ClientError::Api { status: 404, code, .. } if code == "plugin_not_found"),
         "{missing:?}"
     );
-    // An id never reaches another route: these name no plugin.
-    for odd in ["a/b", "..", ".", "a?b", "a#b", "%2e%2e", ""] {
-        let err = client.plugin(odd).await.unwrap_err();
+    // An id never reaches another route: these name no plugin. Unencoded,
+    // `x/../fixture-wasm` would reach the real plugin's routes.
+    let not_found = |what: &str, odd: &str, err: ClientError| {
         assert!(
             matches!(&err, ClientError::Api { status: 404, .. }),
-            "{odd:?}: {err:?}"
+            "{what} {odd:?}: {err:?}"
         );
+    };
+    let empty = serde_json::json!({});
+    for odd in [
+        "a/b",
+        "..",
+        ".",
+        "a?b",
+        "a#b",
+        "%2e%2e",
+        "",
+        "x/../fixture-wasm",
+    ] {
+        not_found("plugin", odd, client.plugin(odd).await.unwrap_err());
         let err = client
             .plugin_items("fixture-wasm", odd, None, None, None)
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, ClientError::Api { status: 404, .. }),
-            "{odd:?}: {err:?}"
+        not_found("items of", odd, err);
+        let err = client.set_plugin_enabled(odd, false).await.unwrap_err();
+        not_found("disable", odd, err);
+        not_found(
+            "settings of",
+            odd,
+            client.plugin_settings(odd).await.unwrap_err(),
         );
+        let err = client.set_plugin_settings(odd, &empty).await.unwrap_err();
+        not_found("set settings of", odd, err);
+        let err = client.sync_plugin_resource(odd, "items").await.unwrap_err();
+        not_found("sync of plugin", odd, err);
+        let err = client
+            .sync_plugin_resource("fixture-wasm", odd)
+            .await
+            .unwrap_err();
+        not_found("sync of resource", odd, err);
+        let err = client.install_plugin_tool(odd, "gh").await.unwrap_err();
+        not_found("install for", odd, err);
     }
     // An installed plugin's tools are never installed, whatever the name (an
     // encoded `/` stays in the name); `.` and `..` reach no route.

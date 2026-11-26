@@ -350,20 +350,14 @@ impl Client {
         enabled: bool,
     ) -> Result<PluginStatus, ClientError> {
         let action = if enabled { "enable" } else { "disable" };
-        self.fetch(
-            self.http
-                .post(self.url(&format!("/v1/plugins/{id}/{action}"))),
-        )
-        .await
+        self.fetch(self.http.post(self.plugin_url(&[id, action], &[])?))
+            .await
     }
 
     /// The settings as the user gave them, without declared defaults.
     pub async fn plugin_settings(&self, id: &str) -> Result<serde_json::Value, ClientError> {
-        self.fetch(
-            self.http
-                .get(self.url(&format!("/v1/plugins/{id}/settings"))),
-        )
-        .await
+        self.fetch(self.http.get(self.plugin_url(&[id, "settings"], &[])?))
+            .await
     }
 
     /// Replaces the settings; `value` must be a JSON object. Fails with code

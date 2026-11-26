@@ -15,6 +15,9 @@ use crate::http::{self, denied, HttpPolicy};
 use crate::secrets::{Secret, SecretSource};
 
 const MAX_LOG_BYTES: usize = 2 * 1024;
+/// Lines one call may log; the rest are dropped, so a plugin cannot flood the
+/// daemon's log.
+const MAX_LOG_LINES: u64 = 100;
 
 /// Why a call runs. It decides which HTTP methods the plugin may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,7 @@ impl HostServices {
             services: Arc::clone(self),
             purpose,
             requests: AtomicU64::new(0),
+            log_lines: AtomicU64::new(0),
         }))
     }
 
@@ -176,8 +180,8 @@ fn sensitive(text: String, key: &str) -> Result<HeaderValue, HttpError> {
     Ok(value)
 }
 
-/// One call into a plugin. It counts the call's requests against the budget;
-/// clones are cheap and share it.
+/// One call into a plugin. It counts the call's requests and log lines
+/// against their budgets; clones are cheap and share them.
 #[derive(Clone)]
 pub struct CallHandle(Arc<Call>);
 
@@ -185,6 +189,7 @@ struct Call {
     services: Arc<HostServices>,
     purpose: CallPurpose,
     requests: AtomicU64,
+    log_lines: AtomicU64,
 }
 
 impl CallHandle {
@@ -228,8 +233,16 @@ impl CallHandle {
 
     /// Logs a plugin message as a tracing event carrying the plugin id. Control
     /// characters and bidi marks are escaped first, then the text is cut to 2 KiB.
+    /// After 100 lines in one call, one warning says the rest are dropped.
     pub fn log(&self, level: LogLevel, message: &str) {
         let plugin = &self.0.services.plugin;
+        let line = self.0.log_lines.fetch_add(1, Ordering::Relaxed) + 1;
+        if line > MAX_LOG_LINES {
+            if line == MAX_LOG_LINES + 1 {
+                tracing::warn!(plugin = %plugin, "further log lines from this call were dropped");
+            }
+            return;
+        }
         let message = log_text(message, MAX_LOG_BYTES);
         match level {
             LogLevel::Debug => tracing::debug!(plugin = %plugin, "{message}"),

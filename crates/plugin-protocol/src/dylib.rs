@@ -10,6 +10,11 @@
 //! the daemon), so each side catches its own panics and answers with an
 //! error instead.
 
+// Catching a panic needs it to unwind; under `panic = "abort"` a plugin's
+// panic would take the daemon down.
+#[cfg(panic = "abort")]
+compile_error!("smithagents plugins rely on unwinding to contain panics");
+
 use std::any::Any;
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
