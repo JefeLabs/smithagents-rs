@@ -23,6 +23,7 @@ fn intent() -> Intent {
         state: IntentState::Draft,
         phase: Phase::Questions,
         seed: Seed {
+            kind: None,
             source: SeedSource::Text,
             text: "seed".into(),
         },

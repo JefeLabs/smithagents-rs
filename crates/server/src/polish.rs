@@ -100,11 +100,7 @@ fn state_name(s: IntentState) -> &'static str {
 }
 
 fn kind_name(k: IntentKind) -> &'static str {
-    match k {
-        IntentKind::Enhancement => "enhancement",
-        IntentKind::Bug => "bug",
-        IntentKind::Task => "task",
-    }
+    k.wire_name()
 }
 
 fn request(
@@ -135,7 +131,7 @@ pub fn pass1_schema() -> Value {
         "required": ["title", "kind", "current_behavior", "questions"],
         "properties": {
             "title": {"type": "string"},
-            "kind": {"type": "string", "enum": ["enhancement", "bug", "task"]},
+            "kind": {"type": "string", "enum": IntentKind::ALL.map(IntentKind::wire_name)},
             "current_behavior": {"type": "string"},
             "questions": {
                 "type": "array",
@@ -195,17 +191,21 @@ pub fn pass1_request(
     repo_root: &Path,
     model: Option<String>,
 ) -> StructuredRequest {
+    let kind_line = match intent.seed.kind {
+        Some(k) => format!("the user chose {}; return exactly that", k.wire_name()),
+        None => "one of new_feature, enhancement, bug, refactor, maintenance or task".to_string(),
+    };
     let prompt = format!(
         "{PREAMBLE}\n\n{block}\n\n\
 Task (pass 1 of 2): read the repository to understand the current behavior relevant to \
 the request, then return:\n\
 - title: a short, specific title for the work\n\
-- kind: one of enhancement, bug or task\n\
+- kind: {kind_line}\n\
 - current_behavior: what the repository does today in this area, grounded in what you read\n\
 - questions: at most 5 steering questions whose answers would materially change the work, \
 each with 2 to 5 options, each option a short label. Ask nothing you can answer by reading \
 the code; return an empty list when nothing is unclear.",
-        block = seed_block(&intent.seed.text)
+        block = seed_block(&intent.seed.text),
     );
     request(prompt, repo_root, model, pass1_schema())
 }
@@ -294,12 +294,11 @@ pub fn apply_pass1(content: &mut Content, raw: &Value) -> Result<(), PolishError
     if title.is_empty() {
         return Err(PolishError::Invalid("missing or empty title".into()));
     }
-    let kind = match text_field(raw, "kind") {
-        Some("enhancement") => IntentKind::Enhancement,
-        Some("bug") => IntentKind::Bug,
-        Some("task") => IntentKind::Task,
-        other => return Err(PolishError::Invalid(format!("unknown kind {other:?}"))),
-    };
+    let kind = text_field(raw, "kind")
+        .and_then(IntentKind::from_wire)
+        .ok_or_else(|| {
+            PolishError::Invalid(format!("unknown kind {:?}", text_field(raw, "kind")))
+        })?;
     let current = text_field(raw, "current_behavior")
         .unwrap_or("")
         .trim()

@@ -43,6 +43,7 @@ fn intent(content: Content) -> Intent {
         state: IntentState::Complete,
         phase: Phase::Review,
         seed: Seed {
+            kind: None,
             source: SeedSource::Text,
             text: "x".into(),
         },

@@ -730,6 +730,7 @@ async fn real_claude_polish_smoke() {
 
         let created = client
             .create_intent(CreateIntentRequest {
+                kind: None,
                 repo_id: None,
                 seed: SeedInput::Chat {
                     agent_id: agent.id,

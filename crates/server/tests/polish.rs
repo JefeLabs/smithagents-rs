@@ -30,6 +30,7 @@ fn intent_with_seed(seed: &str) -> Intent {
         state: IntentState::Draft,
         phase: Phase::Polishing { pass: 1 },
         seed: Seed {
+            kind: None,
             source: SeedSource::Text,
             text: seed.into(),
         },
@@ -72,7 +73,14 @@ fn pass1_request_basics() {
     );
     assert_eq!(
         r.schema["properties"]["kind"]["enum"],
-        json!(["enhancement", "bug", "task"])
+        json!([
+            "new_feature",
+            "enhancement",
+            "bug",
+            "refactor",
+            "maintenance",
+            "task"
+        ])
     );
     let p = r.prompt.to_lowercase();
     assert!(p.contains("untrusted"));
@@ -428,4 +436,30 @@ fn transcript_truncates_keeping_end() {
         assert!(s.starts_with(marker));
         assert!(s.len() <= cap + marker.len() + 2);
     }
+}
+
+#[test]
+fn pass1_accepts_the_new_kinds_and_rejects_unknown_ones() {
+    let raw =
+        |kind: &str| json!({"title": "T", "kind": kind, "current_behavior": "c", "questions": []});
+    let mut c = content();
+    apply_pass1(&mut c, &raw("refactor")).unwrap();
+    assert_eq!(c.kind, IntentKind::Refactor);
+    let mut c = content();
+    let err = apply_pass1(&mut c, &raw("feature")).unwrap_err();
+    assert!(matches!(err, PolishError::Invalid(_)), "{err:?}");
+    assert_eq!(c.kind, IntentKind::Task);
+}
+
+#[test]
+fn pass1_prompt_names_a_chosen_kind_or_lists_all_six() {
+    let mut i = intent_with_seed("make it faster");
+    i.seed.kind = Some(IntentKind::Bug);
+    let r = pass1_request(&i, Path::new("/repo"), None);
+    assert!(r.prompt.contains("the user chose bug"), "{}", r.prompt);
+    let i = intent_with_seed("make it faster");
+    let r = pass1_request(&i, Path::new("/repo"), None);
+    assert!(r
+        .prompt
+        .contains("one of new_feature, enhancement, bug, refactor, maintenance or task"));
 }

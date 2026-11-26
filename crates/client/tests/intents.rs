@@ -158,6 +158,7 @@ async fn full_loop_through_the_client() {
 
     let created = client
         .create_intent(CreateIntentRequest {
+            kind: Some(IntentKind::Refactor),
             repo_id: None,
             seed: SeedInput::Chat {
                 agent_id: agent.id,
@@ -175,6 +176,7 @@ async fn full_loop_through_the_client() {
     })
     .await;
     assert_eq!(at_questions.content.title, "Add dark mode");
+    assert_eq!(at_questions.content.kind, IntentKind::Refactor);
     assert_eq!(at_questions.content.questions.len(), 2);
 
     // Switch the daemon's fake claude to the pass-2 result.
@@ -336,6 +338,7 @@ async fn polish_model_env_reaches_the_cli() {
     let created = fx
         .client
         .create_intent(CreateIntentRequest {
+            kind: None,
             repo_id: Some(repo.id),
             seed: SeedInput::Text("add dark mode".into()),
         })
@@ -381,6 +384,7 @@ async fn daemon_crash_during_pass_one_fails_the_intent_and_retry_works() {
     let created = fx
         .client
         .create_intent(CreateIntentRequest {
+            kind: None,
             repo_id: Some(repo.id),
             seed: SeedInput::Text("add dark mode".into()),
         })
@@ -462,6 +466,7 @@ async fn chat_seed_carries_every_message() {
     }
     let intent = client
         .create_intent(CreateIntentRequest {
+            kind: None,
             repo_id: None,
             seed: SeedInput::Chat {
                 agent_id: agent.id,
