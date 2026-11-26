@@ -6,6 +6,7 @@ pub mod harness;
 pub mod intents;
 pub mod lifecycle;
 pub mod paths;
+pub mod plugins;
 pub mod polish;
 pub mod queue;
 pub mod service;

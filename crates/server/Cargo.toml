@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 smithagents-core = { path = "../core" }
+smithagents-plugin-protocol = { path = "../plugin-protocol" }
+smithagents-plugin-host = { path = "../plugin-host" }
 sqlx = { workspace = true, features = ["macros"] }
 serde.workspace = true
 tokio.workspace = true
@@ -42,6 +44,7 @@ path = "tests/api.rs"
 required-features = ["test-util"]
 
 [dev-dependencies]
+smithagents-plugins-tool = { path = "../../tools/plugins" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
@@ -56,4 +59,9 @@ required-features = ["test-util"]
 [[test]]
 name = "queue"
 path = "tests/queue.rs"
+required-features = ["test-util"]
+
+[[test]]
+name = "plugin_discovery"
+path = "tests/plugin_discovery.rs"
 required-features = ["test-util"]

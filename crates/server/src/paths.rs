@@ -41,6 +41,16 @@ impl Paths {
         self.home.join("worktrees")
     }
 
+    /// Installed plugins live in `plugins_dir()/<id>/`.
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.home.join("plugins")
+    }
+
+    /// Compiled WebAssembly components are cached here.
+    pub fn wasm_cache_dir(&self) -> PathBuf {
+        self.home.join("cache").join("wasm")
+    }
+
     /// Creates the home with owner-only permissions (0700), tightening an
     /// existing one: it holds the chat transcripts and the token's lockfile.
     pub fn ensure_home(&self) -> io::Result<()> {
