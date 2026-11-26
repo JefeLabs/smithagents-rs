@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use smithagents_core::daemon::DaemonInfo;
+use smithagents_plugin_host::{ConfiguredSecrets, SecretError, SecretSource, WasmEngine};
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::harness::claude::ClaudeCodeHarness;
@@ -27,6 +28,9 @@ use smithagents_server::lifecycle::{
     IdleMonitor, LockError,
 };
 use smithagents_server::paths::Paths;
+use smithagents_server::plugins::{
+    builtin_plugins_dir, discover, load_runtime, LoadedPlugin, ManagerConfig, PluginManager,
+};
 use smithagents_server::queue::Scheduler;
 use smithagents_server::service::AgentService;
 use smithagents_server::store::Store;
@@ -216,12 +220,14 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     // Runs a first pass at once, so queued intents whose dependencies
     // resolved while the daemon was down start now.
     let scheduler = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
+    let plugins = start_plugins(paths, &store, &bus).await?;
     let ws_clients = Arc::new(AtomicUsize::new(0));
     let state = AppState {
         service: service.clone(),
         intents,
         bus,
         store,
+        plugins: plugins.clone(),
         token: Arc::from(token.as_str()),
         instance_id: Arc::from(instance_id.as_str()),
         ws_clients: Arc::clone(&ws_clients),
@@ -254,8 +260,113 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     let served = serve(listener, router(state), stop).await;
     // Let a pass in progress finish before the runtime goes away.
     scheduler.shutdown().await;
+    plugins.shutdown().await;
     remove_lockfile(paths);
     Ok(served?)
+}
+
+/// Finds the plugins, builds a runtime for each and starts the manager. A
+/// plugin that cannot load stays listed with its failure; one that is
+/// rejected is only logged. Logs name directories and fixed reasons, never a
+/// manifest's text, a setting or anything from `secrets.toml`.
+async fn start_plugins(
+    paths: &Paths,
+    store: &Store,
+    bus: &EventBus,
+) -> Result<PluginManager, Box<dyn Error>> {
+    let (found, rejected) = discover(builtin_plugins_dir().as_deref(), &paths.plugins_dir());
+    for r in &rejected {
+        tracing::warn!(dir = %r.dir.display(), reason = %r.reason, "plugin rejected");
+    }
+    let engine = start_wasm_engine(paths);
+    let mut plugins = Vec::with_capacity(found.len());
+    for d in &found {
+        let runtime = match &engine {
+            Some(engine) => load_runtime(d, engine).await.map_err(|e| e.to_string()),
+            None => Err("the WebAssembly engine could not start".to_owned()),
+        };
+        if let Err(message) = &runtime {
+            tracing::warn!(plugin = %d.manifest().id, %message, "plugin failed to load");
+        }
+        plugins.push(LoadedPlugin {
+            manifest: d.manifest().clone(),
+            origin: d.origin(),
+            runtime,
+        });
+    }
+    let secrets: Arc<dyn SecretSource> = match ConfiguredSecrets::load(&paths.home) {
+        Ok(secrets) => Arc::new(secrets),
+        Err(e) => {
+            let reason = match &e {
+                // A parse message can quote the file.
+                SecretError::Parse { path, .. } => {
+                    format!("{} is not valid (contents not shown)", path.display())
+                }
+                other => other.to_string(),
+            };
+            tracing::error!("secrets.toml is not used: {reason}");
+            Arc::new(ConfiguredSecrets::default())
+        }
+    };
+    tracing::info!(count = plugins.len(), "plugins found");
+    Ok(PluginManager::start(
+        store.clone(),
+        bus.clone(),
+        secrets,
+        plugins,
+        ManagerConfig::default(),
+    )
+    .await?)
+}
+
+/// One engine for every wasm plugin, caching compiled code in a directory
+/// only this user can write (it holds native code). Without a safe cache
+/// directory the engine runs uncached; `None` if it cannot start at all.
+fn start_wasm_engine(paths: &Paths) -> Option<Arc<WasmEngine>> {
+    let cache = paths.wasm_cache_dir();
+    let cache = match private_cache_dir(&cache) {
+        Ok(()) => Some(cache),
+        Err(e) => {
+            tracing::warn!(dir = %cache.display(), "running without a compile cache: {e}");
+            None
+        }
+    };
+    match WasmEngine::new(cache.as_deref()) {
+        Ok(engine) => Some(Arc::new(engine)),
+        Err(e) if cache.is_some() => {
+            tracing::warn!("the compile cache could not be used ({e}); running without it");
+            WasmEngine::new(None).ok().map(Arc::new)
+        }
+        Err(e) => {
+            tracing::error!("the WebAssembly engine could not start: {e}");
+            None
+        }
+    }
+}
+
+/// Creates `dir` with mode 0700, or tightens an existing one to it.
+fn private_cache_dir(dir: &std::path::Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        // A symlink or a directory owned by someone else is not ours to use.
+        let meta = std::fs::symlink_metadata(dir)?;
+        if !meta.is_dir() || meta.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::other("not a private directory"));
+        }
+    }
+    Ok(())
 }
 
 /// Serves until `stop` resolves, then lets open requests finish for at most

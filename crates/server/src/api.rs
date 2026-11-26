@@ -32,6 +32,7 @@ use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentState,
     IntentVersion, Patch, ReviewAction,
 };
+use smithagents_core::plugin::{ItemsPage, PluginState, PluginStatus};
 use subtle::ConstantTimeEq;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tower_http::cors::{Any, CorsLayer};
@@ -39,6 +40,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::events::{BusError, EventBus, Subscription};
 use crate::git::GitError;
 use crate::intents::{IntentError, IntentService};
+use crate::plugins::{ManagerError, PluginManager};
 use crate::service::{AgentService, ServiceError};
 use crate::store::{Store, StoreError};
 use crate::ui_stream::{Chunk, DONE_SSE, STREAM_HEADER};
@@ -53,6 +55,7 @@ pub struct AppState {
     pub intents: IntentService,
     pub bus: EventBus,
     pub store: Store,
+    pub plugins: PluginManager,
     pub token: Arc<str>,
     /// Identifies this daemon process; see `lifecycle::generate_instance_id`.
     pub instance_id: Arc<str>,
@@ -88,6 +91,19 @@ pub fn router(state: AppState) -> Router {
             "/v1/settings/agent-defaults",
             get(get_agent_defaults).put(put_agent_defaults),
         )
+        .route("/v1/plugins", get(list_plugins))
+        .route("/v1/plugins/{id}", get(get_plugin))
+        .route("/v1/plugins/{id}/enable", post(enable_plugin))
+        .route("/v1/plugins/{id}/disable", post(disable_plugin))
+        .route(
+            "/v1/plugins/{id}/settings",
+            get(get_plugin_settings).put(put_plugin_settings),
+        )
+        .route(
+            "/v1/plugins/{id}/resources/{kind}/sync",
+            post(sync_plugin_resource),
+        )
+        .route("/v1/plugins/{id}/resources/{kind}/items", get(plugin_items))
         .route("/v1/events", get(events))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -230,6 +246,44 @@ where
     }
 }
 
+impl From<ManagerError> for ApiError {
+    /// For the routes where `Disabled` and `InvalidSettings` have no better
+    /// reading than these; the sync route answers them itself.
+    fn from(e: ManagerError) -> Self {
+        use StatusCode as S;
+        match e {
+            ManagerError::UnknownPlugin => {
+                Self::new(S::NOT_FOUND, "plugin_not_found", "no such plugin")
+            }
+            ManagerError::UnknownResource => Self::new(
+                S::NOT_FOUND,
+                "resource_not_found",
+                "the plugin has no such resource",
+            ),
+            ManagerError::Disabled => Self::new(
+                S::CONFLICT,
+                "plugin_disabled",
+                "the plugin is disabled or cannot run",
+            ),
+            ManagerError::Busy => Self::new(
+                S::CONFLICT,
+                "sync_in_progress",
+                "this resource is syncing now",
+            ),
+            ManagerError::InvalidSettings(message) => {
+                Self::new(S::BAD_REQUEST, "invalid_settings", message)
+            }
+            ManagerError::Store(StoreError::BadCursor) => {
+                Self::new(S::BAD_REQUEST, "bad_cursor", "malformed items cursor")
+            }
+            ManagerError::Store(e) => {
+                tracing::error!("plugin request failed: {e}");
+                Self::new(S::INTERNAL_SERVER_ERROR, "internal", "internal error")
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ auth
 
 /// Query string `token` is honored only for this path: browsers cannot set
@@ -264,6 +318,156 @@ async fn authenticate(State(state): State<AppState>, req: Request, next: Next) -
         Some(t) if token_matches(&t, &state.token) => next.run(req).await,
         _ => ApiError::unauthorized().into_response(),
     }
+}
+
+// --------------------------------------------------------------- plugins
+
+/// The body of `PUT /v1/plugins/{id}/settings` is at most this long.
+const MAX_SETTINGS_BYTES: usize = 64 * 1024;
+const DEFAULT_ITEMS_LIMIT: u32 = 50;
+const MAX_ITEMS_LIMIT: u32 = 200;
+const MAX_QUERY_CHARS: usize = 256;
+
+async fn list_plugins(State(s): State<AppState>) -> Json<Vec<PluginStatus>> {
+    Json(s.plugins.list().await)
+}
+
+async fn get_plugin(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PluginStatus>, ApiError> {
+    s.plugins
+        .get(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| ManagerError::UnknownPlugin.into())
+}
+
+async fn enable_plugin(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PluginStatus>, ApiError> {
+    Ok(Json(s.plugins.set_enabled(&id, true).await?))
+}
+
+async fn disable_plugin(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PluginStatus>, ApiError> {
+    Ok(Json(s.plugins.set_enabled(&id, false).await?))
+}
+
+async fn get_plugin_settings(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(s.plugins.settings(&id).await?))
+}
+
+async fn put_plugin_settings(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<PluginStatus>, ApiError> {
+    if body.len() > MAX_SETTINGS_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            format!("settings are at most {MAX_SETTINGS_BYTES} bytes"),
+        ));
+    }
+    let value: serde_json::Value = json_body(&body)?;
+    if !value.is_object() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_settings",
+            "settings must be a JSON object",
+        ));
+    }
+    let plugins = s.plugins;
+    detached(async move { plugins.set_settings(&id, value).await })
+        .await
+        .map(Json)
+}
+
+/// What the state says is wrong, for the answer to a refused sync.
+fn not_ready_message(state: &PluginState) -> String {
+    match state {
+        PluginState::Disabled => "the plugin is disabled".to_owned(),
+        PluginState::Ready => "the plugin cannot run now".to_owned(),
+        PluginState::NeedsAuth { message, .. }
+        | PluginState::NeedsSettings { message }
+        | PluginState::Failed { message }
+        | PluginState::LoadFailed { message } => message.clone(),
+    }
+}
+
+async fn sync_plugin_resource(
+    State(s): State<AppState>,
+    Path((id, kind)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let conflict =
+        |code: &'static str, message: String| ApiError::new(StatusCode::CONFLICT, code, message);
+    match s.plugins.sync_now(&id, &kind).await {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        // `Disabled` also covers a plugin that failed, did not load, or was
+        // stopped: say which.
+        Err(ManagerError::Disabled) => {
+            let status = s
+                .plugins
+                .get(&id)
+                .await
+                .ok_or(ManagerError::UnknownPlugin)?;
+            if status.enabled {
+                Err(conflict(
+                    "plugin_not_ready",
+                    not_ready_message(&status.state),
+                ))
+            } else {
+                Err(conflict(
+                    "plugin_disabled",
+                    "the plugin is disabled".to_owned(),
+                ))
+            }
+        }
+        Err(ManagerError::InvalidSettings(message)) => Err(conflict("plugin_not_ready", message)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ItemsQuery {
+    limit: Option<u32>,
+    after: Option<String>,
+    q: Option<String>,
+}
+
+async fn plugin_items(
+    State(s): State<AppState>,
+    Path((id, kind)): Path<(String, String)>,
+    uri: Uri,
+) -> Result<Json<ItemsPage>, ApiError> {
+    let q: ItemsQuery = query(&uri)?;
+    if q.q
+        .as_deref()
+        .is_some_and(|t| t.chars().count() > MAX_QUERY_CHARS)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            format!("q is at most {MAX_QUERY_CHARS} characters"),
+        ));
+    }
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_ITEMS_LIMIT)
+        .clamp(1, MAX_ITEMS_LIMIT);
+    let text = q.q.as_deref().filter(|t| !t.is_empty());
+    let page = s
+        .plugins
+        .items(&id, &kind, limit, q.after.as_deref(), text)
+        .await?;
+    Ok(Json(page))
 }
 
 // ------------------------------------------------------------- extractors

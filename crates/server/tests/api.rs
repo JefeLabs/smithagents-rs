@@ -13,12 +13,14 @@ use smithagents_core::agent::{Agent, ChatMessage, Repo, Role};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::AgentId;
 use smithagents_core::palette::palette;
+use smithagents_plugin_host::StaticSecrets;
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::harness::HarnessEvent;
 use smithagents_server::intents::IntentService;
 use smithagents_server::paths::Paths;
+use smithagents_server::plugins::{ManagerConfig, PluginManager};
 use smithagents_server::queue::{Scheduler, SchedulerHandle};
 use smithagents_server::service::AgentService;
 use smithagents_server::store::Store;
@@ -61,11 +63,21 @@ async fn fixture(harness: FakeHarness, bus_capacity: usize) -> Fx {
         paths,
     );
     let sched = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
+    let plugins = PluginManager::start(
+        store.clone(),
+        bus.clone(),
+        Arc::new(StaticSecrets(Default::default())),
+        vec![],
+        ManagerConfig::default(),
+    )
+    .await
+    .unwrap();
     let state = AppState {
         service,
         intents,
         bus,
         store,
+        plugins,
         token: Arc::from(TOKEN),
         instance_id: Arc::from(INSTANCE_ID),
         ws_clients: Arc::new(AtomicUsize::new(0)),

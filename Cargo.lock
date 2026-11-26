@@ -7427,6 +7427,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smithagents-core",
+ "smithagents-plugins-tool",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

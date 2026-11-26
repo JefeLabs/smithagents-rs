@@ -22,6 +22,7 @@ use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentVersion, Patch,
 };
+use smithagents_core::plugin::{ItemsPage, PluginStatus};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -301,6 +302,85 @@ impl Client {
                 .json(&defaults),
         )
         .await
+    }
+
+    // ------------------------------------------------------------ plugins
+
+    pub async fn plugins(&self) -> Result<Vec<PluginStatus>, ClientError> {
+        self.fetch(self.http.get(self.url("/v1/plugins"))).await
+    }
+
+    pub async fn plugin(&self, id: &str) -> Result<PluginStatus, ClientError> {
+        self.fetch(self.http.get(self.url(&format!("/v1/plugins/{id}"))))
+            .await
+    }
+
+    pub async fn set_plugin_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<PluginStatus, ClientError> {
+        let action = if enabled { "enable" } else { "disable" };
+        self.fetch(
+            self.http
+                .post(self.url(&format!("/v1/plugins/{id}/{action}"))),
+        )
+        .await
+    }
+
+    /// The settings as the user gave them, without declared defaults.
+    pub async fn plugin_settings(&self, id: &str) -> Result<serde_json::Value, ClientError> {
+        self.fetch(
+            self.http
+                .get(self.url(&format!("/v1/plugins/{id}/settings"))),
+        )
+        .await
+    }
+
+    /// Replaces the settings; `value` must be a JSON object. Fails with code
+    /// `invalid_settings` when the plugin's manifest refuses it.
+    pub async fn set_plugin_settings(
+        &self,
+        id: &str,
+        value: &serde_json::Value,
+    ) -> Result<PluginStatus, ClientError> {
+        self.fetch(
+            self.http
+                .put(self.url(&format!("/v1/plugins/{id}/settings")))
+                .json(value),
+        )
+        .await
+    }
+
+    /// Asks for a sync of one resource now; it runs in the daemon and reports
+    /// through the events. Fails with code `sync_in_progress`,
+    /// `plugin_disabled` or `plugin_not_ready` when it cannot be queued.
+    pub async fn sync_plugin_resource(&self, id: &str, kind: &str) -> Result<(), ClientError> {
+        let url = self.url(&format!("/v1/plugins/{id}/resources/{kind}/sync"));
+        self.send(self.http.post(url)).await.map(drop)
+    }
+
+    /// One page of a resource's items, in the daemon's order. `after` is the
+    /// `next` of the previous page; `q` filters by text.
+    pub async fn plugin_items(
+        &self,
+        id: &str,
+        kind: &str,
+        limit: Option<u32>,
+        after: Option<&str>,
+        q: Option<&str>,
+    ) -> Result<ItemsPage, ClientError> {
+        let limit = limit.map(|n| n.to_string());
+        let params = [("limit", limit.as_deref()), ("after", after), ("q", q)]
+            .into_iter()
+            .filter_map(|(key, value)| Some((key, value?)));
+        let url = reqwest::Url::parse_with_params(
+            &self.url(&format!("/v1/plugins/{id}/resources/{kind}/items")),
+            params,
+        )
+        // An address of the form `http://127.0.0.1:<port>/<path>` always parses.
+        .expect("the daemon's URL parses");
+        self.fetch(self.http.get(url)).await
     }
 
     /// Subscribes to the daemon's events: with `since`, the retained events
