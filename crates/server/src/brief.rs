@@ -1,8 +1,11 @@
 //! Composes the instructions an execution agent receives for an intent: a fixed
 //! system-prompt append and a Markdown first message built from the intent's
-//! accepted content.
+//! accepted content and, for an intent made by Submit, where its files are.
 
 use smithagents_core::intent::{Answer, Intent, IntentKind, Item, ItemStatus};
+
+/// Title of the section that points a feedback intent's agent at its files.
+pub const EVIDENCE_TITLE: &str = "Evidence";
 
 /// How much of a dependency's current behavior is quoted.
 const DEP_BEHAVIOR_CHARS: usize = 300;
@@ -47,6 +50,31 @@ fn bullets(items: &[Item]) -> Vec<String> {
     accepted(items).map(|i| format!("- {}", i.text)).collect()
 }
 
+/// `folder` when it is a plain repository-relative path, as the daemon writes
+/// it: `/`-separated segments of ASCII letters, digits, `-`, `_` and `.`,
+/// none of them empty, `.` or `..`. Anything else is never named.
+fn relative_folder(folder: &str) -> Option<&str> {
+    let plain = |segment: &str| {
+        !matches!(segment, "" | "." | "..")
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    folder.split('/').all(plain).then_some(folder)
+}
+
+/// The Evidence section of an intent made by Submit (an idea intent has its
+/// own brief), naming the folder from the origin the daemon stored.
+fn evidence(intent: &Intent) -> Option<String> {
+    let origin = intent.origin.as_ref().filter(|o| o.idea.is_none())?;
+    let folder = relative_folder(&origin.folder)?;
+    Some(format!(
+        "## {EVIDENCE_TITLE}\n\nThe feedback files are in `{folder}/` on this branch. Read \
+         `issue.md` and look at its images before you start. Leave the folder in place: the \
+         pull request carries it."
+    ))
+}
+
 pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
     let c = &intent.content;
     let mut parts = vec![format!("# {}\n\nKind: {}", c.title, kind_label(c.kind))];
@@ -55,6 +83,7 @@ pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
     if !behavior.is_empty() {
         parts.push(format!("## Current behavior\n\n{behavior}"));
     }
+    parts.extend(evidence(intent));
     parts.extend(section("Preconditions", bullets(&c.preconditions)));
     let criteria = accepted(&c.criteria)
         .enumerate()

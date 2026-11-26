@@ -151,6 +151,32 @@ pub fn branch_name_for_intent(slug: &str) -> String {
     format!("intent/{slug}")
 }
 
+/// Whether `name` is usable as the name of a local branch. Refused before
+/// git runs: an empty name, `@`, a leading `-`, whitespace or control
+/// characters, `..`, `@{`, and a trailing `/` or `.lock`. Anything else must
+/// pass `git check-ref-format --branch`, of which only the exit status is read.
+pub async fn is_valid_branch_name(repo_root: &Path, name: &str) -> Result<bool, GitError> {
+    let refused = name.is_empty()
+        || name == "@"
+        || name.starts_with('-')
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
+        || name.contains("..")
+        || name.contains("@{")
+        || name.ends_with('/')
+        || name.ends_with(".lock");
+    if refused {
+        return Ok(false);
+    }
+    git_ok(repo_root, &["check-ref-format", "--branch", name]).await
+}
+
+/// Whether the local branch `refs/heads/<branch>` exists. Nothing is fetched,
+/// and tags and remote-tracking branches of the same name do not count.
+pub async fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, GitError> {
+    let reference = format!("refs/heads/{branch}");
+    git_ok(repo_root, &["show-ref", "--verify", "--quiet", &reference]).await
+}
+
 /// Creates `branch` from `base` in a new worktree under `worktrees_dir`.
 ///
 /// The directory is `worktrees_dir/<branch with '/' replaced by '-'>`.

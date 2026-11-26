@@ -75,6 +75,9 @@ const AGENT_DEFAULTS_KEY: &str = "agent_defaults";
 const QUEUE_LIMIT_MAX: u32 = 64;
 /// Hex digits of the intent id appended to an intent branch name that is taken.
 const BRANCH_SUFFIX_HEX: usize = 6;
+/// Why a start fails when the stored base branch is not a usable branch name
+/// (the name is not repeated).
+const BASE_BRANCH_INVALID: &str = "the branch this intent starts from no longer exists";
 /// How long to wait for a turn to end before trying again to close the agent
 /// of a failed start (in case the end of the turn was never published).
 const CLOSE_RETRY: Duration = Duration::from_secs(30);
@@ -932,15 +935,18 @@ impl IntentService {
     }
 
     /// Creates the intent's agent on `intent/<slug>` (or, if that branch
-    /// exists, `intent/<slug>-<6 hex of the id>`) and sends it the brief.
+    /// exists, `intent/<slug>-<6 hex of the id>`) from the intent's base
+    /// branch (else the repository's default branch) and sends it the brief.
     /// An agent whose first message is refused is closed again.
     async fn launch_agent(&self, intent: &Intent) -> Result<AgentId, IntentError> {
+        let base = self.checked_base_branch(intent).await?;
         let brief = brief::compose(intent, &self.dep_summaries(intent).await?);
         let agents = &self.inner.agents;
         let options = |branch: String| CreateAgentOptions {
             branch: Some(branch),
             intent_id: Some(intent.id),
             system_prompt_append: Some(brief.system_append.clone()),
+            base: base.clone(),
         };
         let branch = git::branch_name_for_intent(&intent.slug);
         let agent = match agents
@@ -961,6 +967,39 @@ impl IntentService {
             return Err(e.into());
         }
         Ok(agent.id)
+    }
+
+    /// The intent's base branch, once it is known to be a valid branch name
+    /// that exists locally; `None` when the intent has none. Checked before
+    /// anything is made, and never replaced by the default branch: a name
+    /// that is not valid, or a branch that is gone, is `Invalid` with a fixed
+    /// sentence. Nothing is fetched, and nothing git prints is kept.
+    async fn checked_base_branch(&self, intent: &Intent) -> Result<Option<String>, IntentError> {
+        let Some(name) = &intent.base_branch else {
+            return Ok(None);
+        };
+        let repo = self
+            .inner
+            .store
+            .get_repo(intent.repo_id)
+            .await?
+            .ok_or(IntentError::RepoNotFound)?;
+        let git_error = |e: GitError| IntentError::from(ServiceError::Git(e));
+        if !git::is_valid_branch_name(&repo.path, name)
+            .await
+            .map_err(git_error)?
+        {
+            return Err(IntentError::Invalid(BASE_BRANCH_INVALID.into()));
+        }
+        if !git::branch_exists(&repo.path, name)
+            .await
+            .map_err(git_error)?
+        {
+            return Err(IntentError::Invalid(format!(
+                "the base branch {name} no longer exists, so the intent cannot start from it"
+            )));
+        }
+        Ok(Some(name.clone()))
     }
 
     /// Title, slug and current behavior of each accepted dependency's target.

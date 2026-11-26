@@ -59,6 +59,10 @@ pub struct CreateAgentOptions {
     pub branch: Option<String>,
     pub intent_id: Option<IntentId>,
     pub system_prompt_append: Option<String>,
+    /// The local branch to start from (read as `refs/heads/<base>`, never
+    /// fetched); `None`: the repository's default branch. The caller checks
+    /// the name first.
+    pub base: Option<String>,
 }
 
 /// What an agent is reserved for.
@@ -206,7 +210,8 @@ impl AgentService {
     }
 
     /// Like `create_agent`, with an explicit branch (which must not exist yet),
-    /// an owning intent and a system prompt append saved with the agent row.
+    /// a branch to start from, an owning intent and a system prompt append
+    /// saved with the agent row.
     pub async fn create_agent_with(
         &self,
         repo_id: RepoId,
@@ -227,8 +232,13 @@ impl AgentService {
         let id = AgentId::new();
         let branch = opts.branch.unwrap_or_else(|| agent_branch(&name, id));
         let worktrees = self.inner.paths.worktrees_dir().join(repo_dir_name(&repo));
-        let worktree_path =
-            git::create_worktree(&repo.path, &worktrees, &branch, &repo.default_branch).await?;
+        // Fully qualified, so a tag or remote-tracking ref of the same name
+        // is never taken instead.
+        let base = match &opts.base {
+            Some(base) => format!("refs/heads/{base}"),
+            None => repo.default_branch.clone(),
+        };
+        let worktree_path = git::create_worktree(&repo.path, &worktrees, &branch, &base).await?;
         let agent = Agent {
             id,
             name,
@@ -860,6 +870,7 @@ mod tests {
                     branch: Some(git::branch_name_for_intent("fix-it")),
                     intent_id: Some(intent_id),
                     system_prompt_append: Some("do the thing".into()),
+                    base: None,
                 },
             )
             .await
@@ -923,6 +934,7 @@ mod tests {
                     branch: Some("intent/taken".into()),
                     intent_id: Some(IntentId::new()),
                     system_prompt_append: Some("x".into()),
+                    base: None,
                 },
             )
             .await
@@ -935,6 +947,58 @@ mod tests {
             .join("my-repo")
             .join("intent-taken")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn an_agent_can_start_from_another_branch() {
+        let fx = fixture(vec![]).await;
+        let main_tip = git(&fx.repo_dir, &["rev-parse", "main"]);
+        git(&fx.repo_dir, &["switch", "-c", "feedback/x"]);
+        let folder = fx.repo_dir.join("docs/issues/x");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("issue.md"), "# Fix the zoom\n").unwrap();
+        git(&fx.repo_dir, &["add", "--", "docs/issues/x/issue.md"]);
+        git(
+            &fx.repo_dir,
+            &["commit", "-m", "docs(issues): Fix the zoom"],
+        );
+        git(&fx.repo_dir, &["switch", "main"]);
+        // A tag of the same name on `main`: the base is read as a local branch.
+        git(&fx.repo_dir, &["tag", "feedback/x", "main"]);
+
+        let agent = fx
+            .svc
+            .create_agent_with(
+                fx.repo.id,
+                CreateAgentOptions {
+                    base: Some("feedback/x".into()),
+                    branch: Some("intent/y".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent.branch, "intent/y");
+        assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
+        // Succeeds only when the base is an ancestor of the agent's branch.
+        git(
+            &fx.repo_dir,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                "refs/heads/feedback/x",
+                "intent/y",
+            ],
+        );
+        assert_eq!(
+            git(&fx.repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main"
+        );
+
+        // Without a base the agent starts from the default branch.
+        let plain = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        assert!(!plain.worktree_path.join("docs/issues/x").exists());
+        assert_eq!(git(&fx.repo_dir, &["rev-parse", &plain.branch]), main_tip);
     }
 
     #[tokio::test]

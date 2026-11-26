@@ -284,6 +284,7 @@ impl Fx {
                     branch: Some(format!("intent/{}", intent.slug)),
                     intent_id: Some(intent.id),
                     system_prompt_append: None,
+                    base: None,
                 },
             )
             .await

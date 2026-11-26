@@ -1,6 +1,7 @@
 mod common;
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,6 +11,7 @@ use futures::stream::BoxStream;
 use serde_json::{json, Value};
 use smithagents_core::agent::{Agent, Repo, Role};
 use smithagents_core::event::EventKind;
+use smithagents_core::feedback::FeedbackOrigin;
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     Answer, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentKind, IntentState, Item,
@@ -2345,4 +2347,315 @@ async fn a_stored_task_intent_still_loads() {
         f.svc.get(i.id).await.unwrap().content.kind,
         IntentKind::Task
     );
+}
+
+// -------------------------------------------------------------- base branch
+
+/// Why a start fails when the stored base branch is not a usable branch name.
+const BASE_INVALID: &str = "the branch this intent starts from no longer exists";
+const FEEDBACK_X_MISSING: &str =
+    "the base branch feedback/x no longer exists, so the intent cannot start from it";
+
+/// Runs git with a neutral identity and the C locale: its trimmed stdout,
+/// or `None` when it fails.
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_out(cwd: &Path, args: &[&str]) -> String {
+    git_stdout(cwd, args).unwrap_or_else(|| panic!("git {args:?} failed"))
+}
+
+impl Fx {
+    /// A repository whose branch `feedback/x` adds `docs/issues/x/issue.md`
+    /// on top of `main`, as Submit leaves it; `main` stays checked out.
+    async fn feedback_repo(&self) -> (Repo, PathBuf) {
+        let dir = self.tmp.path().join("r1");
+        common::init_repo(&dir);
+        common::git(&dir, &["switch", "-c", "feedback/x"]);
+        std::fs::create_dir_all(dir.join("docs/issues/x")).unwrap();
+        std::fs::write(dir.join("docs/issues/x/issue.md"), "# Fix the zoom\n").unwrap();
+        common::git(&dir, &["add", "--", "docs/issues/x/issue.md"]);
+        common::git(&dir, &["commit", "-m", "docs(issues): Fix the zoom"]);
+        common::git(&dir, &["switch", "main"]);
+        (self.agents.add_repo(&dir).await.unwrap(), dir)
+    }
+
+    /// A text intent polished by the fake harness and reviewed to
+    /// `Complete`, then given `base_branch` and `origin` as Submit stores
+    /// them. They are written through the store: the call that creates an
+    /// intent with them comes with the submit route.
+    async fn complete_intent(
+        &self,
+        repo: &Repo,
+        base_branch: Option<&str>,
+        origin: Option<FeedbackOrigin>,
+    ) -> Intent {
+        self.h.script(vec![pass1("Fix the zoom", 0), pass2(&[])]);
+        let i = self.text_intent(repo).await;
+        let r = self.wait_phase(i.id, Phase::Review).await;
+        let c = &r.content;
+        let items: Vec<ItemId> = c
+            .preconditions
+            .iter()
+            .chain(&c.criteria)
+            .chain(&c.stories)
+            .map(|x| x.id)
+            .collect();
+        for item in items {
+            self.svc
+                .review(i.id, item, ReviewAction::Accept)
+                .await
+                .unwrap();
+        }
+        let mut done = self.svc.get(i.id).await.unwrap();
+        assert_eq!(done.state, IntentState::Complete);
+        done.base_branch = base_branch.map(Into::into);
+        done.origin = origin;
+        self.store.save_intent(&done).await.unwrap();
+        done
+    }
+
+    async fn first_message(&self, agent: &Agent) -> String {
+        let messages = self.store.list_messages(agent.id, 0, 10).await.unwrap();
+        assert_eq!(messages[0].role, Role::User);
+        messages[0].text.clone()
+    }
+
+    /// No agent, no `intent/*` branch and no worktree exist.
+    async fn assert_nothing_started(&self, dir: &Path) {
+        assert!(self.store.list_agents(true).await.unwrap().is_empty());
+        assert_eq!(git_out(dir, &["branch", "--list", "intent/*"]), "");
+        let worktrees = git_out(dir, &["worktree", "list", "--porcelain"]);
+        assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+        let dirs = std::fs::read_dir(self.paths.worktrees_dir().join("r1"));
+        assert!(dirs.map_or(true, |mut d| d.next().is_none()));
+    }
+}
+
+#[tokio::test]
+async fn send_starts_the_agent_from_the_base_branch() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let feedback_tip = git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]);
+    let origin = FeedbackOrigin {
+        folder: "docs/issues/x".into(),
+        branch: "feedback/x".into(),
+        commit: feedback_tip.clone(),
+        idea: None,
+    };
+    let x = f
+        .complete_intent(&repo, Some("feedback/x"), Some(origin))
+        .await;
+
+    let sent = f.svc.send(x.id).await.unwrap();
+
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.branch, format!("intent/{}", x.slug));
+    assert_eq!(agent.branch, "intent/fix-the-zoom");
+    assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
+    let ancestor = [
+        "merge-base",
+        "--is-ancestor",
+        "refs/heads/feedback/x",
+        &agent.branch,
+    ];
+    assert!(git_stdout(&dir, &ancestor).is_some());
+    // The feedback branch and the user's checkout are left as they were.
+    assert_eq!(
+        git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]),
+        feedback_tip
+    );
+    assert_eq!(git_out(&dir, &["branch", "--show-current"]), "main");
+    // The brief tells the agent where the evidence is.
+    let first = f.first_message(&agent).await;
+    assert!(
+        first.contains("## Evidence\n\nThe feedback files are in `docs/issues/x/` on this branch."),
+        "{first}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_base_branch_is_a_start_error() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+    let tip = git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]);
+    common::git(&dir, &["branch", "-D", "feedback/x"]);
+
+    let err = f.svc.send(x.id).await.unwrap_err();
+
+    assert_eq!(err.code(), "invalid");
+    assert_eq!(err.to_string(), FEEDBACK_X_MISSING);
+    let now = f.svc.get(x.id).await.unwrap();
+    assert_eq!(now.state, IntentState::Complete);
+    assert_eq!(now.agent_id, None);
+    assert_eq!(
+        now.last_start_error.as_deref(),
+        Some("could not start the agent: the base branch feedback/x no longer exists, so the intent cannot start from it")
+    );
+    assert!(!f.versions_of(x.id).await.contains(&VersionAuthor::Send));
+    // No silent start from the default branch.
+    f.assert_nothing_started(&dir).await;
+
+    // With the branch back, the same intent starts from it.
+    common::git(&dir, &["branch", "feedback/x", &tip]);
+    let sent = f.svc.send(x.id).await.unwrap();
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
+}
+
+#[tokio::test]
+async fn an_intent_without_a_base_branch_starts_from_the_default_branch() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, None, None).await;
+
+    let sent = f.svc.send(x.id).await.unwrap();
+
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.branch, "intent/fix-the-zoom");
+    assert!(!agent.worktree_path.join("docs").exists());
+    assert_eq!(
+        git_out(&dir, &["rev-parse", &agent.branch]),
+        git_out(&dir, &["rev-parse", "refs/heads/main"])
+    );
+    assert!(!f.first_message(&agent).await.contains("## Evidence"));
+}
+
+#[tokio::test]
+async fn an_unusable_base_branch_name_is_refused_and_nothing_starts() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, None, None).await;
+    let refused = [
+        // Refused before git sees the name.
+        "",
+        "-b",
+        "--orphan=x",
+        "feedback x",
+        "feedback/x\n",
+        "feedback\tx",
+        "feedback/x\u{7f}",
+        "\u{1b}[31mfeedback/x",
+        "feedback/x..main",
+        "../feedback/x",
+        "feedback/x@{1}",
+        "@{-1}",
+        "@",
+        "feedback/",
+        "feedback/x.lock",
+        // Refused by `git check-ref-format --branch`. Several of these name
+        // a commit when git reads them as a revision.
+        "feedback/x~1",
+        "feedback/x^",
+        "feedback/x:docs",
+        "feedback/x?",
+        "feedback/*",
+        "feedback/[x",
+        "feedback//x",
+        "/feedback/x",
+        "feedback/.x",
+        "feedback/x.",
+        "feedback\\x",
+    ];
+    let recorded = format!("could not start the agent: {BASE_INVALID}");
+    for name in refused {
+        let mut i = f.svc.get(x.id).await.unwrap();
+        i.base_branch = Some(name.into());
+        f.store.save_intent(&i).await.unwrap();
+
+        let err = f.svc.send(x.id).await.unwrap_err();
+
+        assert_eq!(
+            (err.code(), err.to_string().as_str()),
+            ("invalid", BASE_INVALID),
+            "{name:?}"
+        );
+        let now = f.svc.get(x.id).await.unwrap();
+        assert_eq!(now.state, IntentState::Complete, "{name:?}");
+        assert_eq!(
+            now.last_start_error.as_deref(),
+            Some(recorded.as_str()),
+            "{name:?}"
+        );
+    }
+    f.assert_nothing_started(&dir).await;
+}
+
+#[tokio::test]
+async fn a_base_branch_is_resolved_locally_and_nothing_is_fetched() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+    let tip = git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]);
+    // `origin` (a bare repository made here) has the branch; locally only a
+    // tag and a remote-tracking ref of that name are left.
+    let bare = f.tmp.path().join("origin.git");
+    let bare_arg = bare.to_str().unwrap();
+    let dir_arg = dir.to_str().unwrap();
+    common::git(f.tmp.path(), &["clone", "--bare", dir_arg, bare_arg]);
+    common::git(&dir, &["remote", "add", "origin", bare_arg]);
+    common::git(
+        &dir,
+        &["update-ref", "refs/remotes/origin/feedback/x", &tip],
+    );
+    common::git(&dir, &["tag", "feedback/x", &tip]);
+    common::git(&dir, &["branch", "-D", "feedback/x"]);
+
+    let err = f.svc.send(x.id).await.unwrap_err();
+    assert_eq!(err.to_string(), FEEDBACK_X_MISSING);
+    f.assert_nothing_started(&dir).await;
+
+    // Without the remote-tracking ref nothing is fetched to replace it.
+    common::git(
+        &dir,
+        &["update-ref", "-d", "refs/remotes/origin/feedback/x"],
+    );
+    let err = f.svc.send(x.id).await.unwrap_err();
+    assert_eq!(err.to_string(), FEEDBACK_X_MISSING);
+    assert_eq!(git_out(&dir, &["for-each-ref", "refs/remotes"]), "");
+    assert!(!dir.join(".git/FETCH_HEAD").exists());
+    assert_eq!(f.svc.get(x.id).await.unwrap().state, IntentState::Complete);
+    f.assert_nothing_started(&dir).await;
 }
