@@ -797,6 +797,7 @@ async fn changing_repo_clears_depends_on() {
         status: ItemStatus::Accepted,
         edited: false,
         intent_ref: Some(IntentId::new()),
+        fixed: false,
     });
     f.store.save_intent(&stored).await.unwrap();
 
@@ -1613,6 +1614,7 @@ async fn pass_two_sees_same_repo_candidates_and_skip_marker() {
         status: ItemStatus::Accepted,
         edited: false,
         intent_ref: Some(t.id),
+        fixed: false,
     });
     f.store.save_intent(&a).await.unwrap();
 
@@ -1853,6 +1855,7 @@ fn item(text: &str, status: ItemStatus) -> Item {
         status,
         edited: false,
         intent_ref: None,
+        fixed: false,
     }
 }
 

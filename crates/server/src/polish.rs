@@ -375,6 +375,7 @@ fn pending_item(text: String, intent_ref: Option<IntentId>) -> Item {
         status: ItemStatus::Pending,
         edited: false,
         intent_ref,
+        fixed: false,
     }
 }
 

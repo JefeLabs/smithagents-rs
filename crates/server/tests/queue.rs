@@ -197,6 +197,7 @@ fn accepted(text: &str, target: Option<IntentId>) -> Item {
         status: ItemStatus::Accepted,
         edited: false,
         intent_ref: target,
+        fixed: false,
     }
 }
 
@@ -255,6 +256,8 @@ impl Fx {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
+            base_branch: None,
+            origin: None,
         };
         let first = IntentVersion {
             intent_id: intent.id,

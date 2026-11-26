@@ -332,6 +332,7 @@ mod tests {
             status,
             edited: false,
             intent_ref: Some(target),
+            fixed: false,
         }
     }
 
@@ -365,6 +366,8 @@ mod tests {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
+            base_branch: None,
+            origin: None,
         }
     }
 

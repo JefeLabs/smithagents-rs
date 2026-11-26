@@ -13,6 +13,7 @@ fn item(text: &str, status: ItemStatus) -> Item {
         status,
         edited: false,
         intent_ref: None,
+        fixed: false,
     }
 }
 
@@ -55,6 +56,8 @@ fn intent(content: Content) -> Intent {
         sent_at: None,
         resolved_at: None,
         last_start_error: None,
+        base_branch: None,
+        origin: None,
     }
 }
 

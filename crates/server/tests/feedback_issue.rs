@@ -1,4 +1,7 @@
 use chrono::{NaiveDate, TimeZone, Utc};
+use smithagents_core::feedback::{
+    AttachmentKind, FeedbackAttachment, FeedbackBox, FeedbackKind, SubmissionId,
+};
 use smithagents_server::feedback::issue::*;
 
 fn date() -> NaiveDate {

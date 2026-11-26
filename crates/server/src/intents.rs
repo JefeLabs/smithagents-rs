@@ -475,6 +475,8 @@ impl IntentService {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
+            base_branch: None,
+            origin: None,
         };
         let first = IntentVersion {
             intent_id: id,

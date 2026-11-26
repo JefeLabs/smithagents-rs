@@ -175,6 +175,8 @@ pub fn intent(slug: &str, state: IntentState, phase: Phase) -> Intent {
         sent_at: matches!(state, IntentState::Sent | IntentState::Resolved).then_some(at),
         resolved_at: (state == IntentState::Resolved).then_some(at),
         last_start_error: None,
+        base_branch: None,
+        origin: None,
     }
 }
 
@@ -186,6 +188,7 @@ pub fn item(text: &str, status: ItemStatus) -> Item {
         status,
         edited: false,
         intent_ref: None,
+        fixed: false,
     }
 }
 

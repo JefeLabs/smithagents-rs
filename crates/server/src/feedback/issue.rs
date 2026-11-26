@@ -7,71 +7,10 @@
 //! front matter holds JSON-quoted strings only.
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
+use smithagents_core::feedback::{AttachmentKind, FeedbackAttachment, FeedbackKind, SubmissionId};
 use smithagents_core::intent::slugify;
-use uuid::Uuid;
 
 use crate::plugins::clean_message;
-
-// moved to smithagents-core by Task 2 (SubmissionId, FeedbackKind,
-// AttachmentKind, FeedbackBox, FeedbackAttachment)
-/// Identifies one submission; made by the app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SubmissionId(pub Uuid);
-
-impl std::fmt::Display for SubmissionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-// moved to smithagents-core by Task 2
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FeedbackKind {
-    NewFeature,
-    Enhancement,
-    Bug,
-}
-
-impl FeedbackKind {
-    fn wire(self) -> &'static str {
-        match self {
-            Self::NewFeature => "new_feature",
-            Self::Enhancement => "enhancement",
-            Self::Bug => "bug",
-        }
-    }
-}
-
-// moved to smithagents-core by Task 2
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachmentKind {
-    Screenshot,
-    Image,
-    Video,
-}
-
-// moved to smithagents-core by Task 2
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FeedbackBox {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-    pub comment: String,
-}
-
-// moved to smithagents-core by Task 2
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FeedbackAttachment {
-    pub kind: AttachmentKind,
-    pub original_name: String,
-    #[serde(default)]
-    pub boxes: Vec<FeedbackBox>,
-}
 
 /// The stored format of a file the daemon writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,7 +322,7 @@ pub fn render_issue(input: &IssueInput<'_>) -> String {
                 .collect::<String>()
         )
     ));
-    out.push_str(&format!("kind: {}\n", input.kind.wire()));
+    out.push_str(&format!("kind: {}\n", input.kind.intent_kind().wire_name()));
     out.push_str(&format!(
         "created: {}\n",
         input.created.to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -459,7 +398,11 @@ pub fn seed_text(
 ) -> String {
     const MORE: &str = "- (more comments in issue.md)";
     let idea: String = input.main_idea.chars().take(MAIN_IDEA_MAX_CHARS).collect();
-    let mut head = format!("{}\n\nKind: {}", idea.trim(), input.kind.wire());
+    let mut head = format!(
+        "{}\n\nKind: {}",
+        idea.trim(),
+        input.kind.intent_kind().wire_name()
+    );
 
     let mut lines = Vec::new();
     let mut shot = 0usize;

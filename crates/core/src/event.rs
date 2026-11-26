@@ -147,6 +147,8 @@ mod tests {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
+            base_branch: None,
+            origin: None,
         }
     }
 
