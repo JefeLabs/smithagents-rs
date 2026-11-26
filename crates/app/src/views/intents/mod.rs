@@ -43,8 +43,9 @@ pub use detail::{
     RETRY_ID,
 };
 pub use sections::{
-    question_card_id, question_option_id, question_skip_id, section_counter_id, section_header_id,
-    section_status_id, QUESTION_ANSWER_ID,
+    item_card_id, item_confirm_id, item_edit_id, item_input_id, item_skip_id, question_card_id,
+    question_option_id, question_skip_id, section_counter_id, section_header_id, section_status_id,
+    skipped_line_id, ITEM_TEXT_ID, QUESTION_ANSWER_ID,
 };
 
 use std::collections::HashMap;
@@ -61,7 +62,7 @@ use gpui_kit::{
     TestSupportExt as _, Window,
 };
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
-use smithagents_core::intent::{AnswerInput, Intent, IntentKind};
+use smithagents_core::intent::{AnswerInput, Intent, IntentKind, ReviewAction};
 use smithagents_theme::native::NativeTheme;
 
 use crate::intent_vm::{header_editable, intent_error_text, IntentFilterChoice, SectionKind};
@@ -91,6 +92,8 @@ pub const INTENTS_EMPTY_ID: &str = "intents-empty";
 /// Element id of the screen's one error line (a status).
 pub const INTENT_ERROR_ID: &str = "intent-error";
 /// Element ids of a card's parts, inside the card ([`intent_card_id`]).
+/// [`CARD_SLUG_ID`] is also the other intent's slug in a Depends on card
+/// ([`item_card_id`]).
 pub const CARD_DOT_ID: &str = "dot";
 pub const CARD_ACCENT_ID: &str = "accent";
 pub const CARD_SLUG_ID: &str = "slug";
@@ -179,12 +182,23 @@ pub struct IntentsPane {
     title_focus: FocusHandle,
     title_input: Entity<InputState>,
     editing_title: Option<IntentId>,
-    /// The detail's sections the user opened or closed, or answered in (kept
-    /// open); the others follow `SectionVm::starts_open`.
+    /// The detail's sections the user opened or closed, or answered or
+    /// reviewed in (kept open); the others follow `SectionVm::starts_open`.
     section_toggles: HashMap<(IntentId, SectionKind), bool>,
     /// The answer of the `Busy::Question` in flight, whose button shows the
     /// spinner.
     pressed_answer: Option<AnswerInput>,
+    /// The input that edits an item's text, and the item it edits while it
+    /// is open (one item at a time).
+    item_input: Entity<InputState>,
+    item_edit: Option<sections::ItemEdit>,
+    /// The focus of the Edit button of the item edited last
+    /// (`item_edit_return`), where closing the input puts a keyboard user.
+    item_edit_focus: FocusHandle,
+    item_edit_return: Option<ItemId>,
+    /// The action of the `Busy::Item` in flight, whose button shows the
+    /// spinner.
+    pressed_review: Option<ReviewAction>,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -194,6 +208,7 @@ impl IntentsPane {
         let focus = cx.focus_handle();
         let text_box = create::new_text_box(window, cx);
         let title_input = detail::new_title_input(window, cx);
+        let item_input = sections::new_item_input(window, cx);
         let subscriptions = vec![
             cx.observe_in(&state, window, |this, _, window, cx| {
                 this.on_state_changed(window, cx)
@@ -210,6 +225,15 @@ impl IntentsPane {
                 |this, _, event: &InputEvent, window, cx| {
                     if let InputEvent::PressEnter { .. } = event {
                         this.save_title(window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &item_input,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.save_item_edit(window, cx);
                     }
                 },
             ),
@@ -244,6 +268,11 @@ impl IntentsPane {
             editing_title: None,
             section_toggles: HashMap::new(),
             pressed_answer: None,
+            item_input,
+            item_edit: None,
+            item_edit_focus: cx.focus_handle().tab_stop(true),
+            item_edit_return: None,
+            pressed_review: None,
             _age_refresh: refresh_ages(cx),
             _subscriptions: subscriptions,
         }
@@ -276,6 +305,7 @@ impl IntentsPane {
         let previous = std::mem::replace(&mut self.screen, screen);
         self.error = None;
         self.editing_title = None;
+        self.item_edit = None;
         self.detail_seen = match screen {
             Screen::Detail(id) => self.state.read(cx).model().intent(id).is_some(),
             Screen::List | Screen::Create => false,
@@ -431,6 +461,8 @@ impl IntentsPane {
                 self.focus.focus(window, cx);
             }
         }
+        // Likewise the item input, once its item cannot be reviewed.
+        self.close_stale_item_edit(window, cx);
         let dropped =
             self.connection == Connection::Connected && connection != Connection::Connected;
         self.connection = connection;

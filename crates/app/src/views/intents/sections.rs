@@ -9,37 +9,77 @@
 //! content while open. A section starts open while it has something to
 //! answer or review ([`SectionVm::starts_open`]); a header click opens or
 //! closes it, and that choice is kept per intent for the pane's lifetime. A
-//! section the user answers in is kept open too, so the last answer does not
-//! fold it away.
+//! section the user answers or reviews in is kept open too, so the last
+//! answer or item does not fold it away. Nothing changes on screen before the
+//! daemon's copy reaches the model.
 //!
 //! Questions: one outlined card per question with its text. While the draft
 //! is in its questions phase (the only time the daemon takes an answer) an
 //! open question offers a button per option and Skip; a decided one shows its
-//! answer ([`answer_text`]). Nothing changes on screen before the daemon's
-//! copy reaches the model. The other four sections are filled by Task 9;
-//! until then they draw their header only.
+//! answer ([`answer_text`]).
+//!
+//! Preconditions, Acceptance criteria and Stories: one outlined card per item
+//! the daemon has not dropped, in its order; a dropped item is only counted,
+//! in a muted "n skipped" line under the cards. An accepted card is outlined
+//! in `status-ok`. While the intent is a draft in review or is complete (the
+//! states the daemon takes a review in) a pending card offers Confirm, Edit
+//! and Skip. Edit puts the text in a one-line input, for one item at a time:
+//! Enter sends the trimmed text, which the daemon saves and accepts, and the
+//! input closes when it answers (it stays, with what was typed, when it
+//! refuses); Escape, or Enter on blank text, closes it unchanged. Depends on
+//! is drawn alike, but a card names the other intent (its slug and title, or
+//! the item's own text while that intent is not in the model) and offers no
+//! Edit.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Escape, Input, InputState};
 use gpui_kit::component::label::Label;
-use gpui_kit::component::{h_flex, v_flex, Disableable as _, Icon, Sizable as _};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, AnyElement, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Role, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
-    Window,
+    div, rems, AnyElement, App, AppContext as _, Context, ElementId, Entity, Focusable as _,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Role,
+    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, Window,
 };
-use smithagents_core::ids::{IntentId, QuestionId};
-use smithagents_core::intent::{Answer, AnswerInput, Intent, IntentState, Phase, Question};
+use smithagents_core::ids::{IntentId, ItemId, QuestionId};
+use smithagents_core::intent::{
+    Answer, AnswerInput, Intent, IntentState, Item, ItemStatus, Phase, Question, ReviewAction,
+};
 
-use super::{Busy, IntentsPane, Paint};
-use crate::intent_vm::{answer_text, section_items, section_vm, SectionKind, SectionVm};
+use super::{Busy, IntentsPane, Paint, CARD_SLUG_ID};
+use crate::intent_vm::{
+    answer_text, dependency_vm, section_items, section_vm, SectionKind, SectionVm,
+};
 
 /// Element id of a decided question's answer ("→ Yes"), inside its card
 /// ([`question_card_id`]).
 pub const QUESTION_ANSWER_ID: &str = "answer";
+/// Element id of an item's text, inside its card ([`item_card_id`]); in a
+/// Depends on card, the other intent's title (or the item's own text while
+/// that intent is not in the model).
+pub const ITEM_TEXT_ID: &str = "text";
 
 const SKIP_LABEL: &str = "Skip";
+const CONFIRM_LABEL: &str = "Confirm";
+const EDIT_LABEL: &str = "Edit";
+/// The item input's accessible name and placeholder.
+const ITEM_INPUT_LABEL: &str = "Item text";
+
+/// The item the item input edits: its intent, its section and its id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ItemEdit {
+    intent: IntentId,
+    kind: SectionKind,
+    item: ItemId,
+}
+
+/// The item input: one line, Enter saves.
+pub(super) fn new_item_input(window: &mut Window, cx: &mut App) -> Entity<InputState> {
+    cx.new(|cx| InputState::new(window, cx).placeholder(ITEM_INPUT_LABEL))
+}
 
 /// Element id of a section's header button (expands and collapses it).
 pub fn section_header_id(kind: SectionKind) -> ElementId {
@@ -72,6 +112,36 @@ pub fn question_skip_id(question: QuestionId) -> ElementId {
     ElementId::Name(format!("intent-question-skip-{question}").into())
 }
 
+/// Element id of an item's card.
+pub fn item_card_id(id: ItemId) -> ElementId {
+    ElementId::Name(format!("intent-item-{id}").into())
+}
+
+/// Element id of an item's Confirm button.
+pub fn item_confirm_id(id: ItemId) -> ElementId {
+    ElementId::Name(format!("intent-item-confirm-{id}").into())
+}
+
+/// Element id of an item's Edit button.
+pub fn item_edit_id(id: ItemId) -> ElementId {
+    ElementId::Name(format!("intent-item-edit-{id}").into())
+}
+
+/// Element id of an item's Skip button.
+pub fn item_skip_id(id: ItemId) -> ElementId {
+    ElementId::Name(format!("intent-item-skip-{id}").into())
+}
+
+/// Element id of the input that edits an item's text.
+pub fn item_input_id(id: ItemId) -> ElementId {
+    ElementId::Name(format!("intent-item-input-{id}").into())
+}
+
+/// Element id of a section's "n skipped" line.
+pub fn skipped_line_id(kind: SectionKind) -> ElementId {
+    ElementId::Name(format!("intent-skipped-{}", kind.as_str()).into())
+}
+
 /// Element id of a section (a labeled group).
 fn section_group_id(kind: SectionKind) -> ElementId {
     ElementId::Name(format!("intent-group-{}", kind.as_str()).into())
@@ -82,6 +152,16 @@ fn has_entries(intent: &Intent, kind: SectionKind) -> bool {
     match kind {
         SectionKind::Questions => !intent.content.questions.is_empty(),
         _ => !section_items(&intent.content, kind).is_empty(),
+    }
+}
+
+/// Whether the daemon takes a review of `intent`'s items: a draft in its
+/// review phase, or a complete intent.
+fn reviewable(intent: &Intent) -> bool {
+    match intent.state {
+        IntentState::Draft => intent.phase == Phase::Review,
+        IntentState::Complete => true,
+        IntentState::Queued | IntentState::Sent | IntentState::Resolved => false,
     }
 }
 
@@ -102,11 +182,10 @@ impl IntentsPane {
             .map(|kind| {
                 let content = match kind {
                     SectionKind::Questions => self.questions(intent, paint, cx),
-                    // Task 9 fills these.
                     SectionKind::Preconditions
                     | SectionKind::Criteria
                     | SectionKind::Stories
-                    | SectionKind::DependsOn => div().into_any_element(),
+                    | SectionKind::DependsOn => self.items(intent, kind, paint, cx),
                 };
                 self.section(intent, kind, content, paint, cx)
             })
@@ -360,4 +439,337 @@ impl IntentsPane {
             cx,
         );
     }
+
+    /// An item section's content (Preconditions, Acceptance criteria,
+    /// Stories or Depends on): a card per item not dropped, in the daemon's
+    /// order, then "n skipped" when any are.
+    fn items(
+        &self,
+        intent: &Intent,
+        kind: SectionKind,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let reviewable = reviewable(intent);
+        let skipped = section_vm(&intent.content, kind).skipped;
+        v_flex()
+            .w_full()
+            .gap_2()
+            .children(
+                section_items(&intent.content, kind)
+                    .iter()
+                    .filter(|item| item.status != ItemStatus::Dropped)
+                    .map(|item| self.item_card(intent.id, kind, item, reviewable, paint, cx)),
+            )
+            .when(skipped > 0, |this| {
+                this.child(
+                    Label::new(format!("{skipped} skipped"))
+                        .id(skipped_line_id(kind))
+                        .text_xs()
+                        .text_color(paint.muted_foreground),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// An item's card: its text (or the input, while it is edited), then,
+    /// with `reviewable`, Confirm, Edit and Skip while it is pending. An
+    /// accepted card is outlined in `status-ok`.
+    fn item_card(
+        &self,
+        intent: IntentId,
+        kind: SectionKind,
+        item: &Item,
+        reviewable: bool,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let editing = reviewable && self.item_edit.is_some_and(|edit| edit.item == item.id);
+        let (name, text) = if kind == SectionKind::DependsOn {
+            self.dependency_text(item, paint, cx)
+        } else {
+            let text = item_text(item.text.clone(), paint).into_any_element();
+            (item.text.clone(), text)
+        };
+        let outline = if item.status == ItemStatus::Accepted {
+            paint.token("status-ok")
+        } else {
+            paint.border
+        };
+        v_flex()
+            .id(item_card_id(item.id))
+            .role(Role::Group)
+            .test_support()
+            .aria_label(name)
+            .w_full()
+            .gap_1p5()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(outline)
+            .map(|this| {
+                if editing {
+                    this.child(self.item_editor(item.id, paint, cx))
+                } else {
+                    this.child(text)
+                }
+            })
+            .when(
+                reviewable && item.status == ItemStatus::Pending && !editing,
+                |this| this.child(self.item_buttons(intent, kind, item.id, cx)),
+            )
+    }
+
+    /// A dependency's text: the other intent's slug, in a monospace tag, and
+    /// its title; or the item's own text while that intent is not in the
+    /// model. Also the card's name.
+    fn dependency_text(
+        &self,
+        item: &Item,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> (String, AnyElement) {
+        let vm = dependency_vm(self.state.read(cx).model(), item);
+        let name = match &vm.slug {
+            Some(slug) => format!("{slug}: {}", vm.title),
+            None => vm.title.clone(),
+        };
+        let text = v_flex()
+            .w_full()
+            .items_start()
+            .gap_1()
+            .when_some(vm.slug, |this, slug| {
+                this.child(
+                    Tag::secondary()
+                        .small()
+                        .max_w_full()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .child(
+                            Label::new(slug)
+                                .id(CARD_SLUG_ID)
+                                .min_w_0()
+                                .line_height(rems(1.))
+                                .text_color(paint.token("secondary-foreground"))
+                                .truncate(),
+                        ),
+                )
+            })
+            .child(item_text(vm.title, paint))
+            .into_any_element();
+        (name, text)
+    }
+
+    /// The input that edits `item`'s text: Enter saves, Escape cancels. It
+    /// shows the spinner while the edit is on its way.
+    fn item_editor(&self, item: ItemId, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {
+        let saving = self.busy == Some(Busy::Item(item));
+        let muted = paint.muted_foreground;
+        // The input passes Escape on; it ends here.
+        div()
+            .w_full()
+            .on_action(cx.listener(|this, _: &Escape, window, cx| this.close_item_edit(window, cx)))
+            .child(
+                Input::new(&self.item_input)
+                    .id(item_input_id(item))
+                    .aria_label(ITEM_INPUT_LABEL)
+                    .small()
+                    .when(saving, |input| {
+                        input.suffix(Spinner::new().xsmall().color(muted))
+                    }),
+            )
+    }
+
+    /// Confirm, Edit (not for a dependency) and Skip. All are disabled while
+    /// any command is in flight; the pressed one shows the spinner.
+    fn item_buttons(
+        &self,
+        intent: IntentId,
+        kind: SectionKind,
+        item: ItemId,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let busy = self.busy.is_some();
+        let pressed = self
+            .pressed_review
+            .as_ref()
+            .filter(|_| self.busy == Some(Busy::Item(item)));
+        let button = |id: ElementId, label: &'static str, action: ReviewAction| {
+            let loading = pressed == Some(&action);
+            Button::new(id)
+                .label(label)
+                .small()
+                .disabled(busy)
+                .loading(loading)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.review_item(intent, kind, item, action.clone(), window, cx)
+                }))
+        };
+        h_flex()
+            .w_full()
+            .flex_wrap()
+            .gap_1()
+            .child(button(item_confirm_id(item), CONFIRM_LABEL, ReviewAction::Accept).outline())
+            .when(kind != SectionKind::DependsOn, |this| {
+                this.child(
+                    Button::new(item_edit_id(item))
+                        .label(EDIT_LABEL)
+                        .small()
+                        .outline()
+                        .disabled(busy)
+                        // Where closing the input puts a keyboard user.
+                        .when(self.item_edit_return == Some(item), |button| {
+                            button.track_focus(&self.item_edit_focus)
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.edit_item(intent, kind, item, window, cx)
+                        })),
+                )
+            })
+            .child(button(item_skip_id(item), SKIP_LABEL, ReviewAction::Drop).ghost())
+    }
+
+    /// Sends `action` for `item`, of section `kind`; nothing while another
+    /// command is in flight. The section stays open from here on. An edit's
+    /// input closes when the daemon answers; when it refuses, the input
+    /// keeps what was typed.
+    fn review_item(
+        &mut self,
+        intent: IntentId,
+        kind: SectionKind,
+        item: ItemId,
+        action: ReviewAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy.is_some() {
+            return;
+        }
+        let edit = matches!(action, ReviewAction::Edit(_));
+        // The edited text is the user's; the log names the action only.
+        let what = match &action {
+            ReviewAction::Accept => "accept",
+            ReviewAction::Edit(_) => "edit",
+            ReviewAction::Drop => "drop",
+        };
+        tracing::debug!(%intent, %item, ?kind, what, "reviewing an item");
+        self.section_toggles.insert((intent, kind), true);
+        self.pressed_review = Some(action.clone());
+        self.command(
+            Busy::Item(item),
+            move |commands| commands.review_item(intent, item, action),
+            move |this, _, window, cx| {
+                if edit && this.item_edit.is_some_and(|open| open.item == item) {
+                    this.close_item_edit(window, cx);
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the item input on `item`, holding its text, with the focus; an
+    /// input open on another item closes unsaved. Nothing while a command
+    /// is in flight, or when the item cannot be reviewed.
+    fn edit_item(
+        &mut self,
+        intent: IntentId,
+        kind: SectionKind,
+        item: ItemId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy.is_some() {
+            return;
+        }
+        let text = self
+            .state
+            .read(cx)
+            .model()
+            .intent(intent)
+            .filter(|open| reviewable(open))
+            .and_then(|open| {
+                section_items(&open.content, kind)
+                    .iter()
+                    .find(|candidate| candidate.id == item)
+            })
+            .map(|found| found.text.clone());
+        let Some(text) = text else {
+            return;
+        };
+        self.item_edit = Some(ItemEdit { intent, kind, item });
+        self.item_edit_return = Some(item);
+        self.item_input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Enter in the item input: non-blank text (trimmed) is sent as an edit,
+    /// which the daemon also accepts; blank text just closes the input.
+    /// Nothing while a command is in flight.
+    pub(super) fn save_item_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.item_edit else {
+            return;
+        };
+        if self.busy.is_some() {
+            return;
+        }
+        let text = self.item_input.read(cx).value().trim().to_owned();
+        if text.is_empty() {
+            self.close_item_edit(window, cx);
+            return;
+        }
+        let action = ReviewAction::Edit(text);
+        self.review_item(edit.intent, edit.kind, edit.item, action, window, cx);
+    }
+
+    /// Closes the item input. A keyboard user goes back to the item's Edit
+    /// button.
+    fn close_item_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.item_edit.take().is_none() {
+            return;
+        }
+        if self.item_input.focus_handle(cx).is_focused(window) {
+            self.item_edit_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Closes the item input once its item can no longer be edited: the
+    /// intent left the states the daemon takes a review in, or the item is
+    /// gone or dropped. A keyboard user stays in the pane.
+    pub(super) fn close_stale_item_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.item_edit else {
+            return;
+        };
+        let editable = self
+            .state
+            .read(cx)
+            .model()
+            .intent(edit.intent)
+            .is_some_and(|intent| {
+                reviewable(intent)
+                    && section_items(&intent.content, edit.kind)
+                        .iter()
+                        .any(|item| item.id == edit.item && item.status != ItemStatus::Dropped)
+            });
+        if editable {
+            return;
+        }
+        tracing::debug!(item = %edit.item, "the edited item can no longer be reviewed");
+        self.item_edit = None;
+        if self.item_input.focus_handle(cx).is_focused(window) {
+            self.focus.focus(window, cx);
+        }
+    }
+}
+
+/// An item's text in its card.
+fn item_text(text: String, paint: &Paint) -> Label {
+    Label::new(text)
+        .id(ITEM_TEXT_ID)
+        .w_full()
+        .text_sm()
+        .text_color(paint.foreground)
 }
