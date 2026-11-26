@@ -45,9 +45,10 @@ pub trait HostApi {
 }
 ```
 
-`SyncRequest` carries `resource` (the kind), `cursor` (what the plugin
-returned as `next_cursor` last time, or none for the start of a listing) and
-`settings` (a JSON object, the user's settings with the manifest's defaults).
+`SyncRequest` carries `resource` (the kind), `cursor` (the `next_cursor` of
+the plugin's last page for this resource, or none when there has been none)
+and `settings` (a JSON object, the user's settings with the manifest's
+defaults).
 
 A `SyncPage` holds:
 
@@ -55,13 +56,24 @@ A `SyncPage` holds:
   (optional), `updated_at` (optional), `version` (optional, any string that
   changes when the record does) and `fields` (a JSON object).
 - `deletes`: ids to remove.
-- `next_cursor`: stored by the daemon and passed back on the next call.
-- `done`: the listing is finished; the next run starts from no cursor.
+- `next_cursor`: stored by the daemon and passed back on the next call,
+  **also after a `done` page**: the next run's first call gets it. A plugin
+  can keep what it needs between listings there (the GitHub plugin keeps
+  each repository's `since` mark in it). Return none to start over.
+- `done`: the listing is finished; the run ends, and the next run (one
+  interval later) begins a new listing.
 - `snapshot_complete`: with `done`, "this listing was the whole truth". The
   daemon then deletes every stored item of this resource that no page of the
   listing returned. Set it only when the plugin really listed everything.
-  A listing the daemon did not see from its start (for instance after a restart
-  in the middle) deletes nothing, whatever the plugin says.
+  For this, a listing begins with a call that has no cursor or with the first
+  call after a `done` page, and the daemon follows it across runs and
+  restarts. A listing whose beginning the daemon did not see deletes nothing,
+  whatever the plugin says.
+
+A cursor can outlive a settings change: new settings make the resource due
+at once but keep its cursor. A plugin must accept a cursor written under an
+older configuration, for instance by noticing it no longer fits and starting
+over (the GitHub plugin fingerprints its repository list in the cursor).
 
 A page that returns no progress (not `done`, and the same cursor it was
 given) ends the run with an error.
@@ -71,8 +83,8 @@ host, written plainly (no spaces or control characters). A page that breaks a
 limit or a shape rule is refused as a whole; see [limits](#limits).
 
 Errors a plugin returns (`PluginError`): `Auth` (the daemon shows the plugin
-as needing sign-in and stops its runs until settings change or a manual
-sync), `RateLimited { retry_after_secs }` (the next run waits for the longer
+as needing sign-in, drops the secret values it cached for the plugin, and
+stops its runs until settings change or a manual sync), `RateLimited { retry_after_secs }` (the next run waits for the longer
 of that time and the resource's interval), `Settings` (the settings are wrong;
 the plugin waits for new ones), `Http` and `Other` (the run fails and is
 retried with a back-off that starts at 30 seconds, doubles, and stops at 30
@@ -136,6 +148,7 @@ daemon lists the directory as not loadable):
 | `entry` | a plain file name: no `/`, no `\`, no `..` |
 | `install_url` | `https`, at most 2048 bytes |
 | duplicates | a secret key, setting key, resource kind or tool name may appear once |
+| `name`, every `label`, a secret's `help` | not blank, at most 128 characters (`help` 512), no control characters, line or paragraph separators or bidi marks |
 | `from_tool.tool` | must name one of the manifest's `[[tools]]` |
 | a secret's `hosts` | each must be one of the manifest's `hosts`; may be left out only when the manifest has exactly one host |
 
@@ -222,8 +235,17 @@ token = { command = ["/opt/homebrew/bin/gh", "auth", "token"] }
 
 Use an absolute path for the program: a daemon started from the app may not
 have your shell's `PATH`. Resolved values are cached in memory for five
-minutes. When a declared secret has no value, the plugin shows `needs_auth`
-and is not called.
+minutes; a plugin's cached values are dropped when the service refuses them
+(an `Auth` error) and when the plugin is enabled, given new settings or
+synced by hand, so a fresh sign-in counts at once. When a declared secret has
+no value, the plugin shows `needs_auth` and is not called; when that secret
+has a `secrets.toml` entry, the message says the entry has no value.
+
+The daemon's own environment reaches agents and `git`, except every
+`SMITHAGENTS_SECRET_*` variable, which the daemon removes from the processes
+it starts. A `{ env = "NAME" }` pointer names a variable that agents still
+inherit, so for anything sensitive prefer a `{ command = [...] }` pointer or
+the `SMITHAGENTS_SECRET_...` form.
 
 Secrets are bound to hosts. The `hosts` list inside a `[[secrets]]` table
 names the hosts the secret may be sent to; with a single manifest host it may
@@ -287,8 +309,10 @@ through the host.
 that is all. Limits per call: 10 seconds of guest CPU (the clock counts time
 the guest is executing; time spent waiting on the host's `http` does not
 count), 64 MiB of memory (linear memories and tables together), 60 seconds of
-wall time. A guest that spins or grows without end is stopped and the run
-fails; the daemon is not affected.
+wall time. What a guest can make the host hold is capped too: 1024 open WASI
+resources and 1 MiB per random-bytes request. A guest that spins or grows
+without end is stopped and the run fails; the daemon is not affected. A
+component file larger than 64 MiB is refused before it is read.
 
 **A native plugin is not sandboxed.** A `dylib` runs with the daemon's rights.
 A panic is caught and reported as a failed call, but a native library that
@@ -319,13 +343,19 @@ writable by group or others. Also:
 - an installed plugin may not be `dylib`, and `process` and `in-process` are
   refused for every plugin;
 - the installed directory may not overlap the built-in one;
+- the built-in directory must not be a symbolic link; if it is, nothing in it
+  loads and no installed plugin loads either (the ids it would reserve cannot
+  be known);
 - the directory and the entry file are checked again just before loading, so
   a file replaced between discovery and load is refused.
 
 A directory that fails a check is skipped and listed with a plain-sentence
 reason; one bad plugin never stops the daemon or other plugins. A plugin that
 passes discovery but cannot be built into a runtime (for example, an entry
-file that is not a component) is listed with state `load_failed`.
+file that is not a component) is listed with state `load_failed`. So is a
+plugin whose stored configuration or sync state cannot be read at start
+("this plugin's stored state could not be read"): it is listed as disabled,
+and the daemon neither runs it nor writes over those rows.
 
 ## The API
 
@@ -341,7 +371,7 @@ header `Authorization: Bearer <daemon token>`. Errors are JSON:
 | `GET /v1/plugins/{id}/settings` | The settings as the user gave them. |
 | `PUT /v1/plugins/{id}/settings` | Replaces the settings (a JSON object, at most 64 KiB, checked against the manifest). |
 | `POST /v1/plugins/{id}/resources/{kind}/sync` | Queues a run of one resource now. |
-| `GET /v1/plugins/{id}/resources/{kind}/items?limit=&after=&q=` | One page of stored items (`limit` 1 to 200, default 50; `after` is the previous page's `next`; `q` filters by text, at most 256 characters). |
+| `GET /v1/plugins/{id}/resources/{kind}/items?limit=&after=&q=` | One page of stored items (`limit` 1 to 200, default 50; `after` is the previous page's `next`; `q`, at most 256 characters, keeps the items whose title contains it: titles only, not `fields`). |
 | `POST /v1/plugins/{id}/tools/{name}/install` | Installs a built-in plugin's tool with mise (see above). |
 
 A plugin's status carries `id`, `name`, `version`, `host`, `builtin`,
@@ -358,10 +388,12 @@ Error codes: `unauthorized` (401, missing or wrong token);
 `invalid_settings` (400, settings the manifest refuses), `bad_cursor` (400,
 malformed `after`), `payload_too_large` (settings body over the limit),
 `no_installer` (400, the tool has no mise package); `not_allowed` (403,
-installing the tool of an installed plugin); `plugin_disabled` (409, disabled,
-failed or unable to run), `sync_in_progress` (409, that resource is syncing
-now), `plugin_not_ready` (409, a sync was asked for while settings are
-missing or invalid; the message says why), `install_in_progress` (409),
+installing the tool of an installed plugin); `plugin_disabled` (409, a sync
+of a disabled plugin, or enabling or new settings for a plugin whose stored
+state could not be read), `sync_in_progress` (409, that resource is syncing
+now), `plugin_not_ready` (409, a sync of an enabled plugin that cannot run
+now: settings missing or invalid, `failed`, `load_failed`, or tools that need
+approval; the message says why), `install_in_progress` (409),
 `mise_missing` (409); `install_failed` (502, mise failed or timed out);
 `internal` (500).
 
@@ -375,7 +407,7 @@ the user lists:
 
 | Resource | Interval | Items |
 | --- | --- | --- |
-| `repository` | 1 hour | One item per repository: description, private and archived flags, default branch, open-issue and star counts, push time. A complete listing: repositories removed from settings are deleted. |
+| `repository` | 1 hour | One item per repository: description, private and archived flags, default branch, open-issue and star counts, push time. A complete listing: the `repository` item of a repository removed from settings is deleted (its issues and pull requests are not; see below). |
 | `issue` | 5 minutes | Issues (pull requests that the issues endpoint also lists are skipped). Id `owner/name#number`; `version` is `updated_at`; fields include state, author, labels, assignees, comment count. Bodies are not stored. |
 | `pull_request` | 5 minutes | Pull requests with state, draft and merged flags, author, labels, requested reviewers, head and base branch names. |
 
@@ -383,6 +415,10 @@ Details that matter when something looks off:
 
 - Setting `repositories` is a list of `owner/name`; names are checked, case
   folded for duplicates, sorted, and at most **50 repositories** are accepted.
+- **A repository removed from `repositories` keeps its issues and pull
+  requests.** They are listed by update time, never as a complete snapshot,
+  so nothing deletes them, and the host cannot yet delete items by
+  repository. They stay stored until a host-side delete-by-scope exists.
 - Issues and pull requests are listed **newest update first**
   (`sort=updated&direction=desc`), bounded by `since` after the first run. A
   change that lands while a listing is being read can then only repeat an item
@@ -486,6 +522,9 @@ Do not paste it into a bug report; it is not in the daemon's log by design.
 | Pages per run | 20 |
 | Settings body | 64 KiB |
 | Manifest file | 256 KiB |
+| Wasm component file | 64 MiB |
+| Log lines per call | 100, then one warning; the rest are dropped |
+| One log line | 2 KiB |
 
 A page over a limit, with a duplicate id, an empty id, `fields` that is not an
 object, or a bad `url` is refused as a whole and the run fails.
@@ -510,3 +549,6 @@ Be aware before relying on these; they do not exist today.
 - Approval of a third-party plugin's command-line tools: an installed plugin
   that declares `[[tools]]` stays in `needs_setup`.
 - GitHub Enterprise hosts and webhook-driven freshness.
+- Deleting by scope: the issues and pull requests of a repository removed
+  from GitHub's settings stay stored until the host can delete a scope of
+  items.
