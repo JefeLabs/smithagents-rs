@@ -19,7 +19,7 @@ use smithagents_core::agent::Repo;
 use smithagents_core::feedback::FeedbackStep;
 use smithagents_core::ids::RepoId;
 use smithagents_server::feedback::repo::{
-    commit_folder, place, push, FileSource, FolderFile, Placement,
+    commit_folder, place, place_and_commit, push, FileSource, FolderFile, Placement,
 };
 use smithagents_server::feedback::FeedbackError;
 use smithagents_server::git::{self, CommitError, GitError, PushError};
@@ -36,8 +36,20 @@ fn date() -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 11, 26).unwrap()
 }
 
-/// Points `HOME` and `XDG_CONFIG_HOME` at an empty directory and turns the
-/// system configuration off, once, before any test of this binary runs git.
+/// An identity a daemon may inherit from the shell that started it and must
+/// never put on a commit.
+const INHERITED_IDENTITY: [(&str, &str); 6] = [
+    ("GIT_AUTHOR_NAME", "LEAK Inherited Author"),
+    ("GIT_AUTHOR_EMAIL", "leak-author@example.invalid"),
+    ("GIT_AUTHOR_DATE", "2001-02-03T04:05:06Z"),
+    ("GIT_COMMITTER_NAME", "LEAK Inherited Committer"),
+    ("GIT_COMMITTER_EMAIL", "leak-committer@example.invalid"),
+    ("GIT_COMMITTER_DATE", "2001-02-03T04:05:06Z"),
+];
+
+/// Points `HOME` and `XDG_CONFIG_HOME` at an empty directory, turns the
+/// system configuration off and sets [`INHERITED_IDENTITY`], once, before any
+/// test of this binary runs git.
 fn isolate_git_config() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -46,11 +58,15 @@ fn isolate_git_config() {
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", &home);
         std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        for (name, value) in INHERITED_IDENTITY {
+            std::env::set_var(name, value);
+        }
     });
 }
 
-/// git as the test runs it: hooks and signing off, and no optional locks, so
-/// the test's own `git status` never rewrites the index it compares.
+/// git as the test runs it: hooks and signing off, no inherited identity,
+/// and no optional locks, so the test's own `git status` never rewrites the
+/// index it compares.
 fn git_cmd(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.args([
@@ -67,7 +83,76 @@ fn git_cmd(cwd: &Path, args: &[&str]) -> Command {
     .env_remove("GIT_DIR")
     .env_remove("GIT_WORK_TREE")
     .env_remove("GIT_INDEX_FILE");
+    for (name, _) in INHERITED_IDENTITY {
+        cmd.env_remove(name);
+    }
     cmd
+}
+
+/// What a crashed run of another daemon process leaves: a worktree under the
+/// feedback directory, locked the way `commit_folder` locks its own (pid 1
+/// is never the test's), whose directory the daemon removed at its start.
+fn crashed_leftover(fx: &Fixture, scratch_name: &str) -> PathBuf {
+    let dir = fx.scratch(scratch_name).join("wt");
+    git(
+        fx.root(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            "--lock",
+            "--reason",
+            "smithagents feedback pid 1",
+            dir.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::remove_dir_all(fx.scratch(scratch_name)).unwrap();
+    std::fs::canonicalize(fx.paths.feedback_tmp_dir())
+        .unwrap()
+        .join(scratch_name)
+        .join("wt")
+}
+
+/// The paths of the repository's registered worktrees.
+fn worktree_paths(root: &Path) -> Vec<String> {
+    git(root, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A worktree of the user's own whose folder was moved away: git still
+/// knows it (`.git/worktrees/<name>`) and a bare prune would delete that.
+fn moved_user_worktree(fx: &Fixture) -> PathBuf {
+    let dir = fx.tmp.path().join("user-wt");
+    git(
+        fx.root(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            dir.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::rename(&dir, fx.tmp.path().join("user-wt-moved")).unwrap();
+    let admin = fx.root().join(".git/worktrees/user-wt");
+    assert!(admin.join("HEAD").exists());
+    admin
+}
+
+/// Whether a process whose command line contains `pattern` is running.
+fn process_running(pattern: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-f", pattern])
+        .output()
+        .unwrap()
+        .status
+        .success()
 }
 
 /// Runs git, panicking on failure; stdout without its trailing newline.
@@ -264,13 +349,21 @@ async fn the_folder_is_committed_on_a_new_branch_from_the_default_branch() {
         "{tree}"
     );
     assert!(tree.contains("\tREADME.md"), "{tree}");
-    // Made with the repository's own identity.
+    // Made with the repository's own identity, not the one the daemon's
+    // environment holds (INHERITED_IDENTITY), and dated now.
     assert_eq!(
         git(
             fx.root(),
             &["log", "-1", "--format=%an <%ae>|%cn <%ce>", &commit]
         ),
         "Test User <test@example.invalid>|Test User <test@example.invalid>"
+    );
+    assert_eq!(
+        git(
+            fx.root(),
+            &["log", "-1", "--date=format:%Y", "--format=%ad %cd", &commit]
+        ),
+        format!("{0} {0}", Utc::now().format("%Y"))
     );
     // The user's checkout is as it was; nothing is left behind.
     assert_eq!(git(fx.root(), &["status", "--porcelain"]), "");
@@ -832,22 +925,10 @@ async fn a_dropped_commit_leaves_no_worktree() {
 #[tokio::test]
 async fn a_crashed_runs_worktree_is_cleaned_up_on_the_next_call() {
     let fx = Fixture::new();
-    // A run that crashed left a worktree in its scratch directory; the daemon
-    // removes `tmp/feedback` when it starts again, which leaves a stale
+    // A run of another daemon process crashed; the daemon removed
+    // `tmp/feedback` when it started again, which leaves a stale, locked
     // registration in the repository.
-    let crashed = fx.scratch("crashed").join("wt");
-    git(
-        fx.root(),
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            crashed.to_str().unwrap(),
-            "main",
-        ],
-    );
-    std::fs::remove_dir_all(fx.scratch("crashed")).unwrap();
+    crashed_leftover(&fx, "crashed");
     // A run that crashed in the very scratch directory it is given again.
     let scratch = fx.scratch("again");
     let leftover = scratch.join("wt");
@@ -1184,7 +1265,30 @@ async fn rev_parse_path_in_branch_and_delete_branch() {
         "{err:?}"
     );
 
-    git::prune_worktrees(root).await.unwrap();
+    let locked = fx.tmp.path().join("locked");
+    git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            "--lock",
+            "--reason",
+            "a reason",
+            locked.to_str().unwrap(),
+        ],
+    );
+    let entries = git::list_worktrees(root).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].path, root);
+    assert_eq!(entries[0].locked, None);
+    assert_eq!(entries[1].path, std::fs::canonicalize(&locked).unwrap());
+    assert_eq!(entries[1].locked.as_deref(), Some("a reason"));
+    git::remove_worktree_at(root, &entries[1].path)
+        .await
+        .unwrap();
+    assert_eq!(git::list_worktrees(root).await.unwrap().len(), 1);
 }
 
 /// A log writer that keeps everything written to it.
@@ -1262,4 +1366,552 @@ async fn nothing_git_prints_reaches_an_error_or_a_log() {
             assert!(!text.contains(word), "{word:?} in {text:?}");
         }
     }
+}
+
+// ---- Fix round 1 ----
+
+/// F1: git is never told to prune; only this tool's own registrations go.
+#[tokio::test]
+async fn a_users_worktree_whose_folder_moved_survives_every_path() {
+    let fx = Fixture::new();
+    let admin = moved_user_worktree(&fx);
+
+    // Success.
+    fx.submit("s1").await;
+    assert!(admin.join("HEAD").exists(), "the success path pruned it");
+
+    // Failure.
+    git(fx.root(), &["config", "--unset", "user.name"]);
+    let placement = place(&fx.repo, "Other", date(), false).await.unwrap();
+    let scratch = fx.scratch("s2");
+    let files = fx.files(&scratch);
+    let err = commit_folder(&fx.repo, &placement, &files, "Other", &scratch)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FeedbackError::GitIdentityMissing), "{err:?}");
+    assert!(admin.join("HEAD").exists(), "the failure path pruned it");
+    git(fx.root(), &["config", "user.name", "Test User"]);
+
+    // Leftovers of a crashed run go; a worktree under the feedback directory
+    // that this tool did not lock is left alone, as is the user's.
+    let crashed = crashed_leftover(&fx, "crashed");
+    let foreign = fx.scratch("foreign");
+    git(
+        fx.root(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            foreign.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::remove_dir_all(&foreign).unwrap();
+    let placement = place(&fx.repo, "Third", date(), false).await.unwrap();
+    let scratch = fx.scratch("s3");
+    let files = fx.files(&scratch);
+    commit_folder(&fx.repo, &placement, &files, "Third", &scratch)
+        .await
+        .unwrap();
+    let paths = worktree_paths(fx.root());
+    assert!(!paths.contains(&crashed.display().to_string()), "{paths:?}");
+    assert_eq!(
+        paths.len(),
+        3,
+        "the checkout, the user's, the foreign: {paths:?}"
+    );
+    assert!(admin.join("HEAD").exists(), "the leftover path pruned it");
+}
+
+/// F2: feedback files are committed byte for byte, whatever the
+/// repository's attributes and filters say, and no filter runs.
+#[tokio::test]
+async fn repository_attributes_and_filters_do_not_shape_the_commit() {
+    let fx = Fixture::new();
+    let ran = fx.tmp.path().join("filter-ran");
+    let filter = fx.tmp.path().join("filter");
+    executable(
+        &filter,
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran.display()),
+    );
+    std::fs::write(
+        fx.root().join(".gitattributes"),
+        "*.jpg filter=lfs diff=lfs merge=lfs -text\n\
+         *.png filter=custom\n\
+         *.md working-tree-encoding=UTF-16 ident text eol=crlf\n",
+    )
+    .unwrap();
+    git(fx.root(), &["add", ".gitattributes"]);
+    git(fx.root(), &["commit", "-q", "-m", "attributes"]);
+    let filter = filter.to_str().unwrap();
+    for driver in ["lfs", "custom"] {
+        for (key, value) in [
+            ("clean", filter),
+            ("smudge", filter),
+            ("process", filter),
+            ("required", "true"),
+        ] {
+            git(
+                fx.root(),
+                &["config", &format!("filter.{driver}.{key}"), value],
+            );
+        }
+    }
+    git(fx.root(), &["config", "core.autocrlf", "true"]);
+
+    let issue = "# Fix\r\nid: $Id: 0123 $\nna\u{ef}ve\n";
+    let jpeg: &[u8] = b"\xff\xd8\xff\xe0 a jpeg \r\n";
+    let scratch = fx.scratch("s");
+    let mut files = fx.files(&scratch);
+    files[0].source = FileSource::Text(issue.into());
+    let staged = scratch.join("upload/file-2");
+    std::fs::write(&staged, jpeg).unwrap();
+    files.push(FolderFile {
+        name: "image-1.jpg".into(),
+        source: FileSource::Staged(staged),
+    });
+    let placement = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    let commit = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+        .await
+        .unwrap();
+
+    let blob = |name: &str| {
+        git_bytes(
+            fx.root(),
+            &["cat-file", "blob", &format!("{commit}:{FOLDER}/{name}")],
+        )
+    };
+    assert_eq!(blob("issue.md"), issue.as_bytes());
+    assert_eq!(blob("screenshot-1.png"), SHOT);
+    assert_eq!(blob("image-1.jpg"), jpeg);
+    assert!(!ran.exists(), "a filter of the repository ran");
+}
+
+/// F3: a repository with a sparse checkout can take feedback, and its
+/// sparse checkout stays as it was.
+#[tokio::test]
+async fn a_sparse_checkout_repository_can_submit() {
+    let fx = Fixture::new();
+    fx.commit_on_main("src/a.txt", "a\n");
+    fx.commit_on_main("other/b.txt", "b\n");
+    git(fx.root(), &["sparse-checkout", "set", "src"]);
+    let sparse = git(fx.root(), &["sparse-checkout", "list"]);
+    let status = git(fx.root(), &["status", "--porcelain=v2", "--branch"]);
+
+    let (_, commit) = fx.submit("s").await;
+
+    assert_eq!(
+        git(fx.root(), &["show", "--name-only", "--format=", &commit]),
+        format!("{FOLDER}/issue.md\n{FOLDER}/screenshot-1.png")
+    );
+    let tree = git(fx.root(), &["ls-tree", "-r", "--name-only", &commit]);
+    assert!(
+        tree.contains("other/b.txt") && tree.contains("src/a.txt"),
+        "{tree}"
+    );
+    assert_eq!(git(fx.root(), &["sparse-checkout", "list"]), sparse);
+    assert_eq!(
+        git(fx.root(), &["status", "--porcelain=v2", "--branch"]),
+        status
+    );
+}
+
+/// F4: a name that was taken after `place` chose it is its own outcome, and
+/// nothing is created.
+#[tokio::test]
+async fn a_name_taken_since_placing_is_reported_and_nothing_is_created() {
+    let fx = Fixture::new();
+    let placement = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    git(fx.root(), &["branch", BRANCH]);
+    let scratch = fx.scratch("s1");
+    let files = fx.files(&scratch);
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FeedbackError::NameTaken), "{err:?}");
+    assert_eq!(err.code(), "name_taken");
+    assert_eq!(err.status().as_u16(), 409);
+    assert_eq!(
+        err.to_string(),
+        "an issue folder or branch of this name was created meanwhile; submit again"
+    );
+    assert_eq!(
+        git(fx.root(), &["rev-parse", BRANCH]),
+        git(fx.root(), &["rev-parse", "main"])
+    );
+    assert!(!scratch.join("wt").exists());
+    assert!(
+        scratch.join("upload/file-1").exists(),
+        "the upload stays for a retry"
+    );
+
+    // The folder appeared on the default branch.
+    let fresh = Fixture::new();
+    let placement = place(&fresh.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    fresh.commit_on_main(&format!("{FOLDER}/issue.md"), "theirs\n");
+    let scratch = fresh.scratch("s");
+    let files = fresh.files(&scratch);
+    let err = commit_folder(&fresh.repo, &placement, &files, "Fix the zoom", &scratch)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FeedbackError::NameTaken), "{err:?}");
+    assert_eq!(fresh.feedback_branches(), "");
+}
+
+/// F4: the same title submitted twice at once gets the next suffix.
+#[tokio::test]
+async fn the_same_title_submitted_twice_at_once_gets_two_names() {
+    let fx = Fixture::new();
+    let (scratch_a, scratch_b) = (fx.scratch("a"), fx.scratch("b"));
+    let (files_a, files_b) = (fx.files(&scratch_a), fx.files(&scratch_b));
+    let (a, b) = tokio::join!(
+        place_and_commit(
+            &fx.repo,
+            "Fix the zoom",
+            date(),
+            false,
+            &files_a,
+            &scratch_a
+        ),
+        place_and_commit(
+            &fx.repo,
+            "Fix the zoom",
+            date(),
+            false,
+            &files_b,
+            &scratch_b
+        ),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let mut slugs = vec![a.0.slug.clone(), b.0.slug.clone()];
+    slugs.sort();
+    assert_eq!(slugs, ["fix-the-zoom", "fix-the-zoom-2"]);
+    for (placement, commit) in [&a, &b] {
+        assert_eq!(git(fx.root(), &["rev-parse", &placement.branch]), *commit);
+        assert_eq!(
+            git(fx.root(), &["show", "--name-only", "--format=", commit]),
+            format!("{0}/issue.md\n{0}/screenshot-1.png", placement.folder)
+        );
+    }
+    assert_eq!(fx.feedback_branches().lines().count(), 2);
+    assert_eq!(fx.worktree_lines(), 1);
+}
+
+/// Holds the lock of `branch` the way a stuck git process would, and makes
+/// git wait for such a lock for ever.
+fn hold_branch_lock(fx: &Fixture, branch: &str) -> PathBuf {
+    git(fx.root(), &["config", "core.filesRefLockTimeout", "-1"]);
+    let lock = fx
+        .root()
+        .join(".git/refs/heads")
+        .join(format!("{branch}.lock"));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "").unwrap();
+    lock
+}
+
+/// F5: a git that never returns is stopped; what this tool made is removed
+/// and the lock it did not make is left.
+#[tokio::test]
+async fn a_git_that_never_returns_is_stopped_and_cleaned_up() {
+    let fx = Fixture::new();
+    let placement = place(&fx.repo, "Hang one", date(), false).await.unwrap();
+    let lock = hold_branch_lock(&fx, &placement.branch);
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+    let started = Instant::now();
+    let err = git::with_git_timeout(
+        Duration::from_secs(2),
+        commit_folder(&fx.repo, &placement, &files, "Hang one", &scratch),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(
+            err,
+            FeedbackError::Git {
+                step: "commit the files",
+                status: None
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "git could not commit the files (no exit status)"
+    );
+    assert!(lock.exists(), "a lock this tool did not make is left");
+    assert!(!git::branch_exists(fx.root(), &placement.branch)
+        .await
+        .unwrap());
+    assert!(!scratch.join("wt").exists());
+    assert_eq!(fx.worktree_lines(), 1);
+    assert!(!process_running(&placement.branch), "git still runs");
+}
+
+/// F5: dropping the future while git hangs kills git and cleans up.
+#[tokio::test]
+async fn dropping_a_hung_commit_kills_git_and_cleans_up() {
+    let fx = Fixture::new();
+    let placement = place(&fx.repo, "Hang two", date(), false).await.unwrap();
+    let lock = hold_branch_lock(&fx, &placement.branch);
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(3),
+        commit_folder(&fx.repo, &placement, &files, "Hang two", &scratch),
+    )
+    .await;
+    assert!(dropped.is_err(), "the commit should have hung: {dropped:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!process_running(&placement.branch), "git still runs");
+    assert!(lock.exists());
+    assert!(!git::branch_exists(fx.root(), &placement.branch)
+        .await
+        .unwrap());
+    assert!(!scratch.join("wt").exists());
+    assert_eq!(fx.worktree_lines(), 1);
+}
+
+/// F7: the URL is the one pushes go to, with any credential in it removed.
+#[tokio::test]
+async fn origin_url_prefers_the_push_url_and_hides_credentials() {
+    let fx = Fixture::new();
+    git(
+        fx.root(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://someone:LEAK-token@github.com/smithagents-test-invalid/widgets.git",
+        ],
+    );
+    assert_eq!(
+        git::origin_url(fx.root()).await.unwrap().as_deref(),
+        Some(GITHUB_URL)
+    );
+    git(
+        fx.root(),
+        &[
+            "config",
+            "remote.origin.pushurl",
+            "https://x-access-token:LEAK@github.com/smithagents-test-invalid/fork.git",
+        ],
+    );
+    assert_eq!(
+        git::origin_url(fx.root()).await.unwrap().as_deref(),
+        Some("https://github.com/smithagents-test-invalid/fork.git")
+    );
+}
+
+/// F7: a remote with only a push URL is a remote.
+#[tokio::test]
+async fn a_push_url_alone_is_a_remote() {
+    let fx = Fixture::new();
+    let bare = fx.tmp.path().join("push-only.git");
+    git(
+        fx.tmp.path(),
+        &["init", "-q", "--bare", bare.to_str().unwrap()],
+    );
+    git(
+        fx.root(),
+        &["config", "remote.origin.pushurl", bare.to_str().unwrap()],
+    );
+    assert_eq!(
+        git::origin_url(fx.root()).await.unwrap(),
+        Some(bare.display().to_string())
+    );
+    let (placement, commit) = fx.submit("s").await;
+    push(&fx.repo, &placement.branch, &placement.branch)
+        .await
+        .unwrap();
+    assert_eq!(git(&bare, &["rev-parse", BRANCH]), commit);
+}
+
+/// F8: a branch name is read as a branch, even when a tag has its name.
+#[tokio::test]
+async fn a_tag_named_like_a_branch_does_not_win() {
+    let fx = Fixture::new();
+    fx.commit_on_main("docs/x/a.md", "tag\n");
+    git(fx.root(), &["tag", "fix"]);
+    git(fx.root(), &["checkout", "-q", "-b", "fix"]);
+    fx.commit_on_main("docs/x/a.md", "branch\n");
+    fx.commit_on_main("docs/x/b.md", "b\n");
+    git(fx.root(), &["checkout", "-q", "main"]);
+    let root = fx.root();
+    assert_eq!(
+        git::show_file(root, "fix", "docs/x/a.md", 100)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("branch\n")
+    );
+    assert_eq!(
+        git::show_file(root, "refs/heads/fix", "docs/x/a.md", 100)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("branch\n")
+    );
+    assert_eq!(
+        git::list_folder(root, "fix", "docs/x").await.unwrap(),
+        vec!["a.md".to_string(), "b.md".to_string()]
+    );
+}
+
+/// F8: a path is a path, never a pattern.
+#[tokio::test]
+async fn pathspec_magic_in_a_path_is_literal() {
+    let fx = Fixture::new();
+    let dir = fx.tmp.path().join("wt");
+    let tip = git(fx.root(), &["rev-parse", "main"]);
+    git::add_detached_worktree(fx.root(), &dir, &tip, "a test of pathspecs")
+        .await
+        .unwrap();
+    std::fs::write(dir.join("x.md"), "x").unwrap();
+    std::fs::write(dir.join("[x].md"), "pattern").unwrap();
+    std::fs::write(dir.join(":(glob)y.md"), "magic").unwrap();
+    std::fs::write(dir.join("y.md"), "y").unwrap();
+    let commit = git::commit_paths(&dir, &["[x].md", ":(glob)y.md"], "m")
+        .await
+        .unwrap();
+    assert_eq!(
+        git(fx.root(), &["show", "--name-only", "--format=", &commit]),
+        ":(glob)y.md\n[x].md"
+    );
+    git(
+        fx.root(),
+        &["worktree", "remove", "-f", "-f", dir.to_str().unwrap()],
+    );
+}
+
+/// F8: the message goes to git on stdin, as one clean line.
+#[tokio::test]
+async fn a_long_title_and_a_bidi_override_make_one_clean_subject() {
+    let fx = Fixture::new();
+    let long = "a".repeat(300 * 1024);
+    let placement = place(&fx.repo, "Long", date(), false).await.unwrap();
+    let scratch = fx.scratch("s1");
+    let files = fx.files(&scratch);
+    let commit = commit_folder(&fx.repo, &placement, &files, &long, &scratch)
+        .await
+        .unwrap();
+    assert_eq!(
+        git(fx.root(), &["log", "-1", "--format=%s", &commit]),
+        format!("docs(issues): {long}")
+    );
+
+    let placement = place(&fx.repo, "Bidi", date(), false).await.unwrap();
+    let scratch = fx.scratch("s2");
+    let files = fx.files(&scratch);
+    let title = "Fix \u{202e}the\u{200b} zoom\u{2066}\u{feff}";
+    let commit = commit_folder(&fx.repo, &placement, &files, title, &scratch)
+        .await
+        .unwrap();
+    assert_eq!(
+        git(fx.root(), &["log", "-1", "--format=%B", &commit]),
+        "docs(issues): Fix the zoom"
+    );
+}
+
+/// F9: a file where the issue folders go is never replaced.
+#[tokio::test]
+async fn a_file_where_the_folders_go_is_refused() {
+    for path in ["docs/issues", "docs"] {
+        let fx = Fixture::new();
+        let placement = Placement {
+            slug: "fix-the-zoom".into(),
+            folder: FOLDER.into(),
+            branch: BRANCH.into(),
+        };
+        fx.commit_on_main(path, "the user's file\n");
+        let err = place(&fx.repo, "Fix the zoom", date(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FeedbackError::FolderBlocked(p) if p == path),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("{path} is a file in this repository, so feedback cannot be stored there.")
+        );
+        assert_eq!(err.code(), "folder_blocked");
+        assert_eq!(err.status().as_u16(), 409);
+
+        let scratch = fx.scratch("s");
+        let files = fx.files(&scratch);
+        let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FeedbackError::FolderBlocked(p) if p == path),
+            "{err:?}"
+        );
+        assert_eq!(fx.feedback_branches(), "");
+        assert_eq!(fx.worktree_lines(), 1);
+    }
+}
+
+/// F9: a branch named `feedback` or `idea` blocks every branch under it.
+#[tokio::test]
+async fn a_branch_named_like_the_prefix_is_refused() {
+    let fx = Fixture::new();
+    git(fx.root(), &["branch", "feedback"]);
+    let err = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, FeedbackError::BranchBlocked(b) if b == "feedback"),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "a branch named feedback exists in this repository, so no branch can be created under feedback/"
+    );
+    assert_eq!(err.code(), "branch_blocked");
+    assert_eq!(err.status().as_u16(), 409);
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+    let placement = Placement {
+        slug: "fix-the-zoom".into(),
+        folder: FOLDER.into(),
+        branch: BRANCH.into(),
+    };
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, FeedbackError::BranchBlocked(b) if b == "feedback"),
+        "{err:?}"
+    );
+
+    // An idea is not blocked by `feedback`, but is by `idea`.
+    assert_eq!(
+        place(&fx.repo, "Fix the zoom", date(), true)
+            .await
+            .unwrap()
+            .branch,
+        "idea/fix-the-zoom"
+    );
+    git(fx.root(), &["branch", "idea"]);
+    let err = place(&fx.repo, "Fix the zoom", date(), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, FeedbackError::BranchBlocked(b) if b == "idea"),
+        "{err:?}"
+    );
 }

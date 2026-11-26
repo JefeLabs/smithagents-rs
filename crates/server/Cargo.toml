@@ -60,6 +60,11 @@ path = "tests/intents.rs"
 required-features = ["test-util"]
 
 [[test]]
+name = "feedback_repo"
+path = "tests/feedback_repo.rs"
+required-features = ["test-util"]
+
+[[test]]
 name = "queue"
 path = "tests/queue.rs"
 required-features = ["test-util"]

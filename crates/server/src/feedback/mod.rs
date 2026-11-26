@@ -36,6 +36,20 @@ pub enum FeedbackError {
     },
     #[error("99 issue folders with this name already exist")]
     NoFreeName,
+    /// The branch or folder `place` chose was created by someone else before
+    /// the commit could use it.
+    #[error("an issue folder or branch of this name was created meanwhile; submit again")]
+    NameTaken,
+    /// `docs` or `docs/issues` is a file (or anything but a folder) on the
+    /// default branch.
+    #[error("{0} is a file in this repository, so feedback cannot be stored there.")]
+    FolderBlocked(String),
+    /// A branch named like the first part of the branch to create
+    /// (`feedback`, `idea`) exists, so git cannot create one under it.
+    #[error(
+        "a branch named {0} exists in this repository, so no branch can be created under {0}/"
+    )]
+    BranchBlocked(String),
     /// A file of the issue folder could not be read or written, or a name in
     /// it was not safe to use (`InvalidInput`).
     #[error("could not prepare the issue folder: {0}")]
@@ -51,6 +65,9 @@ impl FeedbackError {
             Self::GitIdentityMissing => "git_identity_missing",
             Self::Git { .. } => "git_failed",
             Self::NoFreeName => "no_free_name",
+            Self::NameTaken => "name_taken",
+            Self::FolderBlocked(_) => "folder_blocked",
+            Self::BranchBlocked(_) => "branch_blocked",
             Self::Io(_) => "io_error",
         }
     }
@@ -58,9 +75,12 @@ impl FeedbackError {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::RepoNotFound => StatusCode::NOT_FOUND,
-            Self::DefaultBranchMissing(_) | Self::GitIdentityMissing | Self::NoFreeName => {
-                StatusCode::CONFLICT
-            }
+            Self::DefaultBranchMissing(_)
+            | Self::GitIdentityMissing
+            | Self::NoFreeName
+            | Self::NameTaken
+            | Self::FolderBlocked(_)
+            | Self::BranchBlocked(_) => StatusCode::CONFLICT,
             Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

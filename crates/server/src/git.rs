@@ -3,11 +3,13 @@
 //! All commands are spawned directly (never through a shell) with arguments
 //! passed separately, so paths containing spaces or unicode need no escaping.
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::child_env::remove_plugin_secrets;
@@ -41,6 +43,9 @@ pub enum GitError {
     /// never read as an option.
     #[error("a name passed to git must not start with -")]
     UnsafeArgument,
+    /// git did not finish in its time and was killed with its process group.
+    #[error("git did not finish in time")]
+    TimedOut,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -263,14 +268,57 @@ pub async fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), Gi
     Ok(())
 }
 
-// What follows is used by the feedback tool in a user's repository. Every
-// command is isolated (see [`isolated_command`]); none returns or logs what
-// git printed; a value from the user is passed after `--` or where git cannot
-// read it as an option, and one starting with `-` is refused before git runs.
+// What follows is used by the feedback tool in a user's repository.
+//
+// Every command is isolated (see [`isolated_command`]) and runs in a process
+// group of its own for a bounded time (see [`run`]): the whole group is
+// killed when the time is up or the future is dropped. None returns or logs
+// what git printed. A value from the user is passed after `--` or where git
+// cannot read it as an option, and one starting with `-` is refused before
+// git runs. Over SSH, ssh itself may still prompt on a terminal the daemon
+// has (an unknown host key, a passphrase); a push then waits until its
+// timeout.
+
+/// The longest a local git command of the feedback tool may take.
+pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The most of stdout a command keeps; the rest is read and dropped.
+const OUTPUT_MAX: u64 = 16 * 1024 * 1024;
+/// The most of stderr a command keeps, only ever to classify a failure.
+const ERROR_OUTPUT_MAX: u64 = 64 * 1024;
+
+tokio::task_local! {
+    /// Another [`LOCAL_TIMEOUT`] for one task (see [`with_git_timeout`]).
+    static TIMEOUT_OVERRIDE: Duration;
+}
+
+/// The time a local command may take in this task.
+pub(crate) fn local_timeout() -> Duration {
+    TIMEOUT_OVERRIDE
+        .try_with(|timeout| *timeout)
+        .unwrap_or(LOCAL_TIMEOUT)
+}
+
+/// Runs `f` with every local git command of the feedback tool limited to
+/// `timeout` instead of [`LOCAL_TIMEOUT`].
+#[cfg(feature = "test-util")]
+pub async fn with_git_timeout<F: std::future::Future>(timeout: Duration, f: F) -> F::Output {
+    TIMEOUT_OVERRIDE.scope(timeout, f).await
+}
+
+/// `f` (a git call not made through [`run`]) limited to [`local_timeout`];
+/// git is killed when the time is up.
+pub(crate) async fn bounded<T>(
+    f: impl std::future::Future<Output = Result<T, GitError>>,
+) -> Result<T, GitError> {
+    tokio::time::timeout(local_timeout(), f)
+        .await
+        .unwrap_or(Err(GitError::TimedOut))
+}
 
 /// Configuration given ahead of the repository's own: no hook, file-system
-/// monitor or signing program runs, and no background maintenance starts.
-const ISOLATED_CONFIG: [&str; 10] = [
+/// monitor or signing program runs, no background maintenance starts, and a
+/// sparse checkout of the user's does not narrow what is committed.
+const ISOLATED_CONFIG: [&str; 14] = [
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
@@ -281,36 +329,196 @@ const ISOLATED_CONFIG: [&str; 10] = [
     "gc.auto=0",
     "-c",
     "maintenance.auto=false",
+    "-c",
+    "core.sparseCheckout=false",
+    "-c",
+    "index.sparse=false",
 ];
 
-/// [`git_command`] with [`ISOLATED_CONFIG`], no editor (`GIT_EDITOR=:` is
-/// git's "start none") and no program that asks a person for a credential:
-/// an empty `GIT_ASKPASS` stops git looking for one, `SSH_ASKPASS` is
-/// removed, and Git Credential Manager is told not to open a window.
+/// Variables the daemon may have inherited that would point git at other
+/// objects or refs, or put another identity or date on a commit.
+const UNWANTED_ENV: [&str; 12] = [
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+    "SSH_ASKPASS",
+];
+
+/// [`git_command`] with [`ISOLATED_CONFIG`] and without [`UNWANTED_ENV`]; no
+/// editor (`GIT_EDITOR=:` is git's "start none"); paths are never patterns
+/// (`GIT_LITERAL_PATHSPECS`); and no program asks a person for a credential:
+/// an empty `GIT_ASKPASS` stops git looking for one, and Git Credential
+/// Manager is told not to open a window.
 fn isolated_command(cwd: &Path, args: &[&str]) -> Command {
     let all: Vec<&str> = ISOLATED_CONFIG.iter().chain(args).copied().collect();
     let mut cmd = git_command(cwd, &all);
     cmd.env("GIT_EDITOR", ":")
         .env("GIT_ASKPASS", "")
         .env("GCM_INTERACTIVE", "never")
-        .env_remove("SSH_ASKPASS");
+        .env("GIT_LITERAL_PATHSPECS", "1");
+    for name in UNWANTED_ENV {
+        cmd.env_remove(name);
+    }
     cmd
 }
 
-async fn isolated(cwd: &Path, args: &[&str]) -> Result<Output, GitError> {
-    Ok(isolated_command(cwd, args).output().await?)
+/// What a command printed (the start of it) and how it ended.
+struct Ran {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl Ran {
+    fn ok(&self) -> Result<(), GitError> {
+        if self.status.success() {
+            Ok(())
+        } else {
+            Err(GitError::Failed {
+                status: self.status.code(),
+            })
+        }
+    }
+
+    fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).trim().to_string()
+    }
+}
+
+/// Runs `cmd` in a process group of its own for at most `timeout`, with
+/// `input` (or nothing) on stdin. The whole group is killed when the time is
+/// up (`TimedOut`) or the future is dropped.
+async fn run(
+    mut cmd: Command,
+    timeout: Duration,
+    input: Option<&[u8]>,
+    stdout_max: u64,
+) -> Result<Ran, GitError> {
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn()?;
+    // Declared after `child`, so it is dropped first: the group is killed
+    // while its leader is not yet reaped and its id cannot be reused.
+    let mut group = GroupKiller(child.id());
+    let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let write = async move {
+        if let (Some(mut pipe), Some(bytes)) = (stdin, input) {
+            // git may stop reading early; its exit status tells.
+            let _ = pipe.write_all(bytes).await;
+        }
+    };
+    let finish = async {
+        let (_, stdout, stderr, status) = tokio::join!(
+            write,
+            read_capped(stdout, stdout_max),
+            read_capped(stderr, ERROR_OUTPUT_MAX),
+            child.wait()
+        );
+        status.map(|status| Ran {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    match tokio::time::timeout(timeout, finish).await {
+        Ok(Ok(ran)) => {
+            group.0 = None;
+            Ok(ran)
+        }
+        Ok(Err(e)) => Err(GitError::Io(e)),
+        Err(_) => Err(GitError::TimedOut),
+    }
+}
+
+async fn read_capped<R: AsyncRead + Unpin>(pipe: Option<R>, max: u64) -> Vec<u8> {
+    let Some(mut pipe) = pipe else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    let _ = (&mut pipe).take(max).read_to_end(&mut kept).await;
+    let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
+    kept
+}
+
+/// Kills the process group led by the process it names when dropped, unless
+/// cleared first.
+struct GroupKiller(Option<u32>);
+
+impl Drop for GroupKiller {
+    fn drop(&mut self) {
+        kill_group(self.0);
+    }
+}
+
+fn kill_group(leader: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = leader
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        // The group may be gone already.
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
+/// [`run`] for a `Drop`: blocking, output discarded, at most `timeout`; only
+/// whether git succeeded.
+fn run_blocking(cmd: Command, timeout: Duration) -> bool {
+    let mut cmd = cmd.into_std();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                kill_group(Some(child.id()));
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Runs an isolated command for at most [`local_timeout`].
+async fn isolated(cwd: &Path, args: &[&str]) -> Result<Ran, GitError> {
+    run(
+        isolated_command(cwd, args),
+        local_timeout(),
+        None,
+        OUTPUT_MAX,
+    )
+    .await
 }
 
 /// Runs an isolated command and keeps only whether it succeeded.
 async fn isolated_ok(cwd: &Path, args: &[&str]) -> Result<(), GitError> {
-    let out = isolated(cwd, args).await?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(GitError::Failed {
-            status: out.status.code(),
-        })
-    }
+    isolated(cwd, args).await?.ok()
 }
 
 fn refuse_option_like(value: &str) -> Result<(), GitError> {
@@ -319,6 +527,18 @@ fn refuse_option_like(value: &str) -> Result<(), GitError> {
     } else {
         Ok(())
     }
+}
+
+/// `rev` as a commit id (40 or 64 hex digits) or a local branch: any other
+/// name is read as `refs/heads/<name>`, so a tag of the same name never wins.
+fn branch_or_commit(rev: &str) -> Result<String, GitError> {
+    refuse_option_like(rev)?;
+    let is_id = matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit());
+    Ok(if is_id || rev.starts_with("refs/heads/") {
+        rev.to_string()
+    } else {
+        format!("refs/heads/{rev}")
+    })
 }
 
 /// Whether `path` (a file or a folder) exists on the local branch `branch`:
@@ -332,15 +552,57 @@ pub async fn path_in_branch(repo_root: &Path, branch: &str, path: &str) -> Resul
         .success())
 }
 
-/// `remote.origin.url` as configured (`git config --get`), not rewritten by
-/// `url.<base>.insteadOf` as `git remote get-url` would. `None` when unset.
+/// What `path` is at `rev` (a local branch or a commit id, see
+/// [`show_file`]): `blob` (a file or a link), `tree` (a folder) or `commit`
+/// (a submodule); `None` when nothing is there.
+pub async fn path_kind(
+    repo_root: &Path,
+    rev: &str,
+    path: &str,
+) -> Result<Option<String>, GitError> {
+    object_type(repo_root, &format!("{}:{path}", branch_or_commit(rev)?)).await
+}
+
+/// The URL pushes to `origin` go to, as configured: `remote.origin.pushurl`
+/// when set, else `remote.origin.url`, with any user name and password
+/// removed (`https://user:token@host/…` is `https://host/…`). It is read
+/// with `git config`, so a `url.<base>.insteadOf` rewrite is not applied.
+/// `None` when neither is set.
 pub async fn origin_url(repo_root: &Path) -> Result<Option<String>, GitError> {
-    let out = isolated(repo_root, &["config", "--get", "remote.origin.url"]).await?;
-    match out.status.code() {
-        Some(0) => Ok(Some(stdout_of(&out)).filter(|url| !url.is_empty())),
-        // The key is not set.
-        Some(1) => Ok(None),
-        status => Err(GitError::Failed { status }),
+    for key in ["remote.origin.pushurl", "remote.origin.url"] {
+        let ran = isolated(repo_root, &["config", "--get-all", key]).await?;
+        match ran.status.code() {
+            Some(0) => {
+                let text = String::from_utf8_lossy(&ran.stdout);
+                if let Some(url) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    return Ok(Some(without_userinfo(url)));
+                }
+            }
+            // The key is not set.
+            Some(1) => {}
+            status => return Err(GitError::Failed { status }),
+        }
+    }
+    Ok(None)
+}
+
+/// `url` without the user name and password of its authority:
+/// `scheme://user:pass@host/path` and the scp-like `user@host:path`.
+pub(crate) fn without_userinfo(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let end = rest.find('/').unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        return format!("{scheme}://{host}{path}");
+    }
+    match url.split_once(':') {
+        Some((before, after)) if !before.contains('/') => match before.rsplit_once('@') {
+            Some((_, host)) => format!("{host}:{after}"),
+            None => url.to_string(),
+        },
+        _ => url.to_string(),
     }
 }
 
@@ -348,25 +610,23 @@ pub async fn origin_url(repo_root: &Path) -> Result<Option<String>, GitError> {
 pub async fn rev_parse(repo_root: &Path, rev: &str) -> Result<Option<String>, GitError> {
     refuse_option_like(rev)?;
     let commit = format!("{rev}^{{commit}}");
-    let out = isolated(repo_root, &["rev-parse", "--verify", "--quiet", &commit]).await?;
-    match out.status.code() {
-        Some(0) => Ok(Some(stdout_of(&out)).filter(|id| !id.is_empty())),
+    let ran = isolated(repo_root, &["rev-parse", "--verify", "--quiet", &commit]).await?;
+    match ran.status.code() {
+        Some(0) => Ok(Some(ran.stdout_text()).filter(|id| !id.is_empty())),
         Some(1) => Ok(None),
         status => Err(GitError::Failed { status }),
     }
 }
 
-/// Forgets the worktrees whose directory is gone: `git worktree prune`.
-pub async fn prune_worktrees(repo_root: &Path) -> Result<(), GitError> {
-    isolated_ok(repo_root, &["worktree", "prune"]).await
-}
-
-/// [`prune_worktrees`] for a `Drop`: blocking, and only whether it worked.
-pub(crate) fn prune_worktrees_blocking(repo_root: &Path) -> bool {
-    isolated_command(repo_root, &["worktree", "prune"])
-        .into_std()
-        .output()
-        .is_ok_and(|out| out.status.success())
+/// The repository's common git directory, absolute (where `refs/` is).
+pub async fn common_dir(repo_root: &Path) -> Result<PathBuf, GitError> {
+    let ran = isolated(
+        repo_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await?;
+    ran.ok()?;
+    Ok(PathBuf::from(ran.stdout_text()))
 }
 
 /// Deletes the local branch `branch`, merged or not: `git branch -D`.
@@ -383,17 +643,20 @@ pub async fn create_branch(repo_root: &Path, branch: &str, commit: &str) -> Resu
     isolated_ok(repo_root, &["branch", "--no-track", "--", branch, commit]).await
 }
 
-/// Adds a worktree at `dir` (which must not exist) with `HEAD` detached at
-/// `commit` and the index read from it, but no file checked out: a commit
-/// made there keeps every other file of `commit`, and nothing the repository
-/// holds (a checkout hook, a smudge filter, a symbolic link) runs or is
-/// followed while the worktree is made or written to.
+/// Adds a worktree at `dir` (which must not exist), locked with
+/// `lock_reason`, with `HEAD` detached at `commit` and the index read from it
+/// but no file checked out. A commit made there keeps every other file of
+/// `commit`, and nothing the repository holds (a checkout hook, a smudge
+/// filter, a symbolic link) runs or is followed. The lock keeps a prune by
+/// anyone else from removing the worktree while it is used, and names it.
 pub async fn add_detached_worktree(
     repo_root: &Path,
     dir: &Path,
     commit: &str,
+    lock_reason: &str,
 ) -> Result<(), GitError> {
     refuse_option_like(commit)?;
+    refuse_option_like(lock_reason)?;
     let dir_arg = dir.to_string_lossy().into_owned();
     isolated_ok(
         repo_root,
@@ -402,6 +665,9 @@ pub async fn add_detached_worktree(
             "add",
             "--detach",
             "--no-checkout",
+            "--lock",
+            "--reason",
+            lock_reason,
             "--",
             &dir_arg,
             commit,
@@ -411,22 +677,155 @@ pub async fn add_detached_worktree(
     isolated_ok(dir, &["read-tree", "HEAD"]).await
 }
 
+fn remove_worktree_command(repo_root: &Path, dir: &Path) -> Command {
+    let dir_arg = dir.to_string_lossy().into_owned();
+    isolated_command(
+        repo_root,
+        &["worktree", "remove", "--force", "--force", "--", &dir_arg],
+    )
+}
+
+/// Removes the one worktree registered at `dir`, locked or not, with its
+/// directory if there is one: `git worktree remove --force --force`. Nothing
+/// else is pruned: a worktree of the user's whose folder is missing (moved,
+/// on a volume not mounted) keeps its data.
+pub async fn remove_worktree_at(repo_root: &Path, dir: &Path) -> Result<(), GitError> {
+    run(
+        remove_worktree_command(repo_root, dir),
+        local_timeout(),
+        None,
+        OUTPUT_MAX,
+    )
+    .await?
+    .ok()
+}
+
+/// [`remove_worktree_at`] for a `Drop`: blocking, at most `timeout`.
+pub(crate) fn remove_worktree_at_blocking(repo_root: &Path, dir: &Path, timeout: Duration) -> bool {
+    run_blocking(remove_worktree_command(repo_root, dir), timeout)
+}
+
+/// A worktree the repository knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    /// The lock's reason (empty when it has none); `None` when not locked.
+    pub locked: Option<String>,
+}
+
+/// The repository's worktrees, the main one first: `git worktree list
+/// --porcelain -z`.
+pub async fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, GitError> {
+    let ran = isolated(repo_root, &["worktree", "list", "--porcelain", "-z"]).await?;
+    ran.ok()?;
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    for field in ran.stdout.split(|b| *b == 0) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            entries.push(WorktreeEntry {
+                path: PathBuf::from(std::ffi::OsStr::from_bytes(path)),
+                locked: None,
+            });
+        } else if let Some(entry) = entries.last_mut() {
+            if field == b"locked" {
+                entry.locked = Some(String::new());
+            } else if let Some(reason) = field.strip_prefix(b"locked ") {
+                entry.locked = Some(String::from_utf8_lossy(reason).into_owned());
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// What git prints, in the C locale, when it knows no identity to commit as.
 const IDENTITY_MISSING: &str = "Please tell me who you are";
 
-/// `git add -- <paths>` and `git commit --no-verify -m <message>` in
+/// Configuration for adding and committing feedback files: Git LFS is named
+/// and turned off (a second line behind `GIT_ATTR_SOURCE`, which keeps every
+/// in-tree attribute away), the global attributes file is not read, and line
+/// endings are never converted.
+const NO_ATTRIBUTES_CONFIG: [&str; 14] = [
+    "-c",
+    "filter.lfs.clean=",
+    "-c",
+    "filter.lfs.smudge=",
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "filter.lfs.required=false",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.safecrlf=false",
+];
+
+/// `git add -- <paths>` and `git commit --no-verify` with `message` in
 /// `worktree`, then the new commit's id.
 ///
-/// Ignore rules do not drop a path (`--force`). The author is the identity
-/// configured for the repository, never one git guesses from the user and
-/// host names (`user.useConfigOnly`). The commit is never signed: a signing
-/// program could wait for a passphrase no one is there to type.
-/// `--cleanup=whitespace` keeps a configured comment character from eating
-/// the message.
+/// The files are committed byte for byte as plain blobs: no attribute of the
+/// repository applies, so no filter (Git LFS, git-crypt, …), `ident`,
+/// `working-tree-encoding` or line-ending conversion runs or changes them.
+/// With git 2.40 or later attributes are read from the empty tree
+/// (`GIT_ATTR_SOURCE`); with an older git each file is stored with `git
+/// hash-object --no-filters` and `git update-index --cacheinfo`, and its
+/// working copy is removed so the commit never reads it again.
+///
+/// Ignore rules do not drop a path; a path is never a pattern. The author is
+/// the identity configured for the repository, never one git guesses from
+/// the user and host names (`user.useConfigOnly`). The commit is never
+/// signed: a signing program could wait for a passphrase no one is there to
+/// type. The message goes on stdin, and `--cleanup=whitespace` keeps a
+/// configured comment character from eating it.
 pub async fn commit_paths(
     worktree: &Path,
     paths: &[&str],
     message: &str,
+) -> Result<String, CommitError> {
+    let attr_source = attr_source_supported(worktree).await;
+    commit_paths_with(worktree, paths, message, attr_source).await
+}
+
+/// Whether the installed git reads `GIT_ATTR_SOURCE` (2.40 or later). Asked
+/// once.
+async fn attr_source_supported(cwd: &Path) -> bool {
+    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *SUPPORTED
+        .get_or_init(|| async {
+            match isolated(cwd, &["--version"]).await {
+                Ok(ran) if ran.status.success() => version_at_least(&ran.stdout_text(), 2, 40),
+                _ => false,
+            }
+        })
+        .await
+}
+
+/// Whether `git --version`'s answer (`git version 2.40.1 (Apple Git-…)`) is
+/// at least `major.minor`.
+fn version_at_least(answer: &str, major: u32, minor: u32) -> bool {
+    let Some(version) = answer.strip_prefix("git version ") else {
+        return false;
+    };
+    let mut parts = version.split('.').map(|part| {
+        part.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()
+    });
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(have_major), Some(have_minor)) => (have_major, have_minor) >= (major, minor),
+        _ => false,
+    }
+}
+
+/// [`commit_paths`], with `GIT_ATTR_SOURCE` or with the fallback for an
+/// older git.
+pub(crate) async fn commit_paths_with(
+    worktree: &Path,
+    paths: &[&str],
+    message: &str,
+    attr_source: bool,
 ) -> Result<String, CommitError> {
     if paths.is_empty() || paths.iter().any(|p| p.is_empty() || p.starts_with('-')) {
         return Err(CommitError::Io(std::io::Error::new(
@@ -434,14 +833,55 @@ pub async fn commit_paths(
             "a path to commit is empty or starts with -",
         )));
     }
-    let mut add = vec!["add", "--force", "--"];
-    add.extend_from_slice(paths);
-    let out = isolated(worktree, &add).await.map_err(commit_io)?;
-    if !out.status.success() {
-        return Err(CommitError::Failed {
-            status: out.status.code(),
-        });
+    let empty_tree = if attr_source {
+        let ran = isolated(worktree, &["hash-object", "-t", "tree", "/dev/null"])
+            .await
+            .map_err(commit_io)?;
+        ran.ok().map_err(commit_io)?;
+        Some(ran.stdout_text())
+    } else {
+        None
+    };
+    let mut env = vec![("GIT_ATTR_NOSYSTEM", "1")];
+    if let Some(tree) = &empty_tree {
+        env.push(("GIT_ATTR_SOURCE", tree.as_str()));
     }
+    let command = |args: &[&str]| {
+        let mut all: Vec<&str> = NO_ATTRIBUTES_CONFIG.to_vec();
+        all.extend_from_slice(args);
+        let mut cmd = isolated_command(worktree, &all);
+        for (name, value) in &env {
+            cmd.env(name, value);
+        }
+        cmd
+    };
+
+    if attr_source {
+        let mut add = vec!["add", "--force", "--"];
+        add.extend_from_slice(paths);
+        run(command(&add), local_timeout(), None, OUTPUT_MAX)
+            .await
+            .and_then(|ran| ran.ok())
+            .map_err(commit_io)?;
+    } else {
+        for path in paths {
+            let hash = ["hash-object", "-w", "--no-filters", "--", path];
+            let ran = run(command(&hash), local_timeout(), None, OUTPUT_MAX)
+                .await
+                .map_err(commit_io)?;
+            ran.ok().map_err(commit_io)?;
+            let entry = format!("100644,{},{path}", ran.stdout_text());
+            let update = ["update-index", "--add", "--cacheinfo", &entry];
+            run(command(&update), local_timeout(), None, OUTPUT_MAX)
+                .await
+                .and_then(|ran| ran.ok())
+                .map_err(commit_io)?;
+            tokio::fs::remove_file(worktree.join(path))
+                .await
+                .map_err(CommitError::Io)?;
+        }
+    }
+
     let commit = [
         "-c",
         "user.useConfigOnly=true",
@@ -450,28 +890,35 @@ pub async fn commit_paths(
         "--no-verify",
         "--no-gpg-sign",
         "--cleanup=whitespace",
-        "-m",
-        message,
+        "-F",
+        "-",
     ];
-    let out = isolated(worktree, &commit).await.map_err(commit_io)?;
-    if !out.status.success() {
+    let ran = run(
+        command(&commit),
+        local_timeout(),
+        Some(message.as_bytes()),
+        OUTPUT_MAX,
+    )
+    .await
+    .map_err(commit_io)?;
+    if !ran.status.success() {
         return Err(
-            if String::from_utf8_lossy(&out.stderr).contains(IDENTITY_MISSING) {
+            if String::from_utf8_lossy(&ran.stderr).contains(IDENTITY_MISSING) {
                 CommitError::IdentityMissing
             } else {
                 CommitError::Failed {
-                    status: out.status.code(),
+                    status: ran.status.code(),
                 }
             },
         );
     }
-    let out = isolated(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
+    let ran = isolated(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
         .await
         .map_err(commit_io)?;
-    let id = stdout_of(&out);
-    if !out.status.success() || id.is_empty() {
+    let id = ran.stdout_text();
+    if !ran.status.success() || id.is_empty() {
         return Err(CommitError::Failed {
-            status: out.status.code(),
+            status: ran.status.code(),
         });
     }
     Ok(id)
@@ -480,13 +927,11 @@ pub async fn commit_paths(
 fn commit_io(e: GitError) -> CommitError {
     match e {
         GitError::Io(e) => CommitError::Io(e),
+        GitError::Failed { status } => CommitError::Failed { status },
         _ => CommitError::Failed { status: None },
     }
 }
 
-/// The most of each of git's output streams a push keeps to classify a
-/// failure; the rest is read and dropped.
-const PUSH_OUTPUT_MAX: u64 = 64 * 1024;
 /// A branch was refused: not a fast-forward, or declined by the remote.
 const PUSH_REJECTED: [&str; 2] = ["[rejected]", "[remote rejected]"];
 /// No credential, or a wrong one, over HTTPS or SSH.
@@ -509,10 +954,10 @@ const PUSH_NO_REMOTE: &str = "'origin' does not appear to be a git repository";
 /// Never forced, and the repository's settings add nothing: no hook,
 /// signature, tag or submodule. A credential that is not stored fails at once
 /// (`GIT_TERMINAL_PROMPT=0` and no askpass program) instead of waiting for a
-/// person. git runs in a process group of its own, killed whole when the time
-/// is up or the future is dropped. Both names must be valid branch names that
-/// start with neither `-` nor `+`, else `Failed` with no exit status before
-/// git runs.
+/// person. `origin` must have a URL to push to as git sees it (`git remote
+/// get-url --push`: a `pushurl` alone will do), else `NoRemote`. Both names
+/// must be valid branch names that start with neither `-` nor `+`, else
+/// `Failed` with no exit status before git runs.
 pub async fn push_branch(
     repo_root: &Path,
     local: &str,
@@ -521,22 +966,41 @@ pub async fn push_branch(
 ) -> Result<(), PushError> {
     for name in [local, remote_branch] {
         let valid = !name.starts_with(['-', '+'])
-            && is_valid_branch_name(repo_root, name).await.unwrap_or(false);
+            && bounded(is_valid_branch_name(repo_root, name))
+                .await
+                .unwrap_or(false);
         if !valid {
             return Err(PushError::Failed { status: None });
         }
     }
-    match origin_url(repo_root).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return Err(PushError::NoRemote),
-        Err(GitError::Failed { status }) => return Err(PushError::Failed { status }),
+    match isolated(repo_root, &["remote", "get-url", "--push", "origin"]).await {
+        Ok(ran) if ran.status.success() => {}
+        // "No such remote".
+        Ok(ran) if ran.status.code() == Some(2) => return Err(PushError::NoRemote),
+        Ok(ran) => {
+            return Err(PushError::Failed {
+                status: ran.status.code(),
+            })
+        }
+        Err(GitError::TimedOut) => return Err(PushError::Timeout),
         Err(_) => return Err(PushError::Failed { status: None }),
     }
     let refspec = format!("refs/heads/{local}:refs/heads/{remote_branch}");
-    match run_with_timeout(push_command(repo_root, &refspec), timeout).await {
-        Ok(Some((status, _))) if status.success() => Ok(()),
-        Ok(Some((status, output))) => Err(classify_push_failure(&output, status.code())),
-        Ok(None) => Err(PushError::Timeout),
+    match run(
+        push_command(repo_root, &refspec),
+        timeout,
+        None,
+        ERROR_OUTPUT_MAX,
+    )
+    .await
+    {
+        Ok(ran) if ran.status.success() => Ok(()),
+        Ok(ran) => {
+            let mut output = String::from_utf8_lossy(&ran.stdout).into_owned();
+            output.push_str(&String::from_utf8_lossy(&ran.stderr));
+            Err(classify_push_failure(&output, ran.status.code()))
+        }
+        Err(GitError::TimedOut) => Err(PushError::Timeout),
         Err(_) => Err(PushError::Failed { status: None }),
     }
 }
@@ -570,117 +1034,41 @@ fn classify_push_failure(output: &str, status: Option<i32>) -> PushError {
     }
 }
 
-/// Runs `cmd` with stdin closed, in a process group of its own, for at most
-/// `timeout`. `None` when the time ran out (the group is killed); else the
-/// exit status and the start of stdout and stderr.
-async fn run_with_timeout(
-    mut cmd: Command,
-    timeout: Duration,
-) -> std::io::Result<Option<(ExitStatus, String)>> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let mut child = cmd.spawn()?;
-    // Declared after `child`, so it is dropped first: the group is killed
-    // while its leader is not yet reaped and its id cannot be reused.
-    let mut group = GroupKiller(child.id());
-    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-    let run = async {
-        let (out, err, status) =
-            tokio::join!(read_capped(stdout), read_capped(stderr), child.wait());
-        status.map(|status| (status, out + &err))
-    };
-    match tokio::time::timeout(timeout, run).await {
-        Ok(Ok(done)) => {
-            group.0 = None;
-            Ok(Some(done))
-        }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok(None),
-    }
-}
-
-async fn read_capped<R: AsyncRead + Unpin>(pipe: Option<R>) -> String {
-    let Some(mut pipe) = pipe else {
-        return String::new();
-    };
-    let mut kept = Vec::new();
-    let _ = (&mut pipe)
-        .take(PUSH_OUTPUT_MAX)
-        .read_to_end(&mut kept)
-        .await;
-    let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
-    String::from_utf8_lossy(&kept).into_owned()
-}
-
-/// Kills the process group led by the process it names when dropped, unless
-/// cleared first.
-struct GroupKiller(Option<u32>);
-
-impl Drop for GroupKiller {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self
-            .0
-            .and_then(|id| i32::try_from(id).ok())
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            // The group may be gone already.
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
-    }
-}
-
 /// The type of the object `object` (`<rev>:<path>`) names, `None` when it
 /// names nothing.
 async fn object_type(repo_root: &Path, object: &str) -> Result<Option<String>, GitError> {
-    let out = isolated(repo_root, &["cat-file", "-t", object]).await?;
-    Ok(out.status.success().then(|| stdout_of(&out)))
+    let ran = isolated(repo_root, &["cat-file", "-t", object]).await?;
+    Ok(ran.status.success().then(|| ran.stdout_text()))
 }
 
 /// The file `path` at `rev` as text (`git cat-file blob <rev>:<path>`): at
-/// most `max_bytes` of it, cut at a character boundary. `None` when `rev`
-/// names nothing or holds no file at `path`.
+/// most `max_bytes` of it, cut at a character boundary. `rev` is a commit id
+/// or a local branch (`refs/heads/<name>` or `<name>`, never a tag of that
+/// name). `None` when `rev` names nothing or holds no file at `path`.
 pub async fn show_file(
     repo_root: &Path,
     rev: &str,
     path: &str,
     max_bytes: usize,
 ) -> Result<Option<String>, GitError> {
-    refuse_option_like(rev)?;
-    let object = format!("{rev}:{path}");
+    let object = format!("{}:{path}", branch_or_commit(rev)?);
     if object_type(repo_root, &object).await?.as_deref() != Some("blob") {
         return Ok(None);
     }
-    let mut child = isolated_command(repo_root, &["cat-file", "blob", &object])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut bytes = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        let limit = u64::try_from(max_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
-        stdout.take(limit).read_to_end(&mut bytes).await?;
-    }
-    let cut = bytes.len() > max_bytes;
-    if cut {
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let ran = run(
+        isolated_command(repo_root, &["cat-file", "blob", &object]),
+        local_timeout(),
+        None,
+        limit,
+    )
+    .await?;
+    ran.ok()?;
+    let mut bytes = ran.stdout;
+    if bytes.len() > max_bytes {
         bytes.truncate(max_bytes);
-        // The rest is not wanted.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    } else {
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(GitError::Failed {
-                status: status.code(),
-            });
-        }
-    }
-    if cut {
         // Drop a character the cut split.
         if let Err(e) = std::str::from_utf8(&bytes) {
             if e.error_len().is_none() {
@@ -691,27 +1079,22 @@ pub async fn show_file(
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// The names of the files directly in `folder` at `rev`, in git's order:
-/// no subfolder, no submodule. Empty when `rev` names nothing or holds no
-/// folder at `folder`.
+/// The names of the files directly in `folder` at `rev` (as in
+/// [`show_file`]), in git's order: no subfolder, no submodule. Empty when
+/// `rev` names nothing or holds no folder at `folder`.
 pub async fn list_folder(
     repo_root: &Path,
     rev: &str,
     folder: &str,
 ) -> Result<Vec<String>, GitError> {
-    refuse_option_like(rev)?;
-    let object = format!("{rev}:{folder}");
+    let object = format!("{}:{folder}", branch_or_commit(rev)?);
     if object_type(repo_root, &object).await?.as_deref() != Some("tree") {
         return Ok(Vec::new());
     }
-    let out = isolated(repo_root, &["ls-tree", "-z", &object]).await?;
-    if !out.status.success() {
-        return Err(GitError::Failed {
-            status: out.status.code(),
-        });
-    }
+    let ran = isolated(repo_root, &["ls-tree", "-z", &object]).await?;
+    ran.ok()?;
     // Each entry: `<mode> SP <type> SP <id> TAB <name>`, ended by NUL.
-    Ok(out
+    Ok(ran
         .stdout
         .split(|b| *b == 0)
         .filter_map(|entry| {
@@ -802,6 +1185,8 @@ mod tests {
             "commit.gpgSign=false",
             "gc.auto=0",
             "maintenance.auto=false",
+            "core.sparseCheckout=false",
+            "index.sparse=false",
         ] {
             let at = args.iter().position(|a| a == setting).expect(setting);
             assert_eq!(args[at - 1], "-c");
@@ -812,10 +1197,160 @@ mod tests {
         let set = |v: &'static str| Some(Some(std::ffi::OsStr::new(v)));
         assert_eq!(val("GIT_EDITOR"), set(":"));
         assert_eq!(val("GIT_ASKPASS"), set(""));
-        assert_eq!(val("SSH_ASKPASS"), Some(None));
         assert_eq!(val("GCM_INTERACTIVE"), set("never"));
         assert_eq!(val("GIT_TERMINAL_PROMPT"), set("0"));
+        assert_eq!(val("GIT_LITERAL_PATHSPECS"), set("1"));
         assert_eq!(val("LC_ALL"), set("C"));
+        for name in [
+            "SSH_ASKPASS",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_COMMITTER_DATE",
+        ] {
+            assert_eq!(val(name), Some(None), "{name} is removed");
+        }
+    }
+
+    #[test]
+    fn the_git_version_is_read_from_its_answer() {
+        assert!(version_at_least("git version 2.40.0", 2, 40));
+        assert!(version_at_least("git version 2.56.1", 2, 40));
+        assert!(version_at_least("git version 3.0.0", 2, 40));
+        assert!(version_at_least(
+            "git version 2.54.0 (Apple Git-157)",
+            2,
+            40
+        ));
+        assert!(!version_at_least(
+            "git version 2.39.5 (Apple Git-154)",
+            2,
+            40
+        ));
+        assert!(!version_at_least("git version 2.40", 2, 41));
+        assert!(!version_at_least("not git", 2, 40));
+    }
+
+    #[test]
+    fn credentials_are_removed_from_a_url() {
+        for (url, expected) in [
+            (
+                "https://user:LEAK@github.com/o/r.git",
+                "https://github.com/o/r.git",
+            ),
+            (
+                "https://LEAK@github.com/o/r.git",
+                "https://github.com/o/r.git",
+            ),
+            ("ssh://git@github.com/o/r.git", "ssh://github.com/o/r.git"),
+            ("https://github.com/o/r.git", "https://github.com/o/r.git"),
+            ("https://u:p@host", "https://host"),
+            ("git@github.com:o/r.git", "github.com:o/r.git"),
+            ("github.com:o/r.git", "github.com:o/r.git"),
+            ("/srv/repos/a@b/r.git", "/srv/repos/a@b/r.git"),
+            ("./a@b:c", "./a@b:c"),
+        ] {
+            assert_eq!(without_userinfo(url), expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_rev_is_a_commit_id_or_a_local_branch() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(branch_or_commit(id).unwrap(), id);
+        assert_eq!(branch_or_commit("main").unwrap(), "refs/heads/main");
+        assert_eq!(
+            branch_or_commit("feedback/x").unwrap(),
+            "refs/heads/feedback/x"
+        );
+        assert_eq!(branch_or_commit("refs/heads/x").unwrap(), "refs/heads/x");
+        assert_eq!(
+            branch_or_commit("refs/tags/v1").unwrap(),
+            "refs/heads/refs/tags/v1"
+        );
+        assert!(matches!(
+            branch_or_commit("-x"),
+            Err(GitError::UnsafeArgument)
+        ));
+    }
+
+    /// The commit path for a git older than 2.40 (no `GIT_ATTR_SOURCE`).
+    #[tokio::test]
+    async fn without_attr_source_files_are_still_committed_byte_for_byte() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        let ran = tmp.path().join("filter-ran");
+        let filter = tmp.path().join("filter");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&filter, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        std::fs::write(
+            repo.join(".gitattributes"),
+            "*.png filter=lfs\n*.md filter=custom ident working-tree-encoding=UTF-16\n",
+        )
+        .unwrap();
+        g(&repo, &["add", ".gitattributes"]);
+        g(&repo, &["commit", "-q", "-m", "attributes"]);
+        for driver in ["lfs", "custom"] {
+            for key in ["clean", "smudge", "process"] {
+                g(
+                    &repo,
+                    &[
+                        "config",
+                        &format!("filter.{driver}.{key}"),
+                        filter.to_str().unwrap(),
+                    ],
+                );
+            }
+            g(
+                &repo,
+                &["config", &format!("filter.{driver}.required"), "true"],
+            );
+        }
+        g(&repo, &["config", "user.name", "Test User"]);
+        g(&repo, &["config", "user.email", "test@example.invalid"]);
+        let dir = tmp.path().join("wt");
+        let tip = g(&repo, &["rev-parse", "main"]);
+        add_detached_worktree(&repo, &dir, &tip, "a test")
+            .await
+            .unwrap();
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        let text = "a $Id: 0 $\r\nb\n";
+        std::fs::write(dir.join("d/i.md"), text).unwrap();
+        std::fs::write(dir.join("d/s.png"), b"\x89PNG\r\n").unwrap();
+        let commit = commit_paths_with(&dir, &["d/i.md", "d/s.png"], "m", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            g(&repo, &["cat-file", "-p", &format!("{commit}:d/i.md")]),
+            text.trim()
+        );
+        let out = std::process::Command::new("git")
+            .args(["cat-file", "blob", &format!("{commit}:d/s.png")])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, b"\x89PNG\r\n");
+        assert_eq!(
+            g(&repo, &["show", "--name-only", "--format=", &commit]),
+            "d/i.md\nd/s.png"
+        );
+        assert!(!ran.exists(), "a filter of the repository ran");
     }
 
     #[test]
