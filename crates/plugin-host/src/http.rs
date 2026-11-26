@@ -324,7 +324,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || (a == 100 && (b & 0xc0) == 64) // 100.64/10: carrier-grade NAT
         || (a == 192 && b == 0 && c == 0) // 192.0.0/24: IETF protocol assignments
         || (a == 192 && b == 0 && c == 2) // 192.0.2/24: documentation
-        || (a == 198 && (b & 0xfe) == 18) // 198.18/15: benchmarking
+        // 198.18/15 (benchmarking) is allowed on purpose: fake-IP DNS proxies such as Clash and Surge answer from it.
         || (a == 198 && b == 51 && c == 100) // 198.51.100/24: documentation
         || (a == 203 && b == 0 && c == 113) // 203.0.113/24: documentation
         || ip.is_multicast() // 224/4
@@ -379,11 +379,9 @@ mod tests {
             "169.254.169.254",
             "100.64.0.1",
             "100.127.255.255",
-            // IPv4: special purpose, documentation, benchmarking
+            // IPv4: special purpose, documentation
             "192.0.0.8",
             "192.0.2.1",
-            "198.18.0.1",
-            "198.19.255.255",
             "198.51.100.1",
             "203.0.113.1",
             // IPv4: multicast, reserved, broadcast
@@ -414,7 +412,6 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
-            "::ffff:198.18.0.1",
             "::127.0.0.1",
             "64:ff9b::7f00:1",
             "64:ff9b::a00:1",
@@ -437,6 +434,8 @@ mod tests {
             "192.0.1.1",
             "192.0.3.1",
             "198.17.255.255",
+            "198.18.0.1",
+            "198.19.255.255",
             "198.20.0.1",
             "198.51.101.1",
             "203.0.114.1",
@@ -448,6 +447,7 @@ mod tests {
             "3ffe::1",
             "2a01:4f8::1",
             "::ffff:8.8.8.8",
+            "::ffff:198.18.0.1",
             "64:ff9b::808:808",
         ] {
             assert!(public(addr), "{addr} was refused");
