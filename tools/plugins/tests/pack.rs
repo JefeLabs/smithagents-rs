@@ -69,10 +69,43 @@ fn assert_not_writable_by_others(_path: &Path) {}
 #[test]
 fn the_fixtures_are_packed_with_valid_manifests() {
     let packed = pack_fixtures_once();
-    assert_eq!(packed.ids, FIXTURES);
-    for id in &packed.ids {
+    assert_eq!(packed.ids, [&FIXTURES[..], &["github"]].concat());
+    for id in FIXTURES {
         check_fixture(&packed.dir, id);
     }
+}
+
+/// GitHub's own manifest, with the entry named for this platform, beside a
+/// real library.
+fn check_github(dir: &Path) {
+    let dir = dir.join("github");
+    let text = fs::read_to_string(dir.join("plugin.toml")).unwrap();
+    let manifest = Manifest::parse(&text).unwrap();
+    assert_eq!(manifest.id.as_ref(), "github");
+    assert_eq!(manifest.host, HostMode::Dylib);
+    assert_eq!(manifest.hosts, ["api.github.com"]);
+    assert_eq!(manifest.tools[0].name, "gh");
+    assert_eq!(manifest.resources.len(), 3);
+    let entry = format!("{DLL_PREFIX}smithagents_plugin_github_dylib{DLL_SUFFIX}");
+    assert_eq!(manifest.entry.as_deref(), Some(entry.as_str()));
+    // Everything but the entry line is the source file's text.
+    let source = include_str!("../../../plugins/github/plugin.toml");
+    let without_entry = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| !l.starts_with("entry = "))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(without_entry(&text), without_entry(source));
+    assert!(!fs::read(dir.join(&entry)).unwrap().starts_with(b"\0asm"));
+    for file in [dir.join("plugin.toml"), dir.join(&entry)] {
+        assert_not_writable_by_others(&file);
+    }
+}
+
+#[test]
+fn github_is_packed_with_its_own_manifest() {
+    check_github(&pack_fixtures_once().dir);
 }
 
 #[test]
@@ -96,6 +129,7 @@ fn concurrent_packs_into_one_directory_both_succeed() {
     for id in FIXTURES {
         check_fixture(out.path(), id);
     }
+    check_github(out.path());
     // Only the packed files remain: no temporary files.
     let library = format!("{DLL_PREFIX}smithagents_plugin_fixture_dylib{DLL_SUFFIX}");
     for (id, entry) in [
@@ -114,7 +148,7 @@ fn concurrent_packs_into_one_directory_both_succeed() {
 }
 
 #[test]
-fn without_fixtures_nothing_is_packed_yet() {
+fn without_fixtures_only_the_real_plugins_are_packed() {
     let out = tempfile::tempdir().unwrap();
     let packed = pack(&PackOptions {
         release: false,
@@ -122,5 +156,6 @@ fn without_fixtures_nothing_is_packed_yet() {
         fixtures: false,
     })
     .unwrap();
-    assert!(packed.ids.is_empty());
+    assert_eq!(packed.ids, ["github"]);
+    check_github(out.path());
 }

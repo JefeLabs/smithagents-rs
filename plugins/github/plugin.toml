@@ -3,7 +3,7 @@ name = "GitHub"
 version = "0.1.0"
 contract = 1
 host = "dylib"
-entry = "libsmithagents_plugin_github.dylib"
+entry = "libsmithagents_plugin_github_dylib.dylib"
 hosts = ["api.github.com"]
 
 # Sign-in only: the daemon asks `gh auth token` for the token when nothing

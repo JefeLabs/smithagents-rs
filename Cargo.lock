@@ -7491,6 +7491,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "smithagents-plugin-github-dylib"
+version = "0.1.0"
+dependencies = [
+ "smithagents-plugin-github",
+ "smithagents-plugin-protocol",
+ "stabby",
+]
+
+[[package]]
 name = "smithagents-plugin-host"
 version = "0.1.0"
 dependencies = [
@@ -7570,8 +7579,10 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "smithagents-client",
  "smithagents-core",
  "smithagents-plugin-fixture",
+ "smithagents-plugin-github",
  "smithagents-plugin-host",
  "smithagents-plugin-protocol",
  "smithagents-plugins-tool",

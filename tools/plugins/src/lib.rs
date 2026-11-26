@@ -63,9 +63,20 @@ struct Spec {
     lib: &'static str,
     /// `Wasm` or `Dylib`.
     host: HostMode,
-    /// The manifest after the generated header, in parts.
-    body: &'static [&'static str],
+    /// How the manifest is written.
+    manifest: ManifestSource,
     fixture: bool,
+}
+
+/// Where a plugin's manifest comes from.
+#[derive(Clone, Copy)]
+enum ManifestSource {
+    /// The generated header followed by these parts.
+    Generated(&'static [&'static str]),
+    /// The plugin's own `plugin.toml`, whose `entry` is replaced with the
+    /// file built for this platform: a library's file name differs by
+    /// platform, and the source file can name only one.
+    Source(&'static str),
 }
 
 /// The fixture plugin's declarations, with the resources every mode runs:
@@ -166,7 +177,7 @@ const PLUGINS: &[Spec] = &[
         package: "smithagents-plugin-fixture-dylib",
         lib: "smithagents_plugin_fixture_dylib",
         host: HostMode::Dylib,
-        body: &[FIXTURE_DECLS, FIXTURE_DYLIB_ONLY],
+        manifest: ManifestSource::Generated(&[FIXTURE_DECLS, FIXTURE_DYLIB_ONLY]),
         fixture: true,
     },
     Spec {
@@ -175,7 +186,7 @@ const PLUGINS: &[Spec] = &[
         package: "smithagents-plugin-fixture-wasm",
         lib: "smithagents_plugin_fixture_wasm",
         host: HostMode::Wasm,
-        body: &[FIXTURE_DECLS, FIXTURE_WASM_ONLY],
+        manifest: ManifestSource::Generated(&[FIXTURE_DECLS, FIXTURE_WASM_ONLY]),
         fixture: true,
     },
     Spec {
@@ -184,8 +195,17 @@ const PLUGINS: &[Spec] = &[
         package: "smithagents-plugin-fixture-wasm-fs",
         lib: "smithagents_plugin_fixture_wasm_fs",
         host: HostMode::Wasm,
-        body: &[FIXTURE_DECLS, FIXTURE_WASM_ONLY],
+        manifest: ManifestSource::Generated(&[FIXTURE_DECLS, FIXTURE_WASM_ONLY]),
         fixture: true,
+    },
+    Spec {
+        id: "github",
+        name: "GitHub",
+        package: "smithagents-plugin-github-dylib",
+        lib: "smithagents_plugin_github_dylib",
+        host: HostMode::Dylib,
+        manifest: ManifestSource::Source(include_str!("../../../plugins/github/plugin.toml")),
+        fixture: false,
     },
 ];
 
@@ -243,10 +263,16 @@ pub fn pack(opts: &PackOptions) -> Result<Packed, PackError> {
         };
         let artifact = out_dir.join(profile(opts.release)).join(&entry);
         let manifest = manifest_text(spec, &entry);
-        Manifest::parse(&manifest).map_err(|source| PackError::Manifest {
+        let parsed = Manifest::parse(&manifest).map_err(|source| PackError::Manifest {
             id: spec.id.to_string(),
             source,
         })?;
+        if parsed.entry.as_deref() != Some(entry.as_str()) {
+            return Err(PackError::Manifest {
+                id: spec.id.to_string(),
+                source: ManifestError::BadEntry(entry),
+            });
+        }
 
         let dir = opts.out_dir.join(spec.id);
         fs::create_dir_all(&dir).map_err(io_at(&dir))?;
@@ -307,14 +333,36 @@ pub fn pack_library(crate_dir: &Path, lib: &str, out_dir: &Path) -> Result<PathB
 }
 
 fn manifest_text(spec: &Spec, entry: &str) -> String {
-    format!(
-        "id = \"{id}\"\nname = \"{name}\"\nversion = \"{version}\"\ncontract = {CONTRACT_VERSION}\nhost = \"{host}\"\nentry = \"{entry}\"\n{body}",
-        id = spec.id,
-        name = spec.name,
-        version = env!("CARGO_PKG_VERSION"),
-        host = spec.host,
-        body = spec.body.concat(),
-    )
+    match spec.manifest {
+        ManifestSource::Generated(body) => format!(
+            "id = \"{id}\"\nname = \"{name}\"\nversion = \"{version}\"\ncontract = {CONTRACT_VERSION}\nhost = \"{host}\"\nentry = \"{entry}\"\n{body}",
+            id = spec.id,
+            name = spec.name,
+            version = env!("CARGO_PKG_VERSION"),
+            host = spec.host,
+            body = body.concat(),
+        ),
+        ManifestSource::Source(text) => with_entry(text, entry),
+    }
+}
+
+/// `text` with its top-level `entry = ...` line naming `entry`. The line is
+/// found before the first table, where the top-level keys end.
+fn with_entry(text: &str, entry: &str) -> String {
+    let mut in_header = true;
+    let mut out = String::with_capacity(text.len() + entry.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_header = false;
+        }
+        if in_header && trimmed.starts_with("entry") && trimmed[5..].trim_start().starts_with('=') {
+            out.push_str(&format!("entry = \"{entry}\"\n"));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 fn profile(release: bool) -> &'static str {
@@ -416,6 +464,21 @@ fn io_at(path: &Path) -> impl Fn(io::Error) -> PackError + '_ {
     move |source| PackError::Io {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::with_entry;
+
+    #[test]
+    fn only_the_top_level_entry_line_is_replaced() {
+        let text =
+            "id = \"x\"\nentry = \"old.dylib\"\nhosts = []\n[[settings]]\nentry = \"kept\"\n";
+        assert_eq!(
+            with_entry(text, "new.so"),
+            "id = \"x\"\nentry = \"new.so\"\nhosts = []\n[[settings]]\nentry = \"kept\"\n"
+        );
     }
 }
 
