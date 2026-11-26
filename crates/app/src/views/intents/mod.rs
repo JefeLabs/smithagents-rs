@@ -3,9 +3,9 @@
 //! ([`ShellState::right_entry`]).
 //!
 //! The pane shows one [`Screen`] at a time: the list ([`list`]), the create
-//! screen or an intent's detail. The create and detail screens draw only a
-//! way back to the list for now. The filter lives in the pane, so it resets
-//! when the app restarts.
+//! screen ([`create`]) or an intent's detail. The detail draws only a way
+//! back to the list for now. The filter, and the create screen's text, live
+//! in the pane, so they reset when the app restarts.
 //!
 //! Every daemon command goes through [`IntentsPane::run`]: one at a time, so
 //! while one is in flight the others do nothing. Nothing changes on screen
@@ -22,7 +22,15 @@
 //! `card-foreground`), like Settings; everything else comes from tokens and
 //! the agent accents.
 
+mod create;
 mod list;
+
+pub use create::{
+    create_repo_item_id, kind_row_id, ChooseBug, ChooseEnhancement, ChooseMaintenance,
+    ChooseNewFeature, ChooseRefactor, CREATE_CLOSE_ID, CREATE_INPUT_ID, CREATE_KEY_CONTEXT,
+    CREATE_REPO_ID, CREATE_SCREEN_ID, CREATE_TITLE_ID, KIND_DESCRIPTION_ID, KIND_SHORTCUT_ID,
+    KIND_TITLE_ID,
+};
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -31,6 +39,7 @@ use std::time::Duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
+use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::{h_flex, v_flex, Icon, Sizable as _};
 use gpui_kit::{
     div, AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
@@ -38,8 +47,8 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
     TestSupportExt as _, Window,
 };
-use smithagents_core::ids::{IntentId, ItemId, QuestionId};
-use smithagents_core::intent::Intent;
+use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
+use smithagents_core::intent::{Intent, IntentKind};
 use smithagents_theme::native::NativeTheme;
 
 use crate::intent_vm::{intent_error_text, IntentFilterChoice};
@@ -94,9 +103,12 @@ pub fn filter_item_id(choice: IntentFilterChoice) -> ElementId {
     ElementId::Name(format!("intents-filter-{}", choice.as_str()).into())
 }
 
-/// Registers the pane's key bindings. The list needs none: Enter and Space
-/// activate the focused card (a GPUI keyboard click).
-pub fn init(_cx: &mut App) {}
+/// Registers the pane's key bindings: the create screen's ⌥ keys and Escape
+/// ([`create`]). The list needs none: Enter and Space activate the focused
+/// card (a GPUI keyboard click).
+pub fn init(cx: &mut App) {
+    cx.bind_keys(create::key_bindings());
+}
 
 /// What the pane shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,19 +153,43 @@ pub struct IntentsPane {
     card_focus: HashMap<IntentId, FocusHandle>,
     /// The list's scroll position.
     scroll: ScrollHandle,
+    /// The create screen's text, kept between visits.
+    text_box: Entity<TextareaState>,
+    /// The repository picked in the create screen's menu.
+    picked_repo: Option<RepoId>,
+    /// The kind of the create in flight, whose row shows the spinner.
+    creating_kind: Option<IntentKind>,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl IntentsPane {
     pub fn new(state: Entity<ShellState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let subscriptions = vec![cx.observe_in(&state, window, |this, _, window, cx| {
-            this.on_state_changed(window, cx)
-        })];
+        let focus = cx.focus_handle();
+        let text_box = create::new_text_box(window, cx);
+        let subscriptions = vec![
+            cx.observe_in(&state, window, |this, _, window, cx| {
+                this.on_state_changed(window, cx)
+            }),
+            // The kind rows follow whether the text is blank.
+            cx.subscribe_in(&text_box, window, |_, _, event: &InputEvent, _, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            }),
+            // The shell focuses the pane when it shows it: on the create
+            // screen the text box takes that focus, as when the screen opens.
+            cx.on_focus(&focus, window, |this, window, cx| {
+                if this.screen == Screen::Create {
+                    this.text_box
+                        .update(cx, |text_box, cx| text_box.focus(window, cx));
+                }
+            }),
+        ];
         Self {
             connection: state.read(cx).model().connection(),
             state,
-            focus: cx.focus_handle(),
+            focus,
             screen: Screen::List,
             detail_seen: false,
             filter: IntentFilterChoice::default(),
@@ -162,6 +198,9 @@ impl IntentsPane {
             command: None,
             card_focus: HashMap::new(),
             scroll: ScrollHandle::new(),
+            text_box,
+            picked_repo: None,
+            creating_kind: None,
             _age_refresh: refresh_ages(cx),
             _subscriptions: subscriptions,
         }
@@ -180,9 +219,10 @@ impl IntentsPane {
         self.busy
     }
 
-    /// Shows `screen` and clears the error line. A keyboard user stays in
-    /// the pane: back on the list the focus goes to the card the detail was
-    /// opened from, elsewhere to the pane.
+    /// Shows `screen` and clears the error line. The create screen's text box
+    /// takes the focus. Otherwise a keyboard user stays in the pane: back on
+    /// the list the focus goes to the card the detail was opened from,
+    /// elsewhere to the pane.
     pub(crate) fn open_screen(
         &mut self,
         screen: Screen,
@@ -196,7 +236,10 @@ impl IntentsPane {
             Screen::Detail(id) => self.state.read(cx).model().intent(id).is_some(),
             Screen::List | Screen::Create => false,
         };
-        if self.focus.contains_focused(window, cx) {
+        if screen == Screen::Create {
+            self.text_box
+                .update(cx, |text_box, cx| text_box.focus(window, cx));
+        } else if self.focus.contains_focused(window, cx) {
             let card = match (previous, screen) {
                 (Screen::Detail(id), Screen::List) => self.card_focus.get(&id),
                 _ => None,
@@ -326,7 +369,7 @@ impl IntentsPane {
         )
     }
 
-    /// The create and detail screens until they are built: the way back.
+    /// The detail screen until it is built: the way back.
     fn placeholder_screen(&self, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {
         v_flex().size_full().child(
             h_flex().flex_none().w_full().px_1().py_2().child(
@@ -410,9 +453,8 @@ impl Render for IntentsPane {
         let paint = Paint::new(self.state.read(cx), cx);
         let content = match self.screen {
             Screen::List => self.list_screen(&paint, cx).into_any_element(),
-            Screen::Create | Screen::Detail(_) => {
-                self.placeholder_screen(&paint, cx).into_any_element()
-            }
+            Screen::Create => self.create_screen(&paint, cx).into_any_element(),
+            Screen::Detail(_) => self.placeholder_screen(&paint, cx).into_any_element(),
         };
         v_flex()
             .id(INTENTS_PANEL)

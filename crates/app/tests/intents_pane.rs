@@ -33,8 +33,9 @@ use smithagents_app::theme_adapter::{agent_accent, srgb_to_hsla};
 use smithagents_app::view_models::{DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT};
 use smithagents_app::views::intents::{
     filter_item_id, intent_card_id, Busy, IntentsPane, Screen, CARD_ACCENT_ID, CARD_DOT_ID,
-    CARD_HEADING_ID, CARD_LINE_ID, CARD_META_ID, CARD_SLUG_ID, CARD_TITLE_ID, DETAIL_BACK_ID,
-    INTENTS_EMPTY_ID, INTENTS_FILTER_ID, INTENTS_NEW_ID, INTENT_ERROR_ID, INTENT_LIST_ID,
+    CARD_HEADING_ID, CARD_LINE_ID, CARD_META_ID, CARD_SLUG_ID, CARD_TITLE_ID, CREATE_CLOSE_ID,
+    DETAIL_BACK_ID, INTENTS_EMPTY_ID, INTENTS_FILTER_ID, INTENTS_NEW_ID, INTENT_ERROR_ID,
+    INTENT_LIST_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_core::event::{Event, EventKind};
@@ -627,10 +628,10 @@ fn the_plus_button_opens_the_create_screen(cx: &mut TestAppContext) {
     click(cx, window, INTENTS_NEW_ID);
     assert_eq!(screen(cx, &opened.pane), Screen::Create);
     assert_eq!(
-        label_of(cx, window, DETAIL_BACK_ID).as_deref(),
-        Some("Intents")
+        label_of(cx, window, CREATE_CLOSE_ID).as_deref(),
+        Some("Close")
     );
-    click(cx, window, DETAIL_BACK_ID);
+    click(cx, window, CREATE_CLOSE_ID);
     assert_eq!(screen(cx, &opened.pane), Screen::List);
 }
 
@@ -745,6 +746,6 @@ fn a_refused_command_shows_the_daemons_sentence(cx: &mut TestAppContext) {
 
     click(cx, window, INTENTS_NEW_ID);
     assert_eq!(screen(cx, &opened.pane), Screen::Create);
-    click(cx, window, DETAIL_BACK_ID);
+    click(cx, window, CREATE_CLOSE_ID);
     assert_eq!(error_line(cx, window), None, "opening a screen clears it");
 }
