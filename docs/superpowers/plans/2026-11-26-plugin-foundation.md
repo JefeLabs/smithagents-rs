@@ -573,6 +573,59 @@ Startup in `smithagentsd`: after the store opens, `discover(builtin_plugins_dir(
 
 ---
 
+### Task 9b: Command-line tool requirements (owner request, 2026-11-26)
+
+Owner: "some plugin may need a install mechanism if they depend on cli - like github should depend on gh".
+
+**Files:**
+- Modify: `crates/plugin-protocol/src/manifest.rs`, `crates/plugin-host/src/{secrets.rs,lib.rs}`, `crates/plugin-host/src/tools.rs` (new), `crates/core/src/plugin.rs`, `crates/server/src/plugins/manager.rs`, `crates/server/src/api.rs`
+- Test: `crates/plugin-protocol/tests/manifest.rs`, `crates/plugin-host/tests/tools.rs`, `crates/server/tests/plugin_manager.rs`
+
+**Interfaces (Produces):**
+
+```toml
+[[tools]]                      # a command-line program the plugin depends on
+name = "gh"                    # ^[a-z][a-z0-9_-]{0,31}$ ; the executable's name, never a path
+label = "GitHub CLI"
+min_version = "2.40.0"         # optional; compared with the first semver in `<name> --version`
+install_url = "https://cli.github.com"
+install = { brew = "gh" }      # optional hints, shown to the user; nothing is run from them in this plan
+
+[[secrets]]
+key = "token"
+label = "GitHub sign-in"
+from_tool = { tool = "gh", args = ["auth", "token"] }   # default source when secrets.toml and the env have none
+```
+
+```rust
+pub struct ToolDecl { pub name: String, pub label: String, pub min_version: Option<semver::Version>, pub install_url: Option<String>, pub install: BTreeMap<String, String> }
+pub struct ToolSource { pub tool: String, pub args: Vec<String> }        // SecretDecl gains `from_tool: Option<ToolSource>`
+// plugin-host::tools
+pub enum ToolState { Ready { path: PathBuf, version: Option<semver::Version> }, Missing, TooOld { found: semver::Version } }
+pub fn find_tool(name: &str) -> Option<PathBuf>;                         // PATH, then /opt/homebrew/bin, /usr/local/bin, ~/.local/bin
+pub async fn check_tool(decl: &ToolDecl) -> ToolState;
+// core: PluginState gains NeedsSetup { tools: Vec<MissingTool>, message: String }
+pub struct MissingTool { pub name: String, pub label: String, pub reason: String, pub install_url: Option<String>, pub install: BTreeMap<String, String> }
+```
+
+Rules:
+- Tools are run by the daemon, never by the plugin: a plugin still cannot start a process in any host mode. The only use of a tool in this plan is as a secret source (`from_tool`); the value goes through the same `Secret` path and never reaches the plugin.
+- `from_tool` must name a declared tool; `args` are passed without a shell; the same 10 s timeout, closed stdin and first-line rule as `secrets.toml` commands; a non-zero exit means "not signed in" (NeedsAuth with the message "sign in with `gh auth login`", built from the tool name, never from the tool's output).
+- `[[tools]]` and `from_tool` are honoured only for built-in plugins. An installed plugin that declares them is listed with state `NeedsSetup` and the message "command-line tools need approval, which is not built yet" and is never run (running a program named by a third-party manifest needs the permission prompt of a later plan).
+- Order of secret sources: `secrets.toml`, then `SMITHAGENTS_SECRET_<PLUGIN>__<KEY>`, then `from_tool`.
+- Before a run the manager checks every declared tool; a missing or too-old tool is `NeedsSetup` naming it with its install hints, and the plugin is not called. The check result is cached for 60 s; `sync_now`, enabling and `set_settings` re-check.
+- Installing is not done by the daemon in this plan: the status carries the hints, and the settings UI plan adds the "Install" action with approval.
+
+- [ ] **Step 1: Write the tests.** Manifest: the sample parses; unknown tool in `from_tool`, a tool name with `/`, duplicate tool names, a bad `min_version` are each a `ManifestError`. `tools.rs` with fake executables in a temp dir put on a test-only search path: found, missing, too old, version line without a semver (Ready with `version: None` unless `min_version` is set, then TooOld is not claimed: Missing with reason "could not read its version"). Secrets: `from_tool` supplies the value; `secrets.toml` and the env win over it; a failing tool is NeedsAuth and its output appears nowhere. Manager: a built-in plugin with a missing tool is `NeedsSetup` with the hints and is not called; once the fake tool appears and `sync_now` is called it runs; an installed plugin declaring a tool is never run.
+- [ ] **Step 2: Run.** Expected: compile errors.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run.** Expected: PASS. Gate.
+- [ ] **Step 5: Commit.** `feat(plugins): command-line tool requirements and tool-backed sign-in`
+
+Task 10's `plugin.toml` then declares the `gh` tool and `from_tool` for `token`, so GitHub works with no configuration once `gh auth login` has been run. GitHub's data still comes over HTTPS through `HostApi::http`.
+
+---
+
 ### Task 10: The GitHub plugin
 
 **Files:**
