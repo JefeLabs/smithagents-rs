@@ -1170,10 +1170,20 @@ mod settings_pane {
             assert_eq!(SettingsSection::parse(section.as_str()), Some(section));
         }
         assert_eq!(SettingsSection::Appearance.as_str(), "appearance");
+        assert_eq!(SettingsSection::AgentDefaults.as_str(), "agent_defaults");
         assert_eq!(SettingsSection::Repositories.as_str(), "repositories");
         assert_eq!(SettingsSection::Appearance.title(), "Appearance");
+        assert_eq!(SettingsSection::AgentDefaults.title(), "Agent defaults");
         assert_eq!(SettingsSection::Repositories.title(), "Source repositories");
         assert_eq!(SettingsSection::parse("agent-defaults"), None);
+        assert_eq!(
+            SettingsSection::ALL,
+            [
+                SettingsSection::Appearance,
+                SettingsSection::AgentDefaults,
+                SettingsSection::Repositories
+            ]
+        );
         // The scroll index is the position in `ALL`, the pane's order.
         for (ix, section) in SettingsSection::ALL.into_iter().enumerate() {
             assert_eq!(section.index(), ix);
