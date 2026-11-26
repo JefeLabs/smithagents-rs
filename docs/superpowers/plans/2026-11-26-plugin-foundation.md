@@ -211,14 +211,14 @@ interface types {
   record http-response { status: u16, headers: list<tuple<string, string>>, body: list<u8> }
   variant http-error { denied(string), secret-missing(string), timeout, too-large, transport(string) }
   record item { id: string, title: string, url: option<string>, updated-at: option<string>, version: option<string>, fields: string }
-  record sync-request { resource: string, cursor: option<string>, settings: string }
+  record sync-request { %resource: string, cursor: option<string>, settings: string }
   record sync-page { upserts: list<item>, deletes: list<string>, next-cursor: option<string>, done: bool, snapshot-complete: bool }
   variant plugin-error { auth(string), rate-limited(tuple<u32, string>), settings(string), http(string), other(string) }
 }
 
 interface host {
-  use types.{http-request, http-response, http-error, log-level};
-  http-request: func(req: http-request) -> result<http-response, http-error>;
+  use types.{http-request as request, http-response, http-error, log-level};
+  http-request: func(req: request) -> result<http-response, http-error>;
   log: func(level: log-level, message: string);
 }
 
