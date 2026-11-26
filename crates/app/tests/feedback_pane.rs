@@ -31,7 +31,7 @@ use smithagents_app::feedback::text::{
     discard_description, BROKEN_DRAFT_TEXT, EMPTY_TEXT, HELP_LINES, HELP_TITLE, PERMISSION_TEXT,
     SUBMIT_TOOLTIP,
 };
-use smithagents_app::shell::Shell;
+use smithagents_app::shell::{Shell, FEEDBACK_PANEL};
 use smithagents_app::views::feedback::{
     card_id, card_remove_id, comment_badge_id, DISCARD_CANCEL_ID, DISCARD_CONFIRM_ID,
     DISCARD_DIALOG_TITLE_ID, FEEDBACK_ADD_FILES_ID, FEEDBACK_CAPTURE_ID, FEEDBACK_DISCARD_ID,
@@ -629,4 +629,69 @@ fn thumbnails_leave_the_atlas_with_their_cards(cx: &mut TestAppContext) {
     act(cx, window, &feedback, |f, _, cx| f.discard_all(cx));
     frame(cx, window);
     assert!(!in_atlas(cx, window, &after));
+}
+
+#[gpui_kit::test]
+fn enter_on_a_focused_screenshot_card_opens_the_annotator(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = open(cx, &setup);
+    let shot = screenshot(cx, window, &feedback, &setup, &["the toolbar"]);
+    assert_eq!(cx.read(|cx| feedback.read(cx).annotating().cloned()), None);
+
+    let card_focused = |cx: &mut TestAppContext| {
+        with_window(cx, window, |window, _| {
+            window.find(card_id(&shot)).focused()
+        }) == Some(true)
+    };
+    for _ in 0..60 {
+        if card_focused(cx) {
+            break;
+        }
+        with_window(cx, window, |window, cx| window.press("tab", cx));
+        frame(cx, window);
+    }
+    assert!(card_focused(cx), "Tab reaches the screenshot's card");
+
+    with_window(cx, window, |window, cx| window.press("enter", cx));
+    frame(cx, window);
+    assert_eq!(
+        cx.read(|cx| feedback.read(cx).annotating().cloned()),
+        Some(shot)
+    );
+}
+
+#[gpui_kit::test]
+fn many_notices_scroll_and_leave_the_cards_and_buttons_in_the_pane(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _, _) = open(cx, &setup);
+    let mut paths: Vec<PathBuf> = vec![setup.picked_file("good.png", &png(64, 48))];
+    paths.extend(
+        (1..=30).map(|n| setup.picked_file(&format!("meeting-notes-{n}.txt"), b"just words")),
+    );
+    add_files(cx, window, &setup, paths);
+    assert!(notices(cx, window).is_some());
+
+    with_window(cx, window, |window, _| {
+        let pane = window.find(FEEDBACK_PANEL).bounds();
+        let notices = window.find(FEEDBACK_NOTICES_ID).bounds();
+        let list = window.find(FEEDBACK_LIST_ID).bounds();
+        let add = window.find(FEEDBACK_ADD_FILES_ID).bounds();
+        let submit = window.find(FEEDBACK_SUBMIT_ID).bounds();
+        assert!(
+            f32::from(notices.size.height) <= 160.5,
+            "the notices are at most 10 rem tall: {notices:?}"
+        );
+        assert!(notices.bottom() <= list.top(), "{notices:?} {list:?}");
+        assert!(
+            f32::from(list.size.height) >= 100.,
+            "the cards keep their room: {list:?}"
+        );
+        for button in [add, submit] {
+            assert!(
+                button.bottom() <= pane.bottom() && button.top() >= list.bottom(),
+                "the buttons stay in the pane: {button:?} in {pane:?}"
+            );
+        }
+    });
+    assert_eq!(cards(cx, window), ["good.png"]);
 }

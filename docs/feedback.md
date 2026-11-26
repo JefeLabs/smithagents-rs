@@ -13,19 +13,25 @@ The **Feedback** entry on the rail, just below Settings, collects pictures of th
 
 ## Adding files
 
-**Add files…** accepts png, jpg, gif and webp images of at most 10 MB each and mp4 videos of at most 50 MB. A file's contents must match its extension. A draft holds at most 10 attachments and 100 MB in all. Each refused file is named in the pane with the reason; the other files are still added.
+**Add files…** accepts png, jpg, gif and webp images of at most 10 MB each and mp4 videos of at most 50 MB. A file's contents must match its extension. A draft holds at most 10 attachments and 100 MB in all. Each refused file is named in the pane with the reason; the other files are still added. Once the draft is full, the rest of the pick is not looked at and one sentence counts those files.
 
 ## The draft
 
 The draft lives in `<home>/feedback/draft/` (`<home>` is `~/.smithagents`, or `SMITHAGENTS_HOME` when set) and survives quitting the app. **Discard** in the pane deletes it, after asking. Nothing is sent anywhere: **Submit…** is shown but disabled, and submitting arrives with the next update.
 
+A draft that cannot be read at start (damaged, or saved by a newer version) is set aside as `<home>/feedback/draft.broken-<time>/` and a new, empty draft begins. That folder holds the old draft's screenshots and files: delete it when you no longer need it. Only the newest set-aside draft is kept. If the draft cannot even be set aside, the pane says it cannot be saved, and nothing is written over it.
+
 ## Screen Recording permission (macOS)
 
-The first capture asks macOS for Screen Recording permission. Allow SmithAgents in **System Settings → Privacy & Security → Screen Recording**, then quit and reopen SmithAgents: macOS reports the permission only after a restart. Without it, **Add files…** still works.
+The first capture asks macOS for Screen Recording permission. Allow SmithAgents in **System Settings → Privacy & Security → Screen Recording**, then quit and reopen SmithAgents: macOS reports the permission only after a restart. Without it, **Add files…** still works. Started from a terminal (`cargo run`), the app's permission is the terminal's: macOS asks for, and lists, the terminal app, not SmithAgents.
 
-## Manual check
+## Building on Linux
 
-Real capture has never been run by the automated tests: they use a fake capturer, and no test opens the file dialog. After a build, run `cargo run -p host-desktop` with `SMITHAGENTS_HOME` set to a scratch directory, and check:
+A Linux build of the workspace needs libclang and the PipeWire development packages, which the capture library uses; on Debian or Ubuntu its own list is `pkg-config libclang-dev libxcb1-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev`. Capture on Linux and Windows has never been built or run.
+
+## Manual check before release (for testers)
+
+Real capture has never been run by the automated tests: they use a fake capturer, and no test opens the file dialog. After a build, run `cargo run -p host-desktop` with `SMITHAGENTS_HOME` set to a scratch directory (macOS then asks Screen Recording permission for the terminal, not SmithAgents), and check:
 
 1. The first capture shows the system's permission prompt, and capture works after allowing it and reopening the app.
 2. A real capture of the app's own window works on the primary display and on a second display.
@@ -34,4 +40,4 @@ Real capture has never been run by the automated tests: they use a fake capturer
 5. Writing a large screenshot does not stutter when the annotator opens.
 6. The disabled **Submit…** button shows its tooltip.
 7. The annotator can be used from the keyboard.
-8. A Linux build needs libclang and the PipeWire development packages installed; it has not been tried.
+8. A Linux build, with the packages under **Building on Linux**, compiles; it has not been tried.

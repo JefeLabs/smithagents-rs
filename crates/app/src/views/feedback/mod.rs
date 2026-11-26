@@ -5,14 +5,11 @@
 //!
 //! Top to bottom: the heading; "How to submit feedback", collapsed until
 //! the user opens it (not remembered); the notices, a status in the
-//! `destructive` color, while there are any; one card per attachment, or
-//! what to do when there is none; and the buttons. A card shows the
-//! thumbnail (or a paperclip when there is none), the title (the
-//! screenshot's number and comment count, or the file's name), each comment
-//! after its numbered badge, and a remove button. Clicking a screenshot card
-//! reopens the annotator. "Capture" takes a picture of the window as it is,
-//! "Add files…" asks for files, "Discard" asks first, and "Submit…" waits
-//! for the next update.
+//! `destructive` color, while there are any (at most [`NOTICES_MAX_HEIGHT`]
+//! tall, then they scroll); one card per attachment ([`card`]), or what to
+//! do when there is none; and the buttons. "Capture" takes a picture of the
+//! window as it is, "Add files…" asks for files, "Discard" asks first, and
+//! "Submit…" waits for the next update.
 //!
 //! The pane only shows the [`Feedback`] entity and calls it: the draft, the
 //! disk, the capturer and the picker are all there. It does release the
@@ -23,20 +20,21 @@
 //! everything else comes from tokens.
 
 mod annotator;
+mod card;
 mod hold;
 
 pub use annotator::{
     badge_id, Annotator, ANNOTATOR_BAR_HEIGHT, ANNOTATOR_COMMENT_ERROR_ID, ANNOTATOR_COMMENT_ID,
     ANNOTATOR_CONFIRM_DISCARD_ID, ANNOTATOR_DELETE_ID, ANNOTATOR_DISCARD_ID,
     ANNOTATOR_DISCARD_TITLE_ID, ANNOTATOR_DONE_ID, ANNOTATOR_ID, ANNOTATOR_KEEP_ID,
-    ANNOTATOR_TITLE_ID,
+    ANNOTATOR_PICTURE_ERROR_ID, ANNOTATOR_TITLE_ID,
 };
+pub use card::{card_id, card_remove_id, comment_badge_id};
 pub use hold::{HoldButton, HoldEvent, HOLD_RING_ID};
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use gpui_kit::assets::IconName as CatalogIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -49,23 +47,25 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, img, px, AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    RenderImage, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled,
-    Subscription, TestSupportExt as _, Window,
+    div, rems, AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, Role,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, Subscription,
+    TestSupportExt as _, Window,
 };
 
-use crate::feedback::draft::{AttachmentId, AttachmentKind};
+use crate::feedback::draft::AttachmentId;
 use crate::feedback::state::Feedback;
 use crate::feedback::text::{
-    card_title, discard_description, DISCARD_CANCEL, DISCARD_CONFIRM, DISCARD_TITLE, EMPTY_TEXT,
-    HELP_LINES, HELP_TITLE, SUBMIT_TOOLTIP, THUMBNAIL_MAX_WIDTH,
+    discard_description, DISCARD_CANCEL, DISCARD_CONFIRM, DISCARD_TITLE, EMPTY_TEXT, HELP_LINES,
+    HELP_TITLE, SUBMIT_TOOLTIP,
 };
 use crate::shell::FEEDBACK_PANEL;
 use crate::shell_state::ShellState;
 use crate::theme_adapter::{region_paint, token_paint, Region};
 use crate::views::pane_heading;
 use crate::views::rail::RailEntry;
+
+use card::cards;
 
 /// Element id of the pane's heading.
 pub const FEEDBACK_TITLE_ID: &str = "feedback-title";
@@ -89,21 +89,6 @@ pub const DISCARD_DIALOG_TITLE_ID: &str = "feedback-discard-title";
 pub const DISCARD_CANCEL_ID: &str = "feedback-discard-cancel";
 pub const DISCARD_CONFIRM_ID: &str = "feedback-discard-confirm";
 
-/// Element id of an attachment's card; the card is named by its title.
-pub fn card_id(id: &AttachmentId) -> ElementId {
-    ElementId::Name(format!("feedback-card-{}", id.as_str()).into())
-}
-
-/// Element id of a card's remove button.
-pub fn card_remove_id(id: &AttachmentId) -> ElementId {
-    ElementId::Name(format!("feedback-card-remove-{}", id.as_str()).into())
-}
-
-/// Element id of a comment's numbered badge, inside its card.
-pub fn comment_badge_id(number: usize) -> ElementId {
-    ElementId::named_usize("feedback-comment-badge", number)
-}
-
 const TITLE: &str = "Feedback";
 const HEADING: &str = "FEEDBACK";
 const LIST_LABEL: &str = "Attachments";
@@ -111,10 +96,10 @@ const ADD_FILES_LABEL: &str = "Add files…";
 const CAPTURE_LABEL: &str = "Capture";
 const DISCARD_LABEL: &str = "Discard";
 const SUBMIT_LABEL: &str = "Submit…";
-const REMOVE_LABEL: &str = "Remove";
 
-/// A comment badge's height, and its least width.
-const BADGE_SIZE: f32 = 16.;
+/// The most the notices take; more scroll inside, so the cards and the
+/// buttons keep their room.
+pub const NOTICES_MAX_HEIGHT: Rems = rems(10.);
 
 pub struct FeedbackPane {
     state: Entity<ShellState>,
@@ -159,17 +144,6 @@ impl FeedbackPane {
             scroll: ScrollHandle::new(),
             card_focus: HashMap::new(),
             _subscriptions: subscriptions,
-        }
-    }
-
-    /// Keeps one focus handle per screenshot card drawn.
-    fn sync_card_focus(&mut self, cards: &[Card], cx: &mut Context<Self>) {
-        self.card_focus
-            .retain(|id, _| cards.iter().any(|card| card.screenshot && &card.id == id));
-        for card in cards.iter().filter(|card| card.screenshot) {
-            self.card_focus
-                .entry(card.id.clone())
-                .or_insert_with(|| cx.focus_handle().tab_stop(true));
         }
     }
 
@@ -229,107 +203,6 @@ impl FeedbackPane {
                         })),
                 )
             })
-    }
-
-    fn card(&self, card: Card, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {
-        let Card {
-            id,
-            title,
-            screenshot,
-            thumbnail,
-            comments,
-        } = card;
-        let (hover, ring) = (paint.hover, paint.ring);
-        let remove = id.clone();
-        // A screen reader hears the card's title, then its comments.
-        let described = (!comments.is_empty()).then(|| {
-            comments
-                .iter()
-                .enumerate()
-                .map(|(index, comment)| format!("{}. {comment}", index + 1))
-                .collect::<Vec<_>>()
-                .join("\n")
-        });
-        v_flex()
-            .id(card_id(&id))
-            .role(if screenshot {
-                Role::Button
-            } else {
-                Role::ListItem
-            })
-            .test_support()
-            .aria_label(title.clone())
-            .when_some(described, |this, described| {
-                this.aria_description(described)
-            })
-            .flex_none()
-            .w_full()
-            .min_w_0()
-            .gap_1p5()
-            .p_2()
-            .border_1()
-            .border_color(paint.border)
-            .rounded(cx.theme().radius)
-            .bg(paint.surface)
-            .when(screenshot, |this| {
-                let open = id.clone();
-                this.track_focus(&self.card_focus[&id])
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .focus_visible(move |style| style.border_color(ring))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.feedback
-                            .update(cx, |feedback, cx| feedback.open_annotator(&open, cx))
-                    }))
-            })
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1p5()
-                    .items_center()
-                    .when(thumbnail.is_none(), |this| {
-                        this.child(
-                            Icon::new(CatalogIcon::Paperclip)
-                                .small()
-                                .flex_none()
-                                .text_color(paint.muted_foreground),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(paint.foreground)
-                            .truncate()
-                            .child(title),
-                    )
-                    .child(
-                        Button::new(card_remove_id(&remove))
-                            .icon(Icon::new(CatalogIcon::Trash).text_color(paint.muted_foreground))
-                            .ghost()
-                            .xsmall()
-                            .tooltip(REMOVE_LABEL)
-                            .accessibility_label(REMOVE_LABEL)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // Not a click on the card.
-                                cx.stop_propagation();
-                                this.feedback
-                                    .update(cx, |feedback, cx| feedback.remove(&remove, cx));
-                            })),
-                    ),
-            )
-            .when_some(thumbnail, |this, thumbnail| {
-                this.child(thumbnail_view(thumbnail))
-            })
-            .children(
-                comments
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, comment)| comment_line(index + 1, comment, paint)),
-            )
     }
 
     /// Add files and Capture on the left; Discard and Submit on the right.
@@ -495,46 +368,6 @@ fn confirm(
     });
 }
 
-/// What one card shows.
-struct Card {
-    id: AttachmentId,
-    title: String,
-    screenshot: bool,
-    thumbnail: Option<Arc<RenderImage>>,
-    comments: Vec<String>,
-}
-
-/// One card per attachment, in the draft's order. A screenshot's number is
-/// its place among the draft's screenshots.
-fn cards(feedback: &Feedback) -> Vec<Card> {
-    let mut screenshots = 0;
-    feedback
-        .draft()
-        .attachments
-        .iter()
-        .map(|attachment| {
-            let screenshot = attachment.kind == AttachmentKind::Screenshot;
-            let title = if screenshot {
-                screenshots += 1;
-                card_title(screenshots, attachment.boxes.len())
-            } else {
-                attachment.original_name.clone()
-            };
-            Card {
-                id: attachment.id.clone(),
-                title,
-                screenshot,
-                thumbnail: feedback.thumbnail(&attachment.id),
-                comments: attachment
-                    .boxes
-                    .iter()
-                    .map(|annotation| annotation.comment.clone())
-                    .collect(),
-            }
-        })
-        .collect()
-}
-
 /// A line of text that assistive technology reads as one sentence.
 fn sentence(id: impl Into<ElementId>, text: impl Into<SharedString>) -> impl IntoElement + Styled {
     let text = text.into();
@@ -547,7 +380,7 @@ fn sentence(id: impl Into<ElementId>, text: impl Into<SharedString>) -> impl Int
 }
 
 /// The notices, one per line, as a status that announces itself; `None`
-/// when there are none.
+/// when there are none. Taller than [`NOTICES_MAX_HEIGHT`], they scroll.
 fn notices_block(notices: &[String], paint: &Paint) -> Option<AnyElement> {
     if notices.is_empty() {
         return None;
@@ -560,63 +393,21 @@ fn notices_block(notices: &[String], paint: &Paint) -> Option<AnyElement> {
             .aria_label(notices.join("\n"))
             .flex_none()
             .w_full()
+            .max_h(NOTICES_MAX_HEIGHT)
+            .overflow_y_scroll()
             .px_3()
             .py_2()
             .gap_1()
             .text_xs()
             .text_color(paint.destructive)
-            .children(notices.iter().map(|notice| div().child(notice.clone())))
+            // Each keeps its height: the block scrolls instead.
+            .children(
+                notices
+                    .iter()
+                    .map(|notice| div().flex_none().child(notice.clone())),
+            )
             .into_any_element(),
     )
-}
-
-/// The thumbnail at its own size, at most [`THUMBNAIL_MAX_WIDTH`] points
-/// wide and never wider than the card, keeping its shape.
-fn thumbnail_view(thumbnail: Arc<RenderImage>) -> impl IntoElement {
-    let size = thumbnail.size(0);
-    let (width, height) = (size.width.0.max(1) as f32, size.height.0.max(1) as f32);
-    div()
-        .flex_none()
-        .w_full()
-        .max_w(px(width.min(THUMBNAIL_MAX_WIDTH as f32)))
-        .aspect_ratio(width / height)
-        .child(img(thumbnail).size_full())
-}
-
-/// A comment after its number, in a badge: the number in `background` on a
-/// `destructive` fill, the colors of the boxes drawn over a screenshot.
-fn comment_line(number: usize, comment: String, paint: &Paint) -> impl IntoElement {
-    h_flex()
-        .id(ElementId::named_usize("feedback-comment", number))
-        .w_full()
-        .min_w_0()
-        .gap_1p5()
-        .items_start()
-        .child(
-            div()
-                .id(comment_badge_id(number))
-                .test_support()
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(BADGE_SIZE))
-                .min_w(px(BADGE_SIZE))
-                .px_1()
-                .rounded_full()
-                .bg(paint.destructive)
-                .text_color(paint.background)
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(number.to_string()),
-        )
-        .child(
-            Label::new(comment)
-                .flex_1()
-                .min_w_0()
-                .text_xs()
-                .text_color(paint.foreground),
-        )
 }
 
 impl BasePanel for FeedbackPane {

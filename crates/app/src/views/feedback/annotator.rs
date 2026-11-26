@@ -17,6 +17,9 @@
 //! annotator's own controls (a focus trap), and the shell under it handles
 //! none of its keys while it is open.
 //!
+//! A picture that does not decode is one sentence where it would be; Discard
+//! (and Done) still work.
+//!
 //! Boxes are fractions of the picture, so they keep their place at any
 //! window size: the pointer is converted through the rectangle the picture
 //! is drawn in (never the area around it), and a drag that starts or ends
@@ -40,10 +43,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    anchored, canvas, deferred, div, fill, img, outline, point, px, relative, size, AnyElement,
-    App, AppContext as _, BorderStyle, Bounds, Context, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Render,
+    anchored, canvas, deferred, div, fill, img, outline, point, px, relative, rems, size,
+    AnyElement, App, AppContext as _, BorderStyle, Bounds, Context, ElementId, Entity, FocusHandle,
+    Focusable, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Point, Rems, Render,
     RenderImage, Role, Size, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
     Subscription, Task, TestSupportExt as _, Window,
 };
@@ -55,7 +58,7 @@ use crate::feedback::state::Feedback;
 use crate::feedback::text::{
     annotator_discard_description, annotator_title, ANNOTATOR_DISCARD_CONFIRM,
     ANNOTATOR_DISCARD_KEEP, ANNOTATOR_DISCARD_TITLE, COMMENT_HINT, COMMENT_TOO_LONG_TEXT,
-    MAX_BOXES, TOO_MANY_BOXES_TEXT,
+    MAX_BOXES, PICTURE_UNREADABLE_TEXT, TOO_MANY_BOXES_TEXT,
 };
 use crate::theme_adapter::{region_paint, token_paint, Region};
 
@@ -73,6 +76,9 @@ pub const ANNOTATOR_COMMENT_ID: &str = "feedback-annotator-comment";
 /// Element id of the sentence under a comment that is too long (a status).
 pub const ANNOTATOR_COMMENT_ERROR_ID: &str = "feedback-annotator-comment-error";
 pub const ANNOTATOR_DELETE_ID: &str = "feedback-annotator-delete";
+/// Element id of the sentence shown in place of a picture that does not
+/// decode (a status).
+pub const ANNOTATOR_PICTURE_ERROR_ID: &str = "feedback-annotator-picture-error";
 /// Element ids in the dialog Discard opens when the screenshot has boxes.
 pub const ANNOTATOR_DISCARD_TITLE_ID: &str = "feedback-annotator-discard-title";
 pub const ANNOTATOR_KEEP_ID: &str = "feedback-annotator-keep";
@@ -98,8 +104,8 @@ const COMMENT_ROWS: (usize, usize) = (1, 4);
 const PANEL_WIDTH: f32 = 280.;
 /// Space between a box's bottom edge and its comment.
 const PANEL_GAP: f32 = 6.;
-/// A badge's height, and its least width.
-const BADGE_SIZE: f32 = 20.;
+/// A badge's height, and its least width: it grows with the text.
+const BADGE_SIZE: Rems = rems(1.25);
 /// How strongly a box is filled (its outline is solid).
 const BOX_FILL_OPACITY: f32 = 0.12;
 /// Room for the window's traffic lights, which macOS draws over the bar.
@@ -231,6 +237,11 @@ impl Annotator {
     /// decode).
     pub fn image(&self) -> Option<Arc<RenderImage>> {
         self.image.clone()
+    }
+
+    /// The picture was loaded and does not decode.
+    fn unreadable(&self) -> bool {
+        self.loading.is_none() && self.image.is_none()
     }
 
     /// The screenshot's boxes as saved, in their numbers' order.
@@ -643,6 +654,27 @@ impl Annotator {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_release))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_release))
             .children(content.into_iter().flatten())
+            .when(self.unreadable(), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_4()
+                        .child(
+                            div()
+                                .id(ANNOTATOR_PICTURE_ERROR_ID)
+                                .role(Role::Status)
+                                .test_support()
+                                .aria_label(PICTURE_UNREADABLE_TEXT)
+                                .text_sm()
+                                .text_color(paint.foreground)
+                                .child(PICTURE_UNREADABLE_TEXT),
+                        ),
+                )
+            })
     }
 
     /// A layer the size of the drawn picture, so badges and the comment
@@ -769,8 +801,8 @@ fn badge(
         .flex()
         .items_center()
         .justify_center()
-        .h(px(BADGE_SIZE))
-        .min_w(px(BADGE_SIZE))
+        .h(BADGE_SIZE)
+        .min_w(BADGE_SIZE)
         .px_1()
         .rounded_full()
         .border_2()
@@ -879,6 +911,8 @@ struct Paint {
     bar_foreground: Hsla,
     /// Around the picture, and a badge's number.
     background: Hsla,
+    /// The sentence in place of a picture that does not decode.
+    foreground: Hsla,
     border: Hsla,
     /// Boxes, badges, and what a refusal says.
     destructive: Hsla,
@@ -896,6 +930,7 @@ impl Paint {
             bar,
             bar_foreground,
             background: token("background"),
+            foreground: token("foreground"),
             border: token("border"),
             destructive: token("destructive"),
             popover: token("popover"),

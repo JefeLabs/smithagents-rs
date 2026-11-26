@@ -29,6 +29,7 @@ use gpui_kit::{
 use smithagents_app::feedback::annotation::{Annotation, FracRect};
 use smithagents_app::feedback::draft::{AttachmentId, Draft};
 use smithagents_app::feedback::state::Feedback;
+use smithagents_app::feedback::text::PICTURE_UNREADABLE_TEXT;
 use smithagents_app::model::{Action as ModelAction, Connection, ShellModel};
 use smithagents_app::shell::{
     CloseActiveTab, NextTab, Shell, ToggleAgentsPane, ToggleFeedbackPane, ToggleIntentsPane,
@@ -40,7 +41,7 @@ use smithagents_app::views::feedback::{
     badge_id, card_id, Annotator, ANNOTATOR_COMMENT_ERROR_ID, ANNOTATOR_COMMENT_ID,
     ANNOTATOR_CONFIRM_DISCARD_ID, ANNOTATOR_DELETE_ID, ANNOTATOR_DISCARD_ID,
     ANNOTATOR_DISCARD_TITLE_ID, ANNOTATOR_DONE_ID, ANNOTATOR_ID, ANNOTATOR_KEEP_ID,
-    ANNOTATOR_TITLE_ID,
+    ANNOTATOR_PICTURE_ERROR_ID, ANNOTATOR_TITLE_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_capture::test_pattern;
@@ -964,4 +965,35 @@ fn closing_the_pane_after_annotating_gives_the_focus_back(cx: &mut TestAppContex
         assert_eq!(rail_active(cx, &shell), None, "from_pane {from_pane}");
         assert!(row_focused(cx), "from_pane {from_pane}: back on the row");
     }
+}
+
+#[gpui_kit::test]
+fn a_picture_that_does_not_decode_says_so_and_discard_still_works(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell, feedback) = open(cx, &setup);
+    let id = annotating(cx, &feedback);
+    assert_eq!(label_of(cx, window, ANNOTATOR_PICTURE_ERROR_ID), None);
+    click(cx, window, ANNOTATOR_DONE_ID);
+    frame(cx, window);
+    let stored = setup.draft_dir().join("screenshot-1.png");
+    std::fs::write(&stored, b"not a picture").unwrap();
+
+    act(cx, window, &feedback, |f, _, cx| f.open_annotator(&id, cx));
+    frame(cx, window);
+    assert!(annotator(cx, &shell).is_some());
+    assert!(image(cx, &shell).is_none());
+    with_window(cx, window, |window, _| {
+        let said = window.find(ANNOTATOR_PICTURE_ERROR_ID);
+        assert_eq!(said.label(), Some(PICTURE_UNREADABLE_TEXT));
+        assert_eq!(said.role(), Some(Role::Status));
+        assert_ne!(window.find(ANNOTATOR_DISCARD_ID).disabled(), Some(true));
+    });
+    // A drag over where the picture would be draws nothing.
+    drag(cx, window, (300., 233.), (600., 422.));
+    assert!(comment_field(cx, window).is_none());
+
+    click(cx, window, ANNOTATOR_DISCARD_ID);
+    assert!(annotator(cx, &shell).is_none());
+    assert!(draft(cx, &feedback).is_empty());
+    assert!(!stored.exists());
 }

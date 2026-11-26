@@ -17,7 +17,7 @@ use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
     point, px, AppContext as _, Background, ElementId, Entity, MouseButton, Pixels, Point, Role,
-    TestAppContext, WindowHandle,
+    TestAppContext, VisualTestContext, WindowHandle,
 };
 use smithagents_app::app_state::AppStateStore;
 use smithagents_app::model::{Action, Connection, ShellModel};
@@ -470,4 +470,87 @@ fn reveal_settings_still_wins_over_feedback(cx: &mut TestAppContext) {
     assert_eq!(rail_active(cx, &shell), Some(RailEntry::Settings));
     assert!(settings_heading_shown(cx, window));
     assert_eq!(feedback_heading(cx, window), None);
+}
+
+/// The window becomes the active one, as when the person clicks into it.
+fn activate(cx: &mut TestAppContext, window: WindowHandle<Root>) {
+    with_window(cx, window, |window, _| window.activate_window());
+    frame(cx, window);
+}
+
+/// Another window takes over: this one stops being active.
+fn deactivate(cx: &mut TestAppContext, window: WindowHandle<Root>) {
+    VisualTestContext::from_window(window.into(), cx).deactivate_window();
+    frame(cx, window);
+}
+
+/// Tab until the Feedback button has the keyboard focus.
+fn tab_to_feedback(cx: &mut TestAppContext, window: WindowHandle<Root>) {
+    for _ in 0..60 {
+        let focused = with_window(cx, window, |window, _| {
+            window.find(RailEntry::Feedback.element_id()).focused()
+        });
+        if focused == Some(true) {
+            return;
+        }
+        press_key(cx, window, "tab");
+    }
+    panic!("Tab never reached the Feedback button");
+}
+
+#[gpui_kit::test]
+fn enter_on_the_feedback_entry_opens_the_pane_and_never_captures(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell) = open(cx, setup.options());
+    activate(cx, window);
+    tab_to_feedback(cx, window);
+
+    press_key(cx, window, "enter");
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Feedback));
+    assert_eq!(feedback_heading(cx, window).as_deref(), Some("FEEDBACK"));
+    advance(cx, window, 6000);
+    assert_eq!(setup.hops.pending(), 0, "no capture");
+    assert!(setup.capturer.calls().is_empty());
+    assert!(!ring_shown(cx, window));
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Feedback));
+}
+
+#[gpui_kit::test]
+fn a_hold_is_cancelled_when_the_window_goes_inactive(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell) = open(cx, setup.options());
+    let before = rail_active(cx, &shell);
+    activate(cx, window);
+
+    press(cx, window);
+    advance(cx, window, 1000);
+    assert!(ring_shown(cx, window));
+    deactivate(cx, window);
+    advance(cx, window, 3000);
+
+    assert_eq!(setup.hops.pending(), 0, "no capture");
+    assert!(!ring_shown(cx, window));
+    assert_eq!(progress(cx, &shell), 0.0);
+    assert_eq!(rail_active(cx, &shell), before);
+}
+
+#[gpui_kit::test]
+fn after_a_hold_whose_release_was_lost_the_next_key_press_is_a_click(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell) = open(cx, setup.options());
+    let before = rail_active(cx, &shell);
+    assert_ne!(before, Some(RailEntry::Feedback));
+    activate(cx, window);
+
+    press(cx, window);
+    advance(cx, window, 3010);
+    assert_eq!(setup.hops.pending(), 1, "the hold completed");
+    // The button is released in another window: this one never hears it.
+    deactivate(cx, window);
+    activate(cx, window);
+    tab_to_feedback(cx, window);
+    press_key(cx, window, "enter");
+
+    assert_eq!(rail_active(cx, &shell), Some(RailEntry::Feedback));
+    assert_eq!(feedback_heading(cx, window).as_deref(), Some("FEEDBACK"));
 }

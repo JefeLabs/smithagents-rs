@@ -4,10 +4,13 @@
 //! A left press starts the hold: a timer for [`HOLD`] and a repaint loop that
 //! redraws the ring, whose fill is the time held so far (the executor's
 //! clock, never an animation). A release on the button before the end is a
-//! click. A release elsewhere, the pointer leaving the button, or a move
-//! without the left button held (its release was missed) ends the hold with
-//! nothing done. At the end of the hold the ring goes away and the button
-//! says [`HoldEvent::Completed`]; the release that follows is not a click.
+//! click. A release elsewhere, the pointer leaving the button, a move
+//! without the left button held (its release was missed), or the window
+//! going inactive ends the hold with nothing done. At the end of the hold
+//! the ring goes away and the button says [`HoldEvent::Completed`]; the
+//! release that follows is not a click. When that release can no longer
+//! come (it went to another window, or the pointer left first), the next
+//! click (from the keyboard too) is one again.
 
 use std::time::{Duration, Instant};
 
@@ -17,7 +20,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, Context, EventEmitter, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement as _, Render, StatefulInteractiveElement as _,
-    Styled as _, Task, Window,
+    Styled as _, Subscription, Task, Window,
 };
 
 use crate::feedback::text::HOLD;
@@ -50,14 +53,24 @@ pub struct HoldButton {
     /// the hold.
     hold: Option<Task<()>>,
     repaint: Option<Task<()>>,
-    /// A hold completed: the click its release makes is not one.
+    /// A hold completed: the click its release makes is not one. Cleared
+    /// only where no such click can follow: a mouse-up runs before its
+    /// click, so a release on the button never clears it.
     swallow_click: bool,
+    _activation: Subscription,
 }
 
 impl EventEmitter<HoldEvent> for HoldButton {}
 
 impl HoldButton {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // The release of a hold may go to another window: none comes here.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.cancel("the window went inactive", cx);
+                this.swallow_click = false;
+            }
+        });
         Self {
             selected: false,
             icon_color: cx.theme().foreground,
@@ -65,6 +78,7 @@ impl HoldButton {
             hold: None,
             repaint: None,
             swallow_click: false,
+            _activation: activation,
         }
     }
 
@@ -170,6 +184,8 @@ impl Render for HoldButton {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if event.pressed_button != Some(MouseButton::Left) {
+                    // The release was missed: no click comes from it.
+                    this.swallow_click = false;
                     this.cancel("the left button is up", cx);
                 }
             }))
@@ -186,6 +202,8 @@ impl Render for HoldButton {
             .flex_none()
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !hovered {
+                    // The release, if any, is off the button: not a click.
+                    this.swallow_click = false;
                     this.cancel("the pointer left the button", cx);
                 }
             }))

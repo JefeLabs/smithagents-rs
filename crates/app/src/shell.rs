@@ -428,7 +428,7 @@ impl Shell {
         let feedback = cx.new(|cx| Feedback::new(feedback.unwrap_or_default(), cx));
         let feedback_pane =
             cx.new(|cx| FeedbackPane::new(state.clone(), feedback.clone(), window, cx));
-        let hold_button = cx.new(HoldButton::new);
+        let hold_button = cx.new(|cx| HoldButton::new(window, cx));
         let right_panels = vec![
             (RailEntry::Settings, PanelId::from(settings.entity_id())),
             (
@@ -570,7 +570,14 @@ impl Shell {
             // may drop a focused child), so if it held focus the window has
             // none and keys dispatch from the Kit's `Root`, above the shell's
             // key context: the shortcuts would stop working. Take focus back.
+            // While the annotator covers the window, the focus goes back
+            // to it: the shell under it handles none of its keys then.
             cx.on_focus_lost(window, |this, window, cx| {
+                if let Some(annotator) = &this.annotator {
+                    tracing::debug!("focus lost; returning it to the annotator");
+                    annotator.read(cx).focus_handle(cx).focus(window, cx);
+                    return;
+                }
                 tracing::debug!("focus lost; returning it to the shell");
                 this.focus.focus(window, cx);
             }),
