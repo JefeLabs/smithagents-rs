@@ -7124,6 +7124,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "smithagents-plugin-fixture"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "smithagents-plugin-protocol",
+]
+
+[[package]]
 name = "smithagents-plugin-host"
 version = "0.1.0"
 dependencies = [
@@ -7131,6 +7139,8 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "reqwest",
+ "serde_json",
+ "smithagents-plugin-fixture",
  "smithagents-plugin-protocol",
  "tempfile",
  "thiserror 2.0.21",

@@ -8,16 +8,13 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::serve::ListenerExt;
-use axum::Router;
 use base64::{engine::general_purpose::STANDARD, Engine};
+mod common;
+
+use common::TestServer;
 use smithagents_plugin_host::{CallHandle, CallPurpose, HostServices, HttpPolicy, StaticSecrets};
 use smithagents_plugin_protocol::{
     Auth, HttpError, HttpMethod, HttpRequest, HttpResponse, LogLevel, Manifest,
@@ -64,95 +61,6 @@ key = "unset"
 label = "Declared but never configured"
 hosts = ["fixture.invalid"]
 "#;
-
-// ---------------------------------------------------------------- test server
-
-struct Seen {
-    method: String,
-    path: String,
-    headers: HeaderMap,
-}
-
-#[derive(Default)]
-struct Shared {
-    seen: Mutex<Vec<Seen>>,
-}
-
-struct TestServer {
-    port: u16,
-    connections: Arc<AtomicUsize>,
-    shared: Arc<Shared>,
-}
-
-impl TestServer {
-    async fn start() -> TestServer {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let connections = Arc::new(AtomicUsize::new(0));
-        let counter = connections.clone();
-        let listener = listener.tap_io(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-        });
-        let shared = Arc::new(Shared::default());
-        let app = Router::new().fallback(handle).with_state(shared.clone());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        TestServer {
-            port,
-            connections,
-            shared,
-        }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port)
-    }
-
-    fn requests(&self) -> usize {
-        self.shared.seen.lock().unwrap().len()
-    }
-
-    fn paths(&self) -> Vec<String> {
-        let seen = self.shared.seen.lock().unwrap();
-        seen.iter().map(|s| s.path.clone()).collect()
-    }
-
-    fn last_headers(&self) -> HeaderMap {
-        let seen = self.shared.seen.lock().unwrap();
-        seen.last()
-            .expect("the server saw no request")
-            .headers
-            .clone()
-    }
-
-    fn assert_untouched(&self) {
-        assert_eq!(self.requests(), 0, "the server saw a request");
-        assert_eq!(
-            self.connections.load(Ordering::SeqCst),
-            0,
-            "the server saw a connection"
-        );
-    }
-}
-
-async fn handle(State(shared): State<Arc<Shared>>, req: Request) -> Response {
-    let path = req.uri().path().to_string();
-    shared.seen.lock().unwrap().push(Seen {
-        method: req.method().to_string(),
-        path: path.clone(),
-        headers: req.headers().clone(),
-    });
-    match path.as_str() {
-        "/ok" => ([("x-test", "yes")], "hello").into_response(),
-        "/redirect" => (StatusCode::FOUND, [("location", "/target")]).into_response(),
-        "/exact" => vec![b'x'; 5 * MIB].into_response(),
-        "/big" => vec![b'x'; 5 * MIB + 1].into_response(),
-        "/slow" => {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            "late".into_response()
-        }
-        _ => StatusCode::OK.into_response(),
-    }
-}
 
 // ---------------------------------------------------------------- helpers
 

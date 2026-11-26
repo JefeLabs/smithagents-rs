@@ -6,9 +6,13 @@
 //! by the host, so a plugin never sees a secret value.
 
 mod http;
+mod linked;
+mod runtime;
 mod secrets;
 mod services;
 
 pub use http::HttpPolicy;
+pub use linked::LinkedRuntime;
+pub use runtime::{CallError, PluginRuntime};
 pub use secrets::{ConfiguredSecrets, Secret, SecretError, SecretSource, StaticSecrets};
 pub use services::{CallHandle, CallPurpose, HostServices, ServicesError};
