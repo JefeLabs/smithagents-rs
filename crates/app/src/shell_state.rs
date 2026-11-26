@@ -41,6 +41,7 @@ use crate::view_models::{
     connection_banner, repository_added_text, status_to_show, tab_error_text, BannerVm,
     LeftPaneMode, SettingsSection, StatusKind, StatusMessage, OPEN_CHAT_FAILED,
 };
+use crate::views::rail::RailEntry;
 
 /// How often the link's last error is re-read while the link is not
 /// connected: it changes the error between retries without sending an action.
@@ -93,13 +94,14 @@ struct PendingOpen {
 pub enum ShellEvent {
     /// The left pane's mode or expanded width changed (save the layout).
     LeftPaneChanged,
-    /// Show the Settings view in the right dock.
-    RevealSettings,
+    /// Show this rail entry's view: open its dock on it, or switch the open
+    /// dock to it (never closes it). See [`ShellState::reveal`].
+    Reveal(RailEntry),
     /// Bring a Settings section into view (it is already expanded): the
     /// Settings view scrolls toward it, as far as the content below it
     /// allows, and, for Source repositories, focuses the path field (the
     /// only section that asks for this). Emitted after
-    /// [`ShellEvent::RevealSettings`].
+    /// `ShellEvent::Reveal(RailEntry::Settings)`.
     FocusSettings(SettingsSection),
     /// The theme in effect changed: [`ShellState::theme_state`] and
     /// [`ShellState::native_theme`] hold the new one. Emitted once per change,
@@ -350,8 +352,35 @@ impl ShellState {
     pub fn request_settings_focus(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         tracing::debug!(?section, "settings focus requested");
         self.set_settings_section_expanded(section, true, cx);
-        cx.emit(ShellEvent::RevealSettings);
+        self.reveal(RailEntry::Settings, cx);
         cx.emit(ShellEvent::FocusSettings(section));
+    }
+
+    /// The rail entry whose view the right dock shows (while it is open):
+    /// the one last chosen, remembered in `app-state.json`; Settings until
+    /// one is.
+    pub fn right_entry(&self) -> RailEntry {
+        self.app_state.right_pane.unwrap_or(RailEntry::Settings)
+    }
+
+    /// Makes `entry` the right dock's view and saves it (a failed write is
+    /// logged; it still holds this run). Only the shell calls this, as it
+    /// switches the dock ([`Shell::show_rail_entry`](crate::shell::Shell::show_rail_entry));
+    /// a view asks for a pane with [`ShellState::reveal`].
+    pub fn set_right_entry(&mut self, entry: RailEntry, cx: &mut Context<Self>) {
+        if self.app_state.right_pane == Some(entry) {
+            return;
+        }
+        tracing::debug!(?entry, "right pane");
+        self.app_state.right_pane = Some(entry);
+        self.save_app_state();
+        cx.notify();
+    }
+
+    /// Asks the shell to show `entry`'s view ([`ShellEvent::Reveal`]).
+    pub fn reveal(&mut self, entry: RailEntry, cx: &mut Context<Self>) {
+        tracing::debug!(?entry, "reveal requested");
+        cx.emit(ShellEvent::Reveal(entry));
     }
 
     /// Applies one action (from the user or the link), queues its effects and

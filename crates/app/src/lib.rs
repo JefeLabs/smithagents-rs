@@ -8,6 +8,7 @@
 
 pub mod app_state;
 pub mod appearance;
+pub mod assets;
 mod atomic_file;
 pub mod layout_store;
 pub mod link;
@@ -29,6 +30,7 @@ use gpui_kit::{
 use smithagents_center_host::CenterTabHost;
 
 use crate::app_state::AppStateStore;
+use crate::assets::AppAssets;
 use crate::layout_store::{restored_window_bounds, LayoutStore, MIN_WINDOW_SIZE};
 use crate::link::LinkConfig;
 use crate::model::ShellModel;
@@ -61,8 +63,8 @@ pub fn run(
     tab_host: impl FnOnce(&mut App) -> Box<dyn CenterTabHost> + 'static,
 ) -> ! {
     gpui_kit::application()
-        // The Kit's bundled icons; without them every icon draws blank.
-        .with_assets(gpui_kit::assets::Assets)
+        // The app's icons, then the Kit's; an icon neither has draws blank.
+        .with_assets(AppAssets)
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx| {
             gpui_kit::init(cx);

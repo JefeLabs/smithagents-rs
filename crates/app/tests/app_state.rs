@@ -2,6 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use smithagents_app::app_state::{AppState, AppStateStore};
 use smithagents_app::view_models::SettingsSection;
+use smithagents_app::views::rail::RailEntry;
 use smithagents_core::ids::RepoId;
 
 #[test]
@@ -89,6 +90,7 @@ fn collapsed_settings_sections_round_trip() {
         .save(&AppState {
             last_repo_id: Some(id),
             collapsed_sections: vec![SettingsSection::Repositories],
+            ..Default::default()
         })
         .unwrap();
     let loaded = store.load();
@@ -128,4 +130,52 @@ fn collapsed_sections_load_leniently() {
     let loaded = store.load();
     assert_eq!(loaded.last_repo_id, Some(id));
     assert!(loaded.collapsed_sections.is_empty());
+}
+
+#[test]
+fn the_right_pane_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AppStateStore::new(dir.path());
+    assert_eq!(store.load().right_pane, None);
+    let id = RepoId::new();
+    store
+        .save(&AppState {
+            last_repo_id: Some(id),
+            right_pane: Some(RailEntry::Intents),
+            ..Default::default()
+        })
+        .unwrap();
+    let loaded = store.load();
+    assert_eq!(loaded.right_pane, Some(RailEntry::Intents));
+    assert_eq!(loaded.last_repo_id, Some(id), "the other field survives");
+    let text = std::fs::read_to_string(dir.path().join("app-state.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["right_pane"], "intents");
+
+    store
+        .save(&AppState {
+            right_pane: Some(RailEntry::Settings),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(store.load().right_pane, Some(RailEntry::Settings));
+}
+
+#[test]
+fn an_unknown_or_missing_right_pane_loads_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AppStateStore::new(dir.path());
+    let file = dir.path().join("app-state.json");
+    let id = RepoId::new();
+    for text in [
+        format!(r#"{{"last_repo_id": "{id}", "right_pane": "nope"}}"#),
+        format!(r#"{{"last_repo_id": "{id}", "right_pane": 3}}"#),
+        format!(r#"{{"last_repo_id": "{id}", "right_pane": null}}"#),
+        format!(r#"{{"last_repo_id": "{id}"}}"#),
+    ] {
+        std::fs::write(&file, &text).unwrap();
+        let loaded = store.load();
+        assert_eq!(loaded.right_pane, None, "{text}");
+        assert_eq!(loaded.last_repo_id, Some(id), "{text}");
+    }
 }

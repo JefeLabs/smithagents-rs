@@ -1,11 +1,12 @@
 //! The icon rail at the far right edge. Each entry shows its view in a dock;
-//! v1 has one, Settings, in the right dock. Plan 3b adds Intents here.
+//! Settings and Intents share the right dock, one at a time: the state keeps
+//! which one (`ShellState::right_entry`), and `Shell::show_rail_entry`
+//! switches it.
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::DockPlacement;
-use gpui_kit::component::{
-    v_flex, ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
-};
+use gpui_kit::component::{v_flex, ActiveTheme as _, Icon, Selectable as _, Sizable as _};
 use gpui_kit::{
     px, App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
     TestSupportExt as _, Window,
@@ -24,16 +25,18 @@ pub const RAIL_WIDTH: f32 = 40.;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RailEntry {
     Settings,
+    Intents,
 }
 
 impl RailEntry {
     /// Every entry, top to bottom.
-    pub const ALL: &'static [RailEntry] = &[RailEntry::Settings];
+    pub const ALL: &'static [RailEntry] = &[RailEntry::Settings, RailEntry::Intents];
 
     /// The tooltip and accessible name.
     pub fn label(self) -> &'static str {
         match self {
             RailEntry::Settings => "Settings",
+            RailEntry::Intents => "Intents",
         }
     }
 
@@ -41,20 +44,40 @@ impl RailEntry {
     pub fn element_id(self) -> ElementId {
         match self {
             RailEntry::Settings => "rail-settings".into(),
+            RailEntry::Intents => "rail-intents".into(),
         }
     }
 
+    /// The button's icon (from the full catalog; one outside the Kit's
+    /// defaults must be in [`AppIcons`](crate::assets::AppIcons)).
     pub fn icon(self) -> IconName {
         match self {
             RailEntry::Settings => IconName::Settings,
+            RailEntry::Intents => IconName::Lightbulb,
         }
     }
 
     /// The dock the entry's view lives in.
     pub fn placement(self) -> DockPlacement {
         match self {
-            RailEntry::Settings => DockPlacement::Right,
+            RailEntry::Settings | RailEntry::Intents => DockPlacement::Right,
         }
+    }
+
+    /// The name `app-state.json` keeps. Never change one once shipped.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RailEntry::Settings => "settings",
+            RailEntry::Intents => "intents",
+        }
+    }
+
+    /// The entry [`RailEntry::as_str`] names, or `None` for any other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|entry| entry.as_str() == text)
     }
 }
 

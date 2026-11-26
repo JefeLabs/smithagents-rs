@@ -1,4 +1,5 @@
-//! The Settings view in the right dock: a scrollable pane of collapsible
+//! The Settings view in the right dock (drawn while the rail has it
+//! selected; Intents shares the dock): a scrollable pane of collapsible
 //! sections, both expanded until the user collapses one (remembered in
 //! `app-state.json`):
 //!
@@ -47,6 +48,7 @@ use crate::shell::SETTINGS_PANEL;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, token_paint, Region};
 use crate::view_models::SettingsSection;
+use crate::views::rail::RailEntry;
 
 pub use appearance::{
     init, SelectNextOption, SelectPreviousOption, FONT_LABEL, FONT_OPTIONS_ID, RADIO_KEY_CONTEXT,
@@ -252,6 +254,12 @@ impl SettingsPane {
 impl BasePanel for SettingsPane {
     fn panel_name(&self) -> &'static str {
         SETTINGS_PANEL
+    }
+
+    /// Drawn only while the rail has Settings selected, so the dock's group
+    /// has one visible panel and draws no tab bar.
+    fn visible(&self, cx: &App) -> bool {
+        self.state.read(cx).right_entry() == RailEntry::Settings
     }
 
     /// The dock is locked to the shell's layout; its panels never close.
