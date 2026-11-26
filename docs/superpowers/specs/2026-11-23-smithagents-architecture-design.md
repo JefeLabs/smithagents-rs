@@ -31,7 +31,9 @@ Goals
   with every client closed (for remote daemons).
 - A fast native desktop shell (left, bottom, right panes) with a rich web
   center for chat, terminal and graphs.
-- Plugins for context sources, releasable individually, isolated from the daemon.
+- Plugins for context sources, releasable individually. Built-in plugins are
+  trusted and run in the daemon's process; third-party plugins are sandboxed.
+- Long term: a marketplace of third-party plugins. [decided]
 - UI composed on demand by agents (A2UI) from a styled component set.
 - Two-way sync with source tickets, gated by explicit user approval.
 
@@ -44,7 +46,11 @@ Non-goals
 
 Anti-goals (failure even if it "works")
 - Work stalls because a laptop slept or the app closed (remote daemons).
-- A misbehaving plugin takes down the daemon or other plugins.
+- A misbehaving third-party plugin takes down the daemon or other plugins. (A
+  built-in plugin shares the daemon's process, so its panics and slow calls
+  are contained but a hard crash is not; see 4.5.)
+- Third-party plugin code running natively in the daemon's process, or
+  reaching a host, secret or file its manifest did not declare.
 - Any plugin write to Jira/GitHub/etc. happens without user approval.
 - Credentials persisted by the daemon or exposed to the UI.
 - Pane and center state drifting out of sync (daemon is the single source of truth).
@@ -153,7 +159,8 @@ web/                 the one TypeScript package: center-tab web app
                      (chat, terminal, flow); talks to the daemon directly
 plugins/
   github/ jira/ confluence/ nexus/ aws-pipelines/ snyk/ datadog/ ...
-                     each: own version, plugin.toml, binary
+                     built-in plugins; each: own version, plugin.toml,
+                     built as a stabby dynamic library
 deferred hosts:
   host-web, host-web-coder, host-tauri (mobile/tablet)
 dev harness (in scope):
@@ -265,24 +272,60 @@ example "open this issue in a center tab").
 
 ### 4.5 Plugin system
 
-- **Hybrid hosting** [decided: in-process or out-of-process per plugin]. A
-  plugin is one Rust trait implementation plus serializable message types, all
-  defined in `plugin-protocol`. The same plugin can run either way:
-  - In-process: the plugin crate is linked into the daemon and runs on its own
-    supervised task (restart on panic, call timeouts and sync budgets). This
-    protects against panics and slow calls, not against memory or CPU hogs or
-    malice.
-  - Out-of-process: the plugin ships as its own binary that serves the same
-    trait over a versioned stdio/socket protocol (`plugin-protocol::serve`).
-    The daemon supervises the process (restart with backoff, resource limits,
-    log capture). Use this for flaky, heavy, third-party or non-Rust plugins;
-    TypeScript plugins are allowed only here, as a temporary bridge.
-  - `plugin.toml` declares `host = "in-process" | "process"`. Moving a plugin
-    between modes is a manifest and build change, not a rewrite. Default
-    guidance [my call]: first-party, simple, trusted plugins in-process;
-    everything else out-of-process. Process isolation contains crashes but is
-    not a security sandbox; an OS sandbox is separate work if third parties
-    ever write plugins.
+- **Hosting by trust** [decided: stabby for built-in context providers, a
+  Wasmtime sandbox for third-party plugins]. A plugin is one contract: a Rust
+  trait plus serializable message types in `plugin-protocol`, mirrored as a
+  WIT world for WebAssembly. `plugin.toml` declares `host`:
+  - `dylib` (built-in plugins): the plugin is a dynamic library with a
+    stabby ABI-stable interface, loaded into the daemon at start. It runs in
+    the daemon's process on its own supervised task (panics caught at the
+    boundary, restart on panic, call timeouts and sync budgets). This contains
+    panics and slow calls. It does not contain a hard crash, a memory or CPU
+    hog, or malice: a dylib can read everything the daemon holds. Only
+    plugins built and signed by us are ever loaded this way. Loaded libraries
+    are never unloaded; a plugin update takes effect when the daemon restarts.
+  - `wasm` (third-party and marketplace plugins): the plugin is a WebAssembly
+    component run in Wasmtime inside the daemon, so it adds no process. The
+    sandbox is the security boundary: the plugin gets no file system, no
+    environment and no sockets. Its only way out is the host-provided
+    interfaces, and outgoing HTTP is checked against the hosts its manifest
+    declares before the daemon sends it. It receives only the secret keys
+    its manifest declares. Each plugin has fuel/time and memory
+    limits; a trap or an exhausted limit ends that call and restarts that
+    plugin only. Async calls and streams (the streaming-tail resource kind)
+    use the component model's native async.
+  - `process` (escape hatch) [my call]: the plugin ships as its own binary
+    serving the same contract over a versioned stdio/socket protocol
+    (`plugin-protocol::serve`), supervised by the daemon (restart with
+    backoff, resource limits, log capture). For plugins that cannot be
+    compiled to WebAssembly or need a non-Rust runtime; TypeScript plugins
+    are allowed only here, as a temporary bridge. Process isolation contains
+    crashes but is not a security sandbox, so this mode is not offered to
+    marketplace plugins without an OS sandbox.
+  - `in-process` (development and tests) [my call]: the plugin crate is
+    linked into the daemon. Used for the contract's reference plugin and for
+    tests; shipped plugins use `dylib`.
+  - Rules that keep every mode open [my call]: plugins exchange only the
+    contract's serializable types with the daemon, never daemon-internal
+    types, whatever the host mode; every plugin write is a proposal the
+    daemon executes (below), so the approval rule is enforced by the host for
+    `wasm` and `process` and is a contract obligation for `dylib`.
+  - Verified 2026-11-26: Wasmtime 51 is current; WASI 0.3 (final since June
+    2026, on by default from Wasmtime 46) makes `async`, `stream<T>` and
+    `future<T>` part of the component model, though the component model
+    itself is still pre-1.0, so the WIT world is versioned and the Wasmtime
+    version is pinned. `wasmtime-wasi-http` has no built-in host allow-list:
+    the daemon implements the send-request hook and rejects undeclared
+    authorities. Extism (1.41) was considered: simpler, with a built-in
+    allowed-hosts list, but its calls are synchronous bytes-in/bytes-out with
+    no typed contract or streams, and it runs on Wasmtime anyway. stabby is
+    at 72.1.16 and ships a `libloading` integration.
+  - Costs accepted with `dylib`: the workspace forbids `unsafe`; loading a
+    library needs it, so one small loader crate is exempted and nothing else.
+    On macOS the hardened runtime only loads libraries signed by Apple or by
+    our Team ID; built-in dylibs are signed with ours and library validation
+    stays on. (This is also why third-party native libraries are ruled out:
+    they would need the entitlement that disables library validation.)
 - `plugin.toml` manifest: name, version, supported protocol range, resources
   with freshness mode, **settings** (form schema rendered per Space),
   **auth** requirements (secret-backed token, OAuth, browser session; feeds
@@ -321,14 +364,22 @@ example "open this issue in a center tab").
 - Secrets: a provider plugin (Keeper first, as in Intent IDE) resolves secrets
   at agent/plugin start. The daemon does not persist them. Resolution failure
   is surfaced in the session. [my call]
-- Isolation: crash, restart with backoff, rate-limit handling and sync budgets
-  per plugin.
-- Release: out-of-process plugins release individually: per-plugin tags
-  (`github-v0.3.1`), path-filtered CI, per-package release tooling, binaries
-  per target (macOS arm64/x86_64, Linux x86_64/aarch64), and macOS signing and
-  notarization per binary. In-process plugins are compiled into the daemon and
-  release with it, not individually. The daemon supports protocol N and N-1
-  for out-of-process plugins.
+- Isolation: restart with backoff, rate-limit handling and sync budgets per
+  plugin in every mode; crash and resource containment per mode as above.
+- Release: every shipped plugin releases individually with its own version
+  and tag (`github-v0.3.1`), path-filtered CI and per-package release tooling.
+  Built-in `dylib` plugins: one library per target (macOS arm64/x86_64, Linux
+  x86_64/aarch64), signed with our Team ID and notarized; the loader checks
+  the stabby interface report and the contract version at load and refuses a
+  mismatch with a clear message. `wasm` plugins: one `.wasm` component for
+  all targets, no native signing; the marketplace needs its own publisher
+  signature and review, which is not designed yet. `process` plugins:
+  binaries per target, signed and notarized per binary. The daemon supports
+  contract version N and N-1 in every mode.
+- Marketplace (long term, not designed): discovery, install/update UX,
+  publisher identity and signing, review, and a permission prompt showing the
+  hosts and secret keys a plugin declares. The constraints above are what v1
+  of the plugin system must not close off.
 
 ### 4.6 Browser
 
@@ -406,8 +457,16 @@ Plugin boundary
 - B. Out-of-process plugins: isolation, independent release; costs a
   supervisor, a versioned protocol and per-binary distribution.
 - Hybrid: one plugin trait, hosted in-process or out-of-process per plugin.
-  **Chosen (owner).**
-- C. WASM components: strong sandbox; weak SDKs for AWS/Datadog. Rejected for now.
+  Chosen first, then superseded: one process per plugin was judged too many
+  processes for six or more plugins.
+- C. WASM components: strong sandbox; weak SDKs for AWS/Datadog. First
+  rejected, then **chosen for third-party plugins (owner)**: plugins reach
+  services through host-provided HTTP rather than vendor SDKs.
+- D. ABI-stable dynamic libraries (stabby): separate release at in-process
+  speed, no isolation. **Chosen for built-in plugins (owner).** Rejected for
+  third-party code (shared memory and crashes, macOS library validation).
+- E. Extism: quickest path to WASM plugins; untyped synchronous calls, no
+  streams. Rejected in favour of Wasmtime's component model.
 
 UI toolkit and split
 - iced everywhere in Rust (wasm for web hosts): web reach from one codebase;
@@ -588,9 +647,11 @@ transitions, plugin install/update UX, test strategy.
 
 1. GPUI + web center; web hosts and mobile deferred (desktop-first). Owner
    has not answered whether browser access is needed in v1.
-2. [Decided: hybrid] One plugin trait, hosted in-process or out-of-process
-   per plugin; default guidance is in-process for simple trusted first-party
-   plugins and out-of-process for the rest.
+2. [Decided: by trust] One plugin contract; built-in plugins are stabby
+   dynamic libraries in the daemon's process, third-party plugins are
+   WebAssembly components in Wasmtime. Designer's calls to verify: keeping a
+   `process` mode as an escape hatch and a linked `in-process` mode for
+   development; the scoped `unsafe` exemption for the loader.
 3. Freshness modes per integration; views declared in the plugin manifest.
 4. Secrets via a provider plugin resolved at start, bootstrap credential from
    the host environment, never stored.
