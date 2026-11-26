@@ -7,26 +7,20 @@ use serde_json::{Map, Value};
 
 use crate::{CONTRACT_VERSION, MIN_CONTRACT_VERSION};
 
-/// A plugin's id: `^[a-z][a-z0-9-]{1,31}$`.
+/// A plugin's id: `^[a-z][a-z0-9-]{1,31}$` with no `--` and no trailing `-`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PluginId(String);
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
-#[error("invalid plugin id {0:?}: use a lower-case letter, then 1 to 31 lower-case letters, digits or '-'")]
+#[error("invalid plugin id {0:?}: use a lower-case letter, then 1 to 31 lower-case letters, digits or single '-', not ending in '-'")]
 pub struct PluginIdError(String);
 
 impl FromStr for PluginId {
     type Err = PluginIdError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = s.as_bytes();
-        let ok = (2..=32).contains(&bytes.len())
-            && bytes[0].is_ascii_lowercase()
-            && bytes[1..]
-                .iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
-        if ok {
+        if (2..=32).contains(&s.len()) && is_dashed_name(s) {
             Ok(PluginId(s.to_string()))
         } else {
             Err(PluginIdError(s.to_string()))
@@ -83,6 +77,28 @@ impl fmt::Display for HostMode {
     }
 }
 
+/// `^[a-z][a-z0-9-]*$` with no `--` and no trailing `-`. Upper-cased with `-`
+/// as `_`, such names never contain `__` nor end in `_`, so
+/// `SMITHAGENTS_SECRET_<PLUGIN>__<KEY>` names one plugin and key only.
+fn is_dashed_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.first().is_some_and(u8::is_ascii_lowercase)
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && !s.contains("--")
+        && !s.ends_with('-')
+}
+
+/// `^[a-z][a-z0-9_-]{0,63}$`: setting keys and resource kinds, which later
+/// appear in URLs and in the store.
+fn is_plain_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() <= 64
+        && b.first().is_some_and(u8::is_ascii_lowercase)
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretDecl {
@@ -90,6 +106,18 @@ pub struct SecretDecl {
     pub label: String,
     #[serde(default)]
     pub help: Option<String>,
+    /// The hosts this secret may be sent to, each one of the manifest's
+    /// `hosts`. May be left out when the manifest declares exactly one host;
+    /// after [`Manifest::parse`] it is never empty.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+impl SecretDecl {
+    /// `^[a-z][a-z0-9-]{0,63}$` with no `--` and no trailing `-`.
+    pub fn is_valid_key(key: &str) -> bool {
+        key.len() <= 64 && is_dashed_name(key)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +192,16 @@ pub enum ManifestError {
     BadEntry(String),
     #[error("host {0:?} is not a plain DNS host name")]
     BadHost(String),
+    #[error("secret key {0:?}: use a lower-case letter, then up to 63 lower-case letters, digits or single '-', not ending in '-'")]
+    BadSecretKey(String),
+    #[error("secret {0:?} must list its hosts: the manifest does not declare exactly one host")]
+    SecretHostsRequired(String),
+    #[error("secret {key:?}: host {host:?} is not one of the manifest's hosts")]
+    SecretHostNotDeclared { key: String, host: String },
+    #[error("setting key {0:?}: use a lower-case letter, then up to 63 lower-case letters, digits, '-' or '_'")]
+    BadSettingKey(String),
+    #[error("resource kind {0:?}: use a lower-case letter, then up to 63 lower-case letters, digits, '-' or '_'")]
+    BadResourceKind(String),
     #[error("duplicate secret key {0:?}")]
     DuplicateSecret(String),
     #[error("duplicate setting key {0:?}")]
@@ -188,8 +226,11 @@ pub enum SettingsError {
     Unknown(String),
 }
 
+/// A plain DNS name, lower-cased: at least two labels of `[a-z0-9-]` that do
+/// not start or end with `-`, the last starting with a letter. That rules out
+/// `localhost` and every spelling a resolver or URL parser may read as an
+/// address (`127.1`, `0x7f.0x0.0x0.0x1`, `a.0x1`).
 fn normalise_host(raw: &str) -> Result<String, ManifestError> {
-    let bad = || ManifestError::BadHost(raw.to_string());
     let host = raw.to_ascii_lowercase();
     let labels: Vec<&str> = host.split('.').collect();
     let label_ok = |l: &&str| {
@@ -200,12 +241,16 @@ fn normalise_host(raw: &str) -> Result<String, ManifestError> {
             && l.bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
-    // A dotted-quad (or any all-digit tail) is an IP literal, not a name.
-    let ip_like = labels
+    let last_starts_with_letter = labels
         .last()
-        .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
-    if host.len() > 253 || !labels.iter().all(label_ok) || ip_like {
-        return Err(bad());
+        .and_then(|l| l.bytes().next())
+        .is_some_and(|b| b.is_ascii_lowercase());
+    if host.len() > 253
+        || labels.len() < 2
+        || !labels.iter().all(label_ok)
+        || !last_starts_with_letter
+    {
+        return Err(ManifestError::BadHost(raw.to_string()));
     }
     Ok(host)
 }
@@ -240,13 +285,38 @@ impl Manifest {
             .collect::<Result<_, _>>()?;
 
         let mut seen = HashSet::new();
-        for s in &m.secrets {
-            if !seen.insert(s.key.as_str()) {
+        for s in m.secrets.iter_mut() {
+            if !SecretDecl::is_valid_key(&s.key) {
+                return Err(ManifestError::BadSecretKey(s.key.clone()));
+            }
+            if !seen.insert(s.key.clone()) {
                 return Err(ManifestError::DuplicateSecret(s.key.clone()));
+            }
+            if s.hosts.is_empty() {
+                // Bound to the only host, or the manifest must say where it may go.
+                match m.hosts.as_slice() {
+                    [only] => s.hosts = vec![only.clone()],
+                    _ => return Err(ManifestError::SecretHostsRequired(s.key.clone())),
+                }
+            } else {
+                s.hosts = s
+                    .hosts
+                    .iter()
+                    .map(|h| normalise_host(h))
+                    .collect::<Result<_, _>>()?;
+                if let Some(host) = s.hosts.iter().find(|h| !m.hosts.contains(h)) {
+                    return Err(ManifestError::SecretHostNotDeclared {
+                        key: s.key.clone(),
+                        host: host.clone(),
+                    });
+                }
             }
         }
         let mut seen = HashSet::new();
         for s in &m.settings {
+            if !is_plain_name(&s.key) {
+                return Err(ManifestError::BadSettingKey(s.key.clone()));
+            }
             if !seen.insert(s.key.as_str()) {
                 return Err(ManifestError::DuplicateSetting(s.key.clone()));
             }
@@ -256,6 +326,9 @@ impl Manifest {
         }
         let mut seen = HashSet::new();
         for r in &m.resources {
+            if !is_plain_name(&r.kind) {
+                return Err(ManifestError::BadResourceKind(r.kind.clone()));
+            }
             if !seen.insert(r.kind.as_str()) {
                 return Err(ManifestError::DuplicateResource(r.kind.clone()));
             }

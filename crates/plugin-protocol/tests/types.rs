@@ -112,6 +112,65 @@ fn cursor_too_long() {
     p.validate().unwrap();
 }
 
+fn with_url(url: &str) -> SyncPage {
+    let mut it = item("1");
+    it.url = Some(url.to_string());
+    page(vec![it])
+}
+
+#[test]
+fn item_url_must_be_an_absolute_http_url() {
+    for ok in [
+        "https://github.com/octo/repo/issues/1",
+        "http://example.com",
+        "https://example.com:8443/a?b=c#d",
+    ] {
+        with_url(ok).validate().unwrap();
+    }
+    for bad in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "/relative/path",
+        "relative/path",
+        "",
+        "github.com/octo/repo",
+        "https://",
+        "mailto:a@example.com",
+        "data:text/html,hi",
+        "https://exa mple.com/",
+        "https://example.com/a b",
+        " https://example.com/",
+        "https://example.com/\n",
+    ] {
+        assert_eq!(
+            with_url(bad).validate().unwrap_err(),
+            ContractError::BadUrl("1".into()),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn item_url_and_version_at_most_4_kib() {
+    let base = "https://example.com/";
+    let longest = format!("{base}{}", "p".repeat(4096 - base.len()));
+    assert_eq!(longest.len(), 4096);
+    with_url(&longest).validate().unwrap();
+    assert_eq!(
+        with_url(&format!("{longest}p")).validate().unwrap_err(),
+        ContractError::UrlTooLong("1".into())
+    );
+
+    let mut it = item("1");
+    it.version = Some("v".repeat(4096));
+    page(vec![it.clone()]).validate().unwrap();
+    it.version = Some("v".repeat(4097));
+    assert_eq!(
+        page(vec![it]).validate().unwrap_err(),
+        ContractError::VersionTooLong("1".into())
+    );
+}
+
 fn round_trip<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
     v: T,
 ) -> serde_json::Value {

@@ -52,8 +52,8 @@ fn assert_hides(err: &SecretError, forbidden: &[&str]) {
 }
 
 #[tokio::test]
-async fn the_environment_fallback_is_smithagents_secret_plugin_key() {
-    std::env::set_var("SMITHAGENTS_SECRET_MY_PLUG_API_KEY", "fallback-5ecret");
+async fn the_environment_fallback_separates_plugin_and_key_with_a_double_underscore() {
+    std::env::set_var("SMITHAGENTS_SECRET_MY_PLUG__API_KEY", "fallback-5ecret");
     let home = tempfile::tempdir().unwrap();
 
     let secrets = ConfiguredSecrets::load(home.path()).unwrap();
@@ -61,6 +61,37 @@ async fn the_environment_fallback_is_smithagents_secret_plugin_key() {
     assert_eq!(
         value(&secrets, "my-plug", "api-key").await.as_deref(),
         Some("fallback-5ecret")
+    );
+}
+
+#[tokio::test]
+async fn fallback_names_cannot_collide_across_plugins() {
+    // Under a single `_` separator both pairs were SMITHAGENTS_SECRET_GITHUB_API_TOKEN.
+    std::env::set_var("SMITHAGENTS_SECRET_GITHUB__API_TOKEN", "for-github");
+    std::env::set_var("SMITHAGENTS_SECRET_GITHUB_API__TOKEN", "for-github-api");
+    let secrets = ConfiguredSecrets::default();
+
+    assert_eq!(
+        value(&secrets, "github", "api-token").await.as_deref(),
+        Some("for-github")
+    );
+    assert_eq!(
+        value(&secrets, "github-api", "token").await.as_deref(),
+        Some("for-github-api")
+    );
+}
+
+#[tokio::test]
+async fn a_key_outside_the_manifest_rules_has_no_fallback() {
+    // `api.key` would otherwise map onto the same name as `api-key`.
+    std::env::set_var("SMITHAGENTS_SECRET_DOT_PLUG__API_KEY", "dot-5ecret");
+    let secrets = ConfiguredSecrets::default();
+
+    assert_eq!(value(&secrets, "dot-plug", "api.key").await, None);
+    assert_eq!(value(&secrets, "dot-plug", "API-KEY").await, None);
+    assert_eq!(
+        value(&secrets, "dot-plug", "api-key").await.as_deref(),
+        Some("dot-5ecret")
     );
 }
 
@@ -77,7 +108,7 @@ async fn a_secret_configured_nowhere_is_none() {
 #[tokio::test]
 async fn an_env_entry_reads_the_named_variable_and_wins_over_the_fallback() {
     std::env::set_var("SMITHAGENTS_TEST_ENV_ENTRY_7Q3", "entry-5ecret");
-    std::env::set_var("SMITHAGENTS_SECRET_ENV_PLUG_TOKEN", "fallback-5ecret");
+    std::env::set_var("SMITHAGENTS_SECRET_ENV_PLUG__TOKEN", "fallback-5ecret");
     let (_home, secrets) = load(
         r#"
         [env-plug]

@@ -63,13 +63,20 @@ pub(crate) fn is_ip_host(host: &str) -> bool {
     Url::parse(&format!("https://{host}/")).map_or(true, |url| url.domain().is_none())
 }
 
+/// Where a checked request goes.
+pub(crate) struct Target {
+    pub(crate) url: Url,
+    /// The declared host, or `None` for `http://127.0.0.1` under the loopback exemption.
+    pub(crate) host: Option<String>,
+}
+
 /// Checks where a request goes: `https` to a declared host on port 443, or,
 /// under the loopback exemption, `http://127.0.0.1`.
 pub(crate) fn check_url(
     raw: &str,
     hosts: &[String],
     policy: &HttpPolicy,
-) -> Result<Url, HttpError> {
+) -> Result<Target, HttpError> {
     let url = Url::parse(raw).map_err(|e| denied(format!("invalid URL: {e}")))?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(denied("a URL may not carry a user name or password"));
@@ -78,7 +85,7 @@ pub(crate) fn check_url(
         && url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1")
     {
-        return Ok(url);
+        return Ok(Target { url, host: None });
     }
     if url.scheme() != "https" {
         return Err(denied(format!(
@@ -88,17 +95,20 @@ pub(crate) fn check_url(
     }
     // `domain` is `None` for IP literals in every spelling the parser accepts.
     let host = match (url.domain(), url.host_str()) {
-        (Some(domain), _) => domain,
+        (Some(domain), _) => domain.to_string(),
         (None, Some(_)) => return Err(denied("IP address hosts are not allowed")),
         (None, None) => return Err(denied("the URL has no host")),
     };
-    if !hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+    if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
         return Err(denied(format!(
             "host {host:?} is not declared in the plugin manifest"
         )));
     }
     match url.port_or_known_default() {
-        Some(443) => Ok(url),
+        Some(443) => Ok(Target {
+            url,
+            host: Some(host),
+        }),
         Some(port) => Err(denied(format!("port {port} is not allowed; only 443"))),
         None => Err(denied("the URL has no port")),
     }
@@ -121,19 +131,17 @@ pub(crate) fn check_method(purpose: CallPurpose, method: HttpMethod) -> Result<M
     }
 }
 
-/// Headers the host owns: credentials and routing (`Authorization`, `Cookie`,
-/// `Host`, `Proxy-*`) and message framing, which the HTTP client sets itself.
-fn host_owned(name: &HeaderName) -> bool {
+/// `Cookie` and the headers that route or frame the request. The host and the
+/// HTTP client set these; a plugin never does, not even through `Auth::Header`.
+fn routing_or_framing(name: &HeaderName) -> bool {
     let name = name.as_str();
     name.starts_with("proxy-")
         || matches!(
             name,
-            "authorization"
+            "host"
                 | "cookie"
-                | "host"
                 | "connection"
                 | "content-length"
-                | "keep-alive"
                 | "te"
                 | "trailer"
                 | "transfer-encoding"
@@ -141,12 +149,32 @@ fn host_owned(name: &HeaderName) -> bool {
         )
 }
 
-pub(crate) fn plugin_headers(pairs: &[(String, String)]) -> Result<HeaderMap, HttpError> {
+/// Headers asking a server to treat the request as another method.
+fn method_override(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "x-http-method-override" | "x-http-method" | "x-method-override"
+    )
+}
+
+/// Headers a plugin may not set itself: credentials (`Authorization`,
+/// `Cookie`), routing and framing, `Keep-Alive`, and during a sync the
+/// method overrides.
+fn plugin_may_not_set(name: &HeaderName, purpose: CallPurpose) -> bool {
+    routing_or_framing(name)
+        || matches!(name.as_str(), "authorization" | "keep-alive")
+        || (purpose == CallPurpose::Sync && method_override(name))
+}
+
+pub(crate) fn plugin_headers(
+    pairs: &[(String, String)],
+    purpose: CallPurpose,
+) -> Result<HeaderMap, HttpError> {
     let mut headers = HeaderMap::new();
     for (name, value) in pairs {
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| denied(format!("invalid header name {name:?}")))?;
-        if host_owned(&name) {
+        if plugin_may_not_set(&name, purpose) {
             return Err(denied(format!("a plugin may not set the {name} header")));
         }
         let value = HeaderValue::from_str(value)
@@ -156,12 +184,13 @@ pub(crate) fn plugin_headers(pairs: &[(String, String)]) -> Result<HeaderMap, Ht
     Ok(headers)
 }
 
-/// The header an `Auth::Header` fills. It may carry a credential
-/// (`Authorization`, `Cookie`), but not route or frame the request.
-pub(crate) fn auth_header_name(name: &str) -> Result<HeaderName, HttpError> {
+/// The header an `Auth::Header` fills: a valid header token that does not
+/// route or frame the request. `Authorization` is allowed, for schemes such as
+/// `Authorization: token <value>`. During a sync it may not be a method override.
+pub(crate) fn auth_header_name(name: &str, purpose: CallPurpose) -> Result<HeaderName, HttpError> {
     let parsed = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| denied(format!("invalid auth header name {name:?}")))?;
-    if host_owned(&parsed) && !matches!(parsed.as_str(), "authorization" | "cookie") {
+    if routing_or_framing(&parsed) || (purpose == CallPurpose::Sync && method_override(&parsed)) {
         return Err(denied(format!("auth may not set the {parsed} header")));
     }
     Ok(parsed)
@@ -287,24 +316,31 @@ fn is_public(ip: IpAddr) -> bool {
 }
 
 fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
-    !(a == 0                                // 0/8: this network, including unspecified
-        || ip.is_loopback()                 // 127/8
-        || ip.is_private()                  // 10/8, 172.16/12, 192.168/16
-        || ip.is_link_local()               // 169.254/16
-        || (a == 100 && (b & 0xc0) == 64)   // 100.64/10: carrier-grade NAT
-        || ip.is_multicast()                // 224/4
-        || a >= 240) // 240/4: reserved, and broadcast
+    let [a, b, c, _] = ip.octets();
+    let refused = a == 0 // 0/8: this network, including unspecified
+        || ip.is_loopback() // 127/8
+        || ip.is_private() // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local() // 169.254/16
+        || (a == 100 && (b & 0xc0) == 64) // 100.64/10: carrier-grade NAT
+        || (a == 192 && b == 0 && c == 0) // 192.0.0/24: IETF protocol assignments
+        || (a == 192 && b == 0 && c == 2) // 192.0.2/24: documentation
+        || (a == 198 && (b & 0xfe) == 18) // 198.18/15: benchmarking
+        || (a == 198 && b == 51 && c == 100) // 198.51.100/24: documentation
+        || (a == 203 && b == 0 && c == 113) // 203.0.113/24: documentation
+        || ip.is_multicast() // 224/4
+        || a >= 240; // 240/4: reserved, and broadcast
+    !refused
 }
 
+/// Global unicast (`2000::/3`) only, minus the tunnelling and documentation
+/// blocks inside it. Everything else, such as `::1`, `fc00::/7`, `fe80::/10`,
+/// `ff00::/8`, `100::/64` and `64:ff9b:1::/48`, lies outside `2000::/3`.
 fn is_public_v6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || (first & 0xfe00) == 0xfc00   // fc00::/7: unique local
-        || (first & 0xffc0) == 0xfe80   // fe80::/10: link-local
-        || (first & 0xffc0) == 0xfec0   // fec0::/10: site-local (deprecated)
-        || ip.is_multicast()) // ff00::/8
+    let [a, b, ..] = ip.segments();
+    (a & 0xe000) == 0x2000
+        && a != 0x2002 // 2002::/16: 6to4
+        && !(a == 0x2001 && b == 0) // 2001::/32: Teredo
+        && !(a == 0x2001 && b == 0x0db8) // 2001:db8::/32: documentation
 }
 
 /// The IPv4 address inside an IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
@@ -343,6 +379,13 @@ mod tests {
             "169.254.169.254",
             "100.64.0.1",
             "100.127.255.255",
+            // IPv4: special purpose, documentation, benchmarking
+            "192.0.0.8",
+            "192.0.2.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
             // IPv4: multicast, reserved, broadcast
             "224.0.0.1",
             "240.0.0.1",
@@ -356,10 +399,22 @@ mod tests {
             "febf::1",
             "fec0::1",
             "ff02::1",
+            // IPv6 outside 2000::/3, and the special blocks inside it
+            "100::1",
+            "64:ff9b:1::1",
+            "1000::1",
+            "4000::1",
+            "2002::1",
+            "2002:808:808::1",
+            "2001::1",
+            "2001:0:ffff::1",
+            "2001:db8::1",
+            "2001:db8:ffff::1",
             // IPv4 inside IPv6
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
+            "::ffff:198.18.0.1",
             "::127.0.0.1",
             "64:ff9b::7f00:1",
             "64:ff9b::a00:1",
@@ -379,7 +434,18 @@ mod tests {
             "172.15.255.255",
             "172.32.0.1",
             "192.169.0.1",
+            "192.0.1.1",
+            "192.0.3.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "198.51.101.1",
+            "203.0.114.1",
+            "2606:4700::1",
             "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "2001:1::1",
+            "2001:db9::1",
+            "3ffe::1",
             "2a01:4f8::1",
             "::ffff:8.8.8.8",
             "64:ff9b::808:808",

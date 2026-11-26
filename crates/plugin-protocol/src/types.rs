@@ -10,6 +10,8 @@ const MAX_FIELDS_BYTES: usize = 64 * 1024;
 const MAX_TITLE_CHARS: usize = 512;
 const MAX_ID_BYTES: usize = 4 * 1024;
 const MAX_CURSOR_BYTES: usize = 4 * 1024;
+const MAX_URL_BYTES: usize = 4 * 1024;
+const MAX_VERSION_BYTES: usize = 4 * 1024;
 
 /// One sync call: which resource to fetch, from which cursor, with which settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +55,12 @@ pub enum ContractError {
     FieldsNotObject(String),
     #[error("item {0}: title longer than 512 characters")]
     TitleTooLong(String),
+    #[error("item {0}: url longer than 4 KiB")]
+    UrlTooLong(String),
+    #[error("item {0}: url is not an absolute http or https URL")]
+    BadUrl(String),
+    #[error("item {0}: version longer than 4 KiB")]
+    VersionTooLong(String),
     #[error("duplicate id {0}")]
     DuplicateId(String),
     #[error("empty id")]
@@ -61,6 +69,17 @@ pub enum ContractError {
     IdTooLong,
     #[error("cursor longer than 4 KiB")]
     CursorTooLong,
+}
+
+/// An absolute `http` or `https` URL with a host, written out plainly: no
+/// spaces or control characters, which a URL parser would silently drop.
+fn is_web_url(raw: &str) -> bool {
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    url::Url::parse(raw).is_ok_and(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+    })
 }
 
 fn check_id(id: &str) -> Result<(), ContractError> {
@@ -97,6 +116,21 @@ impl SyncPage {
             }
             if item.title.chars().count() > MAX_TITLE_CHARS {
                 return Err(ContractError::TitleTooLong(item.id.clone()));
+            }
+            if let Some(url) = &item.url {
+                if url.len() > MAX_URL_BYTES {
+                    return Err(ContractError::UrlTooLong(item.id.clone()));
+                }
+                if !is_web_url(url) {
+                    return Err(ContractError::BadUrl(item.id.clone()));
+                }
+            }
+            if item
+                .version
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_VERSION_BYTES)
+            {
+                return Err(ContractError::VersionTooLong(item.id.clone()));
             }
             if !item.fields.is_object() {
                 return Err(ContractError::FieldsNotObject(item.id.clone()));

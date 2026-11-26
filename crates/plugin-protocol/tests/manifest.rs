@@ -54,7 +54,8 @@ fn sample_parses() {
         vec![SecretDecl {
             key: "token".into(),
             label: "Personal access token".into(),
-            help: None
+            help: None,
+            hosts: vec!["api.github.com".into()],
         }]
     );
     assert_eq!(m.settings.len(), 1);
@@ -82,13 +83,140 @@ fn unknown_keys_are_rejected_at_every_level() {
 
 #[test]
 fn bad_ids() {
-    for id in ["GitHub", "a", &"a".repeat(33)] {
+    for id in ["GitHub", "a", &"a".repeat(33), "git--hub", "github-"] {
         let text = SAMPLE.replace("id = \"github\"", &format!("id = \"{id}\""));
         assert!(matches!(err(&text), ManifestError::Toml(_)), "{id}");
     }
     assert!("ab".parse::<PluginId>().is_ok());
     assert!("a".repeat(32).parse::<PluginId>().is_ok());
     assert!("a".parse::<PluginId>().is_err());
+}
+
+#[test]
+fn plugin_id_rules() {
+    for ok in ["ab", "a-b", "a1", "github-api", "a-1-b", &"a".repeat(32)] {
+        assert!(ok.parse::<PluginId>().is_ok(), "{ok:?}");
+    }
+    for bad in [
+        "a",
+        "a--b",
+        "ab-",
+        "-ab",
+        "1ab",
+        "Ab",
+        "a_b",
+        "a.b",
+        &"a".repeat(33),
+    ] {
+        assert!(bad.parse::<PluginId>().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn secret_key_rules() {
+    let long = "k".repeat(65);
+    for key in [
+        "Token", "1token", "to--ken", "token-", "-token", "to_ken", "to.ken", "", &long,
+    ] {
+        let text = SAMPLE.replace("key = \"token\"", &format!("key = \"{key}\""));
+        assert_eq!(
+            err(&text),
+            ManifestError::BadSecretKey(key.into()),
+            "{key:?}"
+        );
+    }
+    let longest = "k".repeat(64);
+    for key in ["t", "api-key", "k2", "a-b-c", &longest] {
+        let text = SAMPLE.replace("key = \"token\"", &format!("key = \"{key}\""));
+        assert_eq!(Manifest::parse(&text).unwrap().secrets[0].key, key);
+    }
+}
+
+#[test]
+fn setting_keys_and_resource_kinds() {
+    let long = "k".repeat(65);
+    for name in ["Repos", "1repos", "re pos", "re.pos", "_repos", "", &long] {
+        let text = SAMPLE.replace("key = \"repositories\"", &format!("key = \"{name}\""));
+        assert_eq!(
+            err(&text),
+            ManifestError::BadSettingKey(name.into()),
+            "{name:?}"
+        );
+        let text = SAMPLE.replace("kind = \"issue\"", &format!("kind = \"{name}\""));
+        assert_eq!(
+            err(&text),
+            ManifestError::BadResourceKind(name.into()),
+            "{name:?}"
+        );
+    }
+    let longest = "k".repeat(64);
+    for name in ["r", "pull_request", "pull-request", "k9", "a__b", &longest] {
+        let text = SAMPLE.replace("key = \"repositories\"", &format!("key = \"{name}\""));
+        Manifest::parse(&text).unwrap();
+        let text = SAMPLE.replace("kind = \"issue\"", &format!("kind = \"{name}\""));
+        Manifest::parse(&text).unwrap();
+    }
+}
+
+#[test]
+fn a_secret_without_hosts_is_bound_to_the_only_host() {
+    let m = Manifest::parse(SAMPLE).unwrap();
+    assert_eq!(m.secrets[0].hosts, vec!["api.github.com"]);
+}
+
+#[test]
+fn a_secret_must_name_its_hosts_unless_there_is_exactly_one() {
+    let two = SAMPLE.replace(
+        r#"hosts = ["api.github.com"]"#,
+        r#"hosts = ["api.github.com", "uploads.github.com"]"#,
+    );
+    assert_eq!(
+        err(&two),
+        ManifestError::SecretHostsRequired("token".into())
+    );
+    let none = SAMPLE.replace("hosts = [\"api.github.com\"]\n", "");
+    assert_eq!(
+        err(&none),
+        ManifestError::SecretHostsRequired("token".into())
+    );
+    let empty = two.replace(
+        "label = \"Personal access token\"",
+        "label = \"Personal access token\"\nhosts = []",
+    );
+    assert_eq!(
+        err(&empty),
+        ManifestError::SecretHostsRequired("token".into())
+    );
+
+    let bound = two.replace(
+        "label = \"Personal access token\"",
+        "label = \"Personal access token\"\nhosts = [\"API.github.com\"]",
+    );
+    let m = Manifest::parse(&bound).unwrap();
+    assert_eq!(m.secrets[0].hosts, vec!["api.github.com"]);
+}
+
+#[test]
+fn a_secret_host_must_be_a_manifest_host() {
+    let stray = SAMPLE.replace(
+        "label = \"Personal access token\"",
+        "label = \"Personal access token\"\nhosts = [\"api.github.com\", \"evil.example\"]",
+    );
+    assert_eq!(
+        err(&stray),
+        ManifestError::SecretHostNotDeclared {
+            key: "token".into(),
+            host: "evil.example".into()
+        }
+    );
+    let malformed = SAMPLE.replace(
+        "label = \"Personal access token\"",
+        "label = \"Personal access token\"\nhosts = [\"*.github.com\"]",
+    );
+    assert_eq!(
+        err(&malformed),
+        ManifestError::BadHost("*.github.com".into())
+    );
 }
 
 #[test]
@@ -124,9 +252,37 @@ fn bad_hosts() {
         "[::1]",
         "api.github.com.",
         "",
+        // No dot, or a last label that does not start with a letter: names a
+        // resolver or URL parser may read as an address.
+        "localhost",
+        "0x7f.0x0.0x0.0x1",
+        "127.1",
+        "a.0x1",
+        "a.1b",
+        "a..com",
+        "-a.com",
+        "a-.com",
+        "a.com-",
+        "a_b.com",
     ] {
         let text = SAMPLE.replace("api.github.com", h);
         assert_eq!(err(&text), ManifestError::BadHost(h.to_string()), "{h:?}");
+    }
+}
+
+#[test]
+fn good_hosts() {
+    for h in [
+        "api.github.com",
+        "fixture.invalid",
+        "a.b",
+        "x1.example",
+        "a-b.c-d.org",
+        "1password.com",
+        "example.xn--p1ai",
+    ] {
+        let text = SAMPLE.replace("api.github.com", h);
+        assert_eq!(Manifest::parse(&text).unwrap().hosts, vec![h], "{h:?}");
     }
 }
 

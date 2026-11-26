@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use smithagents_plugin_protocol::PluginId;
+use smithagents_plugin_protocol::{PluginId, SecretDecl};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -81,7 +81,7 @@ enum Entry {
 
 type Key = (String, String);
 
-/// Secrets from `<home>/secrets.toml`, then from `SMITHAGENTS_SECRET_<PLUGIN>_<KEY>`.
+/// Secrets from `<home>/secrets.toml`, then from `SMITHAGENTS_SECRET_<PLUGIN>__<KEY>`.
 ///
 /// The file has one table per plugin id, each key either `{ env = "NAME" }` or
 /// `{ command = ["prog", "arg"] }`. A key listed in the file is resolved only
@@ -141,7 +141,10 @@ impl SecretSource for ConfiguredSecrets {
         let resolved = match self.entries.get(&id) {
             Some(Entry::Env(name)) => from_env(name)?,
             Some(Entry::Command(argv)) => from_command(argv).await?,
-            None => from_env(&env_var_name(plugin, key))?,
+            None => match env_var_name(plugin, key) {
+                Some(name) => from_env(&name)?,
+                None => None,
+            },
         };
         if let Some(secret) = &resolved {
             self.remember(id, secret);
@@ -150,24 +153,20 @@ impl SecretSource for ConfiguredSecrets {
     }
 }
 
-/// `SMITHAGENTS_SECRET_<PLUGIN>_<KEY>`: upper case, anything but a letter or digit becomes `_`.
-fn env_var_name(plugin: &PluginId, key: &str) -> String {
-    let upper = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_uppercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
-    format!(
-        "SMITHAGENTS_SECRET_{}_{}",
+/// `SMITHAGENTS_SECRET_<PLUGIN>__<KEY>`, upper case with `-` as `_`. Neither
+/// a plugin id nor a valid secret key can contain `--` or end in `-`, so the
+/// double underscore separates them unambiguously: no two (plugin, key) pairs
+/// share a name. A key outside the manifest rules has no fallback.
+fn env_var_name(plugin: &PluginId, key: &str) -> Option<String> {
+    if !SecretDecl::is_valid_key(key) {
+        return None;
+    }
+    let upper = |s: &str| s.to_ascii_uppercase().replace('-', "_");
+    Some(format!(
+        "SMITHAGENTS_SECRET_{}__{}",
         upper(plugin.as_ref()),
         upper(key)
-    )
+    ))
 }
 
 /// An empty value counts as unset.
@@ -291,16 +290,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_var_name_upper_cases_and_replaces_separators() {
-        let id: PluginId = "my-plug".parse().unwrap();
+    fn env_var_name_separates_plugin_and_key_with_a_double_underscore() {
+        let id = |s: &str| -> PluginId { s.parse().unwrap() };
         assert_eq!(
-            env_var_name(&id, "api-key"),
-            "SMITHAGENTS_SECRET_MY_PLUG_API_KEY"
+            env_var_name(&id("my-plug"), "api-key").as_deref(),
+            Some("SMITHAGENTS_SECRET_MY_PLUG__API_KEY")
         );
-        assert_eq!(
-            env_var_name(&id, "a.b c"),
-            "SMITHAGENTS_SECRET_MY_PLUG_A_B_C"
+        assert_ne!(
+            env_var_name(&id("github"), "api-token"),
+            env_var_name(&id("github-api"), "token")
         );
+        for bad in ["a.b", "a b", "API", "a--b", "a-", "", "a_b"] {
+            assert_eq!(env_var_name(&id("my-plug"), bad), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -2,8 +2,9 @@
 //!
 //! Nothing here leaves the machine. Allowed requests go to a local axum server
 //! at `http://127.0.0.1:<port>` through `allow_insecure_loopback`; the only name
-//! ever resolved is `localhost`. Every denied request must leave the server
-//! untouched: no TCP connection and no request.
+//! ever resolved is `localhost` (added to the manifest in code, see
+//! [`manifest`]). Every denied request must leave the server untouched: no TCP
+//! connection and no request.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -36,27 +37,32 @@ name = "Test plugin"
 version = "0.1.0"
 contract = 1
 host = "in-process"
-hosts = ["localhost", "fixture.invalid"]
+hosts = ["fixture.invalid", "other.invalid"]
 
 [[secrets]]
 key = "token"
 label = "Token"
+hosts = ["fixture.invalid"]
 
 [[secrets]]
 key = "user"
 label = "User"
+hosts = ["fixture.invalid"]
 
 [[secrets]]
 key = "password"
 label = "Password"
+hosts = ["fixture.invalid"]
 
 [[secrets]]
 key = "api-key"
 label = "API key"
+hosts = ["fixture.invalid", "other.invalid"]
 
 [[secrets]]
 key = "unset"
 label = "Declared but never configured"
+hosts = ["fixture.invalid"]
 "#;
 
 // ---------------------------------------------------------------- test server
@@ -150,8 +156,17 @@ async fn handle(State(shared): State<Arc<Shared>>, req: Request) -> Response {
 
 // ---------------------------------------------------------------- helpers
 
+/// The test manifest plus `localhost`, the one name that resolves without the
+/// network. `Manifest::parse` refuses it (it has no dot), so it is added here,
+/// after parsing, to reach the policy's own checks and the resolver. Every
+/// secret except `token` may also be sent there.
 fn manifest() -> Manifest {
-    Manifest::parse(MANIFEST).unwrap()
+    let mut m = Manifest::parse(MANIFEST).unwrap();
+    m.hosts.push("localhost".into());
+    for secret in m.secrets.iter_mut().filter(|s| s.key != "token") {
+        secret.hosts.push("localhost".into());
+    }
+    m
 }
 
 fn secrets_with(token: &str) -> Arc<StaticSecrets> {
@@ -322,6 +337,63 @@ async fn header_auth_arrives_in_the_named_header_and_replaces_the_plugins_value(
 }
 
 #[tokio::test]
+async fn header_auth_may_fill_authorization() {
+    let server = TestServer::start().await;
+    let call = sync_call(loopback());
+
+    let auth = Auth::Header {
+        name: "Authorization".into(),
+        secret: "api-key".into(),
+    };
+    ok(call.http(with_auth(&server.url("/echo"), auth)).await);
+
+    assert_eq!(server.last_headers()["authorization"], API_KEY);
+}
+
+#[tokio::test]
+async fn header_auth_may_not_name_routing_or_framing_headers() {
+    let server = TestServer::start().await;
+    let call = sync_call(loopback());
+
+    for name in [
+        "Host",
+        "cookie",
+        "Connection",
+        "content-length",
+        "Transfer-Encoding",
+        "Upgrade",
+        "TE",
+        "trailer",
+        "Proxy-Authorization",
+        "proxy-anything",
+        "X-HTTP-Method-Override",
+        "x-http-method",
+        "X-Method-Override",
+    ] {
+        let auth = Auth::Header {
+            name: name.into(),
+            secret: "api-key".into(),
+        };
+        denied(
+            call.http(with_auth(&server.url("/echo"), auth)).await,
+            "may not set",
+        );
+    }
+    for name in ["bad name", "", "x:y"] {
+        let auth = Auth::Header {
+            name: name.into(),
+            secret: "api-key".into(),
+        };
+        denied(
+            call.http(with_auth(&server.url("/echo"), auth)).await,
+            "header name",
+        );
+    }
+
+    server.assert_untouched();
+}
+
+#[tokio::test]
 async fn plugin_headers_are_sent() {
     let server = TestServer::start().await;
     let call = sync_call(loopback());
@@ -404,6 +476,70 @@ async fn the_51st_request_in_one_call_is_denied_and_a_new_call_starts_at_zero() 
 }
 
 // ---------------------------------------------------------------- denied requests
+
+#[tokio::test]
+async fn a_secret_is_sent_only_to_its_own_hosts() {
+    let server = TestServer::start().await;
+    let call = sync_call(HttpPolicy::default());
+
+    // `token` is bound to fixture.invalid; localhost is declared for the plugin
+    // but not for that secret.
+    let token = Auth::Bearer {
+        secret: "token".into(),
+    };
+    let reason = denied(
+        call.http(with_auth("https://localhost/", token)).await,
+        "is not allowed for host",
+    );
+    assert!(
+        reason.contains("\"token\"") && reason.contains("localhost"),
+        "{reason}"
+    );
+    let basic = Auth::Basic {
+        user_secret: "user".into(),
+        password_secret: "token".into(),
+    };
+    denied(
+        call.http(with_auth("https://localhost/", basic)).await,
+        "is not allowed for host",
+    );
+    let header = Auth::Header {
+        name: "X-Api-Key".into(),
+        secret: "token".into(),
+    };
+    denied(
+        call.http(with_auth("https://localhost/", header)).await,
+        "is not allowed for host",
+    );
+
+    // A secret bound to localhost gets past the binding and is stopped only by
+    // the address filter.
+    let api_key = Auth::Bearer {
+        secret: "api-key".into(),
+    };
+    denied(
+        call.http(with_auth("https://localhost/", api_key)).await,
+        "resolves only to",
+    );
+
+    server.assert_untouched();
+}
+
+#[tokio::test]
+async fn under_the_loopback_exemption_any_declared_secret_may_be_sent() {
+    let server = TestServer::start().await;
+    let call = sync_call(loopback());
+
+    let token = Auth::Bearer {
+        secret: "token".into(),
+    };
+    ok(call.http(with_auth(&server.url("/echo"), token)).await);
+
+    assert_eq!(
+        server.last_headers()["authorization"],
+        format!("Bearer {TOKEN}").as_str()
+    );
+}
 
 #[tokio::test]
 async fn url_rules_without_the_loopback_exemption() {
@@ -497,6 +633,10 @@ async fn assert_request_rules(call: &CallHandle, base: &str) {
         ("proxy-connection", "keep-alive"),
         ("Transfer-Encoding", "chunked"),
         ("content-length", "0"),
+        // A sync only reads: no asking the server to treat this GET as a write.
+        ("X-HTTP-Method-Override", "DELETE"),
+        ("x-http-method", "PUT"),
+        ("X-Method-Override", "POST"),
     ] {
         let mut req = get(base);
         req.headers.push(("Accept".into(), "*/*".into()));
@@ -542,7 +682,12 @@ async fn assert_request_rules(call: &CallHandle, base: &str) {
 
     let mut req = request(HttpMethod::Get, base);
     req.body = Some(vec![0; MIB + 1]);
-    denied(call.http(req).await, "body");
+    denied(call.http(req).await, "larger than");
+    for method in [HttpMethod::Get, HttpMethod::Head] {
+        let mut req = request(method, base);
+        req.body = Some(b"x".to_vec());
+        denied(call.http(req).await, "may not send a request body");
+    }
 }
 
 #[tokio::test]
@@ -617,13 +762,10 @@ async fn a_secret_that_is_not_a_valid_header_value_is_denied_without_echoing_it(
 
 #[test]
 fn a_manifest_host_the_url_parser_reads_as_an_ip_is_refused() {
-    // Manifest::parse lets this through (its last label is not all digits), but
-    // a URL parser reads it as 127.0.0.1.
-    let text = MANIFEST.replace(
-        r#"hosts = ["localhost", "fixture.invalid"]"#,
-        r#"hosts = ["0x7f.0x0.0x0.0x1"]"#,
-    );
-    let manifest = Manifest::parse(&text).unwrap();
+    // `Manifest::parse` refuses this host; a manifest built in code can still
+    // carry it, and a URL parser reads it as 127.0.0.1.
+    let mut manifest = manifest();
+    manifest.hosts = vec!["0x7f.0x0.0x0.0x1".into()];
 
     let err = HostServices::new(&manifest, secrets_with(TOKEN), HttpPolicy::default())
         .expect_err("an IP-like host must be refused");
@@ -684,12 +826,17 @@ fn log_names_the_plugin_and_truncates_the_message_to_2_kib() {
 
     tracing::subscriber::with_default(subscriber, || {
         call.log(LogLevel::Warn, &"a".repeat(5000));
-        call.log(LogLevel::Info, "fake\nline \u{1b}[31mred");
+        call.log(
+            LogLevel::Info,
+            "fake\nline \u{1b}[31mred \u{202e}rev \u{2028}sep \u{2066}iso \u{2069}",
+        );
+        // Escaped first, then cut: 3000 newlines become 1024 `\n` pairs.
+        call.log(LogLevel::Error, &"\n".repeat(3000));
     });
 
     let out = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 2, "{out}");
+    assert_eq!(lines.len(), 3, "{out}");
     assert!(lines[0].contains("WARN"), "{}", lines[0]);
     assert!(lines[0].contains("test-plug"), "{}", lines[0]);
     assert!(lines[0].contains(&"a".repeat(2048)), "message cut short");
@@ -698,5 +845,14 @@ fn log_names_the_plugin_and_truncates_the_message_to_2_kib() {
         "message not truncated"
     );
     assert!(lines[1].contains("INFO") && lines[1].contains("test-plug"));
-    assert!(!out.contains('\u{1b}'), "control characters reach the log");
+    for c in ['\u{1b}', '\u{202e}', '\u{2028}', '\u{2066}', '\u{2069}'] {
+        assert!(!out.contains(c), "{c:?} reaches the log");
+    }
+    assert!(lines[1].contains("\\u{202e}rev"), "{}", lines[1]);
+    assert!(lines[2].contains("ERROR"), "{}", lines[2]);
+    assert!(lines[2].contains(&"\\n".repeat(1024)), "escapes cut short");
+    assert!(
+        !lines[2].contains(&"\\n".repeat(1025)),
+        "escaped text not cut"
+    );
 }

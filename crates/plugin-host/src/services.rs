@@ -1,7 +1,7 @@
 //! What one plugin's calls reach: HTTP under the policy, secret injection and logging.
 
-use std::collections::HashSet;
-use std::fmt::{self, Write as _};
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -35,7 +35,8 @@ pub enum ServicesError {
 pub struct HostServices {
     plugin: PluginId,
     hosts: Vec<String>,
-    secret_keys: HashSet<String>,
+    /// Each declared secret and the hosts it may be sent to.
+    secret_hosts: HashMap<String, Vec<String>>,
     secrets: Arc<dyn SecretSource>,
     policy: HttpPolicy,
     client: reqwest::Client,
@@ -64,7 +65,11 @@ impl HostServices {
         Ok(HostServices {
             plugin: manifest.id.clone(),
             hosts,
-            secret_keys: manifest.secrets.iter().map(|s| s.key.clone()).collect(),
+            secret_hosts: manifest
+                .secrets
+                .iter()
+                .map(|s| (s.key.clone(), s.hosts.clone()))
+                .collect(),
             secrets,
             policy,
             client,
@@ -80,13 +85,20 @@ impl HostServices {
         }))
     }
 
-    fn check_declared(&self, key: &str) -> Result<(), HttpError> {
-        if self.secret_keys.contains(key) {
-            Ok(())
-        } else {
-            Err(denied(format!(
+    /// The secret must be declared, and the request must go to one of its
+    /// hosts. `host` is `None` only under the loopback exemption (tests), where
+    /// any declared secret may be sent.
+    fn check_secret(&self, key: &str, host: Option<&str>) -> Result<(), HttpError> {
+        let Some(allowed) = self.secret_hosts.get(key) else {
+            return Err(denied(format!(
                 "secret {key:?} is not declared in the plugin manifest"
-            )))
+            )));
+        };
+        match host {
+            Some(host) if !allowed.iter().any(|h| h.eq_ignore_ascii_case(host)) => Err(denied(
+                format!("secret {key:?} is not allowed for host {host:?}"),
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -109,11 +121,17 @@ impl HostServices {
         }
     }
 
-    /// The header `auth` asks for, with the secret values filled in by the host.
-    async fn auth_header(&self, auth: &Auth) -> Result<(HeaderName, HeaderValue), HttpError> {
+    /// The header `auth` asks for, with the secret values filled in by the
+    /// host. Every check runs before any secret is resolved.
+    async fn auth_header(
+        &self,
+        auth: &Auth,
+        host: Option<&str>,
+        purpose: CallPurpose,
+    ) -> Result<(HeaderName, HeaderValue), HttpError> {
         match auth {
             Auth::Bearer { secret } => {
-                self.check_declared(secret)?;
+                self.check_secret(secret, host)?;
                 let value = self.secret(secret).await?;
                 let value = sensitive(format!("Bearer {}", value.expose()), secret)?;
                 Ok((AUTHORIZATION, value))
@@ -122,8 +140,8 @@ impl HostServices {
                 user_secret,
                 password_secret,
             } => {
-                self.check_declared(user_secret)?;
-                self.check_declared(password_secret)?;
+                self.check_secret(user_secret, host)?;
+                self.check_secret(password_secret, host)?;
                 let user = self.secret(user_secret).await?;
                 let password = self.secret(password_secret).await?;
                 let pair = format!("{}:{}", user.expose(), password.expose());
@@ -131,8 +149,8 @@ impl HostServices {
                 Ok((AUTHORIZATION, value))
             }
             Auth::Header { name, secret } => {
-                let name = http::auth_header_name(name)?;
-                self.check_declared(secret)?;
+                let name = http::auth_header_name(name, purpose)?;
+                self.check_secret(secret, host)?;
                 let value = self.secret(secret).await?;
                 Ok((name, sensitive(value.expose().to_string(), secret)?))
             }
@@ -184,31 +202,35 @@ impl CallHandle {
                 policy.max_requests_per_call
             )));
         }
-        let url = http::check_url(&req.url, &services.hosts, policy)?;
+        let target = http::check_url(&req.url, &services.hosts, policy)?;
         let method = http::check_method(call.purpose, req.method)?;
-        let mut headers = http::plugin_headers(&req.headers)?;
-        if req
-            .body
-            .as_ref()
-            .is_some_and(|b| b.len() > policy.max_request_bytes)
-        {
-            return Err(denied(format!(
-                "request body larger than {} bytes",
-                policy.max_request_bytes
-            )));
+        let mut headers = http::plugin_headers(&req.headers, call.purpose)?;
+        // An empty body is no body.
+        let body = req.body.filter(|b| !b.is_empty());
+        if let Some(body) = &body {
+            if body.len() > policy.max_request_bytes {
+                return Err(denied(format!(
+                    "request body larger than {} bytes",
+                    policy.max_request_bytes
+                )));
+            }
+            if call.purpose == CallPurpose::Sync {
+                return Err(denied("a sync may not send a request body"));
+            }
         }
         if let Some(auth) = &req.auth {
-            let (name, value) = services.auth_header(auth).await?;
+            let host = target.host.as_deref();
+            let (name, value) = services.auth_header(auth, host, call.purpose).await?;
             headers.insert(name, value);
         }
-        http::send(&services.client, policy, method, url, headers, req.body).await
+        http::send(&services.client, policy, method, target.url, headers, body).await
     }
 
-    /// Logs a plugin message as a tracing event carrying the plugin id. The
-    /// message is cut to 2 KiB and its control characters are escaped.
+    /// Logs a plugin message as a tracing event carrying the plugin id. Control
+    /// characters and bidi marks are escaped first, then the text is cut to 2 KiB.
     pub fn log(&self, level: LogLevel, message: &str) {
         let plugin = &self.0.services.plugin;
-        let message = Escaped(truncate(message, MAX_LOG_BYTES));
+        let message = log_text(message, MAX_LOG_BYTES);
         match level {
             LogLevel::Debug => tracing::debug!(plugin = %plugin, "{message}"),
             LogLevel::Info => tracing::info!(plugin = %plugin, "{message}"),
@@ -228,33 +250,36 @@ impl fmt::Debug for CallHandle {
     }
 }
 
-/// The longest prefix of `s` of at most `max` bytes that ends on a character boundary.
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
+/// Plugin text made safe to log: control characters, line and paragraph
+/// separators and bidi embedding, override and isolate marks become `\u{..}`
+/// escapes (`\n` and the like for the common ones), so a plugin cannot forge
+/// log lines, send terminal escapes or reorder what a reader sees. The escaped
+/// text is cut to at most `max` bytes, never inside a character or an escape.
+fn log_text(message: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut piece = String::new();
+    for c in message.chars() {
+        piece.clear();
+        if c.is_control() || is_separator_or_bidi(c) {
+            piece.extend(c.escape_default());
+        } else {
+            piece.push(c);
+        }
+        if out.len() + piece.len() > max {
+            break;
+        }
+        out.push_str(&piece);
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    out
 }
 
-/// Plugin text with control characters escaped, so it cannot forge log lines
-/// or send terminal escapes.
-struct Escaped<'a>(&'a str);
-
-impl fmt::Display for Escaped<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for c in self.0.chars() {
-            if c.is_control() {
-                write!(f, "{}", c.escape_default())?;
-            } else {
-                f.write_char(c)?;
-            }
-        }
-        Ok(())
-    }
+/// U+2028 and U+2029 (line and paragraph separators), U+202A to U+202E (bidi
+/// embeddings and overrides) and U+2066 to U+2069 (bidi isolates).
+fn is_separator_or_bidi(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 #[cfg(test)]
@@ -262,15 +287,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn truncate_keeps_whole_characters() {
-        assert_eq!(truncate("abc", 5), "abc");
-        assert_eq!(truncate("abcdef", 4), "abcd");
-        // 'é' is two bytes; cutting inside it backs off to before it.
-        assert_eq!(truncate("aé", 2), "a");
+    fn log_text_escapes_controls_and_bidi_marks() {
+        assert_eq!(log_text("a\nb\u{1b}[0m", 100), "a\\nb\\u{1b}[0m");
+        assert_eq!(
+            log_text("\u{2028}\u{2029}\u{202a}\u{202e}\u{2066}\u{2069}", 100),
+            "\\u{2028}\\u{2029}\\u{202a}\\u{202e}\\u{2066}\\u{2069}"
+        );
+        assert_eq!(log_text("é \u{2065}", 100), "é \u{2065}");
     }
 
     #[test]
-    fn escaped_neutralises_control_characters() {
-        assert_eq!(Escaped("a\nb\u{1b}[0m").to_string(), "a\\nb\\u{1b}[0m");
+    fn log_text_cuts_after_escaping_on_whole_characters_and_escapes() {
+        assert_eq!(log_text("abc", 5), "abc");
+        assert_eq!(log_text("abcdef", 4), "abcd");
+        // 'é' is two bytes; it does not fit in the second byte.
+        assert_eq!(log_text("aé", 2), "a");
+        // `\n` escapes to two bytes: three fit in 7, and no escape is split.
+        assert_eq!(log_text("\n\n\n\n", 7), "\\n\\n\\n");
     }
 }
