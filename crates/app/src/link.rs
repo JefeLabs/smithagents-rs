@@ -17,6 +17,7 @@ use futures::{FutureExt as _, StreamExt};
 use smithagents_client::{ensure_daemon_with, Client, ClientError, EnsureError, SpawnOptions};
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::daemon::read_lockfile;
+use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, Patch, ReviewAction,
@@ -169,7 +170,7 @@ pub struct DaemonLink {
 
 impl DaemonLink {
     /// Starts the link thread. The receiver yields what the UI must apply:
-    /// `Snapshot`, `IntentsLoaded`, `AgentDefaultsLoaded`,
+    /// `Snapshot`, `IntentsLoaded`, `AgentDefaultsLoaded`, `FeedbackSettingsLoaded`,
     /// `ConnectionChanged(Connected)`, then daemon events; after a loss
     /// `ConnectionChanged(Reconnecting)` and the same loads again.
     pub fn start(config: LinkConfig) -> (DaemonLink, mpsc::Receiver<Action>) {
@@ -366,6 +367,21 @@ impl DaemonLink {
         })
     }
 
+    /// Stores the feedback settings and tells the UI with
+    /// `Action::FeedbackSettingsLoaded`, like [`DaemonLink::set_agent_defaults`].
+    pub fn set_feedback_settings(
+        &self,
+        settings: FeedbackSettings,
+    ) -> impl Future<Output = Result<FeedbackSettings, LinkError>> + Send + 'static {
+        self.cmd.clone().run(move |c, tx| async move {
+            let stored = c.set_feedback_settings(&settings).await?;
+            let _ = tx
+                .send(Action::FeedbackSettingsLoaded(stored.clone()))
+                .await;
+            Ok(stored)
+        })
+    }
+
     /// Runs one intent command and hands its answer to the UI as
     /// `Action::IntentUpserted` too, from the link's runtime, so the model
     /// has it even when the caller drops the future (the event of the same
@@ -487,6 +503,26 @@ impl IntentCommands for DaemonLink {
         defaults: AgentDefaults,
     ) -> LocalBoxFuture<'static, Result<AgentDefaults, LinkError>> {
         DaemonLink::set_agent_defaults(self, defaults).boxed_local()
+    }
+}
+
+/// The commands the Feedback tool and Settings → Source repositories send to
+/// the daemon. [`DaemonLink`] is the production implementation; headless tests
+/// inject a fake through `ShellOptions::feedback_commands`. As for
+/// [`IntentCommands`], the link tells the model of each answer itself.
+pub trait FeedbackCommands {
+    fn set_feedback_settings(
+        &self,
+        settings: FeedbackSettings,
+    ) -> LocalBoxFuture<'static, Result<FeedbackSettings, LinkError>>;
+}
+
+impl FeedbackCommands for DaemonLink {
+    fn set_feedback_settings(
+        &self,
+        settings: FeedbackSettings,
+    ) -> LocalBoxFuture<'static, Result<FeedbackSettings, LinkError>> {
+        DaemonLink::set_feedback_settings(self, settings).boxed_local()
     }
 }
 
@@ -621,10 +657,13 @@ async fn connect_and_forward(
         let agents = client.list_agents(false).await?;
         let intents = client.list_intents(IntentFilter::default()).await?;
         let defaults = client.agent_defaults().await?;
+        let feedback = client.feedback_settings().await?;
         let events = client.events(Some(latest_seq)).await?;
-        Ok::<_, ClientError>((latest_seq, repos, agents, intents, defaults, events))
+        Ok::<_, ClientError>((
+            latest_seq, repos, agents, intents, defaults, feedback, events,
+        ))
     };
-    let (latest_seq, repos, agents, intents, defaults, mut events) =
+    let (latest_seq, repos, agents, intents, defaults, feedback, mut events) =
         match tokio::time::timeout(config.snapshot_timeout, fetch).await {
             Ok(fetched) => fetched.map_err(unreachable)?,
             Err(_) => return Err(unreachable("the daemon did not answer in time")),
@@ -641,6 +680,7 @@ async fn connect_and_forward(
     .await?;
     send(tx, Action::IntentsLoaded(intents)).await?;
     send(tx, Action::AgentDefaultsLoaded(defaults)).await?;
+    send(tx, Action::FeedbackSettingsLoaded(feedback)).await?;
     // Commands work from here on; the UI sees `Connected` after this.
     *lock(&shared.connected) = Some((
         client,

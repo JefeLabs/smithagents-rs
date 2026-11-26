@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use crate::app_state::{AppState, AppStateStore};
 use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
-use crate::link::{AgentCommands, DaemonLink, IntentCommands, LinkFailure};
+use crate::link::{AgentCommands, DaemonLink, FeedbackCommands, IntentCommands, LinkFailure};
 use crate::model::{Action, Connection, Effect, ShellModel};
 use crate::tabs::{PlaceholderHost, TabError, TabManager, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::apply_framework_theme;
@@ -137,6 +137,8 @@ pub struct ShellState {
     commands: Option<Rc<dyn AgentCommands>>,
     /// Replaces the link for intent commands (headless tests).
     intent_commands: Option<Rc<dyn IntentCommands>>,
+    /// Replaces the link for feedback commands (headless tests).
+    feedback_commands: Option<Rc<dyn FeedbackCommands>>,
     /// Replaces the local clock (headless tests).
     clock: Option<Clock>,
     command_timeout: Duration,
@@ -212,6 +214,7 @@ impl ShellState {
             connection_info: None,
             commands,
             intent_commands: None,
+            feedback_commands: None,
             clock: None,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             app_state_store,
@@ -305,6 +308,20 @@ impl ShellState {
             Some(commands) => Some(commands.as_ref()),
             None => self.link.as_ref().map(|link| link as &dyn IntentCommands),
         }
+    }
+
+    /// Where feedback commands go: the injected commands if any, else the
+    /// link; `None` when the shell runs offline.
+    pub fn feedback_commands(&self) -> Option<&dyn FeedbackCommands> {
+        match &self.feedback_commands {
+            Some(commands) => Some(commands.as_ref()),
+            None => self.link.as_ref().map(|link| link as &dyn FeedbackCommands),
+        }
+    }
+
+    /// Replaces the link for feedback commands.
+    pub(crate) fn set_feedback_commands(&mut self, commands: Rc<dyn FeedbackCommands>) {
+        self.feedback_commands = Some(commands);
     }
 
     /// Replaces the link for intent commands.

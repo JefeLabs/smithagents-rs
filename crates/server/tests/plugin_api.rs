@@ -20,6 +20,7 @@ use smithagents_plugin_host::{LinkedRuntime, PluginRuntime, StaticSecrets, ToolF
 use smithagents_plugin_protocol::{HostApi, Manifest, Plugin, PluginError, SyncPage, SyncRequest};
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
+use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::intents::IntentService;
 use smithagents_server::paths::Paths;
@@ -155,7 +156,7 @@ async fn app(
         bus.clone(),
         Arc::new(harness),
         service.clone(),
-        paths,
+        paths.clone(),
     );
     let sched = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
 
@@ -174,9 +175,17 @@ async fn app(
     )
     .await
     .unwrap();
+    let feedback = FeedbackService::new(
+        store.clone(),
+        intents.clone(),
+        service.clone(),
+        manager.clone(),
+        paths,
+    );
     let state = AppState {
         service,
         intents,
+        feedback,
         bus,
         store,
         plugins: manager,

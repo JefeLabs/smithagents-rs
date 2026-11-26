@@ -63,8 +63,9 @@ pub use appearance::{
     THEME_LABEL, THEME_OPTIONS_ID,
 };
 pub use repositories::{
-    repo_row_id, ADD_REPO_ID, BROWSE_REPO_ID, REPOS_EMPTY_ID, REPO_LIST_ID, REPO_PATH_ERROR_ID,
-    REPO_PATH_INPUT_ID, REPO_PATH_LABEL,
+    repo_meta_tag_id, repo_row_id, repo_use_meta_id, ADD_REPO_ID, BROWSE_REPO_ID, META_TAG,
+    REPOS_EMPTY_ID, REPO_LIST_ID, REPO_META_ERROR_ID, REPO_PATH_ERROR_ID, REPO_PATH_INPUT_ID,
+    REPO_PATH_LABEL,
 };
 
 /// Element id of the pane's heading.
@@ -107,6 +108,11 @@ pub struct SettingsPane {
     defaults_command: Option<Task<()>>,
     /// The line under the queue limit: why the last change failed.
     defaults_error: Option<String>,
+    /// The meta repository choice in flight, if any, and the repository it
+    /// was sent for. Dropping it gives it up.
+    meta_command: Option<(RepoId, Task<()>)>,
+    /// The line under the repository list: why the last choice failed.
+    meta_error: Option<String>,
     /// The connection as last seen, to notice it dropping.
     connection: Connection,
     /// One focus handle per theme option, and per font option (their radio
@@ -167,6 +173,8 @@ impl SettingsPane {
             browsing: None,
             defaults_command: None,
             defaults_error: None,
+            meta_command: None,
+            meta_error: None,
             theme_focus: Vec::new(),
             font_focus: Vec::new(),
             _subscriptions: subscriptions,
@@ -186,6 +194,9 @@ impl SettingsPane {
         }
         if dropped && self.defaults_command.is_some() {
             self.give_up_defaults();
+        }
+        if dropped && self.meta_command.is_some() {
+            self.give_up_meta_repo();
         }
         self.notice_late_add(window, cx);
         cx.notify();

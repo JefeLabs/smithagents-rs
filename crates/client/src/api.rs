@@ -18,6 +18,7 @@ use serde_json::json;
 use smithagents_core::agent::{Agent, ChatMessage, Repo};
 use smithagents_core::daemon::DaemonInfo;
 use smithagents_core::event::{Event, EventKind};
+use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentVersion, Patch,
@@ -300,6 +301,23 @@ impl Client {
             self.http
                 .put(self.url("/v1/settings/agent-defaults"))
                 .json(&defaults),
+        )
+        .await
+    }
+
+    pub async fn feedback_settings(&self) -> Result<FeedbackSettings, ClientError> {
+        self.fetch(self.http.get(self.url("/v1/settings/feedback")))
+            .await
+    }
+
+    pub async fn set_feedback_settings(
+        &self,
+        settings: &FeedbackSettings,
+    ) -> Result<FeedbackSettings, ClientError> {
+        self.fetch(
+            self.http
+                .put(self.url("/v1/settings/feedback"))
+                .json(settings),
         )
         .await
     }

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use smithagents_center_host::PixelRect;
 use smithagents_client::ClientError;
 use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::feedback::{effective_meta_repo, FeedbackSettings};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_theme::state::ThemeChoice;
 use smithagents_theme::tokens::{TextScale, ThemeSet};
@@ -701,18 +702,32 @@ pub struct RepoRowVm {
     /// The full path, for display.
     pub path: String,
     pub default_branch: String,
+    /// Intents and feedback go to this repository
+    /// ([`effective_meta_repo`]).
+    pub is_meta: bool,
+    /// The row offers "Use for intents and feedback": not the meta
+    /// repository, there is a choice to make, and the settings are loaded.
+    pub can_set_meta: bool,
 }
 
 /// The daemon's repositories by name (ignoring case), then path. Names and
-/// paths are shown as they are, spaces and any script included.
-pub fn repo_rows(repos: &[Repo]) -> Vec<RepoRowVm> {
+/// paths are shown as they are, spaces and any script included. `settings`
+/// is `None` until the daemon's feedback settings are loaded: then nothing
+/// is stored, and no row can be chosen.
+pub fn repo_rows(repos: &[Repo], settings: Option<&FeedbackSettings>) -> Vec<RepoRowVm> {
+    let meta = effective_meta_repo(settings.and_then(|s| s.meta_repo_id), repos);
     let mut rows: Vec<RepoRowVm> = repos
         .iter()
-        .map(|repo| RepoRowVm {
-            id: repo.id,
-            name: repo_title(&repo.path),
-            path: repo.path.display().to_string(),
-            default_branch: repo.default_branch.clone(),
+        .map(|repo| {
+            let is_meta = meta == Some(repo.id);
+            RepoRowVm {
+                id: repo.id,
+                name: repo_title(&repo.path),
+                path: repo.path.display().to_string(),
+                default_branch: repo.default_branch.clone(),
+                is_meta,
+                can_set_meta: settings.is_some() && !is_meta && repos.len() >= 2,
+            }
         })
         .collect();
     rows.sort_by(|a, b| {

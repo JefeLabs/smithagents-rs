@@ -13,6 +13,7 @@ use smithagents_client::{Client, ClientError, SpawnOptions};
 use smithagents_core::agent::{AgentState, Repo};
 use smithagents_core::daemon::read_lockfile;
 use smithagents_core::event::EventKind;
+use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{
     AgentDefaults, CreateIntentRequest, Intent, IntentKind, IntentState, SeedInput,
@@ -74,9 +75,11 @@ fn client_for(home: &TestHome) -> Client {
     Client::new(&read_lockfile(home.path()).unwrap().expect("lockfile"))
 }
 
-/// What follows a snapshot: the intent list, the agent defaults, then
-/// `Connected`. Returns the two loads.
-async fn loads_then_connected(rx: &mut Receiver<Action>) -> (Vec<Intent>, AgentDefaults) {
+/// What follows a snapshot: the intent list, the agent defaults, the feedback
+/// settings, then `Connected`. Returns the three loads.
+async fn loads_then_connected(
+    rx: &mut Receiver<Action>,
+) -> (Vec<Intent>, AgentDefaults, FeedbackSettings) {
     let intents = match next(rx, "intents").await {
         Action::IntentsLoaded(intents) => intents,
         other => panic!("expected the intents, got {other:?}"),
@@ -85,11 +88,15 @@ async fn loads_then_connected(rx: &mut Receiver<Action>) -> (Vec<Intent>, AgentD
         Action::AgentDefaultsLoaded(defaults) => defaults,
         other => panic!("expected the agent defaults, got {other:?}"),
     };
+    let feedback = match next(rx, "feedback settings").await {
+        Action::FeedbackSettingsLoaded(settings) => settings,
+        other => panic!("expected the feedback settings, got {other:?}"),
+    };
     assert_eq!(
         next(rx, "connected").await,
         Action::ConnectionChanged(Connection::Connected)
     );
-    (intents, defaults)
+    (intents, defaults, feedback)
 }
 
 async fn connected(home: &TestHome) -> (DaemonLink, Receiver<Action>) {
@@ -112,9 +119,10 @@ async fn snapshot_then_connected() {
         }
         other => panic!("expected a snapshot, got {other:?}"),
     }
-    let (intents, defaults) = loads_then_connected(&mut rx).await;
+    let (intents, defaults, feedback) = loads_then_connected(&mut rx).await;
     assert!(intents.is_empty());
     assert_eq!(defaults, AgentDefaults::default());
+    assert_eq!(feedback, FeedbackSettings::default());
     let info = link.connection_info().expect("connection info");
     let lock = read_lockfile(home.path()).unwrap().unwrap();
     assert_eq!(info, (lock.port, lock.token));
@@ -204,6 +212,10 @@ async fn intents_and_defaults_arrive_before_connected() {
         queue_limit: Some(2),
     };
     other.set_agent_defaults(defaults.clone()).await.unwrap();
+    let chosen = FeedbackSettings {
+        meta_repo_id: Some(repo.id),
+    };
+    other.set_feedback_settings(&chosen).await.unwrap();
     drop(first);
 
     let (_link, mut rx) = DaemonLink::start(config(&home));
@@ -211,10 +223,11 @@ async fn intents_and_defaults_arrive_before_connected() {
         next(&mut rx, "snapshot").await,
         Action::Snapshot { .. }
     ));
-    let (intents, loaded) = loads_then_connected(&mut rx).await;
+    let (intents, loaded, feedback) = loads_then_connected(&mut rx).await;
     let ids: Vec<IntentId> = intents.iter().map(|i| i.id).collect();
     assert_eq!(ids, [created.id]);
     assert_eq!(loaded, defaults);
+    assert_eq!(feedback, chosen);
 }
 
 #[tokio::test]

@@ -21,6 +21,7 @@ use smithagents_core::daemon::DaemonInfo;
 use smithagents_plugin_host::{ConfiguredSecrets, SecretError, SecretSource, WasmEngine};
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
+use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::claude::ClaudeCodeHarness;
 use smithagents_server::intents::IntentService;
 use smithagents_server::lifecycle::{
@@ -223,9 +224,17 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     let scheduler = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
     let plugins = start_plugins(paths, &store, &bus).await?;
     let ws_clients = Arc::new(AtomicUsize::new(0));
+    let feedback = FeedbackService::new(
+        store.clone(),
+        intents.clone(),
+        service.clone(),
+        plugins.clone(),
+        paths.clone(),
+    );
     let state = AppState {
         service: service.clone(),
         intents,
+        feedback,
         bus,
         store,
         plugins: plugins.clone(),

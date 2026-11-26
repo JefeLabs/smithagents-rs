@@ -62,7 +62,7 @@ use crate::layout_store::{
     with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
     DEFAULT_RIGHT_DOCK_SIZE, LAYOUT_VERSION, MIN_DOCK_SIZE,
 };
-use crate::link::{AgentCommands, DaemonLink, IntentCommands, LinkConfig};
+use crate::link::{AgentCommands, DaemonLink, FeedbackCommands, IntentCommands, LinkConfig};
 use crate::model::{Action, ShellModel};
 use crate::settings::AppSettingsStore;
 use crate::shell_state::{Clock, ConnectionInfoSource, LinkFailureSource, ShellEvent, ShellState};
@@ -269,6 +269,9 @@ pub struct ShellOptions {
     /// Settings → Agent defaults), so headless tests need no daemon; `None`
     /// sends them through the link.
     pub intent_commands: Option<Rc<dyn IntentCommands>>,
+    /// Replaces the daemon link for the feedback commands (Settings → Source
+    /// repositories); `None` sends them through the link.
+    pub feedback_commands: Option<Rc<dyn FeedbackCommands>>,
     /// The clock the views read ([`ShellState::now`]); `None` is the local
     /// clock. Headless tests inject a fixed one.
     pub clock: Option<Clock>,
@@ -346,6 +349,7 @@ impl Shell {
             connection_info,
             link_failure,
             intent_commands,
+            feedback_commands,
             clock,
             feedback,
         } = options;
@@ -401,6 +405,9 @@ impl Shell {
             }
             if let Some(commands) = intent_commands {
                 state.set_intent_commands(commands);
+            }
+            if let Some(commands) = feedback_commands {
+                state.set_feedback_commands(commands);
             }
             if let Some(clock) = clock {
                 state.set_clock(clock);

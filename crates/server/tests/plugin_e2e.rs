@@ -37,6 +37,7 @@ use smithagents_plugin_protocol::{
 use smithagents_plugins_tool::pack_fixtures_once;
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
+use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::intents::IntentService;
 use smithagents_server::paths::Paths;
@@ -204,14 +205,19 @@ async fn the_real_daemon_runs_packed_native_plugins_and_survives_a_panic() {
     let client = &daemon.client;
 
     // Both are built-ins running as native libraries, beside the plugin
-    // compiled into the daemon.
+    // compiled into the daemon, which has no resources.
     let all = client.plugins().await.unwrap();
     let ids: Vec<_> = all.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(ids, ["feedback", "fixture-dylib", "github"], "{all:?}");
-    for plugin in all.iter().filter(|p| p.id != "feedback") {
+    for plugin in &all {
         assert!(plugin.builtin && plugin.enabled, "{plugin:?}");
-        assert_eq!(plugin.host, "dylib", "{plugin:?}");
+        let host = match plugin.id.as_str() {
+            "feedback" => "in-process",
+            _ => "dylib",
+        };
+        assert_eq!(plugin.host, host, "{plugin:?}");
     }
+    assert_eq!(all[0].resources, [], "{:?}", all[0]);
 
     // GitHub has no repositories configured: it waits for settings and runs
     // nothing (no tool, no request).
@@ -570,7 +576,7 @@ async fn github() -> Github {
         bus.clone(),
         Arc::new(harness),
         service.clone(),
-        paths,
+        paths.clone(),
     );
     let sched = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
 
@@ -610,9 +616,17 @@ async fn github() -> Github {
     )
     .await
     .unwrap();
+    let feedback = FeedbackService::new(
+        store.clone(),
+        intents.clone(),
+        service.clone(),
+        manager.clone(),
+        paths,
+    );
     let state = AppState {
         service,
         intents,
+        feedback,
         bus,
         store,
         plugins: manager,

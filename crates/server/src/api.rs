@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo};
 use smithagents_core::event::{Event, EventKind};
+use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::{AgentId, IntentId, ItemId, MessageId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentState,
@@ -39,6 +40,7 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::events::{BusError, EventBus, Subscription};
+use crate::feedback::{FeedbackError, FeedbackService};
 use crate::git::GitError;
 use crate::intents::{IntentError, IntentService};
 use crate::plugins::{clean_message, ManagerError, PluginManager};
@@ -54,6 +56,7 @@ const MAX_MESSAGE_LIMIT: u32 = 1000;
 pub struct AppState {
     pub service: AgentService,
     pub intents: IntentService,
+    pub feedback: FeedbackService,
     pub bus: EventBus,
     pub store: Store,
     pub plugins: PluginManager,
@@ -91,6 +94,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/settings/agent-defaults",
             get(get_agent_defaults).put(put_agent_defaults),
+        )
+        .route(
+            "/v1/settings/feedback",
+            get(get_feedback_settings).put(put_feedback_settings),
         )
         .route("/v1/plugins", get(list_plugins))
         .route("/v1/plugins/{id}", get(get_plugin))
@@ -218,6 +225,16 @@ impl From<IntentError> for ApiError {
             IntentError::Service(_) => unreachable!("handled above"),
             IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
         };
+        if status.is_server_error() {
+            tracing::error!("request failed: {e}");
+        }
+        Self::new(status, e.code(), e.to_string())
+    }
+}
+
+impl From<FeedbackError> for ApiError {
+    fn from(e: FeedbackError) -> Self {
+        let status = e.status();
         if status.is_server_error() {
             tracing::error!("request failed: {e}");
         }
@@ -1049,6 +1066,23 @@ async fn put_agent_defaults(
     let defaults: AgentDefaults = json_body(&body)?;
     let svc = s.intents;
     detached(async move { svc.set_agent_defaults(defaults).await })
+        .await
+        .map(Json)
+}
+
+async fn get_feedback_settings(
+    State(s): State<AppState>,
+) -> Result<Json<FeedbackSettings>, ApiError> {
+    Ok(Json(s.feedback.settings().await?))
+}
+
+async fn put_feedback_settings(
+    State(s): State<AppState>,
+    body: Bytes,
+) -> Result<Json<FeedbackSettings>, ApiError> {
+    let settings: FeedbackSettings = json_body(&body)?;
+    let svc = s.feedback;
+    detached(async move { svc.set_settings(settings).await })
         .await
         .map(Json)
 }

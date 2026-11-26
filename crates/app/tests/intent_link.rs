@@ -200,6 +200,10 @@ async fn create_review_send_through_the_link() {
         shell.next("agent defaults").await,
         Action::AgentDefaultsLoaded(_)
     ));
+    assert!(matches!(
+        shell.next("feedback settings").await,
+        Action::FeedbackSettingsLoaded(_)
+    ));
     assert_eq!(
         shell.next("connected").await,
         Action::ConnectionChanged(Connection::Connected)
