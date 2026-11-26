@@ -13,7 +13,8 @@
 //!
 //! The body is the intent's current behavior, or its seed text while that is
 //! blank ([`body_text`]), drawn read-only as Markdown, without its images
-//! (it is model output, so it loads nothing: [`no_image`]). While the daemon
+//! (it is model output, so it loads nothing: [`no_image`]); only its `http`
+//! and `https` links open ([`open_body_link`]). While the daemon
 //! polishes the draft the screen says which pass it is on and draws no
 //! sections or actions; when a pass failed it says why and offers "Try
 //! again".
@@ -28,20 +29,22 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::text::TextView;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, rems, AnyElement, App, AppContext as _, Context, ElementId, Entity, Focusable as _,
-    FontWeight, ImageCacheError, ImageSource, InteractiveElement as _, IntoElement,
-    ParentElement as _, Role, SharedUri, StatefulInteractiveElement as _, Styled as _,
-    TestSupportExt as _, WeakEntity, Window,
+    div, rems, AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity,
+    Focusable as _, FontWeight, ImageCacheError, ImageSource, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement as _, Role, SharedString, SharedUri,
+    StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, WeakEntity, Window,
 };
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentKind, IntentState, Patch, Phase};
 
 use super::{Busy, IntentsPane, Paint, Screen, TITLE};
 use crate::intent_vm::{
-    body_text, header_editable, intent_state_label, kind_label, polishing_text, KIND_CHOICES,
+    body_link_opens, body_text, header_editable, intent_state_label, kind_label, polishing_text,
+    KIND_CHOICES,
 };
 
 /// Element id of the button back to the list ("Intents").
@@ -528,7 +531,8 @@ fn back_button(paint: &Paint, cx: &Context<IntentsPane>) -> impl IntoElement {
 }
 
 /// The body as Markdown, read-only, in a frame the tests can find. Its
-/// images are not drawn ([`no_image`]).
+/// images are not drawn ([`no_image`]); its links open only over HTTP
+/// ([`open_body_link`]) and show where they point on hover.
 fn body(intent: &Intent, paint: &Paint) -> impl IntoElement {
     div()
         .id(DETAIL_BODY_ID)
@@ -540,8 +544,37 @@ fn body(intent: &Intent, paint: &Paint) -> impl IntoElement {
             TextView::markdown(DETAIL_BODY_ID, body_text(intent).to_owned())
                 .selectable(true)
                 .image_source(no_image)
+                .on_link_click(open_body_link)
+                .link_tooltip(|url, window, cx| Tooltip::new(url.clone()).build(window, cx))
                 .text_color(paint.foreground),
         )
+}
+
+/// A click on a link in the body (Markdown or HTML, text or linked image:
+/// the view hands every one here instead of opening it). It opens the URL
+/// only when [`body_link_opens`] allows it, for the presses the view itself
+/// opens on: a left or middle click, a keyboard click, a tap that is not a
+/// long press. Any other link does nothing; the log names its scheme only.
+fn open_body_link(url: &SharedString, event: &ClickEvent, _: &mut Window, cx: &mut App) {
+    let pressed = match event {
+        ClickEvent::Mouse(click) => {
+            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+        }
+        ClickEvent::Keyboard(_) => true,
+        ClickEvent::Touch(click) => !click.long_press,
+    };
+    if !pressed {
+        return;
+    }
+    if body_link_opens(url) {
+        cx.open_url(url);
+    } else {
+        let scheme = url::Url::parse(url).map(|url| url.scheme().to_owned());
+        tracing::debug!(
+            scheme = scheme.as_deref().unwrap_or("none"),
+            "a body link that is not http or https was not opened"
+        );
+    }
 }
 
 /// The source of every image in the body: one that fails at once, so the

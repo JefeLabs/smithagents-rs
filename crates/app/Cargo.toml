@@ -28,6 +28,8 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
+# Which links in an intent's body may open (`intent_vm::body_link_opens`).
+url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true

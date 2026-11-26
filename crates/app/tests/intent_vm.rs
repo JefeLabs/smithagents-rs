@@ -298,6 +298,23 @@ fn a_line_of_brackets_is_cut_before_its_links_are_stripped() {
 }
 
 #[test]
+fn only_http_and_https_body_links_open() {
+    for (url, opens) in [
+        ("https://example.com/x", true),
+        ("http://example.com", true),
+        ("HTTPS://EXAMPLE.COM", true),
+        ("file:///etc/passwd", false),
+        ("smithagents://x", false),
+        ("javascript:alert(1)", false),
+        ("mailto:a@example.com", false),
+        ("docs/readme.md", false),
+        ("", false),
+    ] {
+        assert_eq!(body_link_opens(url), opens, "{url:?}");
+    }
+}
+
+#[test]
 fn a_polishing_drafts_card_previews_its_seed() {
     let now = DateTime::parse_from_rfc3339("2026-11-26T10:15:00-08:00").unwrap();
     let mut zoom = draft("untitled-intent", Phase::Polishing { pass: 1 });

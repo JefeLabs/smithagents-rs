@@ -23,7 +23,7 @@ use common::ui::open_shell_options;
 use gpui_kit::base::Root;
 use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
-use gpui_kit::{px, AppContext as _, ElementId, Entity, Role, TestAppContext, WindowHandle};
+use gpui_kit::{point, px, AppContext as _, ElementId, Entity, Role, TestAppContext, WindowHandle};
 use smithagents_app::intent_vm::{SectionKind, KIND_CHOICES};
 use smithagents_app::model::Action;
 use smithagents_app::shell::{Shell, ShellOptions};
@@ -393,6 +393,47 @@ fn the_body_fetches_no_remote_images(cx: &mut TestAppContext) {
     }
     assert_eq!(body_source(cx, &opened).as_deref(), Some(markdown));
     assert_eq!(*requested.lock().unwrap(), Vec::<String>::new());
+}
+
+#[gpui_kit::test]
+fn body_links_open_only_over_http(cx: &mut TestAppContext) {
+    // The body is model output: a click on a link to a file or to another
+    // app (Markdown, or an HTML block's `<a>`) opens nothing. Each body is
+    // just its link, so a click near the body's top-left corner lands on it;
+    // the last, which opens, shows that the clicks do. (Before the fix the
+    // first two opened.)
+    let mut draft = intent("fix-zoom", IntentState::Draft, Phase::Review);
+    draft.content.current_behavior =
+        "<p><a href=\"smithagents://x\">Open the app page</a></p>".into();
+    let opened = open_detail(cx, &draft);
+    let window = opened.window;
+    let click_link = |cx: &mut TestAppContext| {
+        with_window(cx, window, |window, cx| {
+            window.click_at(DETAIL_BODY_ID, point(px(4.), px(8.)), cx)
+        });
+        frame(cx, window);
+    };
+
+    click_link(cx);
+    assert_eq!(
+        cx.opened_url(),
+        None,
+        "an HTML link to an app opens nothing"
+    );
+
+    let file = changed(&draft, |i| {
+        i.content.current_behavior = "[Open the file](file:///etc/passwd)".into()
+    });
+    upsert(cx, &opened, &file);
+    click_link(cx);
+    assert_eq!(cx.opened_url(), None, "a Markdown file link opens nothing");
+
+    let web = changed(&file, |i| {
+        i.content.current_behavior = "[Open the docs](https://example.com/x)".into()
+    });
+    upsert(cx, &opened, &web);
+    click_link(cx);
+    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/x"));
 }
 
 #[gpui_kit::test]

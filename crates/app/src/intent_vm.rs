@@ -534,6 +534,15 @@ pub fn body_text(intent: &Intent) -> &str {
     }
 }
 
+/// Whether a link in an intent's body may open: only an absolute `http` or
+/// `https` URL (in any case) with a host. The body is model output, so a
+/// file, another app's scheme (or this one's), `javascript:`, `mailto:`, a
+/// relative path and anything unparsable open nothing.
+pub fn body_link_opens(url: &str) -> bool {
+    url::Url::parse(url)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+}
+
 /// Whether the header (title, kind) can be edited: a draft that is not being
 /// polished, or a complete intent.
 pub fn header_editable(intent: &Intent) -> bool {
