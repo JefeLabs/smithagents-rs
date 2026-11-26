@@ -42,7 +42,6 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::events::{BusError, EventBus, Subscription};
 use crate::feedback::{upload, FeedbackError, FeedbackService};
-use crate::git::GitError;
 use crate::intents::{IntentError, IntentService};
 use crate::plugins::{clean_message, ManagerError, PluginManager};
 use crate::service::{AgentService, ServiceError};
@@ -190,49 +189,9 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// The status and code an agent-service error answers with.
-fn service_error_parts(e: &ServiceError) -> (StatusCode, &'static str) {
-    use StatusCode as S;
-    match e {
-        ServiceError::RepoNotFound => (S::NOT_FOUND, "repo_not_found"),
-        ServiceError::AgentNotFound => (S::NOT_FOUND, "agent_not_found"),
-        ServiceError::AgentClosed => (S::CONFLICT, "agent_closed"),
-        ServiceError::TurnInProgress => (S::CONFLICT, "turn_in_progress"),
-        ServiceError::Git(GitError::PathNotFound(_)) => (S::BAD_REQUEST, "path_not_found"),
-        ServiceError::Git(GitError::NotAGitRepo) => (S::BAD_REQUEST, "not_a_git_repo"),
-        ServiceError::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
-        ServiceError::Git(GitError::NoDefaultBranch) => (S::BAD_REQUEST, "no_default_branch"),
-        ServiceError::Git(GitError::BranchExists(_)) => (S::CONFLICT, "branch_exists"),
-        ServiceError::Git(_) => (S::INTERNAL_SERVER_ERROR, "git_error"),
-        ServiceError::Store(StoreError::DuplicateRepoPath) => (S::CONFLICT, "repo_exists"),
-        ServiceError::Store(_) => (S::INTERNAL_SERVER_ERROR, "store_error"),
-    }
-}
-
-/// The status and code an intent error answers with, wherever it is
-/// answered (a wrapped agent-service error keeps that error's own).
-pub(crate) fn intent_error_parts(e: &IntentError) -> (StatusCode, &'static str) {
-    use StatusCode as S;
-    let status = match e {
-        IntentError::Service(inner) => return service_error_parts(inner),
-        IntentError::NotFound | IntentError::RepoNotFound | IntentError::AgentNotFound => {
-            S::NOT_FOUND
-        }
-        IntentError::InvalidState { .. }
-        | IntentError::Polishing
-        | IntentError::AlreadyAnswered
-        | IntentError::DependencyCycle
-        | IntentError::DependencyCrossRepo
-        | IntentError::EvidenceInRepo => S::CONFLICT,
-        IntentError::Invalid(_) => S::BAD_REQUEST,
-        IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
-    };
-    (status, e.code())
-}
-
 impl From<ServiceError> for ApiError {
     fn from(e: ServiceError) -> Self {
-        let (status, code) = service_error_parts(&e);
+        let (status, code) = e.status_and_code();
         if status.is_server_error() {
             tracing::error!("request failed: {e}");
         }
@@ -242,7 +201,7 @@ impl From<ServiceError> for ApiError {
 
 impl From<IntentError> for ApiError {
     fn from(e: IntentError) -> Self {
-        let (status, code) = intent_error_parts(&e);
+        let (status, code) = e.status_and_code();
         if status.is_server_error() {
             tracing::error!("request failed: {e}");
         }
@@ -1230,6 +1189,7 @@ mod tests {
     use smithagents_core::intent::Phase;
 
     use super::*;
+    use crate::git::GitError;
 
     /// The variant's name. Exhaustive on purpose: a new `IntentError`
     /// variant does not compile here until it is named, and then fails

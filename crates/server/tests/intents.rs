@@ -2579,6 +2579,10 @@ async fn an_intent_without_a_base_branch_starts_from_the_default_branch() {
     assert!(!f.first_message(&agent).await.contains("## Evidence"));
 }
 
+/// Writes each name straight to the store on purpose: it stands for a stored
+/// base branch that went bad after the intent was made (the creation path
+/// stores the branch Submit has just committed), so what is tested is the
+/// check at start, which must hold whatever the row says.
 #[tokio::test]
 async fn an_unusable_base_branch_name_is_refused_and_nothing_starts() {
     let f = real_fx().await;

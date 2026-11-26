@@ -5,6 +5,7 @@ pub mod upload;
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "test-util")]
 use std::sync::{Mutex, PoisonError};
@@ -20,10 +21,9 @@ use smithagents_core::intent::{CreateIntentRequest, Intent, SeedInput};
 use tokio::sync::Mutex as AsyncMutex;
 
 use self::github::{tool_readiness, AGENT_BROWSER, GH, NOT_INSTALLED};
-use self::issue::{file_names, github_repo, render_issue, seed_text, IssueInput};
-use self::repo::{place_and_commit, FileSource, FolderFile};
+use self::issue::{file_names, github_repo, render_issue, seed_tail, seed_text, IssueInput};
+use self::repo::{find_committed, place_and_commit, FileSource, FolderFile};
 use self::upload::{Staged, UploadLimits};
-use crate::api::intent_error_parts;
 use crate::git::{self, exit_status_text};
 use crate::intents::{CreateExtras, IntentError, IntentService};
 use crate::paths::{ensure_private_real_dir, Paths};
@@ -112,7 +112,7 @@ impl FeedbackError {
             Self::UnsupportedFile(_) => "unsupported_file",
             Self::TooLarge(_) => "payload_too_large",
             Self::ToolMissing(_) => "tool_missing",
-            Self::Intent(e) => intent_error_parts(e).1,
+            Self::Intent(e) => e.status_and_code().1,
         }
     }
 
@@ -129,7 +129,7 @@ impl FeedbackError {
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Intent(e) => intent_error_parts(e).0,
+            Self::Intent(e) => e.status_and_code().0,
         }
     }
 }
@@ -141,6 +141,8 @@ impl FeedbackError {
 /// [`FeedbackService::submit`], which runs one submission at a time: a second
 /// request with the same submission id waits for the first and then answers
 /// with what it recorded, so one id never makes a second commit or intent.
+/// The commit names its submission (`Feedback-Id`), so a commit a stopped
+/// daemon left without its record is taken up again, not made twice.
 #[derive(Clone)]
 pub struct FeedbackService {
     store: Store,
@@ -158,9 +160,35 @@ struct Parts {
     paths: Paths,
     /// Held for the whole of one submission.
     submitting: AsyncMutex<()>,
-    /// The error the next intent step fails with.
+    /// Submissions in [`FeedbackService::submit`], waiting or running.
+    running: AtomicUsize,
     #[cfg(feature = "test-util")]
-    fail_next_intent: Mutex<Option<IntentError>>,
+    faults: Mutex<Faults>,
+}
+
+/// What the next steps fail with (tests only).
+#[cfg(feature = "test-util")]
+#[derive(Default)]
+struct Faults {
+    intent: Option<IntentError>,
+    inserts: u32,
+    saves: u32,
+}
+
+/// Counts a submission in [`Parts::running`] while it lives.
+struct Running<'a>(&'a AtomicUsize);
+
+impl<'a> Running<'a> {
+    fn start(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Running(count)
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FeedbackService {
@@ -181,8 +209,9 @@ impl FeedbackService {
                 plugins,
                 paths,
                 submitting: AsyncMutex::new(()),
+                running: AtomicUsize::new(0),
                 #[cfg(feature = "test-util")]
-                fail_next_intent: Mutex::new(None),
+                faults: Mutex::default(),
             }),
         }
     }
@@ -206,11 +235,33 @@ impl FeedbackService {
     /// intent service is asked.
     #[cfg(feature = "test-util")]
     pub fn fail_next_intent_for_test(&self, error: IntentError) {
-        *self
-            .parts
-            .fail_next_intent
+        self.faults().intent = Some(error);
+    }
+
+    /// Test hook: the next store insert of a submission fails, once.
+    #[cfg(feature = "test-util")]
+    pub fn fail_next_insert_for_test(&self) {
+        self.faults().inserts = 1;
+    }
+
+    /// Test hook: the next `n` store saves of a submission fail.
+    #[cfg(feature = "test-util")]
+    pub fn fail_next_saves_for_test(&self, n: u32) {
+        self.faults().saves = n;
+    }
+
+    #[cfg(feature = "test-util")]
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.parts
+            .faults
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(error);
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Submissions being made now (waiting for their turn or running): the
+    /// daemon is not idle while there is one.
+    pub fn running_submissions(&self) -> usize {
+        self.parts.running.load(Ordering::SeqCst)
     }
 
     pub fn limits(&self) -> UploadLimits {
@@ -326,9 +377,13 @@ impl FeedbackService {
     /// Commits the staged submission's issue folder on a new branch and, for
     /// an intent, creates the intent. A submission already recorded under
     /// this id is continued instead (its uploads are not used): only a step
-    /// that has not succeeded runs again. A failure of the intent step after
-    /// the commit is in the answer's `failed`, not an error.
+    /// that has not succeeded runs again. So is one whose commit is on a
+    /// branch without its record (the daemon stopped in between): that
+    /// commit is recorded, not made again. A record that cannot be stored
+    /// takes its new branch back. A failure of the intent step after the
+    /// commit is in the answer's `failed`, not an error.
     pub async fn submit(&self, staged: Staged) -> Result<FeedbackOutcome, FeedbackError> {
+        let _running = Running::start(&self.parts.running);
         let _turn = self.parts.submitting.lock().await;
         let id = staged.request.submission_id;
         if let Some(recorded) = self.store.get_submission(id).await? {
@@ -342,6 +397,29 @@ impl FeedbackService {
             .get_repo(request.repo_id)
             .await?
             .ok_or(FeedbackError::RepoNotFound)?;
+        // A run that stopped after its commit and before its record.
+        if let Some(found) = find_committed(&repo, id).await? {
+            tracing::info!(submission_id = %id, step = "commit", "taking up a feedback commit made before");
+            let now = (self.clock)();
+            let submission = Submission {
+                id,
+                repo_id: repo.id,
+                request: staged.request.clone(),
+                title: staged.title.clone(),
+                branch: found.branch,
+                commit: found.commit,
+                folder: found.folder,
+                pushed: false,
+                intent_id: None,
+                issue_url: None,
+                created_at: now,
+                updated_at: now,
+            };
+            drop(staged);
+            // Nothing to undo when it fails: the commit stays findable.
+            self.insert_record(&submission).await?;
+            return self.finish(submission).await;
+        }
         if request.send_as == SendAs::GithubIssue {
             return Err(FeedbackError::Invalid(
                 "sending feedback as a GitHub issue is not available yet".into(),
@@ -359,6 +437,7 @@ impl FeedbackService {
             created.date_naive(),
             false,
             &files,
+            id,
             staged.dir.path(),
         )
         .await
@@ -380,9 +459,52 @@ impl FeedbackService {
             created_at: created,
             updated_at: created,
         };
-        self.store.insert_submission(&submission).await?;
         drop(staged);
+        if let Err(e) = self.insert_record(&submission).await {
+            // No branch without its record: take back the one just made,
+            // unless it has moved on since.
+            if git::delete_branch_at(&repo.path, &submission.branch, &submission.commit)
+                .await
+                .is_err()
+            {
+                tracing::error!(submission_id = %id, step = "record", code = "branch_kept", "a feedback branch without its record was left in place");
+            }
+            return Err(e);
+        }
         self.finish(submission).await
+    }
+
+    /// Stores a new submission; a failure is logged with its step and code.
+    async fn insert_record(&self, s: &Submission) -> Result<(), FeedbackError> {
+        #[cfg(feature = "test-util")]
+        if std::mem::take(&mut self.faults().inserts) > 0 {
+            tracing::warn!(submission_id = %s.id, step = "record", code = "store_error", "the feedback submission was not recorded");
+            return Err(StoreError::Conflict("a test failed this insert".into()).into());
+        }
+        self.store.insert_submission(s).await.map_err(|e| {
+            let e = FeedbackError::from(e);
+            tracing::warn!(submission_id = %s.id, step = "record", code = e.code(), "the feedback submission was not recorded");
+            e
+        })
+    }
+
+    /// Saves what a submission got to; a failure is logged with its step and
+    /// code.
+    async fn save_record(&self, s: &Submission) -> Result<(), FeedbackError> {
+        #[cfg(feature = "test-util")]
+        {
+            let mut faults = self.faults();
+            if faults.saves > 0 {
+                faults.saves -= 1;
+                tracing::warn!(submission_id = %s.id, step = "record_intent", code = "store_error", "the feedback submission was not saved");
+                return Err(StoreError::Conflict("a test failed this save".into()).into());
+            }
+        }
+        self.store.save_submission(s).await.map_err(|e| {
+            let e = FeedbackError::from(e);
+            tracing::warn!(submission_id = %s.id, step = "record_intent", code = e.code(), "the feedback submission was not saved");
+            e
+        })
     }
 
     /// `ToolMissing` unless the feedback plugin's `tool` is ready.
@@ -412,14 +534,18 @@ impl FeedbackService {
             ),
             (SendAs::Intent, None) => match self.create_intent(&s).await {
                 Ok(intent) => {
+                    tracing::info!(submission_id = %s.id, step = "create_intent", "feedback intent created");
                     s.intent_id = Some(intent.id);
                     s.updated_at = (self.clock)();
-                    self.store.save_submission(&s).await?;
-                    tracing::info!(submission_id = %s.id, step = "create_intent", "feedback intent created");
+                    // Tried twice; the intent exists either way, so it is the
+                    // answer (a 500 now would invite a second one).
+                    if self.save_record(&s).await.is_err() && self.save_record(&s).await.is_err() {
+                        tracing::error!(submission_id = %s.id, step = "record_intent", code = "store_error", "the feedback intent was made but not recorded");
+                    }
                     Some(intent)
                 }
                 Err(e) => {
-                    let code = intent_error_parts(&e).1;
+                    let code = e.status_and_code().1;
                     tracing::warn!(submission_id = %s.id, step = "create_intent", code, "the feedback intent was not created");
                     failed = Some(FeedbackFailure {
                         step: FeedbackStep::CreateIntent,
@@ -448,13 +574,7 @@ impl FeedbackService {
     /// folder's whereabouts, starting from its branch.
     async fn create_intent(&self, s: &Submission) -> Result<Intent, IntentError> {
         #[cfg(feature = "test-util")]
-        if let Some(e) = self
-            .parts
-            .fail_next_intent
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+        if let Some(e) = self.faults().intent.take() {
             return Err(e);
         }
         let request = &s.request;
@@ -469,7 +589,10 @@ impl FeedbackService {
             // The seed names no file.
             names: &[],
         };
-        let seed = seed_text(&input, &s.folder, &s.branch, &s.commit, MAX_SEED_BYTES);
+        // The intent service refuses a longer seed; the tail is not counted.
+        let tail = seed_tail(&s.folder, &s.branch, &s.commit).len();
+        let budget = MAX_SEED_BYTES.saturating_sub(tail);
+        let seed = seed_text(&input, &s.folder, &s.branch, &s.commit, budget);
         let req = CreateIntentRequest {
             repo_id: Some(s.repo_id),
             kind: Some(request.kind.intent_kind()),

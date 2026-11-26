@@ -388,7 +388,8 @@ pub fn render_issue(input: &IssueInput<'_>) -> String {
     out
 }
 
-/// The text an intent is seeded from.
+/// The text an intent is seeded from: the main idea, the kind, the
+/// screenshots' comments as far as `max_bytes` allows, then [`seed_tail`].
 pub fn seed_text(
     input: &IssueInput<'_>,
     folder: &str,
@@ -445,7 +446,13 @@ pub fn seed_text(
             head.push_str(MORE);
         }
     }
-    format!("{head}\n\nFeedback files: `{folder}/` on branch `{branch}` (commit {commit}).")
+    format!("{head}{}", seed_tail(folder, branch, commit))
+}
+
+/// The end of [`seed_text`], which `max_bytes` does not count: where the
+/// feedback files are.
+pub fn seed_tail(folder: &str, branch: &str, commit: &str) -> String {
+    format!("\n\nFeedback files: `{folder}/` on branch `{branch}` (commit {commit}).")
 }
 
 fn valid_part(s: &str) -> bool {

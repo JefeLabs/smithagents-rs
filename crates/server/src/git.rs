@@ -678,6 +678,116 @@ pub async fn delete_branch(repo_root: &Path, branch: &str) -> Result<(), GitErro
     isolated_ok(repo_root, &["branch", "-D", "--", branch]).await
 }
 
+/// Deletes the local branch `branch` only while it points at `commit` (a
+/// full commit id): `git update-ref -d refs/heads/<branch> <commit>`. A
+/// branch that moved on, or is gone, is not touched (`Failed`).
+pub async fn delete_branch_at(
+    repo_root: &Path,
+    branch: &str,
+    commit: &str,
+) -> Result<(), GitError> {
+    refuse_option_like(branch)?;
+    let is_id = matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_id {
+        return Err(GitError::UnsafeArgument);
+    }
+    let reference = format!("refs/heads/{branch}");
+    isolated_ok(repo_root, &["update-ref", "-d", &reference, commit]).await
+}
+
+/// A local branch's tip and the values of one trailer of its message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailerTip {
+    /// Without `refs/heads/`.
+    pub branch: String,
+    pub commit: String,
+    pub values: Vec<String>,
+}
+
+/// The tips of the local branches under `refs/heads/<namespace>/`, each with
+/// the values of the trailer `key` in its message, as git reads trailers
+/// (the last paragraph, never the subject; folded lines unfolded). One
+/// `git for-each-ref`. `key` and each namespace are letters, digits and `-`.
+pub async fn branch_tips_with_trailer(
+    repo_root: &Path,
+    namespaces: &[&str],
+    key: &str,
+) -> Result<Vec<TrailerTip>, GitError> {
+    let plain =
+        |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if !plain(key) || !namespaces.iter().all(|n| plain(n)) {
+        return Err(GitError::UnsafeArgument);
+    }
+    let format = format!(
+        "--format=%(objectname)%00%(refname)%00%(trailers:key={key},valueonly,unfold,separator=%x00)"
+    );
+    let patterns: Vec<String> = namespaces
+        .iter()
+        .map(|n| format!("refs/heads/{n}"))
+        .collect();
+    let mut args = vec!["for-each-ref", format.as_str()];
+    args.extend(patterns.iter().map(String::as_str));
+    let ran = isolated(repo_root, &args).await?;
+    ran.ok()?;
+    let mut tips = Vec::new();
+    for record in ran.stdout.split(|b| *b == b'\n').filter(|r| !r.is_empty()) {
+        let mut fields = record.split(|b| *b == 0);
+        let (Some(commit), Some(refname)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let refname = String::from_utf8_lossy(refname);
+        let Some(branch) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        // `refs/heads/feedback` itself matches the pattern too.
+        if !namespaces.iter().any(|n| {
+            branch
+                .strip_prefix(n)
+                .is_some_and(|rest| rest.starts_with('/'))
+        }) {
+            continue;
+        }
+        tips.push(TrailerTip {
+            branch: branch.to_string(),
+            commit: String::from_utf8_lossy(commit).into_owned(),
+            values: fields
+                .filter(|v| !v.is_empty())
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .collect(),
+        });
+    }
+    Ok(tips)
+}
+
+/// The paths `commit` (a full commit id) changes against its parent: `git
+/// diff-tree -r --name-only`. Nothing is read through a filter.
+pub async fn commit_changed_paths(repo_root: &Path, commit: &str) -> Result<Vec<String>, GitError> {
+    let is_id = matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    if !is_id {
+        return Err(GitError::UnsafeArgument);
+    }
+    let ran = isolated(
+        repo_root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            commit,
+        ],
+    )
+    .await?;
+    ran.ok()?;
+    Ok(ran
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
 /// Creates the local branch `branch` at `commit`, without tracking anything.
 /// Fails when the branch exists.
 pub async fn create_branch(repo_root: &Path, branch: &str, commit: &str) -> Result<(), GitError> {

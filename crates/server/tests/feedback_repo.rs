@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
 use smithagents_core::agent::Repo;
-use smithagents_core::feedback::FeedbackStep;
+use smithagents_core::feedback::{FeedbackStep, SubmissionId};
 use smithagents_core::ids::RepoId;
 use smithagents_server::feedback::repo::{
-    commit_folder, place, place_and_commit, push, FileSource, FolderFile, Placement,
+    commit_folder, find_committed, place, place_and_commit, push, Committed, FileSource,
+    FolderFile, Placement,
 };
 use smithagents_server::feedback::FeedbackError;
 use smithagents_server::git::{self, CommitError, GitError, PushError};
@@ -31,6 +32,11 @@ const SHOT: &[u8] = b"\x89PNG\r\n\x1a\nnot really a picture\x00\xff";
 const ISSUE_MD: &str = "# Fix the zoom\n\nThe page is too big.\n";
 const BRANCH: &str = "feedback/2026-11-26-fix-the-zoom";
 const FOLDER: &str = "docs/issues/2026-11-26-fix-the-zoom";
+
+/// A new submission id for a commit.
+fn id() -> SubmissionId {
+    SubmissionId::new()
+}
 
 fn date() -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 11, 26).unwrap()
@@ -264,9 +270,16 @@ impl Fixture {
             .unwrap();
         let scratch = self.scratch(scratch_name);
         let files = self.files(&scratch);
-        let commit = commit_folder(&self.repo, &placement, &files, "Fix the zoom", &scratch)
-            .await
-            .unwrap();
+        let commit = commit_folder(
+            &self.repo,
+            &placement,
+            &files,
+            "Fix the zoom",
+            id(),
+            &scratch,
+        )
+        .await
+        .unwrap();
         (placement, commit)
     }
 
@@ -468,7 +481,7 @@ async fn the_branch_starts_from_the_default_branch_as_it_is_now() {
     let new_tip = fx.commit_on_main("later.txt", "later\n");
     let scratch = fx.scratch("s");
     let files = fx.files(&scratch);
-    let commit = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let commit = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap();
     assert_eq!(
@@ -502,7 +515,7 @@ async fn a_missing_default_branch_is_refused_and_nothing_is_created() {
 
     let scratch = fx.scratch("s");
     let files = fx.files(&scratch);
-    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap_err();
     assert!(
@@ -552,7 +565,7 @@ async fn a_failed_commit_leaves_no_branch_and_no_worktree() {
     let scratch = fx.scratch("s1");
     let files = fx.files(&scratch);
 
-    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap_err();
     assert!(matches!(err, FeedbackError::GitIdentityMissing), "{err:?}");
@@ -575,7 +588,7 @@ async fn a_failed_commit_leaves_no_branch_and_no_worktree() {
     assert_eq!(again, placement);
     let scratch = fx.scratch("s2");
     let files = fx.files(&scratch);
-    let commit = commit_folder(&fx.repo, &again, &files, "Fix the zoom", &scratch)
+    let commit = commit_folder(&fx.repo, &again, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap();
     assert_eq!(commit, git(fx.root(), &["rev-parse", BRANCH]));
@@ -593,7 +606,7 @@ async fn an_identity_is_never_guessed() {
         .unwrap();
     let scratch = fx.scratch("s");
     let files = fx.files(&scratch);
-    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap_err();
     assert!(matches!(err, FeedbackError::GitIdentityMissing), "{err:?}");
@@ -782,7 +795,7 @@ async fn a_name_starting_with_a_dash_is_refused_before_git_runs() {
         },
     ];
     for placement in &placements {
-        let err = commit_folder(&nowhere, placement, &files, "t", &scratch)
+        let err = commit_folder(&nowhere, placement, &files, "t", id(), &scratch)
             .await
             .unwrap_err();
         assert!(invalid_input(&err), "{placement:?}: {err:?}");
@@ -790,14 +803,14 @@ async fn a_name_starting_with_a_dash_is_refused_before_git_runs() {
     for name in ["-x", "--all", "../x", "a/b", ".hidden", ""] {
         let mut bad = files.clone();
         bad[0].name = name.into();
-        let err = commit_folder(&nowhere, &good, &bad, "t", &scratch)
+        let err = commit_folder(&nowhere, &good, &bad, "t", id(), &scratch)
             .await
             .unwrap_err();
         assert!(invalid_input(&err), "{name:?}: {err:?}");
     }
     let mut twice = files.clone();
     twice[1].name = "issue.md".into();
-    let err = commit_folder(&nowhere, &good, &twice, "t", &scratch)
+    let err = commit_folder(&nowhere, &good, &twice, "t", id(), &scratch)
         .await
         .unwrap_err();
     assert!(invalid_input(&err), "{err:?}");
@@ -809,7 +822,7 @@ async fn a_name_starting_with_a_dash_is_refused_before_git_runs() {
             branch: branch.into(),
             ..good.clone()
         };
-        let err = commit_folder(&fx.repo, &placement, &files, "t", &scratch)
+        let err = commit_folder(&fx.repo, &placement, &files, "t", id(), &scratch)
             .await
             .unwrap_err();
         assert!(invalid_input(&err), "{branch}: {err:?}");
@@ -863,7 +876,7 @@ async fn the_scratch_directory_is_private_and_holds_the_only_worktree() {
         .await
         .unwrap();
     let files = fx.files(&scratch);
-    commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap();
     assert_eq!(mode(&scratch), 0o700);
@@ -882,7 +895,7 @@ async fn the_scratch_directory_is_private_and_holds_the_only_worktree() {
         name: "screenshot-1.png".into(),
         source: FileSource::Staged(staged),
     }];
-    let err = commit_folder(&fx.repo, &placement, &files, "Other", &link)
+    let err = commit_folder(&fx.repo, &placement, &files, "Other", id(), &link)
         .await
         .unwrap_err();
     assert!(matches!(err, FeedbackError::Io(_)), "{err:?}");
@@ -907,6 +920,7 @@ async fn a_dropped_commit_leaves_no_worktree() {
             &placement,
             &files,
             "Fix the zoom",
+            id(),
             &scratch,
         ));
         // Poll until the folder is being written in the worktree under the
@@ -958,7 +972,7 @@ async fn a_crashed_runs_worktree_is_cleaned_up_on_the_next_call() {
         .await
         .unwrap();
     let files = fx.files(&scratch);
-    let commit = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let commit = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap();
 
@@ -1334,7 +1348,7 @@ async fn nothing_git_prints_reaches_an_error_or_a_log() {
         .unwrap();
     let scratch = fx.scratch("s1");
     let files = fx.files(&scratch);
-    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap_err();
     texts.push(err.to_string());
@@ -1393,7 +1407,7 @@ async fn a_users_worktree_whose_folder_moved_survives_every_path() {
     let placement = place(&fx.repo, "Other", date(), false).await.unwrap();
     let scratch = fx.scratch("s2");
     let files = fx.files(&scratch);
-    let err = commit_folder(&fx.repo, &placement, &files, "Other", &scratch)
+    let err = commit_folder(&fx.repo, &placement, &files, "Other", id(), &scratch)
         .await
         .unwrap_err();
     assert!(matches!(err, FeedbackError::GitIdentityMissing), "{err:?}");
@@ -1419,7 +1433,7 @@ async fn a_users_worktree_whose_folder_moved_survives_every_path() {
     let placement = place(&fx.repo, "Third", date(), false).await.unwrap();
     let scratch = fx.scratch("s3");
     let files = fx.files(&scratch);
-    commit_folder(&fx.repo, &placement, &files, "Third", &scratch)
+    commit_folder(&fx.repo, &placement, &files, "Third", id(), &scratch)
         .await
         .unwrap();
     let paths = worktree_paths(fx.root());
@@ -1494,7 +1508,7 @@ async fn repository_attributes_and_filters_do_not_shape_the_commit() {
     let placement = place(&fx.repo, "Fix the zoom", date(), false)
         .await
         .unwrap();
-    let commit = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let commit = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap();
 
@@ -1550,7 +1564,7 @@ async fn a_name_taken_since_placing_is_reported_and_nothing_is_created() {
     git(fx.root(), &["branch", BRANCH]);
     let scratch = fx.scratch("s1");
     let files = fx.files(&scratch);
-    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap_err();
     assert!(matches!(err, FeedbackError::NameTaken), "{err:?}");
@@ -1578,9 +1592,16 @@ async fn a_name_taken_since_placing_is_reported_and_nothing_is_created() {
     fresh.commit_on_main(&format!("{FOLDER}/issue.md"), "theirs\n");
     let scratch = fresh.scratch("s");
     let files = fresh.files(&scratch);
-    let err = commit_folder(&fresh.repo, &placement, &files, "Fix the zoom", &scratch)
-        .await
-        .unwrap_err();
+    let err = commit_folder(
+        &fresh.repo,
+        &placement,
+        &files,
+        "Fix the zoom",
+        id(),
+        &scratch,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, FeedbackError::NameTaken), "{err:?}");
     assert_eq!(fresh.feedback_branches(), "");
 }
@@ -1598,6 +1619,7 @@ async fn the_same_title_submitted_twice_at_once_gets_two_names() {
             date(),
             false,
             &files_a,
+            id(),
             &scratch_a
         ),
         place_and_commit(
@@ -1606,6 +1628,7 @@ async fn the_same_title_submitted_twice_at_once_gets_two_names() {
             date(),
             false,
             &files_b,
+            id(),
             &scratch_b
         ),
     );
@@ -1649,7 +1672,7 @@ async fn a_git_that_never_returns_is_stopped_and_cleaned_up() {
     let started = Instant::now();
     let err = git::with_git_timeout(
         Duration::from_secs(2),
-        commit_folder(&fx.repo, &placement, &files, "Hang one", &scratch),
+        commit_folder(&fx.repo, &placement, &files, "Hang one", id(), &scratch),
     )
     .await
     .unwrap_err();
@@ -1691,7 +1714,7 @@ async fn dropping_a_hung_commit_kills_git_and_cleans_up() {
     let files = fx.files(&scratch);
     let dropped = tokio::time::timeout(
         Duration::from_secs(3),
-        commit_folder(&fx.repo, &placement, &files, "Hang two", &scratch),
+        commit_folder(&fx.repo, &placement, &files, "Hang two", id(), &scratch),
     )
     .await;
     assert!(dropped.is_err(), "the commit should have hung: {dropped:?}");
@@ -1833,7 +1856,7 @@ async fn a_long_title_and_a_bidi_override_make_one_clean_subject() {
     let placement = place(&fx.repo, "Long", date(), false).await.unwrap();
     let scratch = fx.scratch("s1");
     let files = fx.files(&scratch);
-    let commit = commit_folder(&fx.repo, &placement, &files, &long, &scratch)
+    let commit = commit_folder(&fx.repo, &placement, &files, &long, id(), &scratch)
         .await
         .unwrap();
     assert_eq!(
@@ -1845,12 +1868,13 @@ async fn a_long_title_and_a_bidi_override_make_one_clean_subject() {
     let scratch = fx.scratch("s2");
     let files = fx.files(&scratch);
     let title = "Fix \u{202e}the\u{200b} zoom\u{2066}\u{feff}";
-    let commit = commit_folder(&fx.repo, &placement, &files, title, &scratch)
+    let submission = id();
+    let commit = commit_folder(&fx.repo, &placement, &files, title, submission, &scratch)
         .await
         .unwrap();
     assert_eq!(
         git(fx.root(), &["log", "-1", "--format=%B", &commit]),
-        "docs(issues): Fix the zoom"
+        format!("docs(issues): Fix the zoom\n\nFeedback-Id: {submission}")
     );
 }
 
@@ -1881,7 +1905,7 @@ async fn a_file_where_the_folders_go_is_refused() {
 
         let scratch = fx.scratch("s");
         let files = fx.files(&scratch);
-        let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+        let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
             .await
             .unwrap_err();
         assert!(
@@ -1918,7 +1942,7 @@ async fn a_branch_named_like_the_prefix_is_refused() {
         folder: FOLDER.into(),
         branch: BRANCH.into(),
     };
-    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+    let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap_err();
     assert!(
@@ -1984,7 +2008,7 @@ async fn a_submodule_where_the_folders_go_is_refused() {
         };
         let scratch = fx.scratch("s");
         let files = fx.files(&scratch);
-        let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", &scratch)
+        let err = commit_folder(&fx.repo, &placement, &files, "Fix the zoom", id(), &scratch)
             .await
             .unwrap_err();
         assert!(
@@ -2010,7 +2034,7 @@ async fn a_submodule_at_the_folder_itself_takes_the_name() {
     assert_eq!(placement.slug, "fix-the-zoom-2");
     let scratch = fx.scratch("s");
     let files = fx.files(&scratch);
-    let err = commit_folder(&fx.repo, &stale, &files, "Fix the zoom", &scratch)
+    let err = commit_folder(&fx.repo, &stale, &files, "Fix the zoom", id(), &scratch)
         .await
         .unwrap_err();
     assert!(matches!(err, FeedbackError::NameTaken), "{err:?}");
@@ -2022,4 +2046,104 @@ async fn a_submodule_at_the_folder_itself_takes_the_name() {
         Some("commit")
     );
     assert_eq!(fx.feedback_branches(), "");
+}
+
+// ------------------------------------------------ the commit names its submission
+
+#[tokio::test]
+async fn the_commit_names_its_submission_in_a_trailer_and_is_found_by_it() {
+    let fx = Fixture::new();
+    let placement = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+    let submission = id();
+    let commit = commit_folder(
+        &fx.repo,
+        &placement,
+        &files,
+        "Fix the zoom",
+        submission,
+        &scratch,
+    )
+    .await
+    .unwrap();
+
+    let trailer = git(
+        fx.root(),
+        &[
+            "log",
+            "-1",
+            "--format=%(trailers:key=Feedback-Id,valueonly)",
+            &commit,
+        ],
+    );
+    assert_eq!(trailer, submission.to_string());
+    let found = find_committed(&fx.repo, submission).await.unwrap();
+    assert_eq!(
+        found,
+        Some(Committed {
+            branch: BRANCH.into(),
+            folder: FOLDER.into(),
+            commit: commit.clone(),
+        })
+    );
+    // Another submission's id finds nothing.
+    assert_eq!(find_committed(&fx.repo, id()).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn an_idea_branch_is_found_by_its_trailer_too() {
+    let fx = Fixture::new();
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+    let submission = id();
+    let (placement, commit) = place_and_commit(
+        &fx.repo,
+        "Fix the zoom",
+        date(),
+        true,
+        &files,
+        submission,
+        &scratch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(placement.branch, "idea/fix-the-zoom");
+
+    let found = find_committed(&fx.repo, submission).await.unwrap().unwrap();
+    assert_eq!(
+        (found.branch.as_str(), found.folder.as_str(), found.commit),
+        ("idea/fix-the-zoom", FOLDER, commit)
+    );
+}
+
+#[tokio::test]
+async fn a_branch_is_deleted_only_at_the_commit_it_was_made_at() {
+    let fx = Fixture::new();
+    let (placement, commit) = fx.submit("s").await;
+    let main = git(fx.root(), &["rev-parse", "refs/heads/main"]);
+
+    // Moved on since: kept.
+    let moved = git::delete_branch_at(fx.root(), &placement.branch, &main).await;
+    assert!(moved.is_err(), "{moved:?}");
+    assert_eq!(
+        git(fx.root(), &["rev-parse", &format!("refs/heads/{BRANCH}")]),
+        commit
+    );
+    // Still at its commit: deleted, and nothing else.
+    git::delete_branch_at(fx.root(), &placement.branch, &commit)
+        .await
+        .unwrap();
+    assert_eq!(git(fx.root(), &["branch", "--list", "feedback/*"]), "");
+    assert_eq!(git(fx.root(), &["rev-parse", "refs/heads/main"]), main);
+    // A name or commit that could be an option is refused before git runs.
+    for (branch, at) in [("-d", commit.as_str()), (BRANCH, "-x"), (BRANCH, "main")] {
+        let refused = git::delete_branch_at(fx.root(), branch, at).await;
+        assert!(
+            matches!(refused, Err(GitError::UnsafeArgument)),
+            "{branch} {at}: {refused:?}"
+        );
+    }
 }

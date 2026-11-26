@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use chrono::Utc;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
@@ -51,6 +52,27 @@ pub enum ServiceError {
     Git(#[from] GitError),
     #[error("store: {0}")]
     Store(#[from] StoreError),
+}
+
+impl ServiceError {
+    /// The HTTP status and the stable code this error is answered with.
+    pub fn status_and_code(&self) -> (StatusCode, &'static str) {
+        use StatusCode as S;
+        match self {
+            Self::RepoNotFound => (S::NOT_FOUND, "repo_not_found"),
+            Self::AgentNotFound => (S::NOT_FOUND, "agent_not_found"),
+            Self::AgentClosed => (S::CONFLICT, "agent_closed"),
+            Self::TurnInProgress => (S::CONFLICT, "turn_in_progress"),
+            Self::Git(GitError::PathNotFound(_)) => (S::BAD_REQUEST, "path_not_found"),
+            Self::Git(GitError::NotAGitRepo) => (S::BAD_REQUEST, "not_a_git_repo"),
+            Self::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
+            Self::Git(GitError::NoDefaultBranch) => (S::BAD_REQUEST, "no_default_branch"),
+            Self::Git(GitError::BranchExists(_)) => (S::CONFLICT, "branch_exists"),
+            Self::Git(_) => (S::INTERNAL_SERVER_ERROR, "git_error"),
+            Self::Store(StoreError::DuplicateRepoPath) => (S::CONFLICT, "repo_exists"),
+            Self::Store(_) => (S::INTERNAL_SERVER_ERROR, "store_error"),
+        }
+    }
 }
 
 /// Optional settings for `create_agent_with`.

@@ -43,6 +43,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use chrono::{TimeDelta, Utc};
 use futures::FutureExt;
 use smithagents_core::agent::AgentState;
@@ -166,6 +167,27 @@ impl IntentError {
             IntentError::Service(_) => "service_error",
             IntentError::Store(_) => "store_error",
         }
+    }
+
+    /// The HTTP status and the code this error is answered with, wherever it
+    /// is answered: a wrapped agent-service error keeps that error's own.
+    pub fn status_and_code(&self) -> (StatusCode, &'static str) {
+        use StatusCode as S;
+        let status = match self {
+            IntentError::Service(inner) => return inner.status_and_code(),
+            IntentError::NotFound | IntentError::RepoNotFound | IntentError::AgentNotFound => {
+                S::NOT_FOUND
+            }
+            IntentError::InvalidState { .. }
+            | IntentError::Polishing
+            | IntentError::AlreadyAnswered
+            | IntentError::DependencyCycle
+            | IntentError::DependencyCrossRepo
+            | IntentError::EvidenceInRepo => S::CONFLICT,
+            IntentError::Invalid(_) => S::BAD_REQUEST,
+            IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
+        };
+        (status, self.code())
     }
 }
 

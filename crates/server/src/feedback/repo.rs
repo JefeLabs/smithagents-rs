@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use smithagents_core::agent::Repo;
-use smithagents_core::feedback::{FeedbackFailure, FeedbackStep};
+use smithagents_core::feedback::{FeedbackFailure, FeedbackStep, SubmissionId};
 
 use super::issue::{branch_name, folder_path, issue_slug, with_suffix};
 use super::FeedbackError;
@@ -38,6 +38,13 @@ pub const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SUFFIX: u32 = 99;
 const WORKTREE_STEP: &str = "create the worktree";
 const COMMIT_STEP: &str = "commit the files";
+const FIND_STEP: &str = "look for this submission's commit";
+/// The trailer of a feedback commit that names its submission.
+pub const FEEDBACK_ID_TRAILER: &str = "Feedback-Id";
+/// The branches a submission's commit is made on: `feedback/…`, `idea/…`.
+const BRANCH_NAMESPACES: [&str; 2] = ["feedback", "idea"];
+/// Where issue folders go.
+const ISSUES_DIR: &str = "docs/issues";
 /// The temporary worktree's directory inside the scratch directory.
 const WORKTREE_DIR: &str = "wt";
 const FILE_MODE: u32 = 0o644;
@@ -113,12 +120,13 @@ pub async fn place_and_commit(
     date: NaiveDate,
     idea: bool,
     files: &[FolderFile],
+    id: SubmissionId,
     scratch: &Path,
 ) -> Result<(Placement, String), FeedbackError> {
     let mut retried = false;
     loop {
         let placement = place(repo, title, date, idea).await?;
-        match commit_folder(repo, &placement, files, title, scratch).await {
+        match commit_folder(repo, &placement, files, title, id, scratch).await {
             Ok(commit) => return Ok((placement, commit)),
             Err(FeedbackError::NameTaken) if !retried => retried = true,
             Err(e) => return Err(e),
@@ -127,8 +135,9 @@ pub async fn place_and_commit(
 }
 
 /// Creates `placement.branch` from the default branch in `<scratch>/wt`,
-/// writes the folder, commits `docs(issues): <title>`, removes the worktree,
-/// and returns the commit's id.
+/// writes the folder, commits `docs(issues): <title>` with the trailer
+/// `Feedback-Id: <id>` (so [`find_committed`] finds it again), removes the
+/// worktree, and returns the commit's id.
 ///
 /// `NameTaken` when the branch or the folder appeared since `place` chose
 /// them (see [`place_and_commit`]). On every failure the worktree is removed
@@ -155,6 +164,7 @@ pub async fn commit_folder(
     placement: &Placement,
     files: &[FolderFile],
     title: &str,
+    id: SubmissionId,
     scratch: &Path,
 ) -> Result<String, FeedbackError> {
     let root = repo.path.as_path();
@@ -167,7 +177,7 @@ pub async fn commit_folder(
     // Armed before anything is created: a panic or a dropped future removes
     // the worktree in `Drop`; every other way out goes through `remove`.
     let worktree = TempWorktree::new(root, scratch.join(WORKTREE_DIR), git::local_timeout());
-    let committed = commit_in_worktree(repo, &worktree, placement, files, title).await;
+    let committed = commit_in_worktree(repo, &worktree, placement, files, title, id).await;
     worktree.remove().await;
     if committed.is_ok() {
         for file in files {
@@ -187,6 +197,7 @@ async fn commit_in_worktree(
     placement: &Placement,
     files: &[FolderFile],
     title: &str,
+    id: SubmissionId,
 ) -> Result<String, FeedbackError> {
     let root = repo.path.as_path();
     let dir = worktree.dir.as_path();
@@ -206,7 +217,11 @@ async fn commit_in_worktree(
 
     let paths = write_folder(worktree, &placement.folder, files).await?;
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
-    let message = format!("docs(issues): {}", one_line(title));
+    // The id is a UUID the daemon parsed: nothing else in the trailer.
+    let message = format!(
+        "docs(issues): {}\n\n{FEEDBACK_ID_TRAILER}: {id}",
+        one_line(title)
+    );
     let commit = git::commit_paths(dir, &paths, &message)
         .await
         .map_err(|e| match e {
@@ -303,6 +318,64 @@ fn locked_by_another_run(reason: &str) -> bool {
         .strip_prefix(LOCK_REASON)
         .and_then(|pid| pid.trim().parse::<u32>().ok())
         .is_some_and(|pid| pid != std::process::id())
+}
+
+/// A submission's commit as found on a branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Committed {
+    pub branch: String,
+    /// `docs/issues/<name>`.
+    pub folder: String,
+    pub commit: String,
+}
+
+/// The commit of submission `id`, when a run stopped after making it: the
+/// tip of a local `feedback/…` or `idea/…` branch whose message has the
+/// trailer `Feedback-Id` with exactly that id, and which adds one issue
+/// folder holding `issue.md`. One `git for-each-ref`, then one `git
+/// diff-tree` for a tip that matches.
+pub async fn find_committed(
+    repo: &Repo,
+    id: SubmissionId,
+) -> Result<Option<Committed>, FeedbackError> {
+    let wanted = id.to_string();
+    let tips = git::branch_tips_with_trailer(&repo.path, &BRANCH_NAMESPACES, FEEDBACK_ID_TRAILER)
+        .await
+        .map_err(git_failed(FIND_STEP))?;
+    for tip in tips {
+        // The whole value, exactly.
+        if !tip.values.contains(&wanted) {
+            continue;
+        }
+        let paths = git::commit_changed_paths(&repo.path, &tip.commit)
+            .await
+            .map_err(git_failed(FIND_STEP))?;
+        if let Some(folder) = issue_folder_of(&paths) {
+            return Ok(Some(Committed {
+                branch: tip.branch,
+                folder,
+                commit: tip.commit,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// `docs/issues/<name>` when every path is a file directly in that one
+/// folder (a plain name) and one of them is its `issue.md`.
+fn issue_folder_of(paths: &[String]) -> Option<String> {
+    let first = paths.first()?;
+    let folder = first.rsplit_once('/')?.0;
+    let name = folder.strip_prefix(ISSUES_DIR)?.strip_prefix('/')?;
+    let in_folder = |p: &String| {
+        p.strip_prefix(folder)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(is_plain_name)
+    };
+    (is_plain_name(name)
+        && paths.iter().all(in_folder)
+        && paths.iter().any(|p| p.ends_with("/issue.md")))
+    .then(|| folder.to_string())
 }
 
 /// Pushes the local branch `local` to `origin` as `remote_branch`, never
@@ -812,6 +885,33 @@ mod tests {
         assert!(!locked_by_another_run("initializing"));
         assert!(!locked_by_another_run(""));
         assert!(!locked_by_another_run("smithagents feedback pid x"));
+    }
+
+    #[test]
+    fn the_issue_folder_of_a_commit_is_its_only_folder() {
+        let paths = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let folder = "docs/issues/2026-11-26-x";
+        assert_eq!(
+            issue_folder_of(&paths(&[
+                "docs/issues/2026-11-26-x/issue.md",
+                "docs/issues/2026-11-26-x/screenshot-1.png",
+            ])),
+            Some(folder.to_string())
+        );
+        for bad in [
+            &[][..],
+            &["docs/issues/2026-11-26-x/screenshot-1.png"],
+            &["docs/issues/2026-11-26-x/issue.md", "README.md"],
+            &[
+                "docs/issues/2026-11-26-x/issue.md",
+                "docs/issues/y/issue.md",
+            ],
+            &["docs/issues/a/b/issue.md"],
+            &["docs/issues/.x/issue.md"],
+            &["elsewhere/x/issue.md"],
+        ] {
+            assert_eq!(issue_folder_of(&paths(bad)), None, "{bad:?}");
+        }
     }
 
     #[test]

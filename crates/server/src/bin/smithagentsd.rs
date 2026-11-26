@@ -261,8 +261,11 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
         "listening on 127.0.0.1"
     );
 
+    // A submission whose client went away still runs: the daemon stopping
+    // under it would leave a commit without its record.
+    let running_submissions = state.feedback.clone();
     let idle = IdleMonitor::new(opts.idle_timeout, ws_clients, move || {
-        service.running_agent_count()
+        service.running_agent_count() + running_submissions.running_submissions()
     });
     let stop = async move {
         tokio::select! {

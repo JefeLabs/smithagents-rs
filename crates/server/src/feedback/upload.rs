@@ -60,14 +60,16 @@ pub struct UploadLimits {
 
 impl Default for UploadLimits {
     /// The design's: 10 attachments, 10 MB per image, 50 MB per video,
-    /// 100 MB in all (binary megabytes), and 256 KiB of request.
+    /// 100 MB in all (binary megabytes), and 1 MiB of request (a request at
+    /// every limit, in a script of three-byte characters with JSON escapes,
+    /// is larger than 256 KiB).
     fn default() -> Self {
         UploadLimits {
             attachments: 10,
             image_bytes: 10 * MIB,
             video_bytes: 50 * MIB,
             total_bytes: 100 * MIB,
-            request_bytes: 256 * KIB,
+            request_bytes: MIB,
         }
     }
 }
@@ -192,9 +194,12 @@ fn size_text(bytes: u64) -> String {
     }
 }
 
-/// `{n} KiB` for a whole number of KiB, else `{n} bytes`.
-fn kib_text(bytes: u64) -> String {
-    if bytes > 0 && bytes.is_multiple_of(KIB) {
+/// `{n} MiB` for a whole number of MiB, `{n} KiB` for one of KiB, else
+/// `{n} bytes`.
+fn binary_size_text(bytes: u64) -> String {
+    if bytes > 0 && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes > 0 && bytes.is_multiple_of(KIB) {
         format!("{} KiB", bytes / KIB)
     } else {
         format!("{bytes} bytes")
@@ -398,7 +403,7 @@ async fn read_request(
         if (json.len() + chunk.len()) as u64 > limits.request_bytes {
             return Err(FeedbackError::TooLarge(format!(
                 "the request part is larger than {}",
-                kib_text(limits.request_bytes)
+                binary_size_text(limits.request_bytes)
             )));
         }
         json.extend_from_slice(&chunk);
@@ -507,7 +512,7 @@ mod tests {
         assert_eq!(limits.image_bytes, 10 * 1024 * 1024);
         assert_eq!(limits.video_bytes, 50 * 1024 * 1024);
         assert_eq!(limits.total_bytes, 100 * 1024 * 1024);
-        assert_eq!(limits.request_bytes, 256 * 1024);
+        assert_eq!(limits.request_bytes, 1024 * 1024);
         assert_eq!(limits.body_limit(), 100 * 1024 * 1024 + 1024 * 1024);
     }
 
@@ -535,8 +540,9 @@ mod tests {
         assert_eq!(size_text(10 * MIB), "10 MB");
         assert_eq!(size_text(1024), "1024 bytes");
         assert_eq!(size_text(MIB + 1), "1048577 bytes");
-        assert_eq!(kib_text(256 * KIB), "256 KiB");
-        assert_eq!(kib_text(1000), "1000 bytes");
+        assert_eq!(binary_size_text(MIB), "1 MiB");
+        assert_eq!(binary_size_text(256 * KIB), "256 KiB");
+        assert_eq!(binary_size_text(1000), "1000 bytes");
     }
 
     fn request() -> FeedbackRequest {

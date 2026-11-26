@@ -30,6 +30,7 @@ use smithagents_plugin_host::StaticSecrets;
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::feedback::issue::{file_names, render_issue, FileKind, IssueInput};
+use smithagents_server::feedback::repo::{place_and_commit, FileSource, FolderFile};
 use smithagents_server::feedback::upload::UploadLimits;
 use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::fake::FakeHarness;
@@ -548,11 +549,9 @@ async fn targets_list_repositories_tools_and_the_meta_repository() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let (_, body) = fx.call(Method::GET, "/v1/feedback/targets", None).await;
-    assert_eq!(body["gh"], json!({"ready": false, "reason": "turned off"}));
-    assert_eq!(
-        body["agent_browser"],
-        json!({"ready": false, "reason": "turned off"})
-    );
+    let off = json!({"ready": false, "reason": "turned off or not running"});
+    assert_eq!(body["gh"], off);
+    assert_eq!(body["agent_browser"], off);
 }
 
 #[tokio::test]
@@ -1006,7 +1005,7 @@ async fn hostile_and_oversized_uploads_are_refused_and_leave_nothing() {
     );
     assert!(!text.contains("LEAK"), "{text}");
     let mut huge = request(json!([]));
-    huge["platform"] = json!("x".repeat(300 * 1024));
+    huge["platform"] = json!("x".repeat(1024 * 1024));
     fx.refused(
         &dir,
         &huge,
@@ -1014,7 +1013,7 @@ async fn hostile_and_oversized_uploads_are_refused_and_leave_nothing() {
         (
             large,
             "payload_too_large",
-            "the request part is larger than 256 KiB",
+            "the request part is larger than 1 MiB",
         ),
     )
     .await;
@@ -1626,4 +1625,223 @@ async fn nothing_uploaded_or_typed_reaches_a_log_and_no_file_reaches_an_event() 
         assert!(!text.contains("LEAK"), "{text}");
     }
     assert!(!logged.contains("USERTEXT"), "{logged}");
+}
+
+// ------------------------------------------- fix round 1: never half-made
+
+/// `n` commits on `branch` above `main`.
+fn commits_above_main(dir: &Path, branch: &str) -> String {
+    git_out(dir, &["rev-list", "--count", &format!("main..{branch}")])
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_stored_takes_its_branch_back() {
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    let mut req = request_json(repo.id, "intent");
+    req["attachments"] = json!([image("a.png")]);
+    let shot = png(300);
+    fx.state.feedback.fail_next_insert_for_test();
+
+    let (status, body) = fx.submit(&req, &[("file-1", &shot)]).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"], "store_error", "{body}");
+    fx.assert_nothing_created(&repo.path, &req["submission_id"], "record failed")
+        .await;
+
+    // Sent again: the same name is free, and there is one commit.
+    let (status, out) = fx.submit(&req, &[("file-1", &shot)]).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["branch"], BRANCH);
+    assert_eq!(commits_above_main(&repo.path, BRANCH), "1");
+    assert_eq!(fx.intents().await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_intent_whose_record_cannot_be_saved_is_still_the_answer() {
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+
+    // One failed save is retried.
+    let req = request_json(repo.id, "intent");
+    fx.state.feedback.fail_next_saves_for_test(1);
+    let (status, out) = fx.submit(&req, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let id: IntentId = serde_json::from_value(out["intent"]["id"].clone()).unwrap();
+    let sid: SubmissionId = serde_json::from_value(req["submission_id"].clone()).unwrap();
+    let row = fx.state.store.get_submission(sid).await.unwrap().unwrap();
+    assert_eq!(row.intent_id, Some(id));
+
+    // Two failed saves: the intent that was made is the answer, not a 500.
+    let mut req = request_json(repo.id, "intent");
+    req["main_idea"] = json!("Another idea");
+    fx.state.feedback.fail_next_saves_for_test(2);
+    let (status, out) = fx.submit(&req, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["failed"], Value::Null);
+    let id: IntentId = serde_json::from_value(out["intent"]["id"].clone()).unwrap();
+    let stored = fx.state.store.get_intent(id).await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&stored).unwrap(), out["intent"]);
+    assert_eq!(fx.intents().await.len(), 2);
+}
+
+/// What a daemon stopped between its commit and its record leaves: the
+/// submission's commit on its branch, with no row.
+async fn commit_without_record(fx: &Fx, repo: &Repo, id: &Value) -> String {
+    let id: SubmissionId = serde_json::from_value(id.clone()).unwrap();
+    let files = [FolderFile {
+        name: "issue.md".into(),
+        source: FileSource::Text("# Fix the zoom\n".into()),
+    }];
+    let scratch = fx.paths.feedback_tmp_dir().join("stopped-run");
+    let date = now().date_naive();
+    let (placement, commit) =
+        place_and_commit(repo, "Fix the zoom", date, false, &files, id, &scratch)
+            .await
+            .unwrap();
+    assert_eq!(placement.branch, BRANCH);
+    std::fs::remove_dir_all(&scratch).unwrap();
+    assert_eq!(fx.state.store.get_submission(id).await.unwrap(), None);
+    commit
+}
+
+#[tokio::test]
+async fn a_commit_left_by_a_stopped_daemon_is_adopted() {
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    let mut req = request_json(repo.id, "intent");
+    req["attachments"] = json!([image("a.png")]);
+    let commit = commit_without_record(&fx, &repo, &req["submission_id"]).await;
+
+    let (status, out) = fx.submit(&req, &[("file-1", &png(300))]).await;
+
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["branch"], BRANCH);
+    assert_eq!(out["folder"], FOLDER);
+    assert_eq!(out["commit"], commit);
+    assert_eq!(out["failed"], Value::Null);
+    assert_eq!(out["intent"]["origin"]["commit"], commit);
+    // No second branch and no second commit: the folder is as first committed.
+    assert_eq!(
+        git_out(&repo.path, &["branch", "--list", "feedback/*"]),
+        BRANCH
+    );
+    assert_eq!(commits_above_main(&repo.path, BRANCH), "1");
+    let tree = git_out(
+        &repo.path,
+        &["ls-tree", "--name-only", &format!("{BRANCH}:{FOLDER}")],
+    );
+    assert_eq!(tree, "issue.md");
+    assert_eq!(fx.intents().await.len(), 1);
+    let sid: SubmissionId = serde_json::from_value(req["submission_id"].clone()).unwrap();
+    let row = fx.state.store.get_submission(sid).await.unwrap().unwrap();
+    assert_eq!(
+        (row.branch.as_str(), row.commit.as_str()),
+        (BRANCH, commit.as_str())
+    );
+    assert!(fx.feedback_tmp_is_empty());
+
+    // And the next time it is the recorded submission.
+    let (status, again) = fx.submit(&req, &[("file-1", &png(300))]).await;
+    assert_eq!((status, &again), (StatusCode::OK, &out));
+}
+
+/// A branch `branch` from `main` with one commit whose message is
+/// `message`, adding `docs/issues/<name>/issue.md` as Submit would.
+fn decoy(dir: &Path, branch: &str, name: &str, message: &str) -> String {
+    common::git(dir, &["switch", "-q", "-c", branch, "main"]);
+    let folder = dir.join("docs/issues").join(name);
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("issue.md"), "# A decoy\n").unwrap();
+    common::git(dir, &["add", "docs"]);
+    common::git(
+        dir,
+        &["commit", "-q", "--cleanup=whitespace", "-m", message],
+    );
+    common::git(dir, &["switch", "-q", "main"]);
+    git_out(dir, &["rev-parse", &format!("refs/heads/{branch}")])
+}
+
+#[tokio::test]
+async fn only_this_submissions_trailer_is_adopted() {
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    let dir = repo.path.clone();
+    let req = request_json(repo.id, "intent");
+    let id = req["submission_id"].as_str().unwrap().to_string();
+    let other = SubmissionId::new().to_string();
+    let decoys = [
+        // The id in the title, and in the body but not as the trailer.
+        (
+            "feedback/2026-11-26-title",
+            format!("docs(issues): Feedback-Id: {id}\n\nmentions {id}\nFeedback-Id: {id} too"),
+        ),
+        // A trailer whose value only starts with the id.
+        (
+            "feedback/2026-11-26-longer",
+            format!("docs(issues): x\n\nFeedback-Id: {id}-2"),
+        ),
+        // Another submission's trailer.
+        (
+            "idea/other",
+            format!("docs(issues): x\n\nFeedback-Id: {other}"),
+        ),
+        // The right trailer, on a branch Submit never makes.
+        ("work/x", format!("docs(issues): x\n\nFeedback-Id: {id}")),
+    ];
+    let mut tips = Vec::new();
+    for (i, (branch, message)) in decoys.iter().enumerate() {
+        tips.push(decoy(&dir, branch, &format!("decoy-{i}"), message));
+    }
+
+    let (status, out) = fx.submit(&req, &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["branch"], BRANCH, "{out}");
+    assert!(!tips.contains(&out["commit"].as_str().unwrap().to_string()));
+    assert_eq!(commits_above_main(&dir, BRANCH), "1");
+    let message = git_out(&dir, &["log", "-1", "--format=%B", BRANCH]);
+    assert_eq!(
+        message,
+        format!("docs(issues): Fix the zoom\n\nFeedback-Id: {id}")
+    );
+    // The decoys are left as they were.
+    for ((branch, _), tip) in decoys.iter().zip(&tips) {
+        assert_eq!(
+            &git_out(&dir, &["rev-parse", &format!("refs/heads/{branch}")]),
+            tip
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_maximal_request_in_a_three_byte_script_is_accepted() {
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    // 漢 is three bytes in UTF-8: 20,000 of them, and 20 comments of 500 on
+    // each of ten screenshots, with quotes to escape.
+    let comment = format!("\"{}\"", "漢".repeat(498));
+    let boxes: Vec<Value> = (0..20).map(|_| a_box(&comment)).collect();
+    let mut req = request_json(repo.id, "intent");
+    req["main_idea"] = json!(format!("漢{}", "\"漢".repeat(9_999)));
+    req["attachments"] = json!((0..10)
+        .map(|_| screenshot(json!(boxes)))
+        .collect::<Vec<_>>());
+    let json = req.to_string();
+    assert!(json.len() > 256 * 1024, "{}", json.len());
+    assert_eq!(req["main_idea"].as_str().unwrap().chars().count(), 19_999);
+    let shot = png(64);
+    let names: Vec<String> = (1..=10)
+        .flat_map(|i| [format!("file-{i}"), format!("annotated-{i}")])
+        .collect();
+    let files: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|n| (n.as_str(), shot.as_slice()))
+        .collect();
+
+    let (status, out) = fx.submit(&req, &files).await;
+
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["intent"]["id"].is_string(), "{out}");
 }
