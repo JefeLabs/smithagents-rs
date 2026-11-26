@@ -717,6 +717,58 @@ async fn delete_resource_clears_items_and_state() {
 }
 
 #[tokio::test]
+async fn resetting_a_plugins_state_replaces_its_config_and_sync_rows_but_keeps_its_items() {
+    let store = Store::open_in_memory().await.unwrap();
+    for plugin in ["p", "other"] {
+        let config = PluginConfig {
+            enabled: false,
+            settings: json!({"a": 1}),
+        };
+        store.set_plugin_config(plugin, &config).await.unwrap();
+        for res in ["issues", "prs"] {
+            store
+                .apply_page(
+                    plugin,
+                    res,
+                    "r",
+                    &page(vec![item("a", "A", None)], &[], Some("c")),
+                    time(AT),
+                    Some("r"),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let fresh = PluginConfig {
+        enabled: true,
+        settings: json!({"b": 2}),
+    };
+    store.reset_plugin_state("p", &fresh).await.unwrap();
+
+    assert_eq!(store.plugin_config("p").await.unwrap(), Some(fresh));
+    for res in ["issues", "prs"] {
+        assert_eq!(
+            store.sync_state("p", res).await.unwrap(),
+            SyncState::default()
+        );
+        assert_eq!(store.count_items("p", res).await.unwrap(), 1);
+        // Another plugin's rows are untouched.
+        let other = store.sync_state("other", res).await.unwrap();
+        assert_eq!(other.cursor.as_deref(), Some("c"));
+    }
+    assert_eq!(
+        store
+            .plugin_config("other")
+            .await
+            .unwrap()
+            .unwrap()
+            .settings,
+        json!({"a": 1})
+    );
+}
+
+#[tokio::test]
 async fn known_resources_includes_state_only_and_item_only_kinds_once() {
     let store = Store::open_in_memory().await.unwrap();
     store

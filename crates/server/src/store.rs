@@ -783,6 +783,30 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces the plugin's configuration with `cfg` and drops all of its
+    /// sync state (cursors, listings, due times) in one transaction. Its
+    /// items stay.
+    pub async fn reset_plugin_state(&self, id: &str, cfg: &PluginConfig) -> Result<(), StoreError> {
+        let settings = serde_json::to_string(&cfg.settings).map_err(corrupt)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "INSERT INTO plugin_config (plugin_id, enabled, settings_json) VALUES (?, ?, ?) \
+             ON CONFLICT (plugin_id) DO UPDATE SET enabled = excluded.enabled, \
+             settings_json = excluded.settings_json",
+        )
+        .bind(id)
+        .bind(i64::from(cfg.enabled))
+        .bind(settings)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM resource_sync WHERE plugin_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// The saved state, or the default when the resource never ran.
     pub async fn sync_state(&self, id: &str, resource: &str) -> Result<SyncState, StoreError> {
         let row = sqlx::query("SELECT * FROM resource_sync WHERE plugin_id = ? AND resource = ?")

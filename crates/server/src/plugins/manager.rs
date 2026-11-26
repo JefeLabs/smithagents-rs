@@ -49,7 +49,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// up to `u32::MAX` seconds); keeps stored times within four-digit years.
 const MAX_DELAY: Duration = Duration::from_secs(u32::MAX as u64);
 /// The load failure of a plugin whose rows the store could not read at start.
-const UNREADABLE_STATE: &str = "this plugin's stored state could not be read";
+pub(super) const UNREADABLE_STATE: &str = "this plugin's stored state could not be read";
 
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
@@ -158,10 +158,11 @@ struct Managed {
     manifest: Manifest,
     origin: Origin,
     loaded: Result<Loaded, String>,
-    /// Its stored configuration or sync state could not be read at start. It
-    /// never loads, and nothing writes its rows, so what the store holds is
-    /// left as it is.
-    unreadable_state: bool,
+    /// Its stored configuration or sync state could not be read at start.
+    /// While set it shows as `LoadFailed`, never runs, and nothing writes
+    /// its rows; enabling it or giving it settings replaces them with fresh
+    /// ones ([`Inner::repair`]) and clears this.
+    unreadable_state: AtomicBool,
     /// An installed plugin that declares command-line tools: running a
     /// program a third-party manifest names needs an approval that does not
     /// exist yet, so it never runs.
@@ -241,11 +242,16 @@ impl Managed {
 
     /// Loaded, and allowed to run.
     fn can_run(&self) -> bool {
-        self.loaded.is_ok() && !self.unapproved_tools
+        self.loaded.is_ok() && !self.unapproved_tools && !self.is_unreadable()
     }
 
     fn has_resource(&self, kind: &str) -> bool {
         self.manifest.resources.iter().any(|r| r.kind == kind)
+    }
+
+    /// Its stored state could not be read and has not been replaced yet.
+    fn is_unreadable(&self) -> bool {
+        self.unreadable_state.load(Ordering::SeqCst)
     }
 
     /// Clears `running` if run `token` still holds it.
@@ -341,10 +347,9 @@ fn services_failure(e: &ServicesError) -> &'static str {
 
 impl PluginManager {
     /// Loads every plugin's configuration and sync state, then starts the
-    /// scheduler. A plugin whose runtime failed to load, or whose stored
-    /// rows cannot be read, is kept, as `LoadFailed`, and the others start as
-    /// usual. (A database that cannot be used at all fails earlier, when the
-    /// store is opened.)
+    /// scheduler. A plugin whose runtime failed to load, or one of whose
+    /// stored rows cannot be decoded, is kept, as `LoadFailed`, and the
+    /// others start as usual. Any other store error fails the start.
     pub async fn start(
         store: Store,
         bus: EventBus,
@@ -391,7 +396,7 @@ impl PluginManager {
         let mut managed = BTreeMap::new();
         for plugin in plugins {
             let id = plugin.manifest.id.to_string();
-            let plugin = prepare(&store, &secrets, &cfg.http, &clock, plugin).await;
+            let plugin = prepare(&store, &secrets, &cfg.http, &clock, plugin).await?;
             managed.insert(id, plugin);
         }
         let (active, _) = watch::channel(0);
@@ -441,22 +446,33 @@ impl PluginManager {
     /// Enabling also clears auth and settings problems and failures, drops
     /// the plugin's cached secret values, and makes every resource due now.
     /// Disabling lets a call in flight finish and stops its run before the
-    /// next page. Refused (`Disabled`) for a plugin whose stored state could
-    /// not be read.
+    /// next page. For a plugin whose stored state could not be read,
+    /// enabling replaces its rows with fresh ones (the manifest's default
+    /// settings) and disabling changes nothing.
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<PluginStatus, ManagerError> {
         let inner = &self.inner;
-        let plugin = inner.writable_plugin(id)?;
+        let plugin = inner.plugin(id)?;
         {
             let _config = plugin.config_writes.lock().await;
-            let settings = plugin.live().settings.clone();
-            inner
-                .store
-                .set_plugin_config(id, &PluginConfig { enabled, settings })
-                .await?;
-            let mut live = plugin.live();
-            live.enabled = enabled;
-            if enabled {
-                live.reset(Instant::now(), inner.now());
+            if plugin.is_unreadable() {
+                // Disabled already; nothing is written over the unread rows.
+                if enabled {
+                    let settings = settings::defaults(&plugin.manifest);
+                    inner
+                        .repair(plugin, PluginConfig { enabled, settings })
+                        .await?;
+                }
+            } else {
+                let settings = plugin.live().settings.clone();
+                inner
+                    .store
+                    .set_plugin_config(id, &PluginConfig { enabled, settings })
+                    .await?;
+                let mut live = plugin.live();
+                live.enabled = enabled;
+                if enabled {
+                    live.reset(Instant::now(), inner.now());
+                }
             }
         }
         if enabled {
@@ -474,23 +490,33 @@ impl PluginManager {
 
     /// Stores `value` if it validates against the manifest; then as enabling.
     /// A run in flight stops before its next page and runs again at once.
-    /// Refused (`Disabled`) for a plugin whose stored state could not be read.
+    /// For a plugin whose stored state could not be read, its rows are
+    /// replaced with fresh ones holding `value`, enabled as a newly found
+    /// plugin of its origin would be.
     pub async fn set_settings(&self, id: &str, value: Value) -> Result<PluginStatus, ManagerError> {
         let inner = &self.inner;
-        let plugin = inner.writable_plugin(id)?;
+        let plugin = inner.plugin(id)?;
         settings::effective(&plugin.manifest, &value).map_err(ManagerError::InvalidSettings)?;
         {
             let _config = plugin.config_writes.lock().await;
-            let enabled = plugin.live().enabled;
-            let config = PluginConfig {
-                enabled,
-                settings: value.clone(),
-            };
-            inner.store.set_plugin_config(id, &config).await?;
-            let mut live = plugin.live();
-            live.settings = value;
-            live.settings_error = None;
-            live.reset(Instant::now(), inner.now());
+            if plugin.is_unreadable() {
+                let config = PluginConfig {
+                    enabled: plugin.origin == Origin::Builtin,
+                    settings: value,
+                };
+                inner.repair(plugin, config).await?;
+            } else {
+                let enabled = plugin.live().enabled;
+                let config = PluginConfig {
+                    enabled,
+                    settings: value.clone(),
+                };
+                inner.store.set_plugin_config(id, &config).await?;
+                let mut live = plugin.live();
+                live.settings = value;
+                live.settings_error = None;
+                live.reset(Instant::now(), inner.now());
+            }
         }
         inner.secrets.forget(&plugin.manifest.id);
         inner.persist_all(plugin).await;
@@ -617,14 +643,26 @@ impl Inner {
         self.plugins.get(id).ok_or(ManagerError::UnknownPlugin)
     }
 
-    /// A plugin whose configuration may be written: not one whose stored
-    /// state could not be read.
-    fn writable_plugin(&self, id: &str) -> Result<&Managed, ManagerError> {
-        let plugin = self.plugin(id)?;
-        if plugin.unreadable_state {
-            return Err(ManagerError::Disabled);
+    /// Replaces the rows of a plugin whose stored state could not be read:
+    /// its configuration becomes `config` and its sync state is dropped, in
+    /// one transaction, so a crash leaves either the old rows (still
+    /// unreadable) or the new ones. Its items stay; the next complete
+    /// listing reconciles them. The plugin then starts over as if newly
+    /// found. The caller holds its `config_writes`.
+    async fn repair(&self, plugin: &Managed, config: PluginConfig) -> Result<(), ManagerError> {
+        let _writes = plugin.sync_writes.lock().await;
+        self.store.reset_plugin_state(&plugin.id, &config).await?;
+        tracing::warn!(plugin = %plugin.id, "replaced the plugin's unreadable stored state with a fresh one");
+        let mut live = plugin.live();
+        live.settings_error = settings::effective(&plugin.manifest, &config.settings).err();
+        live.enabled = config.enabled;
+        live.settings = config.settings;
+        for r in &mut live.resources {
+            r.sync = SyncState::default();
         }
-        Ok(plugin)
+        live.reset(Instant::now(), self.now());
+        plugin.unreadable_state.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     fn now(&self) -> DateTime<Utc> {
@@ -642,7 +680,7 @@ impl Inner {
     /// Writes the resource's sync state as it is now; never over rows that
     /// could not be read.
     async fn persist(&self, plugin: &Managed, kind: &str) {
-        if plugin.unreadable_state {
+        if plugin.is_unreadable() {
             return;
         }
         let _writes = plugin.sync_writes.lock().await;
@@ -706,17 +744,26 @@ async fn read_stored(
     Ok(Stored { config, syncs })
 }
 
-/// Builds one plugin's state from its stored rows. Rows that cannot be read
-/// leave the plugin `LoadFailed`, disabled and never written; the database
-/// as a whole works (it was opened and migrated), so any error here is taken
-/// to be this plugin's own.
+/// A value in one of the plugin's own rows that cannot be decoded, as
+/// opposed to a database that cannot be used.
+fn is_unreadable_row(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::Corrupt(_)
+            | StoreError::Sqlx(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_))
+    )
+}
+
+/// Builds one plugin's state from its stored rows. A row that cannot be
+/// decoded leaves the plugin `LoadFailed` (see [`Managed::unreadable_state`]);
+/// any other store error fails the start.
 async fn prepare(
     store: &Store,
     secrets: &Arc<dyn SecretSource>,
     http: &HttpPolicy,
     clock: &WallClock,
     plugin: LoadedPlugin,
-) -> Managed {
+) -> Result<Managed, ManagerError> {
     let LoadedPlugin {
         manifest,
         origin,
@@ -725,21 +772,21 @@ async fn prepare(
     let id = manifest.id.to_string();
     let (stored, unreadable_state) = match read_stored(store, &id, &manifest, origin).await {
         Ok(stored) => (stored, false),
-        Err(_) => {
+        Err(e) if is_unreadable_row(&e) => {
             // The error may quote what the row holds: the id only.
-            tracing::error!(plugin = %id, "{UNREADABLE_STATE}; the plugin is not loaded");
+            tracing::error!(plugin = %id, "{UNREADABLE_STATE}; the plugin is not loaded until it is enabled or given settings");
             let stored = Stored {
                 config: PluginConfig {
                     enabled: false,
-                    settings: Value::Object(Default::default()),
+                    settings: settings::defaults(&manifest),
                 },
                 syncs: vec![SyncState::default(); manifest.resources.len()],
             };
             (stored, true)
         }
+        Err(e) => return Err(e.into()),
     };
     let loaded = match runtime {
-        _ if unreadable_state => Err(UNREADABLE_STATE.to_string()),
         Err(message) => Err(clean_message(&message)),
         Ok(runtime) => match HostServices::new(&manifest, Arc::clone(secrets), http.clone()) {
             Ok(services) => Ok(Loaded {
@@ -768,11 +815,11 @@ async fn prepare(
         Origin::Builtin => false,
         Origin::Installed => !manifest.tools.is_empty(),
     };
-    Managed {
+    Ok(Managed {
         id,
         origin,
         loaded,
-        unreadable_state,
+        unreadable_state: AtomicBool::new(unreadable_state),
         unapproved_tools,
         live: Mutex::new(Live {
             enabled: config.enabled,
@@ -787,7 +834,7 @@ async fn prepare(
         config_writes: tokio::sync::Mutex::new(()),
         sync_writes: tokio::sync::Mutex::new(()),
         manifest,
-    }
+    })
 }
 
 #[cfg(test)]

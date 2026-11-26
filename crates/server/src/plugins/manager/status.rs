@@ -2,7 +2,7 @@
 
 use smithagents_core::plugin::{MissingTool, PluginState, PluginStatus, ResourceStatus};
 
-use super::{tools, Inner, Live, Managed, Problem};
+use super::{tools, Inner, Live, Managed, Problem, UNREADABLE_STATE};
 use crate::plugins::{settings, Origin};
 
 /// Messages shown to users are at most this long.
@@ -41,7 +41,8 @@ fn is_separator_or_bidi(c: char) -> bool {
     )
 }
 
-/// The plugin's state: a load failure, unapproved tools or a stop first
+/// The plugin's state: unreadable stored state, a load failure, unapproved
+/// tools or a stop first
 /// (enabling does not clear them), then disabled, then invalid settings, then
 /// a problem a run met.
 /// Every message goes through [`clean_message`] here as well as where it is
@@ -78,6 +79,11 @@ fn state(plugin: &Managed, live: &Live) -> PluginState {
 }
 
 fn raw_state(plugin: &Managed, live: &Live) -> PluginState {
+    if plugin.is_unreadable() {
+        return PluginState::LoadFailed {
+            message: UNREADABLE_STATE.to_string(),
+        };
+    }
     if let Err(message) = &plugin.loaded {
         return PluginState::LoadFailed {
             message: message.clone(),

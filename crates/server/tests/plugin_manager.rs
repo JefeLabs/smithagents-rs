@@ -1294,104 +1294,300 @@ async fn start_creates_the_configuration_with_defaults_and_origin() {
     assert_eq!(status(&m, "shipped").await.state, PluginState::Disabled);
 }
 
-#[tokio::test]
-async fn one_plugins_unreadable_stored_state_fails_only_that_plugin() {
-    use sqlx::sqlite::SqliteConnectOptions;
-    use sqlx::{ConnectOptions, Connection};
+/// A store in a file, so a test can reach its rows with raw SQL.
+struct FileStore {
+    _dir: tempfile::TempDir,
+    db: PathBuf,
+    store: Store,
+}
 
-    let logs = logs();
+async fn file_store() -> FileStore {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("s.db");
     let store = Store::open(&db).await.unwrap();
+    FileStore {
+        _dir: dir,
+        db,
+        store,
+    }
+}
+
+impl FileStore {
+    async fn connect(&self) -> sqlx::SqliteConnection {
+        use sqlx::ConnectOptions;
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&self.db)
+            .connect()
+            .await
+            .unwrap()
+    }
+
+    async fn exec(&self, sql: &'static str) {
+        use sqlx::Connection;
+        let mut conn = self.connect().await;
+        sqlx::query(sql).execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+    }
+
+    /// The raw `settings_json` of `id`.
+    async fn settings_json(&self, id: &str) -> String {
+        use sqlx::Connection;
+        let mut conn = self.connect().await;
+        let (text,): (String,) =
+            sqlx::query_as("SELECT settings_json FROM plugin_config WHERE plugin_id = ?")
+                .bind(id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        conn.close().await.unwrap();
+        text
+    }
+
+    async fn start(
+        &self,
+        bus: &EventBus,
+        plugins: Vec<LoadedPlugin>,
+    ) -> Result<PluginManager, ManagerError> {
+        PluginManager::start(
+            self.store.clone(),
+            bus.clone(),
+            no_secrets(),
+            plugins,
+            ManagerConfig::default(),
+        )
+        .await
+    }
+}
+
+const GARBLED: &str = "GARBLED{";
+
+fn unreadable() -> PluginState {
+    PluginState::LoadFailed {
+        message: "this plugin's stored state could not be read".into(),
+    }
+}
+
+/// The daemon's own log lines (sqlx's debug lines quote the tests' raw SQL).
+fn daemon_log_lines() -> Vec<String> {
+    logs()
+        .text()
+        .lines()
+        .filter(|l| l.contains("smithagents_server"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_unreadable_plugin_is_load_failed_until_enabling_starts_it_afresh() {
+    logs();
+    let fs = file_store().await;
     for id in ["kept-ok", "garbled"] {
         let config = PluginConfig {
             enabled: true,
             settings: json!({}),
         };
-        store.set_plugin_config(id, &config).await.unwrap();
+        fs.store.set_plugin_config(id, &config).await.unwrap();
     }
-    let raw = || async {
-        SqliteConnectOptions::new()
-            .filename(&db)
-            .connect()
-            .await
-            .unwrap()
-    };
-    let mut conn = raw().await;
-    sqlx::query("UPDATE plugin_config SET settings_json = 'GARBLED{' WHERE plugin_id = 'garbled'")
-        .execute(&mut conn)
+    fs.exec("UPDATE plugin_config SET settings_json = 'GARBLED{' WHERE plugin_id = 'garbled'")
+        .await;
+    let bus = EventBus::new(1024);
+    let mut events = bus.subscribe(None).unwrap().live;
+    let kept = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let garbled = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let org = "[[settings]]\nkey = \"org\"\nlabel = \"Org\"\nkind = \"text\"\ndefault = \"acme\"\n";
+    let m = fs
+        .start(
+            &bus,
+            vec![
+                builtin(manifest("kept-ok", &[("items", 60)], ""), kept.runtime()),
+                builtin(
+                    manifest("garbled", &[("items", 60)], org),
+                    garbled.runtime(),
+                ),
+            ],
+        )
         .await
-        .unwrap();
-    conn.close().await.unwrap();
-
-    let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
-    let m = PluginManager::start(
-        store.clone(),
-        EventBus::new(64),
-        no_secrets(),
-        vec![
-            builtin(manifest("kept-ok", &[("items", 60)], ""), rt.runtime()),
-            builtin(manifest("garbled", &[("items", 60)], ""), rt.runtime()),
-        ],
-        ManagerConfig::default(),
-    )
-    .await
-    .expect("startup continues");
+        .expect("startup continues");
     m.run_due().await;
+    let mut answers = vec![];
 
-    let garbled = status(&m, "garbled").await;
-    assert_eq!(
-        garbled.state,
-        PluginState::LoadFailed {
-            message: "this plugin's stored state could not be read".into()
-        }
-    );
-    assert!(!garbled.enabled);
+    let s = status(&m, "garbled").await;
+    assert_eq!(s.state, unreadable());
+    assert!(!s.enabled);
+    assert_eq!(m.settings("garbled").await.unwrap(), json!({"org": "acme"}));
+    assert!(matches!(
+        m.sync_now("garbled", "items").await,
+        Err(ManagerError::Disabled)
+    ));
     assert_eq!(status(&m, "kept-ok").await.state, PluginState::Ready);
-    assert_eq!(store.count_items("kept-ok", "items").await.unwrap(), 6);
-    assert_eq!(rt.calls(), 3, "only kept-ok ran");
+    assert_eq!(fs.store.count_items("kept-ok", "items").await.unwrap(), 6);
+    assert_eq!((kept.calls(), garbled.calls()), (3, 0));
 
-    // Nothing writes over what could not be read.
-    for refused in [
-        m.set_enabled("garbled", true).await.err(),
-        m.set_settings("garbled", json!({})).await.err(),
-        m.sync_now("garbled", "items").await.err(),
-    ] {
-        assert!(
-            matches!(refused, Some(ManagerError::Disabled)),
-            "{refused:?}"
-        );
-    }
+    // Disabling is accepted and writes nothing.
+    let s = m.set_enabled("garbled", false).await.unwrap();
+    assert_eq!((s.state.clone(), s.enabled), (unreadable(), false));
+    answers.push(serde_json::to_string(&s).unwrap());
+    assert_eq!(fs.settings_json("garbled").await, GARBLED);
+
+    // Enabling replaces the rows: enabled, the manifest's defaults, no sync
+    // state; then it runs like a newly found plugin.
+    let s = m.set_enabled("garbled", true).await.unwrap();
+    assert_eq!((s.state.clone(), s.enabled), (PluginState::Ready, true));
+    answers.push(serde_json::to_string(&s).unwrap());
+    assert_eq!(
+        fs.store.plugin_config("garbled").await.unwrap(),
+        Some(PluginConfig {
+            enabled: true,
+            settings: json!({"org": "acme"})
+        })
+    );
+    m.run_due().await;
+    assert_eq!(garbled.calls(), 3);
+    assert_eq!(fs.store.count_items("garbled", "items").await.unwrap(), 6);
+    assert_eq!(status(&m, "garbled").await.state, PluginState::Ready);
+    answers.push(m.settings("garbled").await.unwrap().to_string());
     m.shutdown().await;
-    let mut conn = raw().await;
-    let (settings,): (String,) =
-        sqlx::query_as("SELECT settings_json FROM plugin_config WHERE plugin_id = 'garbled'")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
-    conn.close().await.unwrap();
-    assert_eq!(settings, "GARBLED{");
-    let sync_rows: Vec<(String,)> =
-        sqlx::query_as("SELECT resource FROM resource_sync WHERE plugin_id = 'garbled'")
-            .fetch_all(&mut raw().await)
-            .await
-            .unwrap();
-    assert!(sync_rows.is_empty(), "{sync_rows:?}");
 
-    // Logged at error with the plugin id, and nothing of the row. (sqlx's
-    // own debug lines quote this test's raw statements.)
-    let text = logs.text();
-    let ours: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("smithagents_server"))
+    // The old text reached no answer, event or log line of the daemon.
+    let mut published = vec![];
+    while let Ok(e) = events.try_recv() {
+        published.push(e.kind);
+    }
+    let text = said(&m.list().await, &published) + &answers.concat();
+    assert!(!text.contains(GARBLED), "{text}");
+    let lines = daemon_log_lines();
+    let garbled_lines: Vec<_> = lines
+        .iter()
+        .filter(|l| l.contains("plugin=garbled"))
         .collect();
     assert!(
-        ours.iter().any(|l| l.contains("ERROR")
-            && l.contains("plugin=garbled")
-            && l.contains("stored state could not be read")),
-        "{text}"
+        garbled_lines
+            .iter()
+            .any(|l| l.contains("ERROR") && l.contains("stored state could not be read")),
+        "{garbled_lines:?}"
     );
-    assert!(ours.iter().all(|l| !l.contains("GARBLED{")), "{ours:?}");
+    assert!(
+        garbled_lines
+            .iter()
+            .any(|l| l.contains("WARN")
+                && l.contains("replaced the plugin's unreadable stored state")),
+        "{garbled_lines:?}"
+    );
+    assert!(lines.iter().all(|l| !l.contains(GARBLED)), "{lines:?}");
+}
+
+#[tokio::test]
+async fn new_settings_repair_an_unreadable_plugin_and_keep_its_items() {
+    logs();
+    let fs = file_store().await;
+    let store = &fs.store;
+    // An installed plugin halfway through a listing, then a sync row whose
+    // failure count does not decode.
+    let config = PluginConfig {
+        enabled: true,
+        settings: json!({"note": "old"}),
+    };
+    store.set_plugin_config("mended", &config).await.unwrap();
+    store
+        .apply_page(
+            "mended",
+            "items",
+            "l0",
+            &page(items(0..2), Some("c1"), false),
+            Utc::now(),
+            Some("l0"),
+            true,
+        )
+        .await
+        .unwrap();
+    fs.exec("UPDATE resource_sync SET failures = 'many' WHERE plugin_id = 'mended'")
+        .await;
+    let rt = Scripted::new(|req| ok(three_pages(req.cursor.as_deref())));
+    let note = "[[settings]]\nkey = \"note\"\nlabel = \"Note\"\nkind = \"text\"\n";
+    let m = fs
+        .start(
+            &EventBus::new(64),
+            vec![installed(
+                manifest("mended", &[("items", 60)], note),
+                rt.runtime(),
+            )],
+        )
+        .await
+        .expect("startup continues");
+    assert_eq!(status(&m, "mended").await.state, unreadable());
+    assert!(matches!(
+        m.set_settings("mended", json!({"note": 5})).await,
+        Err(ManagerError::InvalidSettings(_))
+    ));
+    assert_eq!(status(&m, "mended").await.state, unreadable());
+
+    let s = m
+        .set_settings("mended", json!({"note": "new"}))
+        .await
+        .unwrap();
+    // An installed plugin starts disabled.
+    assert_eq!((s.state.clone(), s.enabled), (PluginState::Disabled, false));
+    assert_eq!(m.settings("mended").await.unwrap(), json!({"note": "new"}));
+    assert_eq!(
+        store.plugin_config("mended").await.unwrap(),
+        Some(PluginConfig {
+            enabled: false,
+            settings: json!({"note": "new"})
+        })
+    );
+    let sync = store.sync_state("mended", "items").await.unwrap();
+    assert_eq!(
+        (sync.cursor, sync.listing_id, sync.failures),
+        (None, None, 0)
+    );
+    // The items stay until a listing reconciles them.
+    assert_eq!(store.count_items("mended", "items").await.unwrap(), 2);
+
+    m.set_enabled("mended", true).await.unwrap();
+    m.run_due().await;
+    assert_eq!(rt.requests()[0].cursor, None);
+    assert_eq!(rt.calls(), 3);
+    assert_eq!(status(&m, "mended").await.state, PluginState::Ready);
+    // The complete listing from no cursor removed `item-0`, which it lacked.
+    assert_eq!(store.count_items("mended", "items").await.unwrap(), 6);
+    m.shutdown().await;
+    let lines = daemon_log_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("WARN")
+            && l.contains("plugin=mended")
+            && l.contains("replaced the plugin's unreadable stored state")),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_store_error_that_is_not_an_undecodable_row_still_fails_the_start() {
+    let fs = file_store().await;
+    // Creating the default configuration fails: the database refuses it.
+    fs.exec(
+        "CREATE TRIGGER no_config BEFORE INSERT ON plugin_config WHEN NEW.plugin_id = 'blocked' \
+         BEGIN SELECT RAISE(ABORT, 'no config'); END",
+    )
+    .await;
+    let rt = Scripted::new(|_| ok(page(vec![], None, true)));
+    let err = fs
+        .start(
+            &EventBus::new(64),
+            vec![
+                builtin(manifest("blocked", &[("items", 60)], ""), rt.runtime()),
+                builtin(manifest("fine", &[("items", 60)], ""), rt.runtime()),
+            ],
+        )
+        .await
+        .err()
+        .expect("the start fails");
+    assert!(
+        matches!(
+            err,
+            ManagerError::Store(StoreError::Sqlx(sqlx::Error::Database(_)))
+        ),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]

@@ -353,9 +353,17 @@ A directory that fails a check is skipped and listed with a plain-sentence
 reason; one bad plugin never stops the daemon or other plugins. A plugin that
 passes discovery but cannot be built into a runtime (for example, an entry
 file that is not a component) is listed with state `load_failed`. So is a
-plugin whose stored configuration or sync state cannot be read at start
-("this plugin's stored state could not be read"): it is listed as disabled,
-and the daemon neither runs it nor writes over those rows.
+plugin one of whose stored rows (its configuration or a resource's sync
+state) holds a value the daemon cannot decode at start ("this plugin's stored
+state could not be read"): it is listed as disabled, its settings read as the
+manifest's defaults, and the daemon neither runs it nor writes over those
+rows; disabling it changes nothing. **Enabling it, or saving its settings,
+repairs it:** in one transaction its configuration is replaced (enabled with
+the manifest's defaults, or the saved settings with the origin's usual
+enabled state: built-in on, installed off) and its sync state is dropped, so
+it starts again from no cursor. Its stored items stay until its next
+complete listing reconciles them. Any other database error while reading a
+plugin's rows still stops the daemon at start.
 
 ## The API
 
@@ -389,8 +397,8 @@ Error codes: `unauthorized` (401, missing or wrong token);
 malformed `after`), `payload_too_large` (settings body over the limit),
 `no_installer` (400, the tool has no mise package); `not_allowed` (403,
 installing the tool of an installed plugin); `plugin_disabled` (409, a sync
-of a disabled plugin, or enabling or new settings for a plugin whose stored
-state could not be read), `sync_in_progress` (409, that resource is syncing
+of a disabled plugin, including one whose stored state could not be read),
+`sync_in_progress` (409, that resource is syncing
 now), `plugin_not_ready` (409, a sync of an enabled plugin that cannot run
 now: settings missing or invalid, `failed`, `load_failed`, or tools that need
 approval; the message says why), `install_in_progress` (409),
