@@ -393,15 +393,15 @@ result is `docs/feedback.md`.
   branch points at by then, and never forced. A branch name `origin` has is
   never chosen for a new submission.
 - **Mentions are neutralised only in what is sent to GitHub** (titles and
-  bodies of issues and pull requests): every `@` followed by an ASCII letter
-  or digit gets a zero-width space after it unless an ASCII letter, digit or
-  `_` comes before it. In a body (rendered as Markdown) an `@` inside a web
-  address GitHub's extended autolink links is left alone, by a rule narrower
-  than GitHub's: the address starts at the start, after white space or after
-  `*`, `_`, `~` or `(`, is `http://` or `https://` with a host holding a `.`
-  and then `/`, `?` or `#`, and ends at the first character outside ASCII
-  letters, digits and `-._~/%?#=&+:@`; a title is never a link and keeps the
-  strict rule. The committed
+  bodies of issues and pull requests), and no `@` that could mention someone
+  is left there as typed: one followed by an ASCII letter or digit, unless an
+  ASCII letter, digit or `_` comes before it. Inside a web address in a body
+  it is written `%40`, so the link still works and nobody is mentioned
+  whether or not GitHub makes it a link (the address: at the start, after
+  white space or after `*`, `_`, `~` or `(`; `http://` or `https://` with a
+  host holding a `.`, then `/`, `?` or `#`; ending at the first character
+  outside ASCII letters, digits and `-._~/%?#=&+:@`). Everywhere else, and
+  anywhere in a title, it gets a zero-width space after it. The committed
   files keep the owner's text. A comment is capped at 500 characters and
   never cut by bytes.
 - **Duplicates.** The search for an issue or a pull request made before

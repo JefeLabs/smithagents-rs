@@ -463,9 +463,52 @@ fn the_not_done_section_is_found() {
     );
 }
 
+/// The positions of every mention-shaped `@` left in `text`: at the start
+/// or after anything but an ASCII letter, digit or `_`, and followed by an
+/// ASCII letter or digit. What is sent to GitHub must hold none.
+fn mentions_left(text: &str) -> Vec<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    (0..chars.len())
+        .filter(|&i| {
+            chars[i] == '@'
+                && (i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_'))
+                && chars.get(i + 1).is_some_and(char::is_ascii_alphanumeric)
+        })
+        .collect()
+}
+
+/// Checks both functions on `text`: no mention-shaped `@` is left, and (for
+/// a text that holds neither a zero-width space nor `%40` of its own)
+/// taking the zero-width spaces out and every `%40` back to `@` gives the
+/// text again, so nothing else was changed. Says what is wrong, if anything.
+fn check_invariant(text: &str) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (name, out) in [
+        ("title", no_mentions_in_title(text)),
+        ("body", no_mentions_in_body(text)),
+    ] {
+        if !mentions_left(&out).is_empty() {
+            wrong.push(format!(
+                "{name}: a mention is left in {out:?} (from {text:?})"
+            ));
+        }
+        if !text.contains('\u{200b}') && !text.contains("%40") {
+            let restored = out.replace('\u{200b}', "").replace("%40", "@");
+            if restored != text {
+                wrong.push(format!("{name}: {out:?} is not {text:?} with marks only"));
+            }
+        }
+        if name == "title" && out.contains("%40") && !text.contains("%40") {
+            wrong.push(format!("title: {out:?} has a %40 (from {text:?})"));
+        }
+    }
+    wrong
+}
+
 #[test]
 fn mentions_are_neutralised_only_where_a_mention_starts() {
     let z = '\u{200b}';
+    let mut wrong = Vec::new();
     for (text, want) in [
         ("@name", format!("@{z}name")),
         ("(@name)", format!("(@{z}name)")),
@@ -482,6 +525,7 @@ fn mentions_are_neutralised_only_where_a_mention_starts() {
         // The same in a title and in a body.
         assert_eq!(no_mentions_in_title(text), want, "{text:?}");
         assert_eq!(no_mentions_in_body(text), want, "{text:?}");
+        wrong.extend(check_invariant(text));
     }
     // Not where GitHub reads a mention: kept as typed.
     for kept in [
@@ -497,41 +541,76 @@ fn mentions_are_neutralised_only_where_a_mention_starts() {
     ] {
         assert_eq!(no_mentions_in_title(kept), kept, "{kept:?}");
         assert_eq!(no_mentions_in_body(kept), kept, "{kept:?}");
+        wrong.extend(check_invariant(kept));
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]
-fn an_at_inside_a_web_address_is_kept_in_a_body_only() {
-    // W2-5, as amended: in a body GitHub renders as Markdown, an address its
-    // extended autolink rule links mentions no one, so its `@` is left
-    // alone; but only where GitHub's own rules start and end such a link,
-    // narrower still, and never in a title.
+fn an_at_inside_a_web_address_is_encoded_in_a_body() {
+    // W2-5, amended twice: no mention-shaped `@` is ever left as typed in
+    // what goes to GitHub. In a body, one inside a web address (as GitHub
+    // may link it: the rule of 6a92ea7) is written `%40`, so the link still
+    // works and, should GitHub not make it a link, the text shows `%40`
+    // and mentions no one; every other one gets the zero-width space, as
+    // every one in a title does.
     let z = '\u{200b}';
     // Every case that does not come out as it should, so all show at once.
     let mut wrong = Vec::new();
-    for kept in [
-        "https://www.npmjs.com/package/@types/node",
-        "See https://medium.com/@someone/post.",
-        "(https://a.b/@x)",
-        "[docs](https://a.b/@scope/pkg)",
-        "*https://a.b/@u*",
-        "_https://a.b/@u_",
-        "~https://a.b/@u~",
-        "HTTPS://A.B/@u",
-        "https://a.b:8080/@u",
-        "https://a.b?x=@u",
-        "https://a.b#@u",
-        "http://a.b/@u",
-        "https://a.b/@x/@y",
-        "https://a.b/@u at the very start",
-        "a line\nhttps://a.b/@u",
-        "a tab\thttps://a.b/@u",
-        "https://a.b/p%40q?r=s&t=u+v:~/@x",
-    ] {
-        // A title is not rendered as Markdown: nothing in it is a link.
-        if no_mentions_in_body(kept) != kept || no_mentions_in_title(kept) == kept {
-            wrong.push(format!("kept {kept:?}"));
+    let mut check = |text: &str, want: &str| {
+        let body = no_mentions_in_body(text);
+        if body != want {
+            wrong.push(format!("body of {text:?} is {body:?}, not {want:?}"));
         }
+        wrong.extend(check_invariant(text));
+    };
+    for (text, want) in [
+        (
+            "https://www.npmjs.com/package/@types/node",
+            "https://www.npmjs.com/package/%40types/node",
+        ),
+        (
+            "See https://medium.com/@someone/post.",
+            "See https://medium.com/%40someone/post.",
+        ),
+        ("(https://a.b/@x)", "(https://a.b/%40x)"),
+        (
+            "[docs](https://a.b/@scope/pkg)",
+            "[docs](https://a.b/%40scope/pkg)",
+        ),
+        ("*https://a.b/@u*", "*https://a.b/%40u*"),
+        ("_https://a.b/@u_", "_https://a.b/%40u_"),
+        ("~https://a.b/@u~", "~https://a.b/%40u~"),
+        ("HTTPS://A.B/@u", "HTTPS://A.B/%40u"),
+        ("https://a.b:8080/@u", "https://a.b:8080/%40u"),
+        ("https://a.b?x=@u", "https://a.b?x=%40u"),
+        ("https://a.b#@u", "https://a.b#%40u"),
+        ("http://a.b/@u", "http://a.b/%40u"),
+        ("https://a.b/@x/@y", "https://a.b/%40x/%40y"),
+        (
+            "https://a.b/@u at the very start",
+            "https://a.b/%40u at the very start",
+        ),
+        ("a line\nhttps://a.b/@u", "a line\nhttps://a.b/%40u"),
+        ("a tab\thttps://a.b/@u", "a tab\thttps://a.b/%40u"),
+        (
+            "https://a.b/p%40q?r=s&t=u+v:~/@x",
+            "https://a.b/p%40q?r=s&t=u+v:~/%40x",
+        ),
+        // A raw HTML block, where GitHub processes no Markdown (so makes no
+        // link) but still reads mentions.
+        (
+            "<details>\nhttps://a.b/@u\n</details>",
+            "<details>\nhttps://a.b/%40u\n</details>",
+        ),
+        // Inside the address, but not mention-shaped: as typed.
+        ("https://a.b/@/x", "https://a.b/@/x"),
+        ("https://a.b/x@y", "https://a.b/x@y"),
+        ("https://a.b/@@x", "https://a.b/@%40x"),
+        // Not an address at all, the `@` after a letter: as typed.
+        ("https://user@a.b/x", "https://user@a.b/x"),
+    ] {
+        check(text, want);
     }
     for (text, want) in [
         // Markdown ends the link before the `@`, or never starts one.
@@ -581,16 +660,52 @@ fn an_at_inside_a_web_address_is_kept_in_a_body_only() {
         // After the address has ended.
         (
             "https://a.b/@x then @name",
-            format!("https://a.b/@x then @{z}name"),
+            format!("https://a.b/%40x then @{z}name"),
         ),
         ("https://a.b/x\n@name", format!("https://a.b/x\n@{z}name")),
-        ("(https://a.b/@x)@name", format!("(https://a.b/@x)@{z}name")),
+        (
+            "(https://a.b/@x)@name",
+            format!("(https://a.b/%40x)@{z}name"),
+        ),
     ] {
-        if no_mentions_in_body(text) != want {
-            wrong.push(format!("neutralised {text:?}"));
-        }
+        check(text, &want);
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn no_mention_is_left_in_any_combination() {
+    // W2-5: the invariant over generated texts, a few hundred of them.
+    let prefixes = [
+        "", " ", "x", "1", "(", "[", "<", "\"", "*", "\n", "=", "\u{e9}",
+    ];
+    let middles = [
+        "https://a.b/@u",
+        "https://a.b?x=@u&y=@v",
+        "HTTP://A.B:80/@u/@v",
+        "https://a-b.c/x@y",
+        "https://a.b/@",
+        "https://a.b/@@u",
+        "https://localhost/@u",
+        "www.a.b/@u",
+        "ftp://a.b/@u",
+        "https://-a.b/@u",
+        "@u",
+        "a@u",
+    ];
+    let suffixes = ["", "@u", " @u", ")@u", ",@u", "\n@x", "x"];
+    let mut wrong = Vec::new();
+    let mut count = 0;
+    for prefix in prefixes {
+        for middle in middles {
+            for suffix in suffixes {
+                wrong.extend(check_invariant(&format!("{prefix}{middle}{suffix}")));
+                count += 1;
+            }
+        }
+    }
+    assert!(count > 500, "{count}");
+    assert!(wrong.is_empty(), "{} of {count}: {wrong:#?}", wrong.len());
 }
 
 #[test]

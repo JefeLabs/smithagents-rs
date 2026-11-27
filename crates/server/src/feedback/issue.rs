@@ -325,24 +325,28 @@ fn comment_line(comment: &str) -> String {
 /// character before it is an ASCII letter or digit or `_`. So `@name`,
 /// `(@name)`, `.@name`, `-@name`, `/@name`, `@@name` and `@org/team` mention
 /// no one, and `a@b.com`, `photo@2x.png` and `x_@y` stay as typed. A title is
-/// not rendered as Markdown, so nothing in it is a link, and the rule holds
-/// throughout (unlike [`no_mentions_in_body`]). For what is sent to GitHub
-/// only; files keep the user's text.
+/// not rendered as Markdown, so nothing in it is a link: every such `@` gets
+/// the zero-width space, web address or not (unlike [`no_mentions_in_body`]).
+/// For what is sent to GitHub only; files keep the user's text.
 pub fn no_mentions_in_title(text: &str) -> String {
     no_mentions(text, false)
 }
 
-/// A body sent to GitHub, which renders it as Markdown (an issue's, a pull
-/// request's): [`no_mentions_in_title`]'s rule, except that an `@` inside a
-/// web address GitHub's extended-autolink rule turns into a link is left
-/// alone, since the text of a link mentions no one
-/// (`https://www.npmjs.com/package/@types/node` stays as typed). Only where
-/// GitHub's own rules start and end such a link, and narrower than what it
-/// links, so some typed addresses still get the invisible character:
+/// A body sent to GitHub (an issue's, a pull request's), in which no
+/// mention-shaped `@` (one [`no_mentions_in_title`] would mark) is left as
+/// typed. One inside a web address GitHub may turn into a link is written
+/// `%40`, the URL encoding of `@`, so the link still works and nobody is
+/// mentioned (`https://www.npmjs.com/package/@types/node` is sent as
+/// `https://www.npmjs.com/package/%40types/node`); every other one gets the
+/// zero-width space, as in a title. Nothing depends on whether GitHub really
+/// makes the address a link (in a raw HTML block it does not): where it does
+/// not, the text shows `%40` and still mentions no one.
 ///
-/// - the address starts at the start of the text or right after ASCII white
-///   space, `*`, `_`, `~` or `(` (never after `[`, `<`, a quote, a
-///   backtick, `=`, `|`, a letter or a digit);
+/// A web address here is narrower than what GitHub links:
+///
+/// - it starts at the start of the text or right after ASCII white space,
+///   `*`, `_`, `~` or `(` (never after `[`, `<`, a quote, a backtick, `=`,
+///   `|`, a letter or a digit);
 /// - with `http://` or `https://` (ASCII, any case);
 /// - then a host of ASCII letters, digits, `-` and `.` that begins and ends
 ///   with a letter or digit and holds a `.` (not `localhost`, no `_`, no
@@ -350,12 +354,12 @@ pub fn no_mentions_in_title(text: &str) -> String {
 /// - then optionally `:` and digits, then `/`, `?` or `#`;
 /// - and it goes on only while each character is an ASCII letter or digit
 ///   or one of `-._~/%?#=&+:@`: anything else (`)`, `]`, `>`, a quote, `|`,
-///   `*`, `,`, `;`, `!`, white space, a character that is not ASCII) ends
-///   it, and an `@` after the end is treated as in a title.
+///   `*`, `,`, `;`, `!`, white space, a character that is not ASCII) ends it.
 ///
-/// So `[x](https://a.b/y)@name`, `<https://a.b/@name>`, `x=https://a.b/@name`,
-/// `https://a.b/x,@name`, `http://localhost:5173/@vite` and `www.a.b/@name`
-/// are neutralised like any other text.
+/// So in `[x](https://a.b/y)@name`, `<https://a.b/@name>`,
+/// `x=https://a.b/@name`, `https://a.b/x,@name`, `http://localhost/@name`
+/// and `www.a.b/@name` the `@` gets the zero-width space, like any other.
+/// Files keep the user's text.
 pub fn no_mentions_in_body(text: &str) -> String {
     no_mentions(text, true)
 }
@@ -374,15 +378,18 @@ fn no_mentions(text: &str, links: bool) -> String {
                 link_end = at + len;
             }
         }
-        out.push(c);
-        if c == '@' && at >= link_end {
-            let starts = before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == '_'));
-            let names = chars
+        let mention = c == '@'
+            && before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == '_'))
+            && chars
                 .peek()
                 .is_some_and(|(_, next)| next.is_ascii_alphanumeric());
-            if starts && names {
-                out.push('\u{200b}');
-            }
+        if !mention {
+            out.push(c);
+        } else if at < link_end {
+            // Inside a web address (bodies only): the link still works.
+            out.push_str("%40");
+        } else {
+            out.push_str("@\u{200b}");
         }
         before = Some(c);
     }

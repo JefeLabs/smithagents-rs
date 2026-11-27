@@ -1255,13 +1255,14 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
         body.contains(&format!("blob/{head}/{FOLDER}/diagram-1.png?raw=true")),
         "{body}"
     );
-    // Nobody is mentioned, and no submission marker is added; a web
-    // address in the body keeps its `@` (W2-5).
+    // Nobody is mentioned, and no submission marker is added; in a web
+    // address of the body the `@` is written `%40` (W2-5).
     assert!(body.contains("@\u{200b}octocat"), "{body}");
     assert!(
-        body.contains("See https://medium.com/@someone/post."),
+        body.contains("See https://medium.com/%40someone/post."),
         "{body}"
     );
+    assert!(!body.contains("@someone"), "{body}");
     assert!(!body.contains("smithagents-feedback:"), "{body}");
 
     // The change was published.

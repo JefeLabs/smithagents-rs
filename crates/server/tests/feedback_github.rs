@@ -811,9 +811,9 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
     assert_eq!(committed, raw.trim_end());
     assert!(!committed.contains(ZWSP), "{committed}");
 
-    // The title and the whole body GitHub gets mention no one. W2-5: a web
-    // address in the body (rendered as Markdown, so it is a link) keeps its
-    // `@`; the title is not rendered, so it is strict throughout.
+    // The title and the whole body GitHub gets mention no one. W2-5: in the
+    // body, an `@` inside a web address is written `%40` (the link still
+    // works); the title gets the zero-width space throughout.
     let create = fx.calls_starting("issue create").pop().unwrap();
     assert!(
         create.starts_with(&format!(
@@ -823,8 +823,8 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
     );
     let body = fx.fake.read("issue-body.md").unwrap();
     for neutral in [
-        format!("# @{ZWSP}octocat the zoom of https://a.b/@x\n"),
-        format!("Types: https://www.npmjs.com/package/@types/node, then @{ZWSP}after."),
+        format!("# @{ZWSP}octocat the zoom of https://a.b/%40x\n"),
+        format!("Types: https://www.npmjs.com/package/%40types/node, then @{ZWSP}after."),
         format!("@{ZWSP}hubot, see (@{ZWSP}reviewer) and @{ZWSP}org/team."),
         format!("cc @{ZWSP}someone and me@example.com"),
         // D-M3: after anything but a letter, digit or `_`, as GitHub may read it.
@@ -840,6 +840,8 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
         "@someone",
         "@scope",
         "@after",
+        "@types",
+        "/@x",
     ] {
         assert!(!body.contains(raw), "{raw} in {body}");
     }
