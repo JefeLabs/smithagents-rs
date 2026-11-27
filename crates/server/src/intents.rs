@@ -411,7 +411,14 @@ impl IntentService {
                     from_seq,
                     to_seq,
                 };
-                (req.repo_id.unwrap_or(agent.repo_id), Seed { source, text })
+                (
+                    req.repo_id.unwrap_or(agent.repo_id),
+                    Seed {
+                        source,
+                        text,
+                        kind: req.kind,
+                    },
+                )
             }
             SeedInput::Text(text) => {
                 let repo_id = req.repo_id.ok_or_else(|| {
@@ -431,6 +438,7 @@ impl IntentService {
                     Seed {
                         source: SeedSource::Text,
                         text,
+                        kind: req.kind,
                     },
                 )
             }
@@ -444,7 +452,7 @@ impl IntentService {
         let now = Utc::now();
         let content = Content {
             title: DEFAULT_TITLE.into(),
-            kind: IntentKind::Task,
+            kind: seed.kind.unwrap_or(IntentKind::Task),
             current_behavior: String::new(),
             questions: vec![],
             preconditions: vec![],
@@ -550,6 +558,9 @@ impl IntentService {
         }
         if let Some(k) = patch.kind {
             intent.content.kind = k;
+            // Pass 1 (and its retry) keeps the seed's kind, so the user's
+            // choice must land there too.
+            intent.seed.kind = Some(k);
         }
         if let Some(b) = patch.current_behavior {
             intent.content.current_behavior = b;
@@ -1136,9 +1147,10 @@ impl IntentService {
         let Some(mut intent) = self.polishing(id, 1).await? else {
             return Ok(());
         };
+        let intent_seed_kind = intent.seed.kind;
         let c = &mut intent.content;
         c.title = polished.title;
-        c.kind = polished.kind;
+        c.kind = intent_seed_kind.unwrap_or(polished.kind);
         c.current_behavior = polished.current_behavior;
         c.questions = polished.questions;
         let start_pass2 = c.questions.is_empty();

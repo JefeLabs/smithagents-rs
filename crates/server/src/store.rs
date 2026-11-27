@@ -1386,6 +1386,7 @@ mod tests {
             state: IntentState::Draft,
             phase: Phase::Polishing { pass: 1 },
             seed: Seed {
+                kind: None,
                 source: SeedSource::Text,
                 text: "seed".into(),
             },

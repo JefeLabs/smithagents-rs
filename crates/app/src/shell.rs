@@ -16,6 +16,11 @@
 //! dock can be closed, so a dock cannot express a fixed narrow strip that
 //! never hides. The right pane is a dock and hides as before.
 //!
+//! The rail's entries share the right dock: each entry's pane is a panel of
+//! the dock's one tab group, and only the entry the state holds
+//! ([`ShellState::right_entry`]) answers `visible`, so one pane is drawn and
+//! the group draws no tab bar. [`Shell::show_rail_entry`] switches it.
+//!
 //! State lives in a separate [`ShellState`] entity, which the panes observe,
 //! so no view holds a handle back to its owner.
 //!
@@ -31,7 +36,7 @@ use std::time::Duration;
 use gpui_kit::base::HandleEdge;
 use gpui_kit::component::dock::{
     panel_handle, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSkin,
-    DockToggleEvent,
+    DockToggleEvent, PanelId,
 };
 use gpui_kit::component::{h_flex, resize_handle, v_flex, ActiveTheme as _};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -39,7 +44,7 @@ use gpui_kit::{
     div, px, App, AppContext as _, Axis, Context, DragMoveEvent, Empty, Entity, FocusHandle,
     InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
     ParentElement as _, Pixels, Render, Styled as _, Subscription, Task, TestSupportExt as _,
-    Window,
+    WeakFocusHandle, Window,
 };
 use smithagents_center_host::CenterTabHost;
 use smithagents_theme::tokens::ThemeSet;
@@ -51,16 +56,17 @@ use crate::layout_store::{
     with_left_pane, with_right_preferred, LayoutStore, LeftPaneLayout, SavedWindow,
     DEFAULT_RIGHT_DOCK_SIZE, LAYOUT_VERSION, MIN_DOCK_SIZE,
 };
-use crate::link::{AgentCommands, DaemonLink, LinkConfig};
+use crate::link::{AgentCommands, DaemonLink, IntentCommands, LinkConfig};
 use crate::model::{Action, ShellModel};
 use crate::settings::AppSettingsStore;
-use crate::shell_state::{ConnectionInfoSource, LinkFailureSource, ShellEvent, ShellState};
+use crate::shell_state::{Clock, ConnectionInfoSource, LinkFailureSource, ShellEvent, ShellState};
 use crate::tabs::{PlaceholderHost, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::{region_paint, OsAppearance, Region, SystemAppearanceSource};
 use crate::update::{NoUpdater, Updater};
 use crate::view_models::{update_button, LeftPaneMode};
 use crate::views::agents::AgentsPane;
 use crate::views::center::{notify_tab_failure, CenterPanel};
+use crate::views::intents::IntentsPane;
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 use crate::views::settings::SettingsPane;
 use crate::views::status_bar::status_bar;
@@ -71,8 +77,14 @@ gpui_kit::actions!(
     [
         /// Switch the left (agents) pane between expanded and compact.
         ToggleAgentsPane,
-        /// Collapse or expand the right dock with the Settings view.
+        /// Show the Settings view in the right dock (opening the dock, or
+        /// switching it from the pane it shows), or close the dock when
+        /// Settings is on screen.
         ToggleSettingsPane,
+        /// Show the Intents view in the right dock (opening the dock, or
+        /// switching it from the pane it shows), or close the dock when
+        /// Intents is on screen.
+        ToggleIntentsPane,
         /// Close the active center tab (nothing without one; the window
         /// stays open).
         CloseActiveTab,
@@ -90,8 +102,10 @@ gpui_kit::actions!(
 
 /// Key context of the shell, for its key bindings.
 pub const KEY_CONTEXT: &str = "SmithAgentsShell";
-/// The right dock's persisted panel name. Never change it once shipped.
+/// The Settings pane's persisted panel name. Never change it once shipped.
 pub const SETTINGS_PANEL: &str = "Settings";
+/// The Intents pane's persisted panel name. Never change it once shipped.
+pub const INTENTS_PANEL: &str = "Intents";
 /// Element id of the left pane's frame.
 pub const LEFT_PANE_ID: &str = "left-pane";
 /// Element id of the left pane's resize handle (expanded only).
@@ -105,20 +119,32 @@ const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Registers the shell's key bindings and the app-wide [`Quit`]:
 /// - `cmd-q` quits (anywhere, also with no window focused);
 /// - `cmd-b` switches the agents pane between expanded and compact,
-///   `cmd-alt-b` hides or shows the settings dock;
+///   `cmd-alt-b` and `cmd-alt-i` show the Settings and the Intents pane, or
+///   hide the right dock when that pane is already on screen (as the rail
+///   does);
 /// - `cmd-w` closes the active tab, `ctrl-tab` and `ctrl-shift-tab` cycle
 ///   the tabs;
 ///
-/// plus the agents pane's and the settings view's own
-/// ([`crate::views::agents::init`], [`crate::views::settings::init`]). (v1 is
+/// plus the agents pane's, the settings view's and the intents pane's own
+/// ([`crate::views::agents::init`], [`crate::views::settings::init`],
+/// [`crate::views::intents::init`]). (v1 is
 /// macOS only. `KeyBinding::new` does not resolve the portable `secondary-`
 /// modifier and panics on it.) The menu bar ([`app_menus`]) shows these
 /// keys as its items' key equivalents.
+///
+/// Call it after `gpui_kit::init`. In debug builds gpui-component binds
+/// `cmd-alt-i` without a context to its inspector. GPUI ranks a binding
+/// without a context as deep as the focus goes, above the shell's context
+/// whenever a view with its own context (the agents pane, a text field) has
+/// the focus, and between equal ranks the later binding wins. So
+/// `cmd-alt-i` is bound without a context too, after the inspector's; its
+/// handler is on the shell, so it acts only while the focus is in the shell.
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-b", ToggleAgentsPane, Some(KEY_CONTEXT)),
         KeyBinding::new("cmd-alt-b", ToggleSettingsPane, Some(KEY_CONTEXT)),
+        KeyBinding::new("cmd-alt-i", ToggleIntentsPane, None),
         KeyBinding::new("cmd-w", CloseActiveTab, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-tab", NextTab, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(KEY_CONTEXT)),
@@ -126,10 +152,11 @@ pub fn init(cx: &mut App) {
     cx.on_action(quit);
     crate::views::agents::init(cx);
     crate::views::settings::init(cx);
+    crate::views::intents::init(cx);
 }
 
-/// The macOS menu bar: the app menu (Quit), View (the two pane toggles)
-/// and Window (Close Tab, enabled only while a tab is active: the shell
+/// The macOS menu bar: the app menu (Quit), View (the pane toggles) and
+/// Window (Close Tab, enabled only while a tab is active: the shell
 /// handles [`CloseActiveTab`] only then). Set once with `App::set_menus`;
 /// each item shows its key binding.
 pub fn app_menus() -> Vec<Menu> {
@@ -141,6 +168,7 @@ pub fn app_menus() -> Vec<Menu> {
         Menu::new("View").items([
             MenuItem::action("Toggle Agents Pane", ToggleAgentsPane),
             MenuItem::action("Toggle Settings", ToggleSettingsPane),
+            MenuItem::action("Toggle Intents", ToggleIntentsPane),
         ]),
         Menu::new("Window").items([MenuItem::action("Close Tab", CloseActiveTab)]),
     ]
@@ -222,6 +250,13 @@ pub struct ShellOptions {
     /// bar's wording); `None` asks the daemon link. Headless tests inject a
     /// fake.
     pub link_failure: Option<LinkFailureSource>,
+    /// Replaces the daemon link for the intent commands (the Intents pane,
+    /// Settings → Agent defaults), so headless tests need no daemon; `None`
+    /// sends them through the link.
+    pub intent_commands: Option<Rc<dyn IntentCommands>>,
+    /// The clock the views read ([`ShellState::now`]); `None` is the local
+    /// clock. Headless tests inject a fixed one.
+    pub clock: Option<Clock>,
 }
 
 /// The drag payload of the left pane's resize handle; draws nothing.
@@ -238,6 +273,9 @@ impl Render for LeftPaneResize {
 pub struct Shell {
     state: Entity<ShellState>,
     dock: Entity<DockArea>,
+    /// Each right-dock rail entry's pane, as a panel of the dock's one tab
+    /// group.
+    right_panels: Vec<(RailEntry, PanelId)>,
     /// The left pane's content: the agents pane, in either mode.
     left_pane: Entity<AgentsPane>,
     layout: Option<LayoutStore>,
@@ -257,6 +295,9 @@ pub struct Shell {
     last_saved_window: Option<SavedWindow>,
     pending_save: Option<Task<()>>,
     focus: FocusHandle,
+    /// Where the focus was, outside the right panes, when one of them took
+    /// it ([`Shell::show_rail_entry`]): closing the dock gives it back.
+    focus_before_right: Option<WeakFocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -278,6 +319,8 @@ impl Shell {
             page_origin,
             connection_info,
             link_failure,
+            intent_commands,
+            clock,
         } = options;
         let link = link.map(DaemonLink::start);
         let tab_host = match tab_host {
@@ -329,6 +372,12 @@ impl Shell {
             if let Some(source) = link_failure {
                 state.set_link_failure_source(source, cx);
             }
+            if let Some(commands) = intent_commands {
+                state.set_intent_commands(commands);
+            }
+            if let Some(clock) = clock {
+                state.set_clock(clock);
+            }
             state.set_tab_host(
                 tab_host,
                 page_origin.unwrap_or_else(|| DEFAULT_PAGE_ORIGIN.to_owned()),
@@ -347,16 +396,30 @@ impl Shell {
         skin.set_toggle_button_visible(false, cx);
         let center = cx.new(|cx| CenterPanel::new(state.clone(), cx));
         let settings = cx.new(|cx| SettingsPane::new(state.clone(), window, cx));
+        let intents = cx.new(|cx| IntentsPane::new(state.clone(), window, cx));
         let left_pane = cx.new(|cx| AgentsPane::new(state.clone(), window, cx));
+        let right_panels = vec![
+            (RailEntry::Settings, PanelId::from(settings.entity_id())),
+            (RailEntry::Intents, PanelId::from(intents.entity_id())),
+        ];
+        // The pane the app showed last (Settings at first).
+        let shown = panel_of(&right_panels, state.read(cx).right_entry());
         dock.update(cx, |area, cx| {
             let center = DockLayout::tabs().panel_view(panel_handle(center), cx);
-            let right = DockLayout::tabs().panel_view(panel_handle(settings), cx);
+            // One tab group for every right pane; each is visible only while
+            // it is the state's right entry, so the group draws no tab bar.
+            let right = DockLayout::tabs()
+                .panel_view(panel_handle(settings), cx)
+                .panel_view(panel_handle(intents), cx);
             area.set_center(center, window, cx);
             area.set_dock(DockPlacement::Right, right, window, cx);
             area.set_dock_size(DockPlacement::Right, right_size, window, cx);
             // The panels stay where the shell puts them: the right dock
             // resizes and hides, but tabs cannot be dragged between regions.
             area.set_locked(true, window, cx);
+            if let Some(shown) = shown {
+                area.select_panel(shown, window, cx);
+            }
             if saved_right.is_some_and(|right| !right.open) {
                 area.toggle_dock(DockPlacement::Right, window, cx);
             }
@@ -396,12 +459,10 @@ impl Shell {
                         this.schedule_layout_save(cx);
                         cx.notify();
                     }
-                    ShellEvent::RevealSettings => {
-                        if this.rail_active(cx) != Some(RailEntry::Settings) {
-                            tracing::debug!(source = "agents", "showing the settings dock");
-                            this.select_rail_entry(RailEntry::Settings, window, cx);
-                            cx.notify();
-                        }
+                    ShellEvent::Reveal(entry) => {
+                        tracing::debug!(source = "reveal", ?entry, "rail show");
+                        this.show_rail_entry(*entry, window, cx);
+                        cx.notify();
                     }
                     // The views repaint from the state's notify; the state
                     // already pushed the theme to the web tabs.
@@ -461,6 +522,7 @@ impl Shell {
         Self {
             state,
             dock,
+            right_panels,
             left_pane,
             layout,
             preferred_right,
@@ -470,6 +532,7 @@ impl Shell {
             last_saved_window: None,
             pending_save: None,
             focus,
+            focus_before_right: None,
             _subscriptions: subscriptions,
         }
     }
@@ -488,26 +551,93 @@ impl Shell {
         &self.dock
     }
 
-    /// The rail entry whose view is on screen.
+    /// The rail entry whose view is on screen: the state's right entry while
+    /// the right dock is open, else `None`.
     pub fn rail_active(&self, cx: &App) -> Option<RailEntry> {
-        RailEntry::ALL
-            .iter()
-            .copied()
-            .find(|entry| self.dock.read(cx).is_dock_open(entry.placement()))
+        let entry = self.state.read(cx).right_entry();
+        self.dock
+            .read(cx)
+            .is_dock_open(entry.placement())
+            .then_some(entry)
     }
 
-    /// Selecting the entry already on screen closes its dock; selecting
-    /// another opens it.
+    /// The rail's click: selecting the entry on screen closes its dock;
+    /// selecting another shows it ([`Shell::show_rail_entry`]). A closed
+    /// pane that held the focus gives it back to where it was before the
+    /// pane took it, or to the shell when that is no longer drawn.
     pub fn select_rail_entry(&mut self, entry: RailEntry, window: &mut Window, cx: &mut App) {
+        if self.rail_active(cx) == Some(entry) {
+            let had_focus = self.right_pane_has_focus(window, cx);
+            self.dock.update(cx, |area, cx| {
+                area.toggle_dock(entry.placement(), window, cx)
+            });
+            if had_focus {
+                self.restore_focus_after_right_pane(window, cx);
+            }
+        } else {
+            self.show_rail_entry(entry, window, cx);
+        }
+    }
+
+    /// Whether the focus is inside one of the right panes.
+    fn right_pane_has_focus(&self, window: &Window, cx: &App) -> bool {
+        let dock = self.dock.read(cx);
+        self.right_panels.iter().any(|(_, panel)| {
+            dock.panel(*panel)
+                .is_some_and(|pane| pane.focus_handle(cx).contains_focused(window, cx))
+        })
+    }
+
+    /// Puts the focus back where it was before a right pane took it; on the
+    /// shell when that element is gone or no longer drawn.
+    fn restore_focus_after_right_pane(&mut self, window: &mut Window, cx: &mut App) {
+        let before = self
+            .focus_before_right
+            .take()
+            .and_then(|weak| weak.upgrade())
+            .filter(|focus| focus.is_rendered(window));
+        tracing::debug!(
+            restored = before.is_some(),
+            "the right pane closed with the focus"
+        );
+        before
+            .unwrap_or_else(|| self.focus.clone())
+            .focus(window, cx);
+    }
+
+    /// Shows `entry`'s pane: makes it the state's right entry, displays its
+    /// panel in the dock's group, opens the dock if it is closed, fits the
+    /// dock to the window and focuses the pane (remembering where the focus
+    /// was, when that is outside the right panes). Never closes the dock.
+    pub fn show_rail_entry(&mut self, entry: RailEntry, window: &mut Window, cx: &mut App) {
+        let Some(panel) = panel_of(&self.right_panels, entry) else {
+            tracing::error!(?entry, "no pane for this rail entry");
+            return;
+        };
+        // Switching from one right pane to another keeps what was
+        // remembered when the first took the focus.
+        if !self.right_pane_has_focus(window, cx) {
+            self.focus_before_right = window.focused(cx).map(|focus| focus.downgrade());
+        }
         let placement = entry.placement();
-        let showing = self.rail_active(cx) == Some(entry);
+        self.state
+            .update(cx, |state, cx| state.set_right_entry(entry, cx));
         self.dock.update(cx, |area, cx| {
-            if area.is_dock_open(placement) == showing {
+            // The panel's `visible` follows the state; selecting it also
+            // redraws the group, which the state change alone does not.
+            area.select_panel(panel, window, cx);
+            if !area.is_dock_open(placement) {
                 area.toggle_dock(placement, window, cx);
             }
         });
-        if !showing {
-            self.refit_right_dock(window, cx);
+        self.refit_right_dock(window, cx);
+        let focus = self
+            .dock
+            .read(cx)
+            .panel(panel)
+            .map(|pane| pane.focus_handle(cx));
+        if let Some(focus) = focus {
+            focus.focus(window, cx);
         }
     }
 
@@ -656,6 +786,16 @@ impl Shell {
         self.select_rail_entry(RailEntry::Settings, window, cx);
     }
 
+    fn on_toggle_intents(
+        &mut self,
+        _: &ToggleIntentsPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::debug!(source = "shortcut", entry = ?RailEntry::Intents, "rail select");
+        self.select_rail_entry(RailEntry::Intents, window, cx);
+    }
+
     fn schedule_layout_save(&mut self, cx: &mut Context<Self>) {
         if self.layout.is_none() {
             return;
@@ -708,6 +848,14 @@ impl Shell {
             }
         }
     }
+}
+
+/// The panel of `entry`'s pane in `panels`.
+fn panel_of(panels: &[(RailEntry, PanelId)], entry: RailEntry) -> Option<PanelId> {
+    panels
+        .iter()
+        .find(|(held, _)| *held == entry)
+        .map(|(_, panel)| *panel)
 }
 
 /// The right dock's width for `preferred` beside the left pane `left` in
@@ -783,6 +931,7 @@ impl Render for Shell {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_toggle_agents))
             .on_action(cx.listener(Self::on_toggle_settings))
+            .on_action(cx.listener(Self::on_toggle_intents))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_previous_tab))
             // Only with a tab to close, so the menu's Close Tab is disabled

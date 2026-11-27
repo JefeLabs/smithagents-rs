@@ -14,6 +14,8 @@ workspace = true
 # so no Xcode `metal` compiler is needed at build time.
 gpui-kit.workspace = true
 smithagents-core = { path = "../core" }
+# The views' clock (`ShellState::now`) and intent times.
+chrono.workspace = true
 futures.workspace = true
 smithagents-client = { path = "../client" }
 smithagents-theme = { path = "../theme" }
@@ -26,6 +28,8 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
+# Which links in an intent's body may open (`intent_vm::body_link_opens`).
+url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true
@@ -33,7 +37,6 @@ signal-hook.workspace = true
 [dev-dependencies]
 # Headless GPUI windows for the shell smoke test (`#[gpui_kit::test]`).
 gpui-kit = { workspace = true, features = ["test-support"] }
-chrono.workspace = true
 tempfile.workspace = true
 # Only to build the client's transport errors in the view-model tests.
 reqwest.workspace = true

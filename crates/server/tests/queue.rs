@@ -243,6 +243,7 @@ impl Fx {
             state,
             phase: Phase::Review,
             seed: Seed {
+                kind: None,
                 source: SeedSource::Text,
                 text: "seed".into(),
             },

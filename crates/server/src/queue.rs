@@ -344,6 +344,7 @@ mod tests {
             state: IntentState::Queued,
             phase: Phase::Review,
             seed: Seed {
+                kind: None,
                 source: SeedSource::Text,
                 text: "s".into(),
             },

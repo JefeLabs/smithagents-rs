@@ -519,19 +519,26 @@ pub fn command_error_text(error: &LinkError) -> String {
 pub enum SettingsSection {
     /// App scope: theme, text size, font.
     Appearance,
+    /// Space scope: what the daemon does for every agent, today the limit on
+    /// agents working at once.
+    AgentDefaults,
     /// Space scope: the daemon's source repositories.
     Repositories,
 }
 
 impl SettingsSection {
     /// Every section, in the pane's order (the order is the scroll index).
-    pub const ALL: [SettingsSection; 2] =
-        [SettingsSection::Appearance, SettingsSection::Repositories];
+    pub const ALL: [SettingsSection; 3] = [
+        SettingsSection::Appearance,
+        SettingsSection::AgentDefaults,
+        SettingsSection::Repositories,
+    ];
 
     /// The section's heading, also its accessible group name.
     pub fn title(self) -> &'static str {
         match self {
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::AgentDefaults => "Agent defaults",
             SettingsSection::Repositories => "Source repositories",
         }
     }
@@ -540,6 +547,7 @@ impl SettingsSection {
     pub fn as_str(self) -> &'static str {
         match self {
             SettingsSection::Appearance => "appearance",
+            SettingsSection::AgentDefaults => "agent_defaults",
             SettingsSection::Repositories => "repositories",
         }
     }
@@ -792,11 +800,11 @@ pub fn repo_matches_sent_path(sent: &Path, sent_canonical: Option<&Path>, repo: 
     sent == repo || sent_canonical.is_some_and(|canonical| canonical.starts_with(repo))
 }
 
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn capitalized(text: &str) -> String {
+pub(crate) fn capitalized(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),

@@ -1670,3 +1670,29 @@ async fn chat_to_a_closed_agent_is_409_agent_closed() {
     let body: Value = serde_json::from_str(&chat_body(resp).await).unwrap();
     assert_error(&body, "agent_closed");
 }
+
+#[tokio::test]
+async fn create_takes_a_kind_and_refuses_an_unknown_one() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            "/v1/intents",
+            Some(json!({ "repo_id": repo.id, "kind": "new_feature", "seed": { "text": "x" } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["content"]["kind"], "new_feature");
+
+    // An unknown enum name fails body parsing, which the API answers as `bad_request`.
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            "/v1/intents",
+            Some(json!({ "repo_id": repo.id, "kind": "feature", "seed": { "text": "x" } })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_error(&body, "bad_request");
+}

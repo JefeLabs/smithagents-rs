@@ -31,12 +31,8 @@ pub struct Brief {
     pub first_message: String,
 }
 
-fn kind_label(kind: IntentKind) -> &'static str {
-    match kind {
-        IntentKind::Enhancement => "enhancement",
-        IntentKind::Bug => "bug",
-        IntentKind::Task => "task",
-    }
+fn kind_label(kind: IntentKind) -> String {
+    kind.wire_name().replace('_', " ")
 }
 
 fn accepted(items: &[Item]) -> impl Iterator<Item = &Item> {

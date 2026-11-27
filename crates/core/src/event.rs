@@ -128,6 +128,7 @@ mod tests {
             seed: Seed {
                 source: SeedSource::Text,
                 text: "s".into(),
+                kind: None,
             },
             content: Content {
                 title: "T".into(),

@@ -931,7 +931,7 @@ fn new_agent_without_a_repository_opens_settings_on_the_path_field(cx: &mut Test
     let home = tempfile::tempdir().unwrap();
     // A short window, so the sections do not fit and must scroll.
     let setup = Setup {
-        size: (1200., 420.),
+        size: (1200., 540.),
         ..Setup::new().home(home.path())
     };
     let (window, shell, state) = setup.open(cx);

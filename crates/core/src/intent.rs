@@ -9,9 +9,39 @@ use crate::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentKind {
+    NewFeature,
     Enhancement,
     Bug,
+    Refactor,
+    Maintenance,
     Task,
+}
+
+impl IntentKind {
+    pub const ALL: [IntentKind; 6] = [
+        IntentKind::NewFeature,
+        IntentKind::Enhancement,
+        IntentKind::Bug,
+        IntentKind::Refactor,
+        IntentKind::Maintenance,
+        IntentKind::Task,
+    ];
+
+    /// The name this kind has on the wire (its serde name).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            IntentKind::NewFeature => "new_feature",
+            IntentKind::Enhancement => "enhancement",
+            IntentKind::Bug => "bug",
+            IntentKind::Refactor => "refactor",
+            IntentKind::Maintenance => "maintenance",
+            IntentKind::Task => "task",
+        }
+    }
+
+    pub fn from_wire(name: &str) -> Option<IntentKind> {
+        IntentKind::ALL.into_iter().find(|k| k.wire_name() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +80,9 @@ pub enum SeedSource {
 pub struct Seed {
     pub source: SeedSource,
     pub text: String,
+    /// The kind chosen at create, kept by polish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<IntentKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -263,6 +296,8 @@ pub enum SeedInput {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateIntentRequest {
     pub repo_id: Option<RepoId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<IntentKind>,
     pub seed: SeedInput,
 }
 
@@ -381,6 +416,7 @@ mod tests {
             seed: Seed {
                 source: SeedSource::Text,
                 text: "s".into(),
+                kind: None,
             },
             content,
             agent_id: None,
@@ -469,6 +505,44 @@ mod tests {
     }
 
     #[test]
+    fn kinds_have_stable_wire_names() {
+        let names = [
+            "new_feature",
+            "enhancement",
+            "bug",
+            "refactor",
+            "maintenance",
+            "task",
+        ];
+        for (k, name) in IntentKind::ALL.into_iter().zip(names) {
+            assert_eq!(serde_json::to_string(&k).unwrap(), format!("\"{name}\""));
+            assert_eq!(k.wire_name(), name);
+            assert_eq!(IntentKind::from_wire(k.wire_name()), Some(k));
+        }
+        assert_eq!(IntentKind::from_wire("feature"), None);
+    }
+
+    #[test]
+    fn old_seed_and_request_json_still_load() {
+        let seed: Seed = serde_json::from_str(r#"{"source":"text","text":"s"}"#).unwrap();
+        assert_eq!(seed.kind, None);
+        let json = serde_json::to_value(&seed).unwrap();
+        assert!(json.get("kind").is_none());
+
+        let req: CreateIntentRequest =
+            serde_json::from_str(r#"{"repo_id":null,"seed":{"text":"hi"}}"#).unwrap();
+        assert_eq!(req.kind, None);
+
+        let req = CreateIntentRequest {
+            repo_id: None,
+            kind: Some(IntentKind::Refactor),
+            seed: SeedInput::Text("hi".into()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["kind"], "refactor");
+    }
+
+    #[test]
     fn slugify_cases() {
         assert_eq!(slugify("Add dark-mode toggle!"), "add-dark-mode-toggle");
         assert_eq!(slugify("  "), "intent");
@@ -538,6 +612,7 @@ mod tests {
 
         let req = CreateIntentRequest {
             repo_id: None,
+            kind: None,
             seed: SeedInput::Text("hi".into()),
         };
         let json = serde_json::to_string(&req).unwrap();

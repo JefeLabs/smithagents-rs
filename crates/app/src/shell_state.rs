@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
+use chrono::{DateTime, FixedOffset};
 use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use raw_window_handle::HasWindowHandle;
 use smithagents_center_host::{validated_origin, CenterTabHost, PixelRect};
@@ -32,7 +33,7 @@ use tokio::sync::mpsc;
 use crate::app_state::{AppState, AppStateStore};
 use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
-use crate::link::{AgentCommands, DaemonLink, LinkFailure};
+use crate::link::{AgentCommands, DaemonLink, IntentCommands, LinkFailure};
 use crate::model::{Action, Connection, Effect, ShellModel};
 use crate::tabs::{PlaceholderHost, TabError, TabManager, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::apply_framework_theme;
@@ -41,6 +42,7 @@ use crate::view_models::{
     connection_banner, repository_added_text, status_to_show, tab_error_text, BannerVm,
     LeftPaneMode, SettingsSection, StatusKind, StatusMessage, OPEN_CHAT_FAILED,
 };
+use crate::views::rail::RailEntry;
 
 /// How often the link's last error is re-read while the link is not
 /// connected: it changes the error between retries without sending an action.
@@ -80,6 +82,11 @@ pub type ConnectionInfoSource = Rc<dyn Fn() -> Option<(u16, String)>>;
 /// [`DaemonLink`]; headless tests inject a fake.
 pub type LinkFailureSource = Rc<dyn Fn() -> Option<LinkFailure>>;
 
+/// Answers the current time, with the offset the views show times in
+/// ([`ShellState::now`]). The app reads the local clock; headless tests
+/// inject a fixed one.
+pub type Clock = Rc<dyn Fn() -> DateTime<FixedOffset>>;
+
 /// An `OpenTab` being carried out: what to put back if its tab fails.
 #[derive(Debug, Clone, Copy)]
 struct PendingOpen {
@@ -93,13 +100,14 @@ struct PendingOpen {
 pub enum ShellEvent {
     /// The left pane's mode or expanded width changed (save the layout).
     LeftPaneChanged,
-    /// Show the Settings view in the right dock.
-    RevealSettings,
+    /// Show this rail entry's view: open its dock on it, or switch the open
+    /// dock to it (never closes it). See [`ShellState::reveal`].
+    Reveal(RailEntry),
     /// Bring a Settings section into view (it is already expanded): the
     /// Settings view scrolls toward it, as far as the content below it
     /// allows, and, for Source repositories, focuses the path field (the
     /// only section that asks for this). Emitted after
-    /// [`ShellEvent::RevealSettings`].
+    /// `ShellEvent::Reveal(RailEntry::Settings)`.
     FocusSettings(SettingsSection),
     /// The theme in effect changed: [`ShellState::theme_state`] and
     /// [`ShellState::native_theme`] hold the new one. Emitted once per change,
@@ -127,6 +135,10 @@ pub struct ShellState {
     connection_info: Option<ConnectionInfoSource>,
     /// Replaces the link for agent commands (headless tests).
     commands: Option<Rc<dyn AgentCommands>>,
+    /// Replaces the link for intent commands (headless tests).
+    intent_commands: Option<Rc<dyn IntentCommands>>,
+    /// Replaces the local clock (headless tests).
+    clock: Option<Clock>,
     command_timeout: Duration,
     /// Where [`AppState`] persists; `None` keeps it in memory.
     app_state_store: Option<AppStateStore>,
@@ -199,6 +211,8 @@ impl ShellState {
             link,
             connection_info: None,
             commands,
+            intent_commands: None,
+            clock: None,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             app_state_store,
             app_state,
@@ -284,6 +298,34 @@ impl ShellState {
         }
     }
 
+    /// Where intent commands go: the injected commands if any, else the
+    /// link; `None` when the shell runs offline.
+    pub fn intent_commands(&self) -> Option<&dyn IntentCommands> {
+        match &self.intent_commands {
+            Some(commands) => Some(commands.as_ref()),
+            None => self.link.as_ref().map(|link| link as &dyn IntentCommands),
+        }
+    }
+
+    /// Replaces the link for intent commands.
+    pub(crate) fn set_intent_commands(&mut self, commands: Rc<dyn IntentCommands>) {
+        self.intent_commands = Some(commands);
+    }
+
+    /// The current time as the views show it: the injected clock's, else the
+    /// local clock's, in the local offset.
+    pub fn now(&self) -> DateTime<FixedOffset> {
+        match &self.clock {
+            Some(clock) => clock(),
+            None => chrono::Local::now().fixed_offset(),
+        }
+    }
+
+    /// Replaces the local clock.
+    pub(crate) fn set_clock(&mut self, clock: Clock) {
+        self.clock = Some(clock);
+    }
+
     /// How long a command may go unanswered before the views give up on it
     /// ([`DEFAULT_COMMAND_TIMEOUT`] unless set).
     pub fn command_timeout(&self) -> Duration {
@@ -350,8 +392,35 @@ impl ShellState {
     pub fn request_settings_focus(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         tracing::debug!(?section, "settings focus requested");
         self.set_settings_section_expanded(section, true, cx);
-        cx.emit(ShellEvent::RevealSettings);
+        self.reveal(RailEntry::Settings, cx);
         cx.emit(ShellEvent::FocusSettings(section));
+    }
+
+    /// The rail entry whose view the right dock shows (while it is open):
+    /// the one last chosen, remembered in `app-state.json`; Settings until
+    /// one is.
+    pub fn right_entry(&self) -> RailEntry {
+        self.app_state.right_pane.unwrap_or(RailEntry::Settings)
+    }
+
+    /// Makes `entry` the right dock's view and saves it (a failed write is
+    /// logged; it still holds this run). Only the shell calls this, as it
+    /// switches the dock ([`Shell::show_rail_entry`](crate::shell::Shell::show_rail_entry));
+    /// a view asks for a pane with [`ShellState::reveal`].
+    pub fn set_right_entry(&mut self, entry: RailEntry, cx: &mut Context<Self>) {
+        if self.app_state.right_pane == Some(entry) {
+            return;
+        }
+        tracing::debug!(?entry, "right pane");
+        self.app_state.right_pane = Some(entry);
+        self.save_app_state();
+        cx.notify();
+    }
+
+    /// Asks the shell to show `entry`'s view ([`ShellEvent::Reveal`]).
+    pub fn reveal(&mut self, entry: RailEntry, cx: &mut Context<Self>) {
+        tracing::debug!(?entry, "reveal requested");
+        cx.emit(ShellEvent::Reveal(entry));
     }
 
     /// Applies one action (from the user or the link), queues its effects and

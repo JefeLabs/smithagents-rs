@@ -378,6 +378,7 @@ impl Fx {
     async fn text_intent(&self, repo: &Repo) -> smithagents_core::intent::Intent {
         self.svc
             .create(CreateIntentRequest {
+                kind: None,
                 repo_id: Some(repo.id),
                 seed: SeedInput::Text("make it faster".into()),
             })
@@ -419,6 +420,7 @@ async fn create_from_chat_tags_source_and_defaults_repo() {
     let i = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: None,
             seed: SeedInput::Chat {
                 agent_id: agent.id,
@@ -467,6 +469,7 @@ async fn create_from_unknown_agent_is_agent_not_found() {
     let err = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: None,
             seed: SeedInput::Chat {
                 agent_id: smithagents_core::ids::AgentId::new(),
@@ -492,6 +495,7 @@ async fn tool_only_chat_is_invalid() {
     let err = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: None,
             seed: SeedInput::Chat {
                 agent_id: agent.id,
@@ -517,6 +521,7 @@ async fn bad_range_is_invalid() {
     let err = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: None,
             seed: SeedInput::Chat {
                 agent_id: agent.id,
@@ -535,6 +540,7 @@ async fn text_seed_requires_repository() {
     let err = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: None,
             seed: SeedInput::Text("hello".into()),
         })
@@ -551,6 +557,7 @@ async fn blank_text_seed_is_invalid_and_unknown_repo_not_found() {
     let err = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: Some(repo.id),
             seed: SeedInput::Text("  \n ".into()),
         })
@@ -560,6 +567,7 @@ async fn blank_text_seed_is_invalid_and_unknown_repo_not_found() {
     let err = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: Some(RepoId::new()),
             seed: SeedInput::Text("hi".into()),
         })
@@ -573,6 +581,7 @@ async fn text_seed_over_the_seed_limit_is_invalid() {
     let f = fx().await;
     let repo = f.repo("r1").await;
     let text_seed = |text: String| CreateIntentRequest {
+        kind: None,
         repo_id: Some(repo.id),
         seed: SeedInput::Text(text),
     };
@@ -611,6 +620,7 @@ async fn explicit_repo_overrides_agent_repo() {
     let i = f
         .svc
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: Some(r2.id),
             seed: SeedInput::Chat {
                 agent_id: agent.id,
@@ -1188,6 +1198,7 @@ async fn polish_model_is_passed_to_the_harness() {
     f.h.script(vec![pass1("T", 0), pass2(&[])]);
     let i = early
         .create(CreateIntentRequest {
+            kind: None,
             repo_id: Some(repo.id),
             seed: SeedInput::Text("x".into()),
         })
@@ -1571,6 +1582,7 @@ async fn pass_two_sees_same_repo_candidates_and_skip_marker() {
         async move {
             let i = seeder
                 .create(CreateIntentRequest {
+                    kind: None,
                     repo_id: Some(repo),
                     seed: SeedInput::Text("other".into()),
                 })
@@ -1718,6 +1730,7 @@ async fn dropped_answer_calls_never_strand_pass_two() {
     let seeded = || async {
         let i = seeder
             .create(CreateIntentRequest {
+                kind: None,
                 repo_id: Some(repo.id),
                 seed: SeedInput::Text("x".into()),
             })
@@ -1766,6 +1779,7 @@ async fn dropped_create_and_retry_calls_never_strand_polishing() {
     let repo = f.repo("r1").await;
     let create = || {
         f.svc.create(CreateIntentRequest {
+            kind: None,
             repo_id: Some(repo.id),
             seed: SeedInput::Text("x".into()),
         })
@@ -2221,4 +2235,111 @@ async fn empty_patch_changes_nothing_and_publishes_nothing() {
     assert_eq!(r.updated_at, i.updated_at);
     let none = tokio::time::timeout(Duration::from_millis(100), sub.live.recv()).await;
     assert!(none.is_err(), "unexpected event");
+}
+
+#[tokio::test]
+async fn create_with_a_kind_survives_pass_one() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    f.h.script(vec![pass1("Tidy the build", 1)]);
+    let i = f
+        .svc
+        .create(CreateIntentRequest {
+            kind: Some(IntentKind::Maintenance),
+            repo_id: Some(repo.id),
+            seed: SeedInput::Text("tidy the build".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(i.content.kind, IntentKind::Maintenance);
+    assert_eq!(i.seed.kind, Some(IntentKind::Maintenance));
+    let q = f.wait_phase(i.id, Phase::Questions).await;
+    assert_eq!(q.content.kind, IntentKind::Maintenance);
+    assert_eq!(q.content.title, "Tidy the build");
+
+    // A failed pass 1 and its retry keep the kind too.
+    f.h.script(vec![Err(HarnessError::Timeout)]);
+    let j = f
+        .svc
+        .create(CreateIntentRequest {
+            kind: Some(IntentKind::Maintenance),
+            repo_id: Some(repo.id),
+            seed: SeedInput::Text("tidy more".into()),
+        })
+        .await
+        .unwrap();
+    let failed = f.wait(j.id, is_failed).await;
+    assert_eq!(failed.content.kind, IntentKind::Maintenance);
+    f.h.script(vec![pass1("Tidy more", 1)]);
+    f.svc.retry_polish(j.id).await.unwrap();
+    let q = f.wait_phase(j.id, Phase::Questions).await;
+    assert_eq!(q.content.kind, IntentKind::Maintenance);
+    assert_eq!(q.content.title, "Tidy more");
+}
+
+#[tokio::test]
+async fn a_kind_patched_after_a_failed_pass_one_survives_the_retry() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    f.h.script(vec![Err(HarnessError::Timeout)]);
+    let i = f
+        .svc
+        .create(CreateIntentRequest {
+            kind: Some(IntentKind::Bug),
+            repo_id: Some(repo.id),
+            seed: SeedInput::Text("the build breaks".into()),
+        })
+        .await
+        .unwrap();
+    f.wait(i.id, is_failed).await;
+    let patched = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                kind: Some(IntentKind::Refactor),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.content.kind, IntentKind::Refactor);
+    assert_eq!(patched.seed.kind, Some(IntentKind::Refactor));
+
+    f.h.script(vec![pass1("Split the build", 1)]);
+    f.svc.retry_polish(i.id).await.unwrap();
+    let q = f.wait_phase(i.id, Phase::Questions).await;
+    assert_eq!(q.content.kind, IntentKind::Refactor);
+    let prompt = f.h.calls().last().unwrap().prompt.clone();
+    assert!(prompt.contains("the user chose refactor"), "{prompt}");
+}
+
+#[tokio::test]
+async fn create_without_a_kind_takes_the_polished_kind() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    f.h.script(vec![pass1("Faster builds", 1)]);
+    let i = f.text_intent(&repo).await;
+    assert_eq!(i.content.kind, IntentKind::Task);
+    assert_eq!(i.seed.kind, None);
+    let q = f.wait_phase(i.id, Phase::Questions).await;
+    assert_eq!(q.content.kind, IntentKind::Enhancement);
+}
+
+#[tokio::test]
+async fn a_stored_task_intent_still_loads() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let i = f.text_intent(&repo).await;
+    assert_eq!(i.content.kind, IntentKind::Task);
+    f.store.save_intent(&i).await.unwrap();
+    let got = f.store.get_intent(i.id).await.unwrap().unwrap();
+    assert_eq!(got.content.kind, IntentKind::Task);
+    assert_eq!(got.seed.kind, None);
+    let seed_json = serde_json::to_string(&got.seed).unwrap();
+    assert!(!seed_json.contains("kind"), "{seed_json}");
+    assert_eq!(
+        f.svc.get(i.id).await.unwrap().content.kind,
+        IntentKind::Task
+    );
 }

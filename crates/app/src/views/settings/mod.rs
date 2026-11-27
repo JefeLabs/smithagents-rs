@@ -1,4 +1,5 @@
-//! The Settings view in the right dock: a scrollable pane of collapsible
+//! The Settings view in the right dock (drawn while the rail has it
+//! selected; Intents shares the dock): a scrollable pane of collapsible
 //! sections, both expanded until the user collapses one (remembered in
 //! `app-state.json`):
 //!
@@ -7,6 +8,9 @@
 //!   select the adjacent option, wrapping), and the text size as a stepper
 //!   over the token set's scale. A change applies live and is saved to
 //!   `app-settings.json`.
+//! - **Agent defaults** (Space scope, [`agent_defaults`]): "Agents working at
+//!   once", a menu of "No limit" and 1 to 16. The daemon's answer, not the
+//!   press, changes the value shown.
 //! - **Source repositories** (Space scope, [`repositories`]): the daemon's
 //!   repositories and an "Add repository" field for a local path.
 //!
@@ -20,9 +24,8 @@
 //!
 //! The pane paints its whole area from `Region::RightPane` (`card`,
 //! `card-foreground`); muted text, errors and borders come from tokens.
-//! Agent defaults (another Space section in the spec) wait for the daemon to
-//! store them (Plan 2).
 
+mod agent_defaults;
 mod appearance;
 mod repositories;
 
@@ -47,7 +50,12 @@ use crate::shell::SETTINGS_PANEL;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, token_paint, Region};
 use crate::view_models::SettingsSection;
+use crate::views::rail::RailEntry;
 
+pub use agent_defaults::{
+    queue_limit_item_id, QUEUE_LIMIT_ERROR_ID, QUEUE_LIMIT_HELP, QUEUE_LIMIT_HELP_ID,
+    QUEUE_LIMIT_ID, QUEUE_LIMIT_LABEL, QUEUE_LIMIT_LABEL_ID,
+};
 pub use appearance::{
     init, SelectNextOption, SelectPreviousOption, FONT_LABEL, FONT_OPTIONS_ID, RADIO_KEY_CONTEXT,
     TEXT_SIZE_DOWN_ID, TEXT_SIZE_ID, TEXT_SIZE_LABEL, TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID,
@@ -94,6 +102,10 @@ pub struct SettingsPane {
     given_up: Option<SentAdd>,
     /// The folder picker, while it is open.
     browsing: Option<Task<()>>,
+    /// The queue limit change in flight, if any. Dropping it gives it up.
+    defaults_command: Option<Task<()>>,
+    /// The line under the queue limit: why the last change failed.
+    defaults_error: Option<String>,
     /// The connection as last seen, to notice it dropping.
     connection: Connection,
     /// One focus handle per theme option, and per font option (their radio
@@ -152,6 +164,8 @@ impl SettingsPane {
             sent: None,
             given_up: None,
             browsing: None,
+            defaults_command: None,
+            defaults_error: None,
             theme_focus: Vec::new(),
             font_focus: Vec::new(),
             _subscriptions: subscriptions,
@@ -168,6 +182,9 @@ impl SettingsPane {
         if dropped && self.adding.is_some() {
             tracing::warn!("the connection dropped while an add waited");
             self.give_up_add();
+        }
+        if dropped && self.defaults_command.is_some() {
+            self.give_up_defaults();
         }
         self.notice_late_add(window, cx);
         cx.notify();
@@ -254,6 +271,12 @@ impl BasePanel for SettingsPane {
         SETTINGS_PANEL
     }
 
+    /// Drawn only while the rail has Settings selected, so the dock's group
+    /// has one visible panel and draws no tab bar.
+    fn visible(&self, cx: &App) -> bool {
+        self.state.read(cx).right_entry() == RailEntry::Settings
+    }
+
     /// The dock is locked to the shell's layout; its panels never close.
     fn closable(&self, _: &App) -> bool {
         false
@@ -307,6 +330,9 @@ impl Render for SettingsPane {
                 let content = match section {
                     SettingsSection::Appearance => {
                         self.appearance_content(&paint, cx).into_any_element()
+                    }
+                    SettingsSection::AgentDefaults => {
+                        self.agent_defaults_content(&paint, cx).into_any_element()
                     }
                     SettingsSection::Repositories => {
                         self.repositories_content(&paint, cx).into_any_element()

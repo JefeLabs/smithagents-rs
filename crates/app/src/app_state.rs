@@ -1,6 +1,7 @@
 //! What the app remembers between runs that is not a setting:
 //! `<home>/app-state.json`, for example
-//! `{ "last_repo_id": "<uuid>", "collapsed_settings_sections": ["appearance"] }`.
+//! `{ "last_repo_id": "<uuid>", "collapsed_settings_sections": ["appearance"],
+//! "right_pane": "intents" }`.
 //!
 //! It is kept apart from `app-settings.json`, whose shape belongs to the theme
 //! crate's `AppearanceSettings`.
@@ -14,6 +15,7 @@ use serde_json::Value;
 use smithagents_core::ids::RepoId;
 
 use crate::view_models::SettingsSection;
+use crate::views::rail::RailEntry;
 
 const FILE_NAME: &str = "app-state.json";
 
@@ -31,10 +33,21 @@ pub struct AppState {
         serialize_with = "section_names"
     )]
     pub collapsed_sections: Vec<SettingsSection>,
+    /// The rail entry the right dock showed last (`None`: never chosen, so
+    /// Settings). Spelled as [`RailEntry::as_str`].
+    #[serde(serialize_with = "rail_entry_name")]
+    pub right_pane: Option<RailEntry>,
 }
 
 fn section_names<S: Serializer>(sections: &[SettingsSection], s: S) -> Result<S::Ok, S::Error> {
     s.collect_seq(sections.iter().map(|section| section.as_str()))
+}
+
+fn rail_entry_name<S: Serializer>(entry: &Option<RailEntry>, s: S) -> Result<S::Ok, S::Error> {
+    match entry {
+        Some(entry) => s.serialize_some(entry.as_str()),
+        None => s.serialize_none(),
+    }
 }
 
 /// Loads and saves [`AppState`] under a home directory.
@@ -110,9 +123,21 @@ impl AppStateStore {
                 Vec::new()
             }
         };
+        let right_pane = value
+            .get("right_pane")
+            .filter(|name| !name.is_null())
+            .and_then(|name| {
+                let entry = name.as_str().and_then(RailEntry::parse);
+                if entry.is_none() {
+                    // An entry of a newer app, or junk.
+                    tracing::debug!("ignoring right_pane {name} in {}", path.display());
+                }
+                entry
+            });
         AppState {
             last_repo_id,
             collapsed_sections,
+            right_pane,
         }
     }
 

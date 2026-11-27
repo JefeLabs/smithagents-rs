@@ -20,7 +20,7 @@ use smithagents_app::layout_store::{saved_left_pane, LayoutStore};
 use smithagents_app::model::{Action as ModelAction, Connection, ShellModel};
 use smithagents_app::shell::{
     app_menus, CloseActiveTab, NextTab, PreviousTab, Quit, ShellOptions, ToggleAgentsPane,
-    ToggleSettingsPane,
+    ToggleIntentsPane, ToggleSettingsPane,
 };
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::tabs::SharedHost;
@@ -146,6 +146,7 @@ fn the_menu_bar_has_quit_view_and_window_entries(cx: &mut TestAppContext) {
                 vec![
                     item("Toggle Agents Pane", &ToggleAgentsPane),
                     item("Toggle Settings", &ToggleSettingsPane),
+                    item("Toggle Intents", &ToggleIntentsPane),
                 ]
             ),
             (
@@ -173,6 +174,7 @@ fn every_menu_action_has_its_key(cx: &mut TestAppContext) {
         assert!(bound(&Quit, "cmd-q"), "cmd-q");
         assert!(bound(&ToggleAgentsPane, "cmd-b"), "cmd-b");
         assert!(bound(&ToggleSettingsPane, "cmd-alt-b"), "cmd-alt-b");
+        assert!(bound(&ToggleIntentsPane, "cmd-alt-i"), "cmd-alt-i");
         assert!(bound(&CloseActiveTab, "cmd-w"), "cmd-w");
         assert!(bound(&NextTab, "ctrl-tab"), "ctrl-tab");
         assert!(bound(&PreviousTab, "ctrl-shift-tab"), "ctrl-shift-tab");

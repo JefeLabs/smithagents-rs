@@ -5,6 +5,7 @@
 pub mod agents;
 pub mod banner;
 pub mod center;
+pub mod intents;
 pub mod rail;
 pub mod settings;
 pub mod status_bar;

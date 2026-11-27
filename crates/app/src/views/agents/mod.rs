@@ -646,8 +646,9 @@ impl Render for AgentsPane {
 }
 
 /// A status dot of `size` px in `style` ([`state_dot`]): a filled disc, or a
-/// hollow 2 px ring; dimmed at half opacity.
-fn status_dot(style: DotStyle, size: f32, color: Hsla) -> Div {
+/// hollow 2 px ring; dimmed at half opacity. The Intents pane's cards draw
+/// their dots with it too.
+pub(crate) fn status_dot(style: DotStyle, size: f32, color: Hsla) -> Div {
     div()
         .flex_none()
         .size(px(size))
