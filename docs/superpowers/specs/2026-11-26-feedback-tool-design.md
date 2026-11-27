@@ -397,8 +397,11 @@ result is `docs/feedback.md`.
   or digit gets a zero-width space after it unless an ASCII letter, digit or
   `_` comes before it. In a body (rendered as Markdown) an `@` inside a web
   address GitHub's extended autolink links is left alone, by a rule narrower
-  than GitHub's (`http://` or `https://`, a host with a `.`, then `/`, `?` or
-  `#`); a title is never a link and keeps the strict rule. The committed
+  than GitHub's: the address starts at the start, after white space or after
+  `*`, `_`, `~` or `(`, is `http://` or `https://` with a host holding a `.`
+  and then `/`, `?` or `#`, and ends at the first character outside ASCII
+  letters, digits and `-._~/%?#=&+:@`; a title is never a link and keeps the
+  strict rule. The committed
   files keep the owner's text. A comment is capped at 500 characters and
   never cut by bytes.
 - **Duplicates.** The search for an issue or a pull request made before

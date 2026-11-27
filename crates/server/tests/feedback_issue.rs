@@ -502,13 +502,21 @@ fn mentions_are_neutralised_only_where_a_mention_starts() {
 
 #[test]
 fn an_at_inside_a_web_address_is_kept_in_a_body_only() {
-    // W2-5: in a body GitHub renders as Markdown, an address its extended
-    // autolink rule links mentions no one, so its `@` is left alone.
+    // W2-5, as amended: in a body GitHub renders as Markdown, an address its
+    // extended autolink rule links mentions no one, so its `@` is left
+    // alone; but only where GitHub's own rules start and end such a link,
+    // narrower still, and never in a title.
     let z = '\u{200b}';
+    // Every case that does not come out as it should, so all show at once.
+    let mut wrong = Vec::new();
     for kept in [
         "https://www.npmjs.com/package/@types/node",
         "See https://medium.com/@someone/post.",
         "(https://a.b/@x)",
+        "[docs](https://a.b/@scope/pkg)",
+        "*https://a.b/@u*",
+        "_https://a.b/@u_",
+        "~https://a.b/@u~",
         "HTTPS://A.B/@u",
         "https://a.b:8080/@u",
         "https://a.b?x=@u",
@@ -516,24 +524,52 @@ fn an_at_inside_a_web_address_is_kept_in_a_body_only() {
         "http://a.b/@u",
         "https://a.b/@x/@y",
         "https://a.b/@u at the very start",
-        "1https://a.b/@u",
-        "https://a.b/\u{e9}@u",
+        "a line\nhttps://a.b/@u",
+        "a tab\thttps://a.b/@u",
+        "https://a.b/p%40q?r=s&t=u+v:~/@x",
     ] {
-        assert_eq!(no_mentions_in_body(kept), kept, "{kept:?}");
         // A title is not rendered as Markdown: nothing in it is a link.
-        assert_ne!(no_mentions_in_title(kept), kept, "{kept:?}");
+        if no_mentions_in_body(kept) != kept || no_mentions_in_title(kept) == kept {
+            wrong.push(format!("kept {kept:?}"));
+        }
     }
     for (text, want) in [
-        ("xhttps://a.b/@u", format!("xhttps://a.b/@{z}u")),
+        // Markdown ends the link before the `@`, or never starts one.
+        ("[x](https://a.b/y)@u", format!("[x](https://a.b/y)@{z}u")),
+        ("<https://a.b/y>@u", format!("<https://a.b/y>@{z}u")),
+        ("`https://a.b/y`@u", format!("`https://a.b/y`@{z}u")),
+        ("\"https://a.b/y\"@u", format!("\"https://a.b/y\"@{z}u")),
+        (
+            "<img src=\"https://a.b/y\">@u",
+            format!("<img src=\"https://a.b/y\">@{z}u"),
+        ),
+        ("| https://a.b/y|@u |", format!("| https://a.b/y|@{z}u |")),
+        ("x=https://a.b/@u", format!("x=https://a.b/@{z}u")),
+        ("[https://a.b/@u", format!("[https://a.b/@{z}u")),
+        ("<https://a.b/@u>", format!("<https://a.b/@{z}u>")),
+        ("'https://a.b/@u'", format!("'https://a.b/@{z}u'")),
+        ("\u{a0}https://a.b/@u", format!("\u{a0}https://a.b/@{z}u")),
+        // A character outside the address's plain set ends it.
+        ("https://a.b/x,@u", format!("https://a.b/x,@{z}u")),
+        ("https://a.b/x*@u", format!("https://a.b/x*@{z}u")),
+        ("https://a.b/x;@u", format!("https://a.b/x;@{z}u")),
+        ("https://a.b/x!@u", format!("https://a.b/x!@{z}u")),
+        ("https://a.b/x)@u", format!("https://a.b/x)@{z}u")),
+        ("https://a.b/x<@u", format!("https://a.b/x<@{z}u")),
+        ("https://a.b/\u{e9}@u", format!("https://a.b/\u{e9}@{z}u")),
+        // Not an address of the rule.
+        ("https://-a.b/@u", format!("https://-a.b/@{z}u")),
+        ("https://a.b./@u", format!("https://a.b./@{z}u")),
         ("https://a_b.c/@u", format!("https://a_b.c/@{z}u")),
         ("https://localhost/@u", format!("https://localhost/@{z}u")),
         (
             "http://localhost:5173/@vite/client",
             format!("http://localhost:5173/@{z}vite/client"),
         ),
+        ("xhttps://a.b/@u", format!("xhttps://a.b/@{z}u")),
+        ("1https://a.b/@u", format!("1https://a.b/@{z}u")),
         ("https:///@u", format!("https:///@{z}u")),
         ("https://a.b @u", format!("https://a.b @{z}u")),
-        ("https://a.b/x<@u", format!("https://a.b/x<@{z}u")),
         ("https://a.b:/@u", format!("https://a.b:/@{z}u")),
         ("https://a.b:80x/@u", format!("https://a.b:80x/@{z}u")),
         (
@@ -542,14 +578,19 @@ fn an_at_inside_a_web_address_is_kept_in_a_body_only() {
         ),
         ("ftp://a.b/@u", format!("ftp://a.b/@{z}u")),
         ("www.a.b/@u", format!("www.a.b/@{z}u")),
+        // After the address has ended.
         (
             "https://a.b/@x then @name",
             format!("https://a.b/@x then @{z}name"),
         ),
         ("https://a.b/x\n@name", format!("https://a.b/x\n@{z}name")),
+        ("(https://a.b/@x)@name", format!("(https://a.b/@x)@{z}name")),
     ] {
-        assert_eq!(no_mentions_in_body(text), want, "{text:?}");
+        if no_mentions_in_body(text) != want {
+            wrong.push(format!("neutralised {text:?}"));
+        }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]

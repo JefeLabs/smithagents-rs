@@ -334,16 +334,28 @@ pub fn no_mentions_in_title(text: &str) -> String {
 
 /// A body sent to GitHub, which renders it as Markdown (an issue's, a pull
 /// request's): [`no_mentions_in_title`]'s rule, except that an `@` inside a
-/// web address GitHub's extended-autolink rule links is left alone, since
-/// the text of a link mentions no one
-/// (`https://www.npmjs.com/package/@types/node` stays as typed). Narrower on
-/// purpose than what GitHub may link: the address starts with `http://` or
-/// `https://` (ASCII, any case) after no ASCII letter (or at the start),
-/// then a host of ASCII letters, digits, `-` and `.` holding a `.`, then
-/// optionally `:` and digits, then `/`, `?` or `#`, and the `@` comes before
-/// any white space or `<`. Anything else (`http://localhost:5173/@vite`,
-/// `www.a.b/@x`, `ftp://…`, a host with `_` or a letter that is not ASCII)
-/// is treated as in a title.
+/// web address GitHub's extended-autolink rule turns into a link is left
+/// alone, since the text of a link mentions no one
+/// (`https://www.npmjs.com/package/@types/node` stays as typed). Only where
+/// GitHub's own rules start and end such a link, and narrower than what it
+/// links, so some typed addresses still get the invisible character:
+///
+/// - the address starts at the start of the text or right after ASCII white
+///   space, `*`, `_`, `~` or `(` (never after `[`, `<`, a quote, a
+///   backtick, `=`, `|`, a letter or a digit);
+/// - with `http://` or `https://` (ASCII, any case);
+/// - then a host of ASCII letters, digits, `-` and `.` that begins and ends
+///   with a letter or digit and holds a `.` (not `localhost`, no `_`, no
+///   letter that is not ASCII);
+/// - then optionally `:` and digits, then `/`, `?` or `#`;
+/// - and it goes on only while each character is an ASCII letter or digit
+///   or one of `-._~/%?#=&+:@`: anything else (`)`, `]`, `>`, a quote, `|`,
+///   `*`, `,`, `;`, `!`, white space, a character that is not ASCII) ends
+///   it, and an `@` after the end is treated as in a title.
+///
+/// So `[x](https://a.b/y)@name`, `<https://a.b/@name>`, `x=https://a.b/@name`,
+/// `https://a.b/x,@name`, `http://localhost:5173/@vite` and `www.a.b/@name`
+/// are neutralised like any other text.
 pub fn no_mentions_in_body(text: &str) -> String {
     no_mentions(text, true)
 }
@@ -357,7 +369,7 @@ fn no_mentions(text: &str, links: bool) -> String {
     let mut link_end = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
-        if links && at >= link_end && before.is_none_or(|b| !b.is_ascii_alphabetic()) {
+        if links && at >= link_end && may_start_address(before) {
             if let Some(len) = web_address_len(&text[at..]) {
                 link_end = at + len;
             }
@@ -377,24 +389,32 @@ fn no_mentions(text: &str, links: bool) -> String {
     out
 }
 
-/// The length in bytes of the web address `text` starts with, up to the
-/// first white space or `<`, when it is one [`no_mentions_in_body`] leaves
-/// alone: `http://` or `https://` (any case), a host of ASCII letters,
-/// digits, `-` and `.` holding a `.`, optionally `:` and digits, then `/`,
-/// `?` or `#`.
+/// Where GitHub's extended autolinks may start: at the start of the text
+/// (`before` is `None`), or after ASCII white space, `*`, `_`, `~` or `(`.
+fn may_start_address(before: Option<char>) -> bool {
+    before.is_none_or(|b| b.is_ascii_whitespace() || matches!(b, '*' | '_' | '~' | '('))
+}
+
+/// The length in bytes of the web address `text` starts with, when it is
+/// one [`no_mentions_in_body`] leaves alone: `http://` or `https://` (any
+/// case), a host of ASCII letters, digits, `-` and `.` that begins and ends
+/// with a letter or digit and holds a `.`, optionally `:` and digits, then
+/// `/`, `?` or `#`, and from there every character in [`in_address`].
 fn web_address_len(text: &str) -> Option<usize> {
     let scheme = ["https://", "http://"].into_iter().find(|scheme| {
         text.get(..scheme.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
     })?;
     let rest = &text[scheme.len()..];
-    let host = rest
+    let host_len = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
         .unwrap_or(rest.len());
-    if host == 0 || !rest[..host].contains('.') {
+    let host = &rest[..host_len];
+    let alnum = |c: char| c.is_ascii_alphanumeric();
+    if !(host.starts_with(alnum) && host.ends_with(alnum) && host.contains('.')) {
         return None;
     }
-    let mut after = &rest[host..];
+    let mut after = &rest[host_len..];
     if let Some(port) = after.strip_prefix(':') {
         let digits = port
             .find(|c: char| !c.is_ascii_digit())
@@ -407,10 +427,18 @@ fn web_address_len(text: &str) -> Option<usize> {
     if !after.starts_with(['/', '?', '#']) {
         return None;
     }
-    Some(
-        text.find(|c: char| c.is_whitespace() || c == '<')
-            .unwrap_or(text.len()),
-    )
+    let path = after.find(|c: char| !in_address(c)).unwrap_or(after.len());
+    Some(text.len() - after.len() + path)
+}
+
+/// The characters a web address goes on with after its host: ASCII letters
+/// and digits and `-._~/%?#=&+:@`.
+fn in_address(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.' | '_' | '~' | '/' | '%' | '?' | '#' | '=' | '&' | '+' | ':' | '@'
+        )
 }
 
 /// `issue.md`.
