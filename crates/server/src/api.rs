@@ -1626,6 +1626,7 @@ mod tests {
         for e in [
             T::NotFound,
             T::NotStarted,
+            T::OutputLost,
             T::Timeout,
             T::TooMuchOutput,
             T::Failed { status: Some(1) },

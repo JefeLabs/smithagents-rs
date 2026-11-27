@@ -309,7 +309,8 @@ async fn command_secret(
 ) -> Result<Option<Secret>, SecretError> {
     match run_command(cmd, COMMAND_TIMEOUT, Stdout::FirstLine).await {
         Ok(line) => Ok(line.map(Secret)),
-        Err(RunError::Spawn(e)) => Err(SecretError::Spawn {
+        // Either way there is no secret to use.
+        Err(RunError::Spawn(e) | RunError::Lost(e)) => Err(SecretError::Spawn {
             program: program.to_string(),
             message: e.to_string(),
         }),
@@ -339,8 +340,11 @@ pub(crate) enum Stdout {
 /// Why a command the host ran did not succeed. Never carries its output.
 #[derive(Debug)]
 pub(crate) enum RunError {
-    /// It could not be started, read or waited for.
+    /// It could not be started: nothing ran.
     Spawn(std::io::Error),
+    /// It started, but its output could not be read or its end could not be
+    /// awaited: what it did before that is not known.
+    Lost(std::io::Error),
     Timeout,
     /// It printed more than 64 KiB.
     TooMuchOutput,
@@ -382,12 +386,12 @@ pub(crate) async fn run_command(
             pipe.take(MAX_OUTPUT_BYTES + 1)
                 .read_to_end(&mut out)
                 .await
-                .map_err(RunError::Spawn)?;
+                .map_err(RunError::Lost)?;
             if out.len() as u64 > MAX_OUTPUT_BYTES {
                 return Err(RunError::TooMuchOutput);
             }
         }
-        let status = child.wait().await.map_err(RunError::Spawn)?;
+        let status = child.wait().await.map_err(RunError::Lost)?;
         Ok((status, out))
     };
     let (status, out) = match tokio::time::timeout(timeout, run).await {
