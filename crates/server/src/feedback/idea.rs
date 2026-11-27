@@ -229,9 +229,15 @@ impl FeedbackService {
     /// `gh` not ready (`GhNotReady`); an agent's branch that changes more
     /// than the issue folder (`OutOfScope`); a default branch with commits
     /// `origin` has not got, or a repository never fetched (`Unpublished`).
+    /// A repository that is, or may be, public needs `public_acknowledged`
+    /// (`PublicNotAcknowledged`), asked on every press that would publish.
     /// A failed push or `gh` call is `Step`, and what succeeded before it
     /// stays done.
-    pub async fn open_pull_request(&self, id: IntentId) -> Result<Intent, FeedbackError> {
+    pub async fn open_pull_request(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> Result<Intent, FeedbackError> {
         let _running = Running::start(&self.parts.running);
         let _own = self.parts.ideas.lock(id).await;
         let intent = self.intent(id).await?;
@@ -248,11 +254,35 @@ impl FeedbackService {
             return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
         }
         let agent = self.idle_agent(&intent).await?;
+        let github = self
+            .github_of(&repo)
+            .await?
+            .ok_or(FeedbackError::NoGithubRemote)?;
+        let gh = self.gh();
+        if let Some(reason) = gh_readiness(&gh).await.reason {
+            return Err(FeedbackError::GhNotReady(not_ready_sentence(&reason)));
+        }
+        // Asked on every press, before a commit is chosen, recorded or
+        // pushed.
+        self.acknowledgement(&github, public_acknowledged)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(intent_id = %id, step = "acknowledge", code = e.code(), "the idea branch was not pushed");
+            })?;
+        for branch in [&repo.default_branch, &origin.branch] {
+            let valid = !branch.starts_with('-')
+                && git::bounded(git::is_valid_branch_name(&repo.path, branch))
+                    .await
+                    .map_err(read_failed)?;
+            if !valid {
+                return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
+            }
+        }
         // The commit to push: the one chosen at an earlier press, else the
-        // agent's branch as it is now (read right after the turn check).
-        // One chosen before that was never pushed and is gone from the
-        // repository (the branch was reset and the commit pruned) cannot be
-        // pushed, so one is chosen again.
+        // agent's branch as it is now ([`Self::settled_head`]). One chosen
+        // before that was never pushed and is gone from the repository (the
+        // branch was reset and the commit pruned) cannot be pushed, so one
+        // is chosen again.
         let chosen = match &idea.pr_commit {
             Some(commit) if !idea.pr_pushed => {
                 let present = git::is_commit_id(commit)
@@ -268,23 +298,6 @@ impl FeedbackService {
             Some(commit) => (commit, idea.pr_pushed, false),
             None => (self.settled_head(&repo, &agent).await?, false, true),
         };
-        let github = self
-            .github_of(&repo)
-            .await?
-            .ok_or(FeedbackError::NoGithubRemote)?;
-        let gh = self.gh();
-        if let Some(reason) = gh_readiness(&gh).await.reason {
-            return Err(FeedbackError::GhNotReady(not_ready_sentence(&reason)));
-        }
-        for branch in [&repo.default_branch, &origin.branch] {
-            let valid = !branch.starts_with('-')
-                && git::bounded(git::is_valid_branch_name(&repo.path, branch))
-                    .await
-                    .map_err(read_failed)?;
-            if !valid {
-                return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
-            }
-        }
         if new {
             check_scope(&repo, origin, &head).await.inspect_err(|e| {
                 tracing::warn!(intent_id = %id, step = "check_scope", code = e.code(), "the idea branch was not pushed");
@@ -575,10 +588,13 @@ impl FeedbackService {
     }
 
     /// The commit the agent's branch (`refs/heads/<branch>`: never a tag of
-    /// that name) is at, read once its turn was found over ([`Self::idle_agent`]);
-    /// `NotReady` when a turn started meanwhile, since the branch may then
-    /// hold a commit made in the middle of it.
+    /// that name) is at, read right after a check that no turn is in
+    /// flight; `NotReady` when one is, or when one started while the branch
+    /// was read, since it may then hold a commit made in the middle of it.
     async fn settled_head(&self, repo: &Repo, agent: &Agent) -> Result<String, FeedbackError> {
+        if self.parts.agents.turn_in_flight(agent.id) {
+            return Err(FeedbackError::NotReady(STILL_WORKING.to_owned()));
+        }
         let head = git::rev_parse(&repo.path, &format!("refs/heads/{}", agent.branch))
             .await
             .map_err(read_failed)?

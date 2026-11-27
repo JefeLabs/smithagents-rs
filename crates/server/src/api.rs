@@ -1046,15 +1046,31 @@ async fn resolve_intent(
         .map(Json)
 }
 
-/// An idea intent's "Open pull request". Detached, so a client that goes
-/// away does not stop a push or `gh` half-way.
+/// The body of "Open pull request": none, or `{"public_acknowledged": …}`.
+#[derive(Default, Deserialize)]
+struct OpenPullRequestBody {
+    #[serde(default)]
+    public_acknowledged: bool,
+}
+
+/// An idea intent's "Open pull request", with an optional body (no body, or
+/// `{}`: not acknowledged). Detached, so a client that goes away does not
+/// stop a push or `gh` half-way.
 async fn open_pull_request(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    body: Bytes,
 ) -> Result<Json<Intent>, ApiError> {
     let id: IntentId = path_id(&id, "intent")?;
+    let OpenPullRequestBody {
+        public_acknowledged,
+    } = if body.is_empty() {
+        OpenPullRequestBody::default()
+    } else {
+        json_body(&body)?
+    };
     let svc = s.feedback;
-    detached(async move { svc.open_pull_request(id).await })
+    detached(async move { svc.open_pull_request(id, public_acknowledged).await })
         .await
         .map(Json)
 }
@@ -1392,6 +1408,7 @@ mod tests {
             FeedbackError::Step(_) => "Step",
             FeedbackError::Unpublished(_) => "Unpublished",
             FeedbackError::IdeaBlocked(_) => "IdeaBlocked",
+            FeedbackError::PublicNotAcknowledged(_) => "PublicNotAcknowledged",
         }
     }
 
@@ -1549,6 +1566,12 @@ mod tests {
                 "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.",
             ),
             (
+                FeedbackError::PublicNotAcknowledged(crate::feedback::PUBLIC_SENTENCE),
+                S::CONFLICT,
+                "public_not_acknowledged",
+                "This repository is public. The screenshots will be visible to anyone. Confirm that before sending.",
+            ),
+            (
                 FeedbackError::IdeaBlocked(crate::feedback::idea::IdeaBlocked::BranchGone),
                 S::CONFLICT,
                 "idea_branch_missing",
@@ -1557,7 +1580,7 @@ mod tests {
         ];
         let covered: std::collections::BTreeSet<&str> =
             cases.iter().map(|(e, ..)| feedback_variant(e)).collect();
-        assert_eq!(covered.len(), 24, "{covered:?}");
+        assert_eq!(covered.len(), 25, "{covered:?}");
 
         for (e, status, code, message) in cases {
             assert_eq!((e.status(), e.code()), (status, code), "{message}");

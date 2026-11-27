@@ -61,6 +61,11 @@ const REPO_ARG: &str = "--repo=github.com/smithagents-test-invalid/widgets";
 const PR_URL: &str = "https://github.com/smithagents-test-invalid/widgets/pull/8";
 /// What the agent of every idea intent here writes under "Not done".
 const NOT_DONE: &str = "The demo video: the project did not start.";
+/// The refusals of a pull request in a repository that is, or may be,
+/// public, asked for without the user's acknowledgement.
+const PUBLIC: &str =
+    "This repository is public. The screenshots will be visible to anyone. Confirm that before sending.";
+const MAYBE_PUBLIC: &str = "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.";
 /// The refusals while the default branch is not known to be on origin.
 const UNPUSHED: &str = "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.";
 const NEVER_FETCHED: &str = "This repository has never been fetched from origin, so it is not known what is already published. Run git fetch first.";
@@ -309,14 +314,27 @@ impl Fx {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// `POST /v1/intents/{id}/pull-request`, as text.
+    /// `POST /v1/intents/{id}/pull-request` once the user confirmed that the
+    /// screenshots may be public, as the app sends it; as text.
     async fn open_pr_text(&self, id: IntentId) -> (StatusCode, String) {
         self.call_text(
             Method::POST,
             &format!("/v1/intents/{id}/pull-request"),
-            None,
+            Some(json!({"public_acknowledged": true})),
         )
         .await
+    }
+
+    /// `POST /v1/intents/{id}/pull-request` with this raw body (or none).
+    async fn open_pr_raw(&self, id: IntentId, body: Option<&str>) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/intents/{id}/pull-request"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+            .unwrap();
+        self.send(req).await
     }
 
     /// `POST /v1/intents/{id}/pull-request`.
@@ -2115,4 +2133,79 @@ async fn lasting_conditions_have_codes_of_their_own() {
         )
     );
     assert_eq!(bare_branches(&bare), Vec::<String>::new(), "main untouched");
+}
+
+#[tokio::test]
+async fn a_pull_request_in_a_public_repository_needs_the_acknowledgement() {
+    let fx = fixture_with(Opts {
+        turns: 2,
+        ..Opts::default()
+    })
+    .await;
+    fx.fake.set("visibility", "PUBLIC");
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, _, head) = fx.sent_idea(&repo).await;
+
+    // No body, an empty object, or `false`: refused before a commit is
+    // chosen, recorded or pushed.
+    for body in [None, Some("{}"), Some(r#"{"public_acknowledged": false}"#)] {
+        let (status, answer) = fx.open_pr_raw(idea.id, body).await;
+        assert_eq!(
+            refusal(status, &answer),
+            (
+                StatusCode::CONFLICT,
+                Some("public_not_acknowledged"),
+                Some(PUBLIC)
+            ),
+            "{body:?}"
+        );
+    }
+    assert!(bare_branches(&bare).is_empty(), "nothing pushed");
+    assert_eq!(fx.idea_of(idea.id).await.pr_commit, None, "nothing chosen");
+    assert!(fx.calls_starting("pr").is_empty(), "{:?}", fx.fake.calls());
+    // A body that is not JSON is the route's usual 400.
+    let (status, answer) = fx.open_pr_raw(idea.id, Some("not json")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"], "bad_request");
+
+    // Acknowledged: opened.
+    let (status, answer) = fx.open_pr(idea.id).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["origin"]["idea"]["pr_url"], PR_URL);
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), head);
+
+    // gh cannot tell: it may be public. (The same GitHub repository: past
+    // the 10 minutes its answer is used again.)
+    let (repo, bare) = fx.github_repo("r2").await;
+    let (idea, _, _) = fx.sent_idea(&repo).await;
+    fx.fake.set("fail", "repo view");
+    fx.minutes.store(11, Ordering::SeqCst);
+    let (status, answer) = fx.open_pr_raw(idea.id, None).await;
+    assert_eq!(
+        refusal(status, &answer),
+        (
+            StatusCode::CONFLICT,
+            Some("public_not_acknowledged"),
+            Some(MAYBE_PUBLIC)
+        )
+    );
+    assert!(bare_branches(&bare).is_empty());
+}
+
+#[tokio::test]
+async fn a_pull_request_in_a_private_repository_needs_no_acknowledgement() {
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, _, head) = fx.sent_idea(&repo).await;
+
+    let (status, answer) = fx.open_pr_raw(idea.id, None).await;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["origin"]["idea"]["pr_url"], PR_URL);
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), head);
+    assert_eq!(fx.calls_starting("repo view").len(), 1);
 }

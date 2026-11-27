@@ -377,11 +377,19 @@ impl Client {
     }
 
     /// `POST /v1/intents/{id}/pull-request`: an idea intent's "Open pull
-    /// request" (the push and `gh`), answered with the intent. No timeout: a
-    /// push and `gh` can take minutes.
-    pub async fn open_pull_request(&self, id: IntentId) -> Result<Intent, ClientError> {
+    /// request" (the push and `gh`), answered with the intent.
+    /// `public_acknowledged`: the user confirmed that a public repository
+    /// shows the screenshots to anyone (the daemon refuses a public or
+    /// possibly public one without it). No timeout: a push and `gh` can take
+    /// minutes.
+    pub async fn open_pull_request(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> Result<Intent, ClientError> {
         let url = self.url(&format!("/v1/intents/{id}/pull-request"));
-        self.fetch(self.http.post(url)).await
+        let body = json!({ "public_acknowledged": public_acknowledged });
+        self.fetch(self.http.post(url).json(&body)).await
     }
 
     /// `POST /v1/intents/{id}/implementation`: an idea intent's "Create

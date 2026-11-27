@@ -48,6 +48,11 @@ const REPO_ARG: &str = "--repo=github.com/smithagents-test-invalid/widgets";
 /// The sign-in check, for github.com only.
 const AUTH: &str = "auth status --hostname=github.com";
 const BRANCH: &str = "feedback/2026-11-26-fix-the-zoom";
+/// The refusals of a GitHub issue to a repository that is, or may be,
+/// public, sent without the user's acknowledgement.
+const PUBLIC: &str =
+    "This repository is public. The screenshots will be visible to anyone. Confirm that before sending.";
+const MAYBE_PUBLIC: &str = "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.";
 /// The refusals while the default branch is not known to be on origin.
 const UNPUSHED: &str = "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.";
 const NEVER_FETCHED: &str = "This repository has never been fetched from origin, so it is not known what is already published. Run git fetch first.";
@@ -393,11 +398,20 @@ fn redirect(repo: &Repo, target: &Path) {
 }
 
 /// A `github_issue` request for `repo`: "Fix the zoom", kind `new_feature`,
-/// one screenshot with one comment.
+/// one screenshot with one comment, sent once the user confirmed that the
+/// screenshots may be public (`public_acknowledged`).
 fn issue_request(repo: &Repo) -> Value {
     let mut req = request_json(repo.id, "github_issue");
     req["kind"] = json!("new_feature");
     req["attachments"] = json!([screenshot("Too big")]);
+    req["public_acknowledged"] = json!(true);
+    req
+}
+
+/// [`issue_request`] as an older app sends it: no `public_acknowledged`.
+fn unacknowledged_issue_request(repo: &Repo) -> Value {
+    let mut req = issue_request(repo);
+    req.as_object_mut().unwrap().remove("public_acknowledged");
     req
 }
 
@@ -1707,4 +1721,113 @@ async fn every_push_checks_what_origin_has_first() {
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["pushed"], true);
     assert_eq!(again["issue_url"], ISSUE_URL);
+}
+
+// --------------------------------------------- the public-repository question
+
+#[tokio::test]
+async fn a_public_repository_needs_the_users_acknowledgement() {
+    let fx = fixture().await;
+    fx.fake.set("visibility", "PUBLIC");
+    let (repo, bare) = fx.github_repo("r1").await;
+    // An older app's request has no acknowledgement: refused, nothing made.
+    let req = unacknowledged_issue_request(&repo);
+    let (status, body) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        (body["error"].as_str(), body["message"].as_str()),
+        (Some("public_not_acknowledged"), Some(PUBLIC))
+    );
+    assert_eq!(git_out(&repo.path, &["branch", "--list", "feedback/*"]), "");
+    assert_eq!(fx.row(&req["submission_id"]).await, None);
+    assert!(fx.feedback_tmp_is_empty());
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "");
+    assert!(
+        fx.calls_starting("issue").is_empty(),
+        "{:?}",
+        fx.fake.calls()
+    );
+    // So is `false`.
+    let mut refused = req.clone();
+    refused["public_acknowledged"] = json!(false);
+    let (status, body) = fx.submit_shot(&refused).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (StatusCode::CONFLICT, Some("public_not_acknowledged"))
+    );
+
+    // Acknowledged, under the same id: made.
+    let mut acknowledged = req.clone();
+    acknowledged["public_acknowledged"] = json!(true);
+    let (status, out) = fx.submit_shot(&acknowledged).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["issue_url"], ISSUE_URL);
+}
+
+#[tokio::test]
+async fn a_private_repository_is_not_asked_and_an_unknown_one_is() {
+    let fx = fixture().await;
+    let (repo, _bare) = fx.github_repo("r1").await;
+    // Private (the fake's default): no acknowledgement needed.
+    let (status, out) = fx.submit_shot(&unacknowledged_issue_request(&repo)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["issue_url"], ISSUE_URL);
+    assert_eq!(
+        fx.calls_starting("repo view").len(),
+        1,
+        "{:?}",
+        fx.fake.calls()
+    );
+
+    // gh cannot tell: it may be public. (The same GitHub repository: past
+    // the 10 minutes its answer is used again.)
+    let (other, bare) = fx.github_repo("r2").await;
+    fx.fake.set("fail", "repo view");
+    fx.minutes.store(11, Ordering::SeqCst);
+    let req = unacknowledged_issue_request(&other);
+    let (status, body) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        (body["error"].as_str(), body["message"].as_str()),
+        (Some("public_not_acknowledged"), Some(MAYBE_PUBLIC))
+    );
+    assert_eq!(fx.row(&req["submission_id"]).await, None);
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "");
+    // The intent path is never asked.
+    let mut intent = req.clone();
+    intent["send_as"] = json!("intent");
+    let (status, out) = fx.submit_shot(&intent).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+}
+
+#[tokio::test]
+async fn a_recorded_submission_is_not_asked_again() {
+    let fx = fixture().await;
+    fx.fake.set("visibility", "PUBLIC");
+    let (repo, bare) = fx.github_repo("r1").await;
+    let hook = refuse_pushes(&bare);
+    let req = issue_request(&repo);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["failed"]["code"], "push_rejected", "{out}");
+    std::fs::remove_file(&hook).unwrap();
+
+    // The retry route has no acknowledgement, and needs none.
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["issue_url"], ISSUE_URL);
+    // Nor does the same request sent again without it.
+    let (status, same) = fx
+        .submit_shot(&unacknowledged_issue_request_like(&req))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{same}");
+    assert_eq!(same["issue_url"], ISSUE_URL);
+    assert_eq!(fx.calls_starting("issue create").len(), 1);
+}
+
+/// `req` without its `public_acknowledged`.
+fn unacknowledged_issue_request_like(req: &Value) -> Value {
+    let mut req = req.clone();
+    req.as_object_mut().unwrap().remove("public_acknowledged");
+    req
 }

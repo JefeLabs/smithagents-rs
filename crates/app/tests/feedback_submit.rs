@@ -1962,3 +1962,117 @@ fn a_demo_video_comes_back_when_the_reloaded_targets_have_agent_browser(cx: &mut
         Some("Only works for projects a browser can show.")
     );
 }
+
+// ---- The public-repository acknowledgement ----------------------------------
+
+/// Whether a dialog is open.
+fn dialog(cx: &mut TestAppContext, window: WindowHandle<Root>) -> bool {
+    with_window(cx, window, |window, cx| window.has_active_dialog(cx))
+}
+
+/// Whether a label reads `text`.
+fn label_reads(cx: &mut TestAppContext, window: WindowHandle<Root>, text: &str) -> bool {
+    with_window(cx, window, |window, _| {
+        window
+            .find_all_by_role(Role::Label)
+            .iter()
+            .any(|label| label.value() == Some(text))
+    })
+}
+
+#[gpui_kit::test]
+fn the_acknowledgement_is_sent_only_after_the_dialog(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let (alpha, beta) = (repos[0].id, repos[1].id);
+    let opened = open(cx, &setup, &repos, Some(alpha));
+    let window = opened.window;
+    screenshot(cx, &opened, &setup, &["the toolbar"]);
+    // alpha is public.
+    open_submit(
+        cx,
+        &opened,
+        targets(
+            &[(alpha, true, Some(true)), (beta, true, Some(false))],
+            true,
+            false,
+        ),
+    );
+    type_idea(cx, window, "Fix the zoom");
+    click(cx, window, SEND_ISSUE_ID);
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    click(cx, window, PUBLIC_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 1);
+    assert!(submits[0].0.public_acknowledged, "confirmed in the dialog");
+}
+
+#[gpui_kit::test]
+fn an_intent_carries_no_acknowledgement(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    click(cx, opened.window, SUBMIT_CONFIRM_ID);
+    assert!(!dialog(cx, opened.window), "not asked");
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 1);
+    assert!(!submits[0].0.public_acknowledged);
+}
+
+#[gpui_kit::test]
+fn a_daemon_that_still_asks_gets_the_question_and_the_same_id(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let opened = open(cx, &setup, &repos, Some(alpha));
+    let window = opened.window;
+    screenshot(cx, &opened, &setup, &["the toolbar"]);
+    // The app believes alpha private: no dialog, no acknowledgement.
+    open_submit(
+        cx,
+        &opened,
+        targets(&[(alpha, true, Some(false))], true, false),
+    );
+    type_idea(cx, window, "Fix the zoom");
+    click(cx, window, SEND_ISSUE_ID);
+    opened.fake.queue_outcome(Err(api(
+        409,
+        "public_not_acknowledged",
+        "This repository is public. The screenshots will be visible to anyone. Confirm that before sending.",
+    )));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let first = opened.fake.submits();
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].0.public_acknowledged);
+
+    // The daemon says otherwise: the question, with the "may be public"
+    // warning; the form is not locked.
+    assert!(dialog(cx, window), "asked");
+    assert!(label_reads(cx, window, MAYBE_PUBLIC_WARNING));
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+
+    // Cancel: nothing more is sent, the form stays editable.
+    click(cx, window, PUBLIC_CANCEL_ID);
+    assert!(!dialog(cx, window));
+    assert_eq!(opened.fake.submits().len(), 1);
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+
+    // Again, and confirmed: sent again under the same id, acknowledged.
+    opened.fake.queue_outcome(Err(api(
+        409,
+        "public_not_acknowledged",
+        "This repository is public. The screenshots will be visible to anyone. Confirm that before sending.",
+    )));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(dialog(cx, window));
+    click(cx, window, PUBLIC_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(
+        submits.len(),
+        3,
+        "the refused one, then the acknowledged one"
+    );
+    assert_eq!(submits[2].0.submission_id, first[0].0.submission_id);
+    assert!(submits[2].0.public_acknowledged);
+    assert!(!dialog(cx, window), "asked once");
+}

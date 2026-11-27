@@ -147,7 +147,18 @@ pub enum FeedbackError {
     /// An idea action cannot go ahead until something changes.
     #[error("{}", .0.sentence())]
     IdeaBlocked(idea::IdeaBlocked),
+    /// A GitHub issue or pull request for a repository that is (or, when
+    /// `gh` cannot tell, may be) public, without the user's acknowledgement:
+    /// [`PUBLIC_SENTENCE`] or [`MAYBE_PUBLIC_SENTENCE`].
+    #[error("{0}")]
+    PublicNotAcknowledged(&'static str),
 }
+
+/// Why a GitHub issue or pull request was refused for a public repository.
+pub const PUBLIC_SENTENCE: &str =
+    "This repository is public. The screenshots will be visible to anyone. Confirm that before sending.";
+/// The same, for a repository `gh` could not tell the visibility of.
+pub const MAYBE_PUBLIC_SENTENCE: &str = "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.";
 
 impl FeedbackError {
     pub fn code(&self) -> &str {
@@ -176,6 +187,7 @@ impl FeedbackError {
             Self::Step(failure) => &failure.code,
             Self::Unpublished(_) => repo::UNPUSHED_CODE,
             Self::IdeaBlocked(blocked) => blocked.code(),
+            Self::PublicNotAcknowledged(_) => "public_not_acknowledged",
         }
     }
 
@@ -195,7 +207,8 @@ impl FeedbackError {
             | Self::NotReady(_)
             | Self::OutOfScope(_)
             | Self::Unpublished(_)
-            | Self::IdeaBlocked(_) => StatusCode::CONFLICT,
+            | Self::IdeaBlocked(_)
+            | Self::PublicNotAcknowledged(_) => StatusCode::CONFLICT,
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -672,12 +685,21 @@ impl FeedbackService {
         // submission is continued, never refused.
         let gh_checked = staged.request.send_as == SendAs::GithubIssue
             && self.store.get_submission(id).await?.is_none();
-        if gh_checked {
-            self.require_github(staged.request.repo_id).await?;
-        }
+        // Asked here too (`gh` may be asked whether the repository is
+        // public); its answer counts only for a new commit, after the push
+        // check (see `record`).
+        let acknowledged = if gh_checked {
+            let github = self.require_github(staged.request.repo_id).await?;
+            Some(
+                self.acknowledgement(&github, staged.request.public_acknowledged)
+                    .await,
+            )
+        } else {
+            None
+        };
         let submission = {
             let _turn = self.parts.submitting.lock().await;
-            self.record(staged).await?
+            self.record(staged, acknowledged).await?
         };
         self.finish(submission, gh_checked).await
     }
@@ -698,8 +720,13 @@ impl FeedbackService {
     }
 
     /// The submission's record: the stored one, the one of a commit made
-    /// before, or a new commit's.
-    async fn record(&self, staged: Staged) -> Result<Submission, FeedbackError> {
+    /// before, or a new commit's. `acknowledged`: for a GitHub issue, what
+    /// [`Self::acknowledgement`] answered; it refuses only a new commit.
+    async fn record(
+        &self,
+        staged: Staged,
+        acknowledged: Option<Result<(), FeedbackError>>,
+    ) -> Result<Submission, FeedbackError> {
         let id = staged.request.submission_id;
         if let Some(recorded) = self.store.get_submission(id).await? {
             drop(staged);
@@ -746,6 +773,10 @@ impl FeedbackService {
                 .inspect_err(|e| {
                     tracing::warn!(submission_id = %id, step = "commit", code = e.code(), "feedback was not committed");
                 })?;
+            if let Some(Err(e)) = acknowledged {
+                tracing::warn!(submission_id = %id, step = "commit", code = e.code(), "feedback was not committed");
+                return Err(e);
+            }
         }
 
         let created = (self.clock)();
@@ -794,20 +825,42 @@ impl FeedbackService {
         Ok(submission)
     }
 
-    /// `NoGithubRemote` unless the repository's `origin` is on github.com,
-    /// then `GhNotReady` unless `gh` is ready and signed in.
-    async fn require_github(&self, repo_id: RepoId) -> Result<(), FeedbackError> {
+    /// The github.com repository `origin` names; `NoGithubRemote` when it is
+    /// none, then `GhNotReady` unless `gh` is ready and signed in.
+    async fn require_github(&self, repo_id: RepoId) -> Result<GithubRepo, FeedbackError> {
         let repo = self
             .store
             .get_repo(repo_id)
             .await?
             .ok_or(FeedbackError::RepoNotFound)?;
-        if self.github_of(&repo).await?.is_none() {
-            return Err(FeedbackError::NoGithubRemote);
-        }
+        let github = self
+            .github_of(&repo)
+            .await?
+            .ok_or(FeedbackError::NoGithubRemote)?;
         match gh_readiness(&self.gh()).await.reason {
-            None => Ok(()),
+            None => Ok(github),
             Some(reason) => Err(FeedbackError::GhNotReady(not_ready_sentence(&reason))),
+        }
+    }
+
+    /// The one rule for sending the screenshots to GitHub (an issue, an
+    /// idea's pull request): `Ok` when the user acknowledged that they may
+    /// be public, or `github` is private ([`Self::visibility`]: `gh repo
+    /// view`, or its answer of the last 10 minutes); else
+    /// `PublicNotAcknowledged`, with [`PUBLIC_SENTENCE`] for a public
+    /// repository and [`MAYBE_PUBLIC_SENTENCE`] when `gh` cannot tell.
+    async fn acknowledgement(
+        &self,
+        github: &GithubRepo,
+        acknowledged: bool,
+    ) -> Result<(), FeedbackError> {
+        if acknowledged {
+            return Ok(());
+        }
+        match self.visibility(&self.gh(), github).await {
+            Some(false) => Ok(()),
+            Some(true) => Err(FeedbackError::PublicNotAcknowledged(PUBLIC_SENTENCE)),
+            None => Err(FeedbackError::PublicNotAcknowledged(MAYBE_PUBLIC_SENTENCE)),
         }
     }
 

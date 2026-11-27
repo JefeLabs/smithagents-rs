@@ -52,13 +52,15 @@ pub const KINDS: [FeedbackKind; 3] = [
 /// demo video without `agent-browser`),
 /// `repo::require_published_default_branch` (`unpushed_commits`, for an
 /// issue: the default branch has commits `origin` has not got, or nothing
-/// was ever fetched) and
+/// was ever fetched), `FeedbackService::acknowledgement`
+/// (`public_not_acknowledged`, for an issue to a repository that is or may
+/// be public, sent without the user's acknowledgement) and
 /// `repo::place_and_commit` (`default_branch_missing`,
 /// `git_identity_missing`, `no_free_name`, `name_taken`, `folder_blocked`,
 /// `branch_blocked`). They count only as a 4xx answer: the daemon sends
 /// `git_failed` and `io_error` as 500, and any 5xx locks. (Before a push,
 /// `unpushed_commits` is a failed step of a recorded submission instead.)
-pub const NOTHING_MADE_CODES: [&str; 13] = [
+pub const NOTHING_MADE_CODES: [&str; 14] = [
     "invalid",
     "unsupported_file",
     "payload_too_large",
@@ -72,7 +74,14 @@ pub const NOTHING_MADE_CODES: [&str; 13] = [
     "folder_blocked",
     "branch_blocked",
     "unpushed_commits",
+    PUBLIC_NOT_ACKNOWLEDGED,
 ];
+
+/// The daemon's code for a GitHub issue to a repository that is or may be
+/// public, sent without the user's acknowledgement: the app asks (with
+/// [`MAYBE_PUBLIC_WARNING`](crate::feedback::text::MAYBE_PUBLIC_WARNING))
+/// and sends again with it.
+pub const PUBLIC_NOT_ACKNOWLEDGED: &str = "public_not_acknowledged";
 
 /// The daemon's code when a tool the submission needs is not ready: only
 /// `agent-browser`, for an idea package's demo video.
@@ -96,6 +105,12 @@ pub enum SendFailure {
     /// Something may exist under the id: a 5xx, an unknown code, a transport
     /// failure after the request was sent. The draft is locked.
     MayExist,
+}
+
+/// Whether the daemon refused a request because the repository is or may
+/// be public and the user did not acknowledge it ([`PUBLIC_NOT_ACKNOWLEDGED`]).
+pub fn asks_to_acknowledge(error: &LinkError) -> bool {
+    matches!(error, LinkError::Client(ClientError::Api { code, .. }) if code == PUBLIC_NOT_ACKNOWLEDGED)
 }
 
 pub fn send_failure(error: &LinkError) -> SendFailure {

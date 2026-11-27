@@ -82,6 +82,12 @@ pub struct FeedbackRequest {
     pub platform: String,
     #[serde(default)]
     pub attachments: Vec<FeedbackAttachment>,
+    /// The user confirmed that the screenshots will be visible to anyone if
+    /// the repository is public (asked before every GitHub issue to a
+    /// repository that is or may be public). An older app sends nothing:
+    /// not acknowledged.
+    #[serde(default)]
+    pub public_acknowledged: bool,
 }
 
 /// The step of a submission that failed after its files were committed.
@@ -222,6 +228,7 @@ mod tests {
                 original_name: "a.png".into(),
                 boxes: vec![],
             }],
+            public_acknowledged: true,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["send_as"], "github_issue");
@@ -235,6 +242,7 @@ mod tests {
         assert_eq!(got.idea, None);
         assert!(got.attachments.is_empty());
         assert_eq!(got.send_as, SendAs::Intent);
+        assert!(!got.public_acknowledged, "an older app's request");
 
         let mut bad = min;
         bad["kind"] = json!("feature");

@@ -10,9 +10,9 @@ use common::feedback_submit::{outcome_with_intent, outcome_with_issue};
 use common::intents::{intent, FakeIntents};
 use smithagents_app::feedback::draft::{Attachment, AttachmentId, AttachmentKind, Draft};
 use smithagents_app::feedback::submit_vm::{
-    attachments_phrase, can_confirm, confirm_label, demo_help, issue_reason, public_warning,
-    result_text, send_failure, starting_repo, submit_error_text, summary, upload_problem,
-    SendFailure, KINDS,
+    asks_to_acknowledge, attachments_phrase, can_confirm, confirm_label, demo_help, issue_reason,
+    public_warning, result_text, send_failure, starting_repo, submit_error_text, summary,
+    upload_problem, SendFailure, KINDS,
 };
 use smithagents_app::feedback::text::{
     DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON,
@@ -715,6 +715,7 @@ fn what_a_failed_send_leaves_under_its_id() {
         (409, "folder_blocked"),
         (409, "branch_blocked"),
         (409, "unpushed_commits"),
+        (409, "public_not_acknowledged"),
     ] {
         assert_eq!(
             send_failure(&api(status, code, "x")),
@@ -796,4 +797,24 @@ fn the_fixed_sentences_of_this_round() {
             FeedbackKind::Bug
         ]
     );
+}
+
+#[test]
+fn only_the_acknowledgement_refusal_asks_again() {
+    assert!(asks_to_acknowledge(&api(
+        409,
+        "public_not_acknowledged",
+        "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.",
+    )));
+    for e in [
+        api(
+            409,
+            "gh_not_ready",
+            "GitHub CLI (gh) is not signed in; run: gh auth login",
+        ),
+        api(409, "unpushed_commits", "x"),
+        LinkError::NotConnected,
+    ] {
+        assert!(!asks_to_acknowledge(&e), "{e:?}");
+    }
 }

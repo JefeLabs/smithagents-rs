@@ -366,7 +366,10 @@ fn open_pull_request_asks_first(cx: &mut TestAppContext) {
     click(cx, window, OPEN_PR_ID);
     click(cx, window, OPEN_PR_CONFIRM_ID);
     assert!(!dialog_open(cx, window));
-    assert_eq!(calls(&opened), [FeedbackCall::OpenPullRequest(resolved.id)]);
+    assert_eq!(
+        calls(&opened),
+        [FeedbackCall::OpenPullRequest(resolved.id, true)]
+    );
     assert_eq!(
         busy(cx, &opened),
         Some(Busy::PullRequest),
@@ -409,7 +412,10 @@ fn a_second_press_while_busy_sends_nothing(cx: &mut TestAppContext) {
         window.double_click(IMPLEMENT_ID, cx)
     });
     frame(cx, window);
-    assert_eq!(calls(&opened), [FeedbackCall::OpenPullRequest(resolved.id)]);
+    assert_eq!(
+        calls(&opened),
+        [FeedbackCall::OpenPullRequest(resolved.id, true)]
+    );
     assert_eq!(busy(cx, &opened), Some(Busy::PullRequest));
 }
 

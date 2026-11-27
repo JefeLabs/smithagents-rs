@@ -424,6 +424,7 @@ async fn a_running_submission_keeps_an_idle_daemon_up() {
         app_version: "0.1.0".into(),
         platform: "macos".into(),
         attachments: vec![],
+        public_acknowledged: false,
     };
     let submit = {
         let (client, request) = (client.clone(), request.clone());

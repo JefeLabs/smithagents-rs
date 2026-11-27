@@ -33,7 +33,9 @@ pub enum FeedbackCall {
     Targets,
     Submit(FeedbackRequest, Vec<FeedbackFile>),
     Retry(SubmissionId),
-    OpenPullRequest(IntentId),
+    /// The idea intent, and whether the user acknowledged a public
+    /// repository.
+    OpenPullRequest(IntentId, bool),
     Implement(IntentId),
 }
 
@@ -192,8 +194,8 @@ impl FeedbackCommands for FakeFeedback {
         self.outcomes.borrow_mut().reply(|| Err(LinkError::Stopped))
     }
 
-    fn open_pull_request(&self, id: IntentId) -> IntentAnswer {
-        self.record(FeedbackCall::OpenPullRequest(id));
+    fn open_pull_request(&self, id: IntentId, public_acknowledged: bool) -> IntentAnswer {
+        self.record(FeedbackCall::OpenPullRequest(id, public_acknowledged));
         self.intents.borrow_mut().reply(|| Err(LinkError::Stopped))
     }
 

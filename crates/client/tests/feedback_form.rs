@@ -85,6 +85,7 @@ fn request() -> FeedbackRequest {
             original_name: "Screen Shot.png".into(),
             boxes: vec![],
         }],
+        public_acknowledged: true,
     }
 }
 
@@ -343,7 +344,7 @@ async fn the_idea_actions_post_to_the_intent_and_decode_it() {
         let c = client(port);
         let got = tokio::time::timeout(PATIENCE, async {
             if route == "pull-request" {
-                c.open_pull_request(intent.id).await
+                c.open_pull_request(intent.id, true).await
             } else {
                 c.create_implementation_intent(intent.id).await
             }
@@ -359,13 +360,23 @@ async fn the_idea_actions_post_to_the_intent_and_decode_it() {
             head.contains(&format!("authorization: bearer {TOKEN}")),
             "{head}"
         );
-        assert!(body.is_empty(), "{route}");
+        if route == "pull-request" {
+            // The user's acknowledgement goes along.
+            let sent: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(sent, json!({"public_acknowledged": true}));
+            assert!(head.contains("content-type: application/json"), "{head}");
+        } else {
+            assert!(body.is_empty(), "{route}");
+        }
     }
 
     // A failed step decodes with its own code.
     let refusal = json!({"error": "push_rejected", "message": "git could not push to origin: the remote rejected the branch"});
     let (port, _server) = answer_once(502, refusal).await;
-    let err = client(port).open_pull_request(intent.id).await.unwrap_err();
+    let err = client(port)
+        .open_pull_request(intent.id, false)
+        .await
+        .unwrap_err();
     assert!(
         matches!(&err, ClientError::Api { status: 502, code, .. } if code == "push_rejected"),
         "{err:?}"

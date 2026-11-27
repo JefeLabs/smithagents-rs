@@ -563,6 +563,7 @@ mod tests {
             app_version: "0.1.0+dev".into(),
             platform: "macos-14_arm".into(),
             attachments: vec![],
+            public_acknowledged: false,
         }
     }
 

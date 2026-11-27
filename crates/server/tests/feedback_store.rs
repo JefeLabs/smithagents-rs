@@ -219,6 +219,7 @@ fn submission(repo_id: RepoId) -> Submission {
                 original_name: "a.png".into(),
                 boxes: vec![],
             }],
+            public_acknowledged: false,
         },
         title: "Fix the zoom".into(),
         branch: "feedback/fix-the-zoom".into(),

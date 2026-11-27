@@ -339,12 +339,16 @@ impl IntentsPane {
     }
 
     /// Asks the daemon to push the idea branch and open its pull request;
-    /// nothing while another command is in flight.
+    /// nothing while another command is in flight. Only sent from the
+    /// confirmation, whose text says a public repository shows the
+    /// screenshots to anyone: so it is acknowledged (the daemon refuses a
+    /// public or possibly public repository without it, which this answer
+    /// then never meets).
     fn open_pull_request(&mut self, id: IntentId, window: &mut Window, cx: &mut Context<Self>) {
         tracing::debug!(%id, "opening an idea's pull request");
         self.feedback_command(
             Busy::PullRequest,
-            move |commands| commands.open_pull_request(id),
+            move |commands| commands.open_pull_request(id, true),
             |_, _, _, _| {},
             window,
             cx,

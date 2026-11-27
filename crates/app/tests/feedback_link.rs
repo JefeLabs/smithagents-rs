@@ -154,6 +154,7 @@ async fn the_created_intent_is_in_the_model_when_the_answer_arrives() {
                 comment: "the toolbar".into(),
             }],
         }],
+        public_acknowledged: false,
     };
     let files = vec![
         FeedbackFile {

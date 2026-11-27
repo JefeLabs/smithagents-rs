@@ -63,14 +63,15 @@ use super::card::cards;
 use super::{confirm, Confirmation, FeedbackPane, FeedbackScreen, Paint};
 use crate::feedback::state::{Pending, SentTo, SUBMIT_TIMEOUT};
 use crate::feedback::submit_vm::{
-    can_confirm, confirm_label, failure_text, issue_reason, public_warning, result_text,
-    send_failure, starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
+    asks_to_acknowledge, can_confirm, confirm_label, failure_text, issue_reason, public_warning,
+    result_text, send_failure, starting_repo, submit_error_text, summary, upload_problem,
+    SendFailure, KINDS,
 };
 use crate::feedback::text::{
     BACK_LABEL, CHOOSE_REPO_TEXT, KIND_LABEL, MAIN_IDEA_HINT, MAIN_IDEA_LABEL,
-    NOTHING_CREATED_TEXT, PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL,
-    SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL, START_OVER_LABEL,
-    START_OVER_RISK_TEXT, START_OVER_TITLE, START_OVER_TOOLTIP,
+    MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE,
+    REPO_LABEL, RETRY_LABEL, SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL,
+    START_OVER_LABEL, START_OVER_RISK_TEXT, START_OVER_TITLE, START_OVER_TOOLTIP,
 };
 use crate::intent_vm::kind_label;
 use crate::link::LinkError;
@@ -564,7 +565,8 @@ impl FeedbackPane {
     }
 
     /// Sends now, or, for a GitHub issue in a repository that is or may be
-    /// public, after the user confirms (every time).
+    /// public, after the user confirms (every time): only then does the
+    /// request carry `public_acknowledged`.
     fn ask_then_send(
         &mut self,
         to: SentTo,
@@ -573,9 +575,22 @@ impl FeedbackPane {
         cx: &mut Context<Self>,
     ) {
         let Some(warning) = public_warning(to.send_as, self.target(Some(to.repo_id))) else {
-            self.send(to, attempt, window, cx);
+            self.send(to, attempt, false, window, cx);
             return;
         };
+        self.ask_public(to, attempt, warning, window, cx);
+    }
+
+    /// Asks whether the screenshots may go to a repository that is or may
+    /// be public (`warning` says which); confirmed, sends acknowledged.
+    fn ask_public(
+        &mut self,
+        to: SentTo,
+        attempt: Attempt,
+        warning: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let pane: WeakEntity<Self> = cx.entity().downgrade();
         let ask = Confirmation {
             title_id: PUBLIC_CONFIRM_TITLE_ID,
@@ -592,7 +607,7 @@ impl FeedbackPane {
         confirm(
             ask,
             move |window, cx| {
-                let _ = pane.update(cx, |pane, cx| pane.send(to, attempt, window, cx));
+                let _ = pane.update(cx, |pane, cx| pane.send(to, attempt, true, window, cx));
             },
             window,
             cx,
@@ -604,7 +619,17 @@ impl FeedbackPane {
     /// never while a capture or other work on the draft runs. A draft the
     /// daemon would refuse is not sent: the error line says why. The target
     /// is on disk before the request leaves ([`Feedback::mark_sent`]).
-    fn send(&mut self, to: SentTo, attempt: Attempt, window: &mut Window, cx: &mut Context<Self>) {
+    /// `acknowledged`: the user confirmed that a public repository shows the
+    /// screenshots to anyone (the retry route carries nothing: the daemon
+    /// does not ask again for a recorded submission).
+    fn send(
+        &mut self,
+        to: SentTo,
+        attempt: Attempt,
+        acknowledged: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.submit.busy.is_some() {
             tracing::debug!("a feedback submission is already under way");
             return;
@@ -672,6 +697,7 @@ impl FeedbackPane {
                     app_version: smithagents_core::VERSION.to_owned(),
                     platform: std::env::consts::OS.to_owned(),
                     attachments,
+                    public_acknowledged: acknowledged,
                 };
                 tracing::info!(%submission_id, send_as = ?to.send_as, "sending feedback");
                 Sending::Submit(request, files.into_iter().map(|(file, _)| file).collect())
@@ -701,7 +727,7 @@ impl FeedbackPane {
         self.submit.command = Some(cx.spawn_in(window, async move |this, cx| {
             let answer = answered(command, timer).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.finish(to, attempt, before, answer, window, cx)
+                this.finish(to, attempt, acknowledged, before, answer, window, cx)
             });
         }));
         cx.notify();
@@ -710,10 +736,12 @@ impl FeedbackPane {
     /// `answer` is `None` when the daemon did not answer in time; `before`
     /// is where the submission stood before this attempt. Whatever may exist
     /// under the id keeps the draft locked (see [`send_failure`]).
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &mut self,
         to: SentTo,
         attempt: Attempt,
+        acknowledged: bool,
         before: (Option<SentTo>, bool),
         answer: Option<Result<FeedbackOutcome, LinkError>>,
         window: &mut Window,
@@ -770,6 +798,13 @@ impl FeedbackPane {
                         self.feedback
                             .update(cx, |feedback, cx| feedback.set_sent(sent, awaiting, cx));
                         self.after_refusal(&e, window, cx);
+                        // The app took the repository for private, the
+                        // daemon does not: asked now, and sent again under
+                        // the same id once confirmed.
+                        if !acknowledged && attempt != Attempt::Retry && asks_to_acknowledge(&e) {
+                            tracing::info!("the daemon asks to confirm a public repository");
+                            self.ask_public(to, attempt, MAYBE_PUBLIC_WARNING, window, cx);
+                        }
                         Some(submit_error_text(&e))
                     }
                     SendFailure::NotRecorded
@@ -779,7 +814,7 @@ impl FeedbackPane {
                         tracing::info!(
                             "no record of a submission whose answer never came; sending it again"
                         );
-                        self.send(to, Attempt::Reupload, window, cx);
+                        self.send(to, Attempt::Reupload, acknowledged, window, cx);
                         cx.notify();
                         return;
                     }

@@ -415,13 +415,18 @@ impl DaemonLink {
         self.feedback_command(move |c| async move { c.retry_feedback(id).await })
     }
 
-    /// An idea intent's "Open pull request"; the answer reaches the UI as
-    /// `Action::IntentUpserted` too, as for every intent command.
+    /// An idea intent's "Open pull request" (`public_acknowledged`: the user
+    /// confirmed that a public repository shows the screenshots to anyone);
+    /// the answer reaches the UI as `Action::IntentUpserted` too, as for
+    /// every intent command.
     pub fn open_pull_request(
         &self,
         id: IntentId,
+        public_acknowledged: bool,
     ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
-        self.intent_command(move |c| async move { c.open_pull_request(id).await })
+        self.intent_command(
+            move |c| async move { c.open_pull_request(id, public_acknowledged).await },
+        )
     }
 
     /// An idea intent's "Create implementation intent"; the new intent
@@ -600,8 +605,10 @@ pub trait FeedbackCommands {
         id: SubmissionId,
     ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>>;
     /// Pushes the idea intent's work as its idea branch and opens a draft
-    /// pull request; the link upserts the answer.
-    fn open_pull_request(&self, id: IntentId) -> IntentAnswer;
+    /// pull request; `public_acknowledged` once the user confirmed that a
+    /// public repository shows the screenshots to anyone. The link upserts
+    /// the answer.
+    fn open_pull_request(&self, id: IntentId, public_acknowledged: bool) -> IntentAnswer;
     /// Creates the idea intent's implementation intent (once); the link
     /// upserts the answer.
     fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer;
@@ -634,8 +641,8 @@ impl FeedbackCommands for DaemonLink {
         DaemonLink::retry_feedback(self, id).boxed_local()
     }
 
-    fn open_pull_request(&self, id: IntentId) -> IntentAnswer {
-        DaemonLink::open_pull_request(self, id).boxed_local()
+    fn open_pull_request(&self, id: IntentId, public_acknowledged: bool) -> IntentAnswer {
+        DaemonLink::open_pull_request(self, id, public_acknowledged).boxed_local()
     }
 
     fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer {
