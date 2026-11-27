@@ -108,6 +108,36 @@ fn github_is_packed_with_its_own_manifest() {
     check_github(&pack_fixtures_once().dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn folders_others_can_write_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // What a umask of 002 (or an earlier, laxer run) leaves: discovery
+    // refuses a plugins folder, or a plugin's folder, that others can write.
+    let out = tempfile::tempdir().unwrap();
+    let root = out.path().join("plugins");
+    for dir in [root.clone(), root.join("fixture-dylib")] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+
+    pack(&PackOptions {
+        release: true,
+        out_dir: root.clone(),
+        fixtures: true,
+    })
+    .unwrap();
+
+    assert_not_writable_by_others(&root);
+    for id in FIXTURES {
+        assert_not_writable_by_others(&root.join(id));
+    }
+    // Nothing else of the folder's mode changes.
+    let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
 #[test]
 fn concurrent_packs_into_one_directory_both_succeed() {
     let out = tempfile::tempdir().unwrap();

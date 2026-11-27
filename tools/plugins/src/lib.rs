@@ -276,6 +276,12 @@ pub fn pack(opts: &PackOptions) -> Result<Packed, PackError> {
 
         let dir = opts.out_dir.join(spec.id);
         fs::create_dir_all(&dir).map_err(io_at(&dir))?;
+        // `create_dir_all` leaves the mode to the umask, and a folder that
+        // was already there keeps its own: discovery refuses both the
+        // plugins folder and a plugin's folder when others can write them.
+        for folder in [opts.out_dir.as_path(), dir.as_path()] {
+            keep_others_from_writing(folder).map_err(io_at(folder))?;
+        }
         let bytes = fs::read(&artifact).map_err(io_at(&artifact))?;
         write_atomic(&dir.join(&entry), &bytes, mode)?;
         write_atomic(&dir.join("plugin.toml"), manifest.as_bytes(), FILE_MODE)?;
@@ -457,6 +463,23 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+/// Takes the group's and others' write permission from `folder`, if they
+/// have it; the rest of its mode stays.
+#[cfg(unix)]
+fn keep_others_from_writing(folder: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(folder)?.permissions().mode();
+    if mode & 0o022 == 0 {
+        return Ok(());
+    }
+    fs::set_permissions(folder, fs::Permissions::from_mode(mode & !0o022))
+}
+
+#[cfg(not(unix))]
+fn keep_others_from_writing(_folder: &Path) -> io::Result<()> {
     Ok(())
 }
 
