@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 # The one crate allowed `unsafe`: loading a library and fetching its entry
-# cannot be done without it. Each use carries its own allowance.
+# cannot be done without it. Each use carries its own `expect` with a reason.
 [lints.rust]
 unsafe_code = "deny"
 

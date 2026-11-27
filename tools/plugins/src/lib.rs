@@ -307,6 +307,47 @@ pub fn pack_fixtures_once() -> &'static Packed {
     })
 }
 
+/// A folder of a test's own inside the plugins folder of the running
+/// executable (`<its directory>/plugins/<name>.<pid>.<n>`), removed when
+/// dropped. For tests that load a native plugin: the loader opens a library
+/// only from inside that plugins folder, which for a test is the folder
+/// beside the test executable. Neither folder is writable by the group or
+/// others, as discovery requires. Panics if it cannot be made.
+#[derive(Debug)]
+pub struct BuiltinScratch {
+    dir: PathBuf,
+}
+
+impl BuiltinScratch {
+    pub fn new(name: &str) -> BuiltinScratch {
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let exe = std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .expect("the running executable has a path");
+        let plugins = exe
+            .parent()
+            .expect("an executable sits in a directory")
+            .join("plugins");
+        let n = MADE.fetch_add(1, Ordering::Relaxed);
+        let dir = plugins.join(format!("{name}.{}.{n}", std::process::id()));
+        fs::create_dir_all(&dir)
+            .and_then(|()| keep_others_from_writing(&plugins))
+            .and_then(|()| keep_others_from_writing(&dir))
+            .unwrap_or_else(|e| panic!("cannot make {}: {e}", dir.display()));
+        BuiltinScratch { dir }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for BuiltinScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Builds the `cdylib` crate in `crate_dir`, which stands apart from this
 /// workspace (its manifest has its own `[workspace]` table), and copies its
 /// library, named from `lib`, into `out_dir`. Returns the copy's path.

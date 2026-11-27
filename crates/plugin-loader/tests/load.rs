@@ -5,10 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use smithagents_plugin_loader::{load, DylibLoadError, LoadedPlugin};
+use smithagents_plugin_loader::{builtin_dir, load, load_unchecked, DylibLoadError, LoadedPlugin};
 use smithagents_plugin_protocol::dylib::{BoxedDylibHost, DylibHost, DYLIB_ENTRY_SYMBOL};
 use smithagents_plugin_protocol::{HostReply, Manifest, PluginCall, PluginReply, SyncRequest};
-use smithagents_plugins_tool::{pack_fixtures_once, pack_library, workspace_root};
+use smithagents_plugins_tool::{pack_fixtures_once, pack_library, workspace_root, BuiltinScratch};
 
 /// A host that refuses every call: these tests make none.
 struct NoHost;
@@ -26,12 +26,35 @@ fn host() -> BoxedDylibHost {
     stabby::boxed::Box::new(NoHost).into()
 }
 
-/// The packed `fixture-dylib` library, as its manifest names it.
+/// The packed `fixture-dylib` library, as its manifest names it: where the
+/// packer wrote it, which is outside the plugins folder of this test.
 fn fixture() -> PathBuf {
     let dir = pack_fixtures_once().dir.join("fixture-dylib");
     let manifest = std::fs::read_to_string(dir.join("plugin.toml")).unwrap();
     let manifest = Manifest::parse(&manifest).unwrap();
     dir.join(manifest.entry.unwrap())
+}
+
+/// A copy of [`fixture`] inside this test executable's plugins folder, the
+/// only place [`load`] opens a library from.
+fn builtin_fixture(scratch: &BuiltinScratch) -> PathBuf {
+    let from = fixture();
+    let to = scratch.path().join(from.file_name().unwrap());
+    std::fs::copy(&from, &to).unwrap();
+    to
+}
+
+/// [`load_unchecked`] for a file a test made itself, wherever it is.
+fn load_anywhere(path: &Path) -> Result<LoadedPlugin, DylibLoadError> {
+    // SAFETY: every path given here is a file one of these tests wrote or a
+    // library built from this workspace against this plugin interface.
+    #[expect(
+        unsafe_code,
+        reason = "these tests load libraries they built themselves"
+    )]
+    unsafe {
+        load_unchecked(path, host())
+    }
 }
 
 /// One of the test libraries beside this file, built and packed into `out`.
@@ -57,7 +80,7 @@ fn sync(plugin: &LoadedPlugin, call: u64, resource: &str) -> PluginReply {
 
 /// The refusal for `path`. Its message is one line and names the file.
 fn refused(path: &Path) -> DylibLoadError {
-    let Err(err) = load(path, host()) else {
+    let Err(err) = load_anywhere(path) else {
         panic!("{} was loaded", path.display());
     };
     let message = err.to_string();
@@ -69,7 +92,8 @@ fn refused(path: &Path) -> DylibLoadError {
 
 #[test]
 fn the_packed_fixture_answers_a_sync_call() {
-    let plugin = load(&fixture(), host()).unwrap();
+    let scratch = BuiltinScratch::new("loader");
+    let plugin = load(&builtin_fixture(&scratch), host()).unwrap();
     match sync(&plugin, 1, "items") {
         PluginReply::Sync(Ok(page)) => {
             let ids: Vec<_> = page.upserts.iter().map(|i| i.id.as_str()).collect();
@@ -81,7 +105,8 @@ fn the_packed_fixture_answers_a_sync_call() {
 
 #[test]
 fn the_fixture_answers_a_panic_and_unreadable_input_and_keeps_serving() {
-    let plugin = load(&fixture(), host()).unwrap();
+    let scratch = BuiltinScratch::new("loader");
+    let plugin = load(&builtin_fixture(&scratch), host()).unwrap();
     match sync(&plugin, 1, "panic") {
         PluginReply::Panicked { message } => {
             assert!(message.starts_with("fixture panic"), "{message}")
@@ -133,4 +158,42 @@ fn an_entry_with_another_signature_is_refused_as_a_mismatch() {
     let err = refused(&path);
     assert!(matches!(err, DylibLoadError::Mismatch { .. }), "{err:?}");
     assert!(err.to_string().contains("mismatch"), "{err}");
+}
+
+#[test]
+fn a_library_outside_the_plugins_folder_is_not_opened() {
+    // Opening a library runs its code in this process, so the folder is
+    // checked before anything is opened, and by the loader itself: no caller
+    // has to remember to.
+    let outside = fixture();
+    assert!(!outside.starts_with(builtin_dir().unwrap()));
+    let Err(err) = load(&outside, host()) else {
+        panic!("a library outside the plugins folder was loaded");
+    };
+    assert!(matches!(err, DylibLoadError::NotBuiltin { .. }), "{err:?}");
+    let message = err.to_string();
+    assert!(!message.contains('\n'), "{message}");
+    let file = outside.file_name().unwrap().to_str().unwrap();
+    assert!(message.contains(file), "{message}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_inside_the_plugins_folder_to_a_library_outside_is_not_opened() {
+    let scratch = BuiltinScratch::new("loader-link");
+    let link = scratch.path().join("liblinked.dylib");
+    std::os::unix::fs::symlink(fixture(), &link).unwrap();
+    let Err(err) = load(&link, host()) else {
+        panic!("a link to a library outside the plugins folder was followed");
+    };
+    assert!(matches!(err, DylibLoadError::NotBuiltin { .. }), "{err:?}");
+}
+
+#[test]
+fn a_missing_file_in_the_plugins_folder_is_refused_as_before() {
+    let scratch = BuiltinScratch::new("loader-missing");
+    let Err(err) = load(&scratch.path().join("libabsent.dylib"), host()) else {
+        panic!("a missing library was loaded");
+    };
+    assert!(matches!(err, DylibLoadError::Open { .. }), "{err:?}");
 }

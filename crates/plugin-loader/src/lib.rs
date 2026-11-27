@@ -1,7 +1,14 @@
-//! Loads a built-in plugin from a native library: the only code in the
-//! workspace that needs `unsafe`, kept to opening the library and fetching
-//! its entry. Everything else crosses the boundary through stabby's checked
-//! interfaces in `smithagents_plugin_protocol::dylib`.
+//! Loads a built-in plugin from a native library: the only hand-written
+//! `unsafe` in the workspace, kept to opening the library and fetching its
+//! entry. Everything else crosses the boundary through stabby's checked
+//! interfaces in `smithagents_plugin_protocol::dylib`. (stabby's and
+//! wit-bindgen's macros also expand to `unsafe` in the crates that use them;
+//! the workspace's `forbid(unsafe_code)` does not see macro output.)
+//!
+//! Opening a library runs its code in this process, so which file may be
+//! opened is decided here, beside the `unsafe`, and not left to callers:
+//! [`load`] opens only what lies inside [`builtin_dir`]. [`load_unchecked`]
+//! opens any path and is `unsafe` for that reason.
 //!
 //! A loaded library is never unloaded: the plugin object and anything it
 //! hands out point into the library's code.
@@ -33,6 +40,13 @@ pub enum DylibLoadError {
         entry_name()
     )]
     Mismatch { path: PathBuf },
+    /// The file is not inside the plugins folder beside the running
+    /// executable. It was not opened.
+    #[error(
+        "{} is not in the plugins folder beside this executable; a native plugin is loaded only from there",
+        path.display()
+    )]
+    NotBuiltin { path: PathBuf },
 }
 
 fn entry_name() -> &'static str {
@@ -44,15 +58,71 @@ pub struct LoadedPlugin {
     plugin: BoxedDylibPlugin,
 }
 
-/// Opens `path`, checks its entry against [`DylibEntry`] and calls it with
-/// `host`. Only built-in plugins, which ship beside the daemon, may be loaded
-/// this way: opening a library runs its code in the daemon's process.
+/// `<directory of the running executable>/plugins`, with the executable's
+/// links resolved: the one folder native plugins are loaded from. Whoever
+/// can write there can replace the executable itself, so what lies in it is
+/// trusted as much as the executable is. `None` when the executable's path
+/// cannot be found.
+pub fn builtin_dir() -> Option<PathBuf> {
+    let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+    Some(exe.parent()?.join("plugins"))
+}
+
+/// Opens the library at `path`, checks its entry against [`DylibEntry`] and
+/// calls it with `host`, if the file lies inside [`builtin_dir`] once every
+/// link in `path` is resolved. Anything else is refused unopened
+/// ([`DylibLoadError::NotBuiltin`]): opening a library runs its code in this
+/// process.
+///
+/// # Errors
+///
+/// [`DylibLoadError::Open`] for a file that is missing or is not a library,
+/// `NotBuiltin` for one outside the plugins folder, `NoEntry` and `Mismatch`
+/// for a library that is not a plugin built against this interface.
 pub fn load(path: &Path, host: BoxedDylibHost) -> Result<LoadedPlugin, DylibLoadError> {
-    // SAFETY: opening a library runs its initialisers in this process. The
-    // caller passes only built-in plugins, built from this workspace against
-    // the same interface crate. The library is leaked right after, never
+    let real = std::fs::canonicalize(path).map_err(|e| DylibLoadError::Open {
+        path: path.to_path_buf(),
+        message: describe(&e),
+    })?;
+    let builtin = builtin_dir().and_then(|dir| std::fs::canonicalize(dir).ok());
+    if !builtin.is_some_and(|dir| real.starts_with(dir)) {
+        return Err(DylibLoadError::NotBuiltin {
+            path: path.to_path_buf(),
+        });
+    }
+    // SAFETY: `real` is a file inside the plugins folder that ships beside
+    // this executable, and nothing in its path is a link to elsewhere. Only
+    // who can replace the executable can put a file there, and what ships
+    // there is built from this workspace against this interface crate.
+    #[expect(
+        unsafe_code,
+        reason = "a library inside the executable's own plugins folder"
+    )]
+    unsafe {
+        load_unchecked(&real, host)
+    }
+}
+
+/// [`load`] without the check of where the file is.
+///
+/// # Safety
+///
+/// `path` must name a library built against this build of
+/// `smithagents-plugin-protocol`, from code that is trusted as much as this
+/// process: opening it runs its initialisers here, and its entry is called.
+///
+/// # Errors
+///
+/// As [`load`], without `NotBuiltin`.
+#[expect(unsafe_code, reason = "opening a library cannot be done without it")]
+pub unsafe fn load_unchecked(
+    path: &Path,
+    host: BoxedDylibHost,
+) -> Result<LoadedPlugin, DylibLoadError> {
+    // SAFETY: opening a library runs its initialisers in this process, which
+    // the caller has vouched for. The library is leaked right after, never
     // unloaded, so code and data it hands out stay valid for the process.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "opening a library the caller vouches for")]
     let library = unsafe { Library::new(path) }.map_err(|e| DylibLoadError::Open {
         path: path.to_path_buf(),
         message: describe(&e),
@@ -63,7 +133,7 @@ pub fn load(path: &Path, host: BoxedDylibHost) -> Result<LoadedPlugin, DylibLoad
     // compares the type report compiled into the library with `DylibEntry`'s
     // report here and returns the function only when they agree, so the
     // pointer has the type we call it with. The leaked library outlives it.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "fetching the entry stabby has checked")]
     let entry = unsafe { library.get_stabbied::<DylibEntry>(DYLIB_ENTRY_SYMBOL) }.map_err(|e| {
         let path = path.to_path_buf();
         // A missing symbol is libloading's error; a mismatch is stabby's own

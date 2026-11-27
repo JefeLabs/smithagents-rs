@@ -11,16 +11,21 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithagents_plugin_host::{CallError, CallPurpose, DylibRuntime, LoadError, PluginRuntime};
 use smithagents_plugin_protocol::{HostMode, Manifest, SyncPage, SyncRequest};
-use smithagents_plugins_tool::pack_fixtures_once;
+use smithagents_plugins_tool::{pack_fixtures_once, BuiltinScratch};
 
 use common::{fixture_services, TestServer};
 
-/// The packed fixture library, as its manifest names it.
-fn library() -> PathBuf {
+/// The packed fixture library, as its manifest names it, copied into this
+/// test executable's plugins folder: a native plugin is loaded only from
+/// there. The copy goes when the returned folder is dropped.
+fn library() -> (BuiltinScratch, PathBuf) {
     let dir = pack_fixtures_once().dir.join("fixture-dylib");
     let manifest = std::fs::read_to_string(dir.join("plugin.toml")).unwrap();
-    let manifest = Manifest::parse(&manifest).unwrap();
-    dir.join(manifest.entry.unwrap())
+    let entry = Manifest::parse(&manifest).unwrap().entry.unwrap();
+    let scratch = BuiltinScratch::new("plugin-host-dylib");
+    let library = scratch.path().join(&entry);
+    std::fs::copy(dir.join(&entry), &library).unwrap();
+    (scratch, library)
 }
 
 async fn call(
@@ -41,7 +46,8 @@ async fn call(
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_then_every_call_is_refused() {
     let server = TestServer::start().await;
-    let runtime = DylibRuntime::load(&library(), Duration::from_millis(200)).unwrap();
+    let (_plugins, library) = library();
+    let runtime = DylibRuntime::load(&library, Duration::from_millis(200)).unwrap();
     assert_eq!(runtime.mode(), HostMode::Dylib);
     let runtime: Arc<dyn PluginRuntime> = Arc::new(runtime);
     // The suite ends with a call that times out.
@@ -62,7 +68,8 @@ async fn conformance_then_every_call_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_call_under_a_finished_calls_number_is_a_bad_call() {
     let server = TestServer::start().await;
-    let runtime = DylibRuntime::load(&library(), Duration::from_secs(10)).unwrap();
+    let (_plugins, library) = library();
+    let runtime = DylibRuntime::load(&library, Duration::from_secs(10)).unwrap();
     call(&runtime, "items", json!({})).await.unwrap();
     // `stale-call` sends an HTTP request under the number of the call above.
     let settings = json!({ "url": server.url("/ok") });
@@ -76,7 +83,8 @@ async fn a_host_call_under_a_finished_calls_number_is_a_bad_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ten_concurrent_calls_on_one_runtime_all_succeed() {
-    let runtime = DylibRuntime::load(&library(), Duration::from_secs(10)).unwrap();
+    let (_plugins, library) = library();
+    let runtime = DylibRuntime::load(&library, Duration::from_secs(10)).unwrap();
     let runtime = Arc::new(runtime);
     let mut calls = tokio::task::JoinSet::new();
     for _ in 0..10 {

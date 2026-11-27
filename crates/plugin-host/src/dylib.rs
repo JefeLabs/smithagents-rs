@@ -40,9 +40,17 @@ pub struct DylibRuntime {
     stopped: AtomicBool,
 }
 
+/// `<directory of the running executable>/plugins`: the one folder native
+/// plugins are loaded from. `None` when the executable's path cannot be
+/// found.
+pub fn builtin_plugins_dir() -> Option<std::path::PathBuf> {
+    smithagents_plugin_loader::builtin_dir()
+}
+
 impl DylibRuntime {
-    /// Loads the library at `path`. Only built-in plugins may be loaded: the
-    /// library runs in the daemon's process.
+    /// Loads the library at `path`, which must lie inside
+    /// [`builtin_plugins_dir`]: the library runs in the daemon's process, so
+    /// the loader opens nothing from anywhere else, whoever asks.
     pub fn load(path: &Path, call_timeout: Duration) -> Result<DylibRuntime, LoadError> {
         let calls = Arc::new(LiveCalls::default());
         let host: BoxedDylibHost = stabby::boxed::Box::new(HostSide {

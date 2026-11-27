@@ -1,6 +1,7 @@
 //! Plugin discovery: which directories hold a plugin that may load, and how
-//! it is loaded. This is the only place that keeps native (dylib) plugins to
-//! the built-in directory: the loader crate accepts any path.
+//! it is loaded. Native (dylib) plugins are kept to the built-in directory
+//! twice: here, by their origin and by the checks below, and by the loader
+//! crate, which opens no library outside the folder beside the executable.
 //!
 //! Trust model (Unix; other platforms have no permission bits to check and
 //! skip these checks). The anchor is the directory holding the daemon
@@ -110,10 +111,10 @@ pub struct Rejected {
 }
 
 /// `<directory of the running executable>/plugins`, with the executable's
-/// symlinks resolved so the directory is the real one.
+/// symlinks resolved so the directory is the real one: the folder the
+/// loader opens native plugins from, and no other.
 pub fn builtin_plugins_dir() -> Option<PathBuf> {
-    let exe = fs::canonicalize(std::env::current_exe().ok()?).ok()?;
-    Some(exe.parent()?.join("plugins"))
+    smithagents_plugin_host::builtin_plugins_dir()
 }
 
 #[derive(Default)]
