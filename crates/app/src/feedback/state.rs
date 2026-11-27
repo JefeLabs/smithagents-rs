@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 use futures::future::{Either, LocalBoxFuture};
 use futures::FutureExt as _;
 use gpui_kit::{
-    App, AppContext as _, Context, EventEmitter, PathPromptOptions, RenderImage, Task, Window,
+    App, AppContext as _, Context, EventEmitter, PathPromptOptions, RenderImage, Subscription,
+    Task, Window,
 };
 use serde::{Deserialize, Serialize};
 use smithagents_capture::{CaptureError, Capturer, Frame, WindowTarget};
@@ -262,7 +263,17 @@ pub struct Feedback {
     submitting: bool,
     /// The last success sentence, until the draft changes.
     result: Option<String>,
+    /// A typed main idea that waits [`IDEA_SAVE_DELAY`] to be written.
+    idea_save: Option<Task<()>>,
+    /// Write a waiting main idea when the app quits or the draft goes away.
+    _write_on_exit: [Subscription; 2],
 }
+
+/// How long a typed main idea waits for more typing before it is written.
+/// Writing the draft is a full flush to disk on the thread that draws the
+/// window, so it is done once per pause, not once per key. A crash within
+/// the pause loses that much typing; a quit does not.
+pub const IDEA_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 impl EventEmitter<FeedbackEvent> for Feedback {}
 
@@ -307,6 +318,14 @@ impl Feedback {
             thumbnails: HashMap::new(),
             retired: Vec::new(),
             pending,
+            idea_save: None,
+            _write_on_exit: [
+                cx.on_app_quit(|this, _| {
+                    this.write_waiting_idea();
+                    async {}
+                }),
+                cx.on_release(|this, _| this.write_waiting_idea()),
+            ],
             submitting: false,
             result: None,
         };
@@ -864,13 +883,33 @@ impl Feedback {
     // ---- Submitting ------------------------------------------------------
 
     /// Keeps the main idea (the first line is the title). Not while locked.
+    /// The draft holds it at once; it is written when the typing has paused
+    /// for [`IDEA_SAVE_DELAY`], or sooner with anything else that writes the
+    /// draft, before a submission begins, and when the app quits.
     pub fn set_main_idea(&mut self, text: String, cx: &mut Context<Self>) {
         if self.locked() || self.draft.main_idea == text {
             return;
         }
         self.draft.main_idea = text;
-        self.save();
+        // The draft changed, so the last success sentence goes, as in `save`.
+        self.result = None;
+        // Replacing the task cancels the previous wait: a debounce.
+        self.idea_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(IDEA_SAVE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                this.write_waiting_idea();
+                cx.notify();
+            });
+        }));
         cx.notify();
+    }
+
+    /// Writes the draft now if a typed main idea is still waiting to be
+    /// written (a failure is said).
+    fn write_waiting_idea(&mut self) {
+        if self.idea_save.is_some() {
+            self.save();
+        }
     }
 
     /// Keeps the kind, by its wire name. Not while locked.
@@ -921,6 +960,8 @@ impl Feedback {
     /// `submission.json` (a failed write is said; the id still holds for
     /// this run).
     pub fn begin_submission(&mut self, cx: &mut Context<Self>) -> SubmissionId {
+        // What is sent is what a restart finds in the draft.
+        self.write_waiting_idea();
         if let Some(pending) = &self.pending {
             return pending.submission_id;
         }
@@ -1110,6 +1151,8 @@ impl Feedback {
     /// changed, so the last success sentence goes.
     fn save(&mut self) -> bool {
         self.result = None;
+        // The whole draft is written, a waiting main idea with it.
+        self.idea_save = None;
         match self.files.save(&self.draft) {
             Ok(()) => true,
             Err(e) => {
