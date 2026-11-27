@@ -597,74 +597,6 @@ pub async fn tracking_branch_exists(repo_root: &Path, branch: &str) -> Result<bo
     }
 }
 
-/// What a Git LFS pointer file starts with.
-const LFS_POINTER_START: &[u8] = b"version https://git-lfs.github.com/spec/v1";
-/// The largest file Git LFS writes as a pointer.
-const LFS_POINTER_MAX: u64 = 1024;
-
-/// Whether any file under `folder` at `commit` (a full commit id) is a Git
-/// LFS pointer: a blob of at most 1024 bytes that starts with `version
-/// https://git-lfs.github.com/spec/v1`. The sizes come from `git ls-tree -r
-/// -l -z`; only the small blobs are read, each at most 1024 bytes, never
-/// through a filter.
-pub async fn has_lfs_pointer(
-    repo_root: &Path,
-    commit: &str,
-    folder: &str,
-) -> Result<bool, GitError> {
-    if !is_commit_id(commit) {
-        return Err(GitError::UnsafeArgument);
-    }
-    let ran = isolated(
-        repo_root,
-        &[
-            "ls-tree",
-            "-r",
-            "-l",
-            "-z",
-            "--full-tree",
-            commit,
-            "--",
-            folder,
-        ],
-    )
-    .await?;
-    ran.ok()?;
-    // Each entry: `<mode> SP <type> SP <id> SP+ <size> TAB <path>`, ended by
-    // NUL; a submodule's size is `-`.
-    let small: Vec<String> = ran
-        .stdout
-        .split(|b| *b == 0)
-        .filter_map(|entry| {
-            let tab = entry.iter().position(|b| *b == b'\t')?;
-            let head = std::str::from_utf8(&entry[..tab]).ok()?;
-            let mut fields = head.split_ascii_whitespace();
-            let (_mode, kind, id, size) = (
-                fields.next()?,
-                fields.next()?,
-                fields.next()?,
-                fields.next()?,
-            );
-            let size: u64 = size.parse().ok()?;
-            (kind == "blob" && size <= LFS_POINTER_MAX && is_commit_id(id)).then(|| id.to_owned())
-        })
-        .collect();
-    for id in small {
-        let read = run(
-            isolated_command(repo_root, &["cat-file", "blob", &id]),
-            local_timeout(),
-            None,
-            LFS_POINTER_MAX,
-        )
-        .await?;
-        read.ok()?;
-        if read.stdout.starts_with(LFS_POINTER_START) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// What `path` is at `rev` (a local branch or a commit id, see
 /// [`show_file`]): `blob` (a file or a link), `tree` (a folder) or `commit`
 /// (a submodule, mode 160000); `None` when nothing is there or `rev` names
@@ -978,24 +910,11 @@ pub async fn changes_since(
     head: &str,
     max_commits: usize,
 ) -> Result<Changes, GitError> {
-    if !is_commit_id(base) || !is_commit_id(head) {
-        return Err(GitError::UnsafeArgument);
-    }
-    let ancestor = isolated(repo_root, &["merge-base", "--is-ancestor", base, head]).await?;
-    match ancestor.status.code() {
-        Some(0) => {}
-        Some(1) => return Ok(Changes::NotOnBase),
-        status => return Err(GitError::Failed { status }),
-    }
-    let max = format!("--max-count={}", max_commits.saturating_add(1));
-    let range = format!("{base}..{head}");
-    let listed = isolated(repo_root, &["rev-list", &max, &range, "--"]).await?;
-    listed.ok()?;
-    let commits = String::from_utf8_lossy(&listed.stdout).into_owned();
-    let commits: Vec<&str> = commits.lines().filter(|l| !l.is_empty()).collect();
-    if commits.len() > max_commits {
-        return Ok(Changes::TooMany);
-    }
+    let commits = match commits_since(repo_root, base, head, max_commits).await? {
+        CommitsSince::Commits(commits) => commits,
+        CommitsSince::NotOnBase => return Ok(Changes::NotOnBase),
+        CommitsSince::TooMany => return Ok(Changes::TooMany),
+    };
     if commits.is_empty() {
         return Ok(Changes::Paths(Vec::new()));
     }
@@ -1031,6 +950,231 @@ pub async fn changes_since(
             .map(|p| String::from_utf8_lossy(p).into_owned())
             .collect(),
     ))
+}
+
+/// The commits after `base` up to `head`: see [`commits_since`].
+enum CommitsSince {
+    Commits(Vec<String>),
+    NotOnBase,
+    TooMany,
+}
+
+/// `git rev-list <base>..<head>` (both full commit ids), at most
+/// `max_commits` of them, else `TooMany`; `NotOnBase` unless `git merge-base
+/// --is-ancestor <base> <head>` holds. Two git processes.
+async fn commits_since(
+    repo_root: &Path,
+    base: &str,
+    head: &str,
+    max_commits: usize,
+) -> Result<CommitsSince, GitError> {
+    if !is_commit_id(base) || !is_commit_id(head) {
+        return Err(GitError::UnsafeArgument);
+    }
+    let ancestor = isolated(repo_root, &["merge-base", "--is-ancestor", base, head]).await?;
+    match ancestor.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(CommitsSince::NotOnBase),
+        status => return Err(GitError::Failed { status }),
+    }
+    let max = format!("--max-count={}", max_commits.saturating_add(1));
+    let range = format!("{base}..{head}");
+    let listed = isolated(repo_root, &["rev-list", &max, &range, "--"]).await?;
+    listed.ok()?;
+    let commits: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(if commits.len() > max_commits {
+        CommitsSince::TooMany
+    } else {
+        CommitsSince::Commits(commits)
+    })
+}
+
+/// What a Git LFS pointer file starts with.
+const LFS_POINTER_START: &[u8] = b"version https://git-lfs.github.com/spec/v1";
+/// The largest file Git LFS writes as a pointer.
+const LFS_POINTER_MAX: u64 = 1024;
+/// The modes `git diff-tree --raw` gives what is no blob: nothing (a file
+/// deleted) and a submodule.
+const NO_BLOB_MODES: [&str; 2] = ["000000", "160000"];
+
+/// What the commits on top of a base hold under a folder: see
+/// [`lfs_pointer_since`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LfsCheck {
+    /// No Git LFS pointer in any of them.
+    Clean,
+    /// One of them has one.
+    Pointer,
+    /// The head does not have the base in its history.
+    NotOnBase,
+    /// More commits than were to be looked at, or more than git may print
+    /// here.
+    TooMany,
+}
+
+/// Whether a commit after `base` up to `head` (both full commit ids) has a
+/// Git LFS pointer under `folder`: a blob of at most 1024 bytes that starts
+/// with `version https://git-lfs.github.com/spec/v1`. Every blob such a
+/// commit puts under the folder (against each of its parents, as
+/// [`changes_since`] reads them) is looked at, so a pointer committed and
+/// replaced later is found too: the push publishes the whole history.
+///
+/// Bounded as [`changes_since`] is: `NotOnBase`, and `TooMany` past
+/// `max_commits` commits or when what git prints does not fit the output it
+/// may print here. Five git processes at most (`merge-base`, `rev-list`, one
+/// `diff-tree --stdin --raw` over the whole range, one `cat-file
+/// --batch-check` for the sizes, one `cat-file --batch` for the blobs of at
+/// most 1024 bytes); nothing is read through a filter, and no larger blob is
+/// read at all.
+pub async fn lfs_pointer_since(
+    repo_root: &Path,
+    base: &str,
+    head: &str,
+    folder: &str,
+    max_commits: usize,
+) -> Result<LfsCheck, GitError> {
+    let commits = match commits_since(repo_root, base, head, max_commits).await? {
+        CommitsSince::Commits(commits) => commits,
+        CommitsSince::NotOnBase => return Ok(LfsCheck::NotOnBase),
+        CommitsSince::TooMany => return Ok(LfsCheck::TooMany),
+    };
+    if commits.is_empty() {
+        return Ok(LfsCheck::Clean);
+    }
+    let diff = [
+        "diff-tree",
+        "--stdin",
+        "-r",
+        "-m",
+        "--root",
+        "--no-commit-id",
+        "--raw",
+        "--no-renames",
+        "-z",
+        "--",
+        folder,
+    ];
+    let Some(changed) = run_capped(repo_root, &diff, &lines(&commits), OUTPUT_MAX).await? else {
+        return Ok(LfsCheck::TooMany);
+    };
+    let blobs = blobs_put(&changed);
+    if blobs.is_empty() {
+        return Ok(LfsCheck::Clean);
+    }
+    let check = ["cat-file", "--batch-check"];
+    let Some(sizes) = run_capped(repo_root, &check, &lines(&blobs), OUTPUT_MAX).await? else {
+        return Ok(LfsCheck::TooMany);
+    };
+    let small = small_blobs(&sizes)?;
+    if small.is_empty() {
+        return Ok(LfsCheck::Clean);
+    }
+    // Each one comes as `<id> blob <size>` LF, the blob, LF.
+    let expected: u64 = small
+        .iter()
+        .map(|(id, size)| format!("{id} blob {size}\n").len() as u64 + size + 1)
+        .sum();
+    if expected > OUTPUT_MAX {
+        return Ok(LfsCheck::TooMany);
+    }
+    let ids: Vec<&str> = small.iter().map(|(id, _)| id.as_str()).collect();
+    let Some(read) =
+        run_capped(repo_root, &["cat-file", "--batch"], &lines(&ids), expected).await?
+    else {
+        return Err(GitError::Failed { status: None });
+    };
+    let mut rest = read.as_slice();
+    for (id, size) in &small {
+        let header = format!("{id} blob {size}\n");
+        let blob = rest
+            .strip_prefix(header.as_bytes())
+            .and_then(|after| after.get(..usize::try_from(*size).ok()?))
+            .ok_or(GitError::Failed { status: None })?;
+        if blob.starts_with(LFS_POINTER_START) {
+            return Ok(LfsCheck::Pointer);
+        }
+        rest = &rest[header.len() + blob.len()..];
+        rest = rest
+            .strip_prefix(b"\n")
+            .ok_or(GitError::Failed { status: None })?;
+    }
+    Ok(LfsCheck::Clean)
+}
+
+/// `items`, one per line, for a git command's stdin.
+fn lines<S: AsRef<str>>(items: &[S]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{}\n", item.as_ref()))
+        .collect()
+}
+
+/// What the isolated command `args` printed with `input` on stdin; `None`
+/// when that is more than `max` bytes.
+async fn run_capped(
+    repo_root: &Path,
+    args: &[&str],
+    input: &str,
+    max: u64,
+) -> Result<Option<Vec<u8>>, GitError> {
+    let ran = run(
+        isolated_command(repo_root, args),
+        local_timeout(),
+        Some(input.as_bytes()),
+        max.saturating_add(1),
+    )
+    .await?;
+    ran.ok()?;
+    Ok((ran.stdout.len() as u64 <= max).then_some(ran.stdout))
+}
+
+/// The blobs `git diff-tree --raw -z` output puts in place, once each: the
+/// new side of every entry, but a deletion's or a submodule's. Each entry is
+/// `:<old mode> SP <new mode> SP <old id> SP <new id> SP <status>` NUL, then
+/// its path and NUL (no renames, so one path).
+fn blobs_put(raw: &[u8]) -> Vec<String> {
+    let mut blobs = std::collections::BTreeSet::new();
+    for field in raw.split(|b| *b == 0) {
+        let Some(entry) = field.strip_prefix(b":") else {
+            continue;
+        };
+        let Ok(entry) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        let fields: Vec<&str> = entry.split(' ').collect();
+        if let [_, mode, _, id, _] = fields.as_slice() {
+            if !NO_BLOB_MODES.contains(mode) && is_commit_id(id) && id.bytes().any(|b| b != b'0') {
+                blobs.insert((*id).to_owned());
+            }
+        }
+    }
+    blobs.into_iter().collect()
+}
+
+/// The blobs of at most [`LFS_POINTER_MAX`] bytes in `git cat-file
+/// --batch-check` output (`<id> <type> <size>` per line), with their sizes.
+/// An object that is missing, or is no blob, is a failure: the commits that
+/// name it are not whole here.
+fn small_blobs(listed: &[u8]) -> Result<Vec<(String, u64)>, GitError> {
+    let mut small = Vec::new();
+    for line in listed.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let line = std::str::from_utf8(line).map_err(|_| GitError::Failed { status: None })?;
+        let fields: Vec<&str> = line.split(' ').collect();
+        let [id, "blob", size] = fields.as_slice() else {
+            return Err(GitError::Failed { status: None });
+        };
+        let size: u64 = size
+            .parse()
+            .map_err(|_| GitError::Failed { status: None })?;
+        if is_commit_id(id) && size <= LFS_POINTER_MAX {
+            small.push(((*id).to_owned(), size));
+        }
+    }
+    Ok(small)
 }
 
 /// Creates the local branch `branch` at `commit`, without tracking anything.
@@ -1881,35 +2025,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_lfs_pointer_is_found_only_under_the_folder() {
+    async fn an_lfs_pointer_in_any_commit_on_top_of_the_base_is_found() {
+        const FOLDER: &str = "docs/issues/x";
+        let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 12345\n";
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("r");
         init_repo(&dir, "main");
-        let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 12345\n";
-        let write = |path: &str, text: &[u8]| {
-            let file = dir.join(path);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, text).unwrap();
+        // Writes each file and commits; the commit.
+        let commit = |files: &[(&str, &[u8])], message: &str| {
+            for (path, bytes) in files {
+                let file = dir.join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, bytes).unwrap();
+            }
+            g(&dir, &["add", "-A"]);
+            g(&dir, &["commit", "-q", "--allow-empty", "-m", message]);
+            g(&dir, &["rev-parse", "HEAD"])
         };
-        write("docs/issues/x/issue.md", b"# x\n");
-        write("docs/issues/x/sub/big.bin", &vec![b'v'; 4096]);
-        write("elsewhere/demo.mp4", pointer.as_bytes());
-        g(&dir, &["add", "-A"]);
-        g(&dir, &["commit", "-q", "-m", "files"]);
-        let clean = g(&dir, &["rev-parse", "HEAD"]);
-        assert!(!has_lfs_pointer(&dir, &clean, "docs/issues/x")
-            .await
-            .unwrap());
-        assert!(has_lfs_pointer(&dir, &clean, "elsewhere").await.unwrap());
+        let base = commit(&[("docs/issues/x/issue.md", b"# x\n")], "base");
+        let check = |head: String, max_commits: usize| {
+            let (dir, base) = (dir.clone(), base.clone());
+            async move { lfs_pointer_since(&dir, &base, &head, FOLDER, max_commits).await }
+        };
+        let branch = |name: &str| g(&dir, &["checkout", "-q", "-b", name, &base]);
 
-        // In a subfolder too, and whatever the file is called.
-        write("docs/issues/x/sub/demo.mp4", pointer.as_bytes());
-        g(&dir, &["add", "-A"]);
-        g(&dir, &["commit", "-q", "-m", "pointer"]);
-        let with = g(&dir, &["rev-parse", "HEAD"]);
-        assert!(has_lfs_pointer(&dir, &with, "docs/issues/x").await.unwrap());
+        // A pointer added in one commit and replaced by the real file in
+        // the next is still published with the branch's history.
+        branch("history");
+        commit(
+            &[("docs/issues/x/demo.mp4", pointer)],
+            "the demo, through LFS",
+        );
+        let replaced = commit(
+            &[("docs/issues/x/demo.mp4", b"\0\0\0\x18ftypmp42")],
+            "the demo",
+        );
+        assert_eq!(check(replaced, 10).await.unwrap(), LfsCheck::Pointer);
+
+        // A pointer in the tip, in a subfolder, whatever the file is called.
+        branch("tip");
+        commit(&[("docs/issues/x/notes.md", b"notes\n")], "notes");
+        let tip = commit(&[("docs/issues/x/sub/clip", pointer)], "a clip");
+        assert_eq!(check(tip, 10).await.unwrap(), LfsCheck::Pointer);
+
+        // No pointer in any commit under the folder: a large file that
+        // starts like one (no pointer is over 1024 bytes), a small file that
+        // only mentions the line later, a pointer outside the folder.
+        branch("clean");
+        let mut large = pointer.to_vec();
+        large.resize(4096, b'v');
+        commit(&[("docs/issues/x/big.bin", large.as_slice())], "large");
+        commit(
+            &[(
+                "docs/issues/x/explainer.md",
+                b"How LFS files look:\n\nversion https://git-lfs.github.com/spec/v1\n",
+            )],
+            "explainer",
+        );
+        commit(&[("elsewhere/demo.mp4", pointer)], "elsewhere");
+        let clean = commit(&[("docs/issues/x/explainer.md", b"# Explainer\n")], "again");
+        assert_eq!(check(clean.clone(), 10).await.unwrap(), LfsCheck::Clean);
+        // Nothing on top of the base.
+        assert_eq!(check(base.clone(), 10).await.unwrap(), LfsCheck::Clean);
+
+        // Bounded as `changes_since` is.
+        assert_eq!(check(clean, 3).await.unwrap(), LfsCheck::TooMany);
+        g(&dir, &["checkout", "-q", "--orphan", "other"]);
+        let other = commit(&[], "other");
+        assert_eq!(check(other, 10).await.unwrap(), LfsCheck::NotOnBase);
         assert!(matches!(
-            has_lfs_pointer(&dir, "main", "docs/issues/x").await,
+            lfs_pointer_since(&dir, &base, "main", FOLDER, 10).await,
             Err(GitError::UnsafeArgument)
         ));
     }

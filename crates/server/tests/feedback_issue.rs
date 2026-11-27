@@ -479,7 +479,9 @@ fn mentions_are_neutralised_only_where_a_mention_starts() {
         ("pkg/@name", format!("pkg/@{z}name")),
         ("@@name", format!("@@{z}name")),
     ] {
-        assert_eq!(no_mentions(text), want, "{text:?}");
+        // The same in a title and in a body.
+        assert_eq!(no_mentions_in_title(text), want, "{text:?}");
+        assert_eq!(no_mentions_in_body(text), want, "{text:?}");
     }
     // Not where GitHub reads a mention: kept as typed.
     for kept in [
@@ -493,7 +495,60 @@ fn mentions_are_neutralised_only_where_a_mention_starts() {
         "@\u{e9}",
         "",
     ] {
-        assert_eq!(no_mentions(kept), kept, "{kept:?}");
+        assert_eq!(no_mentions_in_title(kept), kept, "{kept:?}");
+        assert_eq!(no_mentions_in_body(kept), kept, "{kept:?}");
+    }
+}
+
+#[test]
+fn an_at_inside_a_web_address_is_kept_in_a_body_only() {
+    // W2-5: in a body GitHub renders as Markdown, an address its extended
+    // autolink rule links mentions no one, so its `@` is left alone.
+    let z = '\u{200b}';
+    for kept in [
+        "https://www.npmjs.com/package/@types/node",
+        "See https://medium.com/@someone/post.",
+        "(https://a.b/@x)",
+        "HTTPS://A.B/@u",
+        "https://a.b:8080/@u",
+        "https://a.b?x=@u",
+        "https://a.b#@u",
+        "http://a.b/@u",
+        "https://a.b/@x/@y",
+        "https://a.b/@u at the very start",
+        "1https://a.b/@u",
+        "https://a.b/\u{e9}@u",
+    ] {
+        assert_eq!(no_mentions_in_body(kept), kept, "{kept:?}");
+        // A title is not rendered as Markdown: nothing in it is a link.
+        assert_ne!(no_mentions_in_title(kept), kept, "{kept:?}");
+    }
+    for (text, want) in [
+        ("xhttps://a.b/@u", format!("xhttps://a.b/@{z}u")),
+        ("https://a_b.c/@u", format!("https://a_b.c/@{z}u")),
+        ("https://localhost/@u", format!("https://localhost/@{z}u")),
+        (
+            "http://localhost:5173/@vite/client",
+            format!("http://localhost:5173/@{z}vite/client"),
+        ),
+        ("https:///@u", format!("https:///@{z}u")),
+        ("https://a.b @u", format!("https://a.b @{z}u")),
+        ("https://a.b/x<@u", format!("https://a.b/x<@{z}u")),
+        ("https://a.b:/@u", format!("https://a.b:/@{z}u")),
+        ("https://a.b:80x/@u", format!("https://a.b:80x/@{z}u")),
+        (
+            "https://b\u{fc}cher.de/@u",
+            format!("https://b\u{fc}cher.de/@{z}u"),
+        ),
+        ("ftp://a.b/@u", format!("ftp://a.b/@{z}u")),
+        ("www.a.b/@u", format!("www.a.b/@{z}u")),
+        (
+            "https://a.b/@x then @name",
+            format!("https://a.b/@x then @{z}name"),
+        ),
+        ("https://a.b/x\n@name", format!("https://a.b/x\n@{z}name")),
+    ] {
+        assert_eq!(no_mentions_in_body(text), want, "{text:?}");
     }
 }
 

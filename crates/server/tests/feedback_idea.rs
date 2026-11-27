@@ -482,7 +482,7 @@ impl Fx {
 }
 
 /// The explainer every idea agent here commits.
-const EXPLAINER: &str = "# Fix the zoom\n\n## What\n\nThe page is drawn too big; ask @octocat.\n\n![d](diagram-1.png)\n\n## Not done\n\nThe demo video: the project\ndid not start.\n";
+const EXPLAINER: &str = "# Fix the zoom\n\n## What\n\nThe page is drawn too big; ask @octocat. See https://medium.com/@someone/post.\n\n![d](diagram-1.png)\n\n## Not done\n\nThe demo video: the project\ndid not start.\n";
 
 /// Writes `files` into the issue folder of the worktree `dir` and commits
 /// them; the new commit's id.
@@ -1198,6 +1198,10 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
     let (idea, agent, head) = fx.sent_idea(&repo).await;
     // A tag named like the agent's branch, elsewhere: the branch is read.
     common::git(&repo.path, &["tag", &agent.branch, "main"]);
+    // A title with a web address in it (a title is never a link).
+    let mut titled = fx.state.intents.get(idea.id).await.unwrap();
+    titled.content.title = "Fix the zoom of https://a.b/@x".into();
+    fx.state.store.save_intent(&titled).await.unwrap();
     let seq = fx.state.bus.latest_seq();
 
     let (status, body) = fx.open_pr(idea.id).await;
@@ -1236,7 +1240,10 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
         )),
         "{calls:?}"
     );
-    assert!(calls[2].contains(" --body-file="), "{calls:?}");
+    assert!(
+        calls[2].contains(" --title=Fix the zoom of https://a.b/@\u{200b}x --body-file="),
+        "{calls:?}"
+    );
     assert!(calls[2].ends_with(REPO_ARG), "{calls:?}");
 
     let body = fx.fake.read("pr-body.md").unwrap();
@@ -1248,8 +1255,13 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
         body.contains(&format!("blob/{head}/{FOLDER}/diagram-1.png?raw=true")),
         "{body}"
     );
-    // Nobody is mentioned, and no submission marker is added.
+    // Nobody is mentioned, and no submission marker is added; a web
+    // address in the body keeps its `@` (W2-5).
     assert!(body.contains("@\u{200b}octocat"), "{body}");
+    assert!(
+        body.contains("See https://medium.com/@someone/post."),
+        "{body}"
+    );
     assert!(!body.contains("smithagents-feedback:"), "{body}");
 
     // The change was published.
@@ -2340,6 +2352,55 @@ async fn an_idea_branch_origin_already_has_says_how_to_get_out() {
 #[tokio::test]
 async fn an_idea_committed_through_git_lfs_is_refused() {
     // D-I1: a pointer pushed with hooks off would never upload its object.
+    // W2-4: also one an earlier commit of the agent's branch holds, though
+    // a later one replaced it: the push publishes the whole history.
+    let fx = fixture_with(Opts {
+        turns: 2,
+        ..Opts::default()
+    })
+    .await;
+    let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
+    for (name, replaced) in [("r1", false), ("r2", true)] {
+        let (repo, bare) = fx.github_repo(name).await;
+        let (idea, agent, _) = fx.sent_idea(&repo).await;
+        commit_in(
+            &agent.worktree_path,
+            &[("demo.mp4", pointer)],
+            "the demo video",
+        );
+        if replaced {
+            commit_in(
+                &agent.worktree_path,
+                &[("demo.mp4", "not a pointer any more")],
+                "the demo video, without LFS",
+            );
+        }
+
+        let (status, body) = fx.open_pr(idea.id).await;
+
+        assert_eq!(
+            refusal(status, &body),
+            (
+                StatusCode::CONFLICT,
+                Some("idea_lfs"),
+                Some("The idea's files were committed through Git LFS, now or in an earlier commit of the agent's branch, which this push does not upload. Turn Git LFS off for docs/issues and have the branch's commits made again without it.")
+            ),
+            "{name}"
+        );
+        assert!(bare_branches(&bare).is_empty(), "{name}: nothing pushed");
+        assert_eq!(
+            fx.idea_of(idea.id).await.pr_commit,
+            None,
+            "{name}: nothing chosen"
+        );
+    }
+    assert!(fx.calls_starting("pr").is_empty(), "{:?}", fx.fake.calls());
+}
+
+#[tokio::test]
+async fn a_commit_chosen_earlier_is_checked_for_git_lfs_again() {
+    // W2-4: the check runs for a commit chosen at an earlier press and not
+    // yet pushed too, over the whole range on top of the idea's commit.
     let fx = fixture_with(Opts {
         turns: 1,
         ..Opts::default()
@@ -2347,27 +2408,34 @@ async fn an_idea_committed_through_git_lfs_is_refused() {
     .await;
     let (repo, bare) = fx.github_repo("r1").await;
     let (idea, agent, _) = fx.sent_idea(&repo).await;
+    let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
     commit_in(
         &agent.worktree_path,
-        &[(
-            "demo.mp4",
-            "version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n",
-        )],
-        "the demo video",
+        &[("demo.mp4", pointer)],
+        "through LFS",
     );
+    let head = commit_in(
+        &agent.worktree_path,
+        &[("demo.mp4", "not a pointer any more")],
+        "without LFS",
+    );
+    // Chosen at an earlier press (before this check covered the history),
+    // and not pushed.
+    let mut stored = fx.state.intents.get(idea.id).await.unwrap();
+    stored
+        .origin
+        .as_mut()
+        .unwrap()
+        .idea
+        .as_mut()
+        .unwrap()
+        .pr_commit = Some(head.clone());
+    fx.state.store.save_intent(&stored).await.unwrap();
 
     let (status, body) = fx.open_pr(idea.id).await;
 
-    assert_eq!(
-        refusal(status, &body),
-        (
-            StatusCode::CONFLICT,
-            Some("idea_lfs"),
-            Some("The idea's files were committed through Git LFS, which this push does not upload. Turn Git LFS off for docs/issues and ask the agent to commit them again.")
-        )
-    );
+    assert_eq!(refusal(status, &body).1, Some("idea_lfs"), "{body}");
     assert!(bare_branches(&bare).is_empty(), "nothing pushed");
-    assert_eq!(fx.idea_of(idea.id).await.pr_commit, None, "nothing chosen");
     assert!(fx.calls_starting("pr").is_empty(), "{:?}", fx.fake.calls());
 }
 

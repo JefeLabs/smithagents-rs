@@ -754,7 +754,7 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
     let (repo, _bare) = fx.github_repo("r1").await;
     let mut req = issue_request(&repo);
     req["main_idea"] = json!(
-        "@octocat the zoom\n\n@hubot, see (@reviewer) and @org/team.\nMail a@b.com or pkg/@scope."
+        "@octocat the zoom of https://a.b/@x\n\n@hubot, see (@reviewer) and @org/team.\nMail a@b.com or pkg/@scope.\nTypes: https://www.npmjs.com/package/@types/node, then @after."
     );
     req["attachments"] = json!([
         screenshot("cc @someone and me@example.com"),
@@ -777,7 +777,7 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
         (AttachmentKind::Image, FileKind::Png),
     ]);
     let raw = render_issue(&IssueInput {
-        title: "@octocat the zoom",
+        title: "@octocat the zoom of https://a.b/@x",
         main_idea: &request.main_idea,
         kind: request.kind,
         created: start(),
@@ -795,17 +795,20 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
     assert_eq!(committed, raw.trim_end());
     assert!(!committed.contains(ZWSP), "{committed}");
 
-    // The title and the whole body GitHub gets mention no one.
+    // The title and the whole body GitHub gets mention no one. W2-5: a web
+    // address in the body (rendered as Markdown, so it is a link) keeps its
+    // `@`; the title is not rendered, so it is strict throughout.
     let create = fx.calls_starting("issue create").pop().unwrap();
     assert!(
         create.starts_with(&format!(
-            "issue create --title=@{ZWSP}octocat the zoom --body-file="
+            "issue create --title=@{ZWSP}octocat the zoom of https://a.b/@{ZWSP}x --body-file="
         )),
         "{create}"
     );
     let body = fx.fake.read("issue-body.md").unwrap();
     for neutral in [
-        format!("# @{ZWSP}octocat the zoom\n"),
+        format!("# @{ZWSP}octocat the zoom of https://a.b/@x\n"),
+        format!("Types: https://www.npmjs.com/package/@types/node, then @{ZWSP}after."),
         format!("@{ZWSP}hubot, see (@{ZWSP}reviewer) and @{ZWSP}org/team."),
         format!("cc @{ZWSP}someone and me@example.com"),
         // D-M3: after anything but a letter, digit or `_`, as GitHub may read it.
@@ -820,6 +823,7 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
         "@org",
         "@someone",
         "@scope",
+        "@after",
     ] {
         assert!(!body.contains(raw), "{raw} in {body}");
     }

@@ -28,8 +28,8 @@ use self::github::{
     VISIBILITY_TIMEOUT,
 };
 use self::issue::{
-    file_names, issue_body, marker, no_mentions, permalink_base, render_issue, seed_tail,
-    seed_text, IssueInput,
+    file_names, issue_body, marker, no_mentions_in_body, no_mentions_in_title, permalink_base,
+    render_issue, seed_tail, seed_text, IssueInput,
 };
 use self::repo::{find_committed, place_and_commit, FileSource, FolderFile};
 use self::upload::{Staged, StagingDir, UploadLimits};
@@ -1216,7 +1216,7 @@ impl FeedbackService {
     /// ago (`issue_unconfirmed`), a new one ([`create_issue`]) from a body
     /// written to a scratch directory of its own (removed afterwards).
     /// GitHub gets the title and the body mentioning no one
-    /// ([`no_mentions`]).
+    /// ([`no_mentions_in_title`], [`no_mentions_in_body`]).
     async fn make_issue(
         &self,
         s: &Submission,
@@ -1257,7 +1257,7 @@ impl FeedbackService {
             tracing::warn!(submission_id = %s.id, step = "create_issue", kind = ?e.kind(), "could not write the issue's body");
             body_failure()
         })?;
-        let title = no_mentions(&s.title);
+        let title = no_mentions_in_title(&s.title);
         let label = label_for(s.request.kind);
         match create_issue(&gh, github, &title, &body_file, label).await {
             Ok(url) => {
@@ -1279,8 +1279,8 @@ impl FeedbackService {
 
 /// The body of a submission's issue: its `issue.md` as committed, without
 /// front matter, links to the folder's files as permalinks to the commit,
-/// mentioning no one ([`no_mentions`]: `issue.md` itself keeps the user's
-/// text), and the submission's marker last.
+/// mentioning no one ([`no_mentions_in_body`]: `issue.md` itself keeps the
+/// user's text), and the submission's marker last.
 async fn issue_text(
     s: &Submission,
     repo: &Repo,
@@ -1293,7 +1293,7 @@ async fn issue_text(
         (Ok(Some(issue_md)), Ok(files)) => {
             let base = permalink_base(&github.owner, &github.name, &s.commit, &s.folder);
             // Before the body is cut to its length, so what is added counts.
-            let text = no_mentions(&issue_md);
+            let text = no_mentions_in_body(&issue_md);
             Ok(issue_body(&text, &files, &base, Some(&marker(s.id))))
         }
         _ => {

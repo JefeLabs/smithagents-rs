@@ -319,22 +319,55 @@ fn comment_line(comment: &str) -> String {
         .to_string()
 }
 
-/// `text` with a zero-width space after each `@` where GitHub may read a
-/// mention (and notify whoever it names): every `@` followed by an ASCII
-/// letter or digit, unless the character before it is an ASCII letter or
-/// digit or `_`. So `@name`, `(@name)`, `.@name`, `-@name`, `/@name`,
-/// `@@name` and `@org/team` mention no one, and `a@b.com`, `photo@2x.png`
-/// and `x_@y` stay as typed. For what is sent to GitHub only; files keep
-/// the user's text.
-pub fn no_mentions(text: &str) -> String {
+/// A title sent to GitHub (an issue's, a pull request's) with a zero-width
+/// space after each `@` where GitHub may read a mention (and notify whoever
+/// it names): every `@` followed by an ASCII letter or digit, unless the
+/// character before it is an ASCII letter or digit or `_`. So `@name`,
+/// `(@name)`, `.@name`, `-@name`, `/@name`, `@@name` and `@org/team` mention
+/// no one, and `a@b.com`, `photo@2x.png` and `x_@y` stay as typed. A title is
+/// not rendered as Markdown, so nothing in it is a link, and the rule holds
+/// throughout (unlike [`no_mentions_in_body`]). For what is sent to GitHub
+/// only; files keep the user's text.
+pub fn no_mentions_in_title(text: &str) -> String {
+    no_mentions(text, false)
+}
+
+/// A body sent to GitHub, which renders it as Markdown (an issue's, a pull
+/// request's): [`no_mentions_in_title`]'s rule, except that an `@` inside a
+/// web address GitHub's extended-autolink rule links is left alone, since
+/// the text of a link mentions no one
+/// (`https://www.npmjs.com/package/@types/node` stays as typed). Narrower on
+/// purpose than what GitHub may link: the address starts with `http://` or
+/// `https://` (ASCII, any case) after no ASCII letter (or at the start),
+/// then a host of ASCII letters, digits, `-` and `.` holding a `.`, then
+/// optionally `:` and digits, then `/`, `?` or `#`, and the `@` comes before
+/// any white space or `<`. Anything else (`http://localhost:5173/@vite`,
+/// `www.a.b/@x`, `ftp://…`, a host with `_` or a letter that is not ASCII)
+/// is treated as in a title.
+pub fn no_mentions_in_body(text: &str) -> String {
+    no_mentions(text, true)
+}
+
+/// The one implementation of [`no_mentions_in_title`] (`links`: false) and
+/// [`no_mentions_in_body`] (`links`: true).
+fn no_mentions(text: &str, links: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut before: Option<char> = None;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
+    // The end (a byte offset) of the web address the text is in, if any.
+    let mut link_end = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if links && at >= link_end && before.is_none_or(|b| !b.is_ascii_alphabetic()) {
+            if let Some(len) = web_address_len(&text[at..]) {
+                link_end = at + len;
+            }
+        }
         out.push(c);
-        if c == '@' {
+        if c == '@' && at >= link_end {
             let starts = before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == '_'));
-            let names = chars.peek().is_some_and(char::is_ascii_alphanumeric);
+            let names = chars
+                .peek()
+                .is_some_and(|(_, next)| next.is_ascii_alphanumeric());
             if starts && names {
                 out.push('\u{200b}');
             }
@@ -342,6 +375,42 @@ pub fn no_mentions(text: &str) -> String {
         before = Some(c);
     }
     out
+}
+
+/// The length in bytes of the web address `text` starts with, up to the
+/// first white space or `<`, when it is one [`no_mentions_in_body`] leaves
+/// alone: `http://` or `https://` (any case), a host of ASCII letters,
+/// digits, `-` and `.` holding a `.`, optionally `:` and digits, then `/`,
+/// `?` or `#`.
+fn web_address_len(text: &str) -> Option<usize> {
+    let scheme = ["https://", "http://"].into_iter().find(|scheme| {
+        text.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    })?;
+    let rest = &text[scheme.len()..];
+    let host = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+        .unwrap_or(rest.len());
+    if host == 0 || !rest[..host].contains('.') {
+        return None;
+    }
+    let mut after = &rest[host..];
+    if let Some(port) = after.strip_prefix(':') {
+        let digits = port
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(port.len());
+        if digits == 0 {
+            return None;
+        }
+        after = &port[digits..];
+    }
+    if !after.starts_with(['/', '?', '#']) {
+        return None;
+    }
+    Some(
+        text.find(|c: char| c.is_whitespace() || c == '<')
+            .unwrap_or(text.len()),
+    )
 }
 
 /// `issue.md`.

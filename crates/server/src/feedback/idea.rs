@@ -16,7 +16,8 @@
 //!   on top of the idea's own changes nothing outside the issue folder: the
 //!   agent was told to commit only there, and an idea pull request must not
 //!   publish code nobody reviewed as part of the idea. No file of the folder
-//!   may be a Git LFS pointer (the push uploads no LFS object).
+//!   may be a Git LFS pointer in any of those commits (the push uploads no
+//!   LFS object, and publishes the whole history).
 //!   Each finished step (the push, the pull request) is recorded, so a retry
 //!   after a failure runs only what is left. The pull request is looked for
 //!   (by the signed-in user, for that branch) before one is opened, and none
@@ -46,13 +47,16 @@ use super::github::{
     body_failure_at, create_pull_request, find_pull_request, gh_readiness, not_ready_sentence,
     DraftPullRequest, Gh, GithubRepo, NotCreated, PullRequestSearch,
 };
-use super::issue::{no_mentions, not_done_section, permalink_base, pull_request_body, title_of};
+use super::issue::{
+    no_mentions_in_body, no_mentions_in_title, not_done_section, permalink_base, pull_request_body,
+    title_of,
+};
 use super::upload::StagingDir;
 use super::{
     locked, recent, repo, FeedbackError, FeedbackService, Running, BODY_FILE, ISSUE_MD,
     ISSUE_MD_MAX_BYTES,
 };
-use crate::git::{self, Changes, GitError};
+use crate::git::{self, Changes, GitError, LfsCheck};
 use crate::intents::CreateExtras;
 use crate::polish::MAX_SEED_BYTES;
 
@@ -194,8 +198,9 @@ pub enum IdeaBlocked {
     NotSubmits,
     /// `issue.md` is not in the agent's work (deleted, or unreadable).
     Incomplete,
-    /// A file of the issue folder is a Git LFS pointer: the push runs no
-    /// hook, so Git LFS would never upload what it points to.
+    /// A file of the issue folder is a Git LFS pointer in a commit the push
+    /// publishes (its tip or an earlier one): the push runs no hook, so Git
+    /// LFS would never upload what it points to.
     Lfs,
 }
 
@@ -216,7 +221,7 @@ impl IdeaBlocked {
             Self::BranchGone => "the idea agent's branch no longer exists",
             Self::NotSubmits => "the idea intent's folder or branch is not one Submit made",
             Self::Incomplete => "The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.",
-            Self::Lfs => "The idea's files were committed through Git LFS, which this push does not upload. Turn Git LFS off for docs/issues and ask the agent to commit them again.",
+            Self::Lfs => "The idea's files were committed through Git LFS, now or in an earlier commit of the agent's branch, which this push does not upload. Turn Git LFS off for docs/issues and have the branch's commits made again without it.",
         }
     }
 }
@@ -238,11 +243,12 @@ impl FeedbackService {
     /// nothing pushed: an intent that is not an idea (`NotAnIdea`), not sent
     /// or resolved, or whose agent still works (`NotReady`); one whose agent,
     /// branch, folder or `issue.md` is not there (`IdeaBlocked`); a
-    /// repository whose `origin` is not on github.com (`NoGithubRemote`);
-    /// `gh` not ready (`GhNotReady`); an agent's branch that changes more
-    /// than the issue folder (`OutOfScope`); a folder holding a Git LFS
-    /// pointer (`IdeaBlocked(Lfs)`); a default branch with commits `origin`
-    /// has not got, or a repository never fetched (`Unpublished`). A
+    /// repository git cannot read (`OriginUnreadable`) or whose `origin` is
+    /// not on github.com (`NoGithubRemote`); `gh` not ready (`GhNotReady`);
+    /// an agent's branch that changes more than the issue folder
+    /// (`OutOfScope`); a folder holding a Git LFS pointer in any commit to
+    /// push (`IdeaBlocked(Lfs)`); a default branch with commits `origin` has
+    /// not got, or a repository never fetched (`Unpublished`). A
     /// repository that is, or may be, public needs `public_acknowledged`
     /// (`PublicNotAcknowledged`), asked on every press that would publish.
     /// Every refusal comes before the commit is recorded. A failed push or
@@ -312,7 +318,7 @@ impl FeedbackService {
                 .inspect_err(refused("check_scope"))?;
         }
         if !pushed {
-            require_no_lfs_pointer(&repo, &origin.folder, &head)
+            require_no_lfs_pointer(&repo, origin, &head)
                 .await
                 .inspect_err(refused("check_lfs"))?;
         }
@@ -320,8 +326,9 @@ impl FeedbackService {
         let text = pull_request_text(&repo, &github, &origin.folder, &head)
             .await
             .inspect_err(refused("read_idea"))?;
-        let title =
-            no_mentions(&title_of(&intent.content.title).unwrap_or_else(|| UNTITLED.to_owned()));
+        let title = no_mentions_in_title(
+            &title_of(&intent.content.title).unwrap_or_else(|| UNTITLED.to_owned()),
+        );
         if !pushed {
             // Nothing the idea's commit is built on may publish the user's
             // unpushed work (the push checks it again).
@@ -694,17 +701,9 @@ async fn check_scope(
     origin: &FeedbackOrigin,
     head: &str,
 ) -> Result<(), FeedbackError> {
-    let base = &origin.commit;
-    let present = git::is_commit_id(base)
-        && git::rev_parse(&repo.path, base)
-            .await
-            .map_err(read_failed)?
-            .is_some_and(|found| found == *base);
-    if !present {
-        return Err(FeedbackError::OutOfScope(NOT_ON_IDEA));
-    }
+    require_idea_commit(repo, origin).await?;
     let inside = format!("{}/", origin.folder);
-    match git::changes_since(&repo.path, base, head, MAX_IDEA_COMMITS)
+    match git::changes_since(&repo.path, &origin.commit, head, MAX_IDEA_COMMITS)
         .await
         .map_err(read_failed)?
     {
@@ -715,24 +714,54 @@ async fn check_scope(
     }
 }
 
-/// `IdeaBlocked(Lfs)` when a file under the issue folder at `head` is a Git
-/// LFS pointer ([`git::has_lfs_pointer`]).
+/// `OutOfScope(NOT_ON_IDEA)` unless the idea's own commit (`origin.commit`)
+/// is a commit of this repository.
+async fn require_idea_commit(repo: &Repo, origin: &FeedbackOrigin) -> Result<(), FeedbackError> {
+    let base = &origin.commit;
+    let present = git::is_commit_id(base)
+        && git::rev_parse(&repo.path, base)
+            .await
+            .map_err(read_failed)?
+            .is_some_and(|found| found == *base);
+    if present {
+        Ok(())
+    } else {
+        Err(FeedbackError::OutOfScope(NOT_ON_IDEA))
+    }
+}
+
+/// `IdeaBlocked(Lfs)` when a commit the push would publish on top of the
+/// idea's own (each after `origin.commit` up to and including `head`) has a
+/// Git LFS pointer under the issue folder ([`git::lfs_pointer_since`]); a
+/// pointer replaced by a later commit is still in the history pushed.
+/// `OutOfScope` as [`check_scope`] answers for a branch without the idea's
+/// commit or with too many commits on top of it.
 async fn require_no_lfs_pointer(
     repo: &Repo,
-    folder: &str,
+    origin: &FeedbackOrigin,
     head: &str,
 ) -> Result<(), FeedbackError> {
-    if git::has_lfs_pointer(&repo.path, head, folder)
-        .await
-        .map_err(read_failed)?
+    require_idea_commit(repo, origin).await?;
+    match git::lfs_pointer_since(
+        &repo.path,
+        &origin.commit,
+        head,
+        &origin.folder,
+        MAX_IDEA_COMMITS,
+    )
+    .await
+    .map_err(read_failed)?
     {
-        return Err(FeedbackError::IdeaBlocked(IdeaBlocked::Lfs));
+        LfsCheck::Clean => Ok(()),
+        LfsCheck::Pointer => Err(FeedbackError::IdeaBlocked(IdeaBlocked::Lfs)),
+        LfsCheck::NotOnBase => Err(FeedbackError::OutOfScope(NOT_ON_IDEA)),
+        LfsCheck::TooMany => Err(FeedbackError::OutOfScope(TOO_MANY_COMMITS)),
     }
-    Ok(())
 }
 
 /// The pull request's body ([`pull_request_body`] of `issue.md` and
-/// `explainer.md` as committed at `head`, mentioning no one: [`no_mentions`])
+/// `explainer.md` as committed at `head`, mentioning no one:
+/// [`no_mentions_in_body`])
 /// and the explainer's "Not done" section. `IdeaBlocked(Incomplete)` when
 /// `issue.md` is not there or cannot be read.
 async fn pull_request_text(
@@ -753,9 +782,14 @@ async fn pull_request_text(
         .await
         .map_err(read_failed)?;
     let base = permalink_base(&github.owner, &github.name, head, folder);
-    let explained = explainer.as_deref().map(no_mentions);
+    let explained = explainer.as_deref().map(no_mentions_in_body);
     Ok(PullRequestText {
-        body: pull_request_body(&no_mentions(&issue_md), explained.as_deref(), &files, &base),
+        body: pull_request_body(
+            &no_mentions_in_body(&issue_md),
+            explained.as_deref(),
+            &files,
+            &base,
+        ),
         not_done: explainer.as_deref().and_then(not_done_section),
     })
 }
