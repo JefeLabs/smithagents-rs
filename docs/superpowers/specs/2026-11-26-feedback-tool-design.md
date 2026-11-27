@@ -328,48 +328,75 @@ result is `docs/feedback.md`.
   fixed criterion that nothing is implemented is always set.
 - **Fixed criteria are enforced.** The review routes refuse to edit or drop
   a fixed item, polish keeps them first and unchanged, and the polish prompts
-  are told the intent prepares an idea package. An intent made from feedback,
-  and one with a fixed dependency, cannot change repository
-  (`evidence_in_repo`, `fixed_dependency`).
+  are told the intent prepares an idea package. The Intents detail tags a
+  fixed item "fixed" and offers no Edit or Skip on it. An intent made from
+  feedback, and one with a fixed dependency, cannot change repository
+  (`evidence_in_repo`, `fixed_dependency`). An idea intent's agent is never
+  told to rebase onto its dependencies (that rewrites the idea's commit).
 - **A push guard.** The folder commit is built on the local default branch,
   so a push would publish the owner's unpushed commits too. Before an issue
-  submission commits, and before every push (Submit, Retry, Open pull
-  request), the daemon refuses (`unpushed_commits`) unless everything under
-  the folder commit is on `refs/remotes/origin/*`: "The default branch has
-  commits that are not on origin. Push them first, so they are not published
-  with this feedback.", or, never fetched, "This repository has never been
-  fetched from origin, so it is not known what is already published. Run git
-  fetch first." The intent path is not refused at Submit. Built in the fix
-  commit `e5f14b8`, after the build described here.
-- **The public-repository warning is enforced by the daemon too.** The
-  design had it in the app only. Both publishing paths, "A GitHub issue" and
-  "Open pull request", are refused (409 `public_not_acknowledged`) when the
-  repository is public or its visibility cannot be determined, unless the
-  request carries `public_acknowledged: true`: "This repository is public.
-  The screenshots will be visible to anyone. Confirm that before sending." or
-  "This repository may be public. The screenshots will be visible to anyone.
-  Confirm that before sending." The app sets it only after its confirmation
-  dialog, which it shows before every such send, Retry included. A recorded
-  submission that is retried is not asked again, so the retry route carries
-  no acknowledgement; the intent path never pushes and is never asked.
+  submission commits (or takes up a commit a stopped daemon left), before an
+  idea package commits to a GitHub repository that has been fetched, and
+  inside the one function that pushes (Submit, Retry, Open pull request), the
+  daemon refuses (`unpushed_commits`) unless everything under the folder
+  commit is on `refs/remotes/origin/*`: "The default branch has commits that
+  are not on origin. Push them first, so they are not published with this
+  feedback.", or, never fetched, "This repository has never been fetched
+  from origin, so it is not known what is already published. Run git fetch
+  first." A folder commit that is not in the repository is refused
+  (`commit_missing`), and `git replace` objects are ignored, so what is
+  checked is what is pushed. A plain intent is not checked by the guard.
+  Added by the fix round that keeps unpushed default-branch work from being
+  published, after the build described here.
+- **The public-repository warning covers every route that publishes, and
+  the daemon enforces it.** The design had it in the app only, and for
+  issues only. A plain intent publishes too: its agent opens a pull request
+  that carries the folder. "A GitHub issue", a plain intent to a repository
+  whose `origin` is on GitHub, "Open pull request" and "Create
+  implementation intent" (`POST /v1/intents/{id}/implementation` takes the
+  same optional body as the pull-request route) are refused (409
+  `public_not_acknowledged`) when the repository is public or its visibility
+  cannot be determined (also without `gh`), unless the request carries
+  `public_acknowledged: true`: "This repository is public. The screenshots
+  will be visible to anyone. Confirm that before sending." or "This
+  repository may be public. The screenshots will be visible to anyone.
+  Confirm that before sending." An acknowledged request runs no `gh`. An
+  idea package submission is not asked: nothing of it is published before
+  its two actions. The app asks before every such send, Retry included: for
+  an intent with "This repository is public. The agent's pull request will
+  include the screenshots, visible to anyone." (or "…may be public…"), and
+  always before "Create implementation intent…" ("Creates an intent to
+  build this idea. Its agent's pull request will include the idea's
+  screenshots and explainer. If the repository is public, they will be
+  visible to anyone."). A recorded submission that is retried is not asked
+  again, so the retry route carries no acknowledgement.
 - **Locking per submission.** In the daemon, one submission id runs once at
   a time and a repeat answers with what was recorded; commits are made one at
   a time, and the steps after a commit hold up no other submission. In the
   app, the draft is locked (Retry, Start over) only while something may exist
   under its id; a refusal after which the daemon made nothing keeps it
-  editable under the same id.
+  editable under the same id, except a refused re-upload (sent only after an
+  earlier request went unanswered), which stays locked. An answer that does
+  not name this submission and what it made locks too. A locked draft with
+  no answer says "This feedback may already have been sent. Press Retry to
+  find out, or Start over to send it as a new submission."
 - **A crash between the commit and its record** is recovered from the
   commit's `Feedback-Id: <submission id>` trailer: sending the same id again
-  takes up that commit instead of making a second one.
+  takes up that commit instead of making a second one, after the same checks
+  as a new submission. An intent made but not recorded is found by its
+  origin and taken up.
 - **Commits are unsigned and run no hooks; files are ordinary blobs.** No
   repository attribute or filter (Git LFS, git-crypt, encodings) applies to
   the issue folder. git 2.36 or newer is required.
 - **Pushes** happen for "A GitHub issue" (at Submit or Retry) and for "Open
   pull request". What is pushed is the recorded commit, never whatever the
-  branch points at by then, and never forced.
+  branch points at by then, and never forced. A branch name `origin` has is
+  never chosen for a new submission.
 - **Mentions are neutralised only in what is sent to GitHub** (titles and
-  bodies of issues and pull requests); the committed files keep the owner's
-  text.
+  bodies of issues and pull requests): every `@` followed by a letter or
+  digit gets a zero-width space after it unless an ASCII letter, digit or
+  `_` comes before it. The committed files keep the owner's text. A comment
+  is capped at 500 characters and never cut by bytes.
 - **Duplicates.** The search for an issue or a pull request made before
   looks only at the signed-in user's own (`--author=@me`): the submission id
   is public once pushed. After `gh` ran without a usable answer, nothing is
@@ -377,7 +404,13 @@ result is `docs/feedback.md`.
 - **"Open pull request"** pushes only when every commit of the agent on top
   of the idea's changes only the issue folder (`idea_out_of_scope`), and
   refuses with nothing pushed when the agent's branch has no `issue.md`
-  (`idea_incomplete`). The agent's commits are published as it wrote them.
+  (`idea_incomplete`) or a file of the folder is a Git LFS pointer
+  (`idea_lfs`: "The idea's files were committed through Git LFS, which this
+  push does not upload. Turn Git LFS off for docs/issues and ask the agent
+  to commit them again."). The commit to push is recorded only after every
+  refusal, and pushed again at a later press only while the agent's branch
+  still holds it. A pull request is taken for the idea's only when its head
+  is the commit pushed. The agent's commits are published as it wrote them.
   "Not done" is read from `explainer.md` when the pull request is opened and
   shown in the idea intent's detail, with the pull request's address and a
   copy button (tooltip "Copy link").
@@ -386,3 +419,10 @@ result is `docs/feedback.md`.
   browser can show."
 - **The upload** limit is the 100 MB of files plus 1 MiB for the request
   part and the boundaries.
+- **The two idea actions** wait for the daemon as long as a submission (10
+  minutes), and show the daemon's sentence when it refuses for the intent's
+  state.
+- **An intent's agent branch tracks nothing** (`--no-track`), and a worktree
+  that cannot be made from the intent's base branch is the fixed start error
+  "The intent's base branch could not be checked out."
+  (`base_branch_failed`).

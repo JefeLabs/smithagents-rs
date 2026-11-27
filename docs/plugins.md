@@ -543,7 +543,7 @@ the daemon does not stop for idleness while one runs.
 | `POST /v1/feedback` | A submission (below). Answers with the outcome: `submission_id`, `repo_id`, `branch`, `commit`, `folder`, `pushed`, `intent`, `issue_url`, and `failed` (`step`, `code`, `message`) when a step after the commit failed. The same id again continues that submission: nothing is committed twice, and only what has not succeeded runs. |
 | `POST /v1/feedback/{id}/retry` | Runs what has not succeeded of the recorded submission `id` (the intent, or the push and then the issue); the same answer. |
 | `POST /v1/intents/{id}/pull-request` | An idea intent's "Open pull request". Optional body `{"public_acknowledged": true \| false}` (none means `false`). Answers with the intent; `origin.idea.pr_url` holds the pull request. |
-| `POST /v1/intents/{id}/implementation` | An idea intent's "Create implementation intent": 201 with the new intent, or with the one made before. |
+| `POST /v1/intents/{id}/implementation` | An idea intent's "Create implementation intent". Optional body `{"public_acknowledged": true \| false}` (none means `false`), as for the pull request: the new intent's agent opens a pull request that carries the idea's files. 201 with the new intent, or with the one made before. |
 
 **The submission** is `multipart/form-data`: the part `request` first, then
 `file-<i>` for every attachment and `annotated-<i>` for every screenshot (`i`
@@ -575,8 +575,9 @@ removed when the request ends, and leftovers are removed at daemon start. The
 
 `kind` is `new_feature`, `enhancement` or `bug`; `send_as` is `intent` or
 `github_issue`; `idea` (optional) needs `intent` and at least one part;
-`public_acknowledged` (optional, `false` when left out) matters only for an
-issue; an attachment's `kind` is `screenshot`, `image` or `video`, and only a
+`public_acknowledged` (optional, `false` when left out) matters for an issue
+and for a plain intent (no `idea`) to a repository whose `origin` is on
+GitHub; an attachment's `kind` is `screenshot`, `image` or `video`, and only a
 screenshot has `boxes`, given as fractions of the image (0 to 1);
 `app_version` and `platform` are 1 to 32 of `A-Z a-z 0-9 . _ + -`.
 
@@ -590,19 +591,26 @@ message is a fixed sentence, never something git or `gh` printed):
   the whole upload over its limit), `repo_not_found` (404); 409
   `default_branch_missing`, `git_identity_missing`, `no_free_name`,
   `name_taken`, `folder_blocked`, `branch_blocked`, `tool_missing` (Demo video
-  without `agent-browser`), and for an issue `no_github_remote`,
-  `gh_not_ready`, `unpushed_commits` and `public_not_acknowledged`. Also 500
-  `git_failed`, `io_error`, `store_error`.
-- `POST /v1/feedback/{id}/retry`: `submission_not_found` (404), `bad_request`
-  (400, not a submission id).
+  without `agent-browser`); for an issue `no_github_remote`, `gh_not_ready`,
+  `unpushed_commits` and `public_not_acknowledged`; for a plain intent to a
+  repository whose `origin` is on GitHub `public_not_acknowledged`; for an
+  idea package to one, `unpushed_commits` once the repository has been
+  fetched from `origin`. These are checked before a commit is made and before
+  one a stopped daemon left is taken up. Also 500 `git_failed`, `io_error`,
+  `store_error`. A recorded submission that is continued can also answer
+  `intent_not_found` (its intent was deleted) or `repo_not_found` (404).
+- `POST /v1/feedback/{id}/retry`: `bad_request` (400, not a submission id);
+  `submission_not_found`, `repo_not_found`, `intent_not_found` (404);
+  `store_error` (500).
 - In `failed` (a 200 answer: the commit exists): step `create_intent` with the
   intent service's code; step `push` with `push_rejected`, `push_auth`,
   `push_no_remote`, `push_timeout`, `push_failed`, `commit_missing` ("The
-  feedback commit is no longer in this repository, so it cannot be pushed.")
-  or `unpushed_commits`; step `create_issue` with `gh_not_ready`, `gh_failed`,
-  `gh_timeout`, `gh_bad_answer`, `issue_unconfirmed` ("GitHub has not
-  confirmed whether the issue was created. Try again in a minute."),
-  `no_github_remote`, `git_failed` or `io_error`.
+  feedback commit is no longer in this repository, so it cannot be pushed."),
+  `unpushed_commits`, `no_github_remote`, `git_failed` or `io_error`; step
+  `create_issue` with `gh_not_ready`, `gh_failed`, `gh_timeout`,
+  `gh_bad_answer`, `issue_unconfirmed` ("GitHub has not confirmed whether the
+  issue was created. Try again in a minute."), `no_github_remote`,
+  `git_failed` or `io_error`.
 - `POST /v1/intents/{id}/pull-request`, with nothing pushed: `bad_request`
   (400, a malformed body or id); `intent_not_found`, `repo_not_found` (404);
   409 `not_an_idea`, `invalid_state` (not sent yet, or the agent is still
@@ -611,19 +619,29 @@ message is a fixed sentence, never something git or `gh` printed):
   exists"), `idea_origin_invalid` ("the idea intent's folder or branch is not
   one Submit made"), `idea_out_of_scope` (the agent's branch changes
   files outside the issue folder, lacks the idea's commit, or has more than
-  1000 commits on top of it), `idea_incomplete` ("The idea's issue.md is
-  missing from the agent's branch, so a pull request cannot be opened."),
-  `unpushed_commits`, `public_not_acknowledged`, `no_github_remote`,
-  `gh_not_ready`; 500 `git_failed` (git could not read the repository),
-  `io_error`, `store_error`. A failed push or `gh` call is 502 with the
-  step's own code (the push codes above, `gh_failed`, `gh_timeout`,
-  `gh_bad_answer`, `gh_not_ready`, `pr_unconfirmed`, or `io_error` when the
-  pull request's body could not be written); what succeeded before it stays
-  done.
-- `POST /v1/intents/{id}/implementation`: `intent_not_found`,
-  `repo_not_found` (404); 409 `not_an_idea`, `invalid_state`,
-  `idea_agent_missing`, `idea_branch_missing`, `idea_origin_invalid`; the
-  intent service's codes when the intent cannot be made.
+  1000 commits on top of it), `idea_lfs` ("The idea's files were committed
+  through Git LFS, which this push does not upload. Turn Git LFS off for
+  docs/issues and ask the agent to commit them again."), `idea_incomplete`
+  ("The idea's issue.md is missing from the agent's branch, so a pull
+  request cannot be opened."), `unpushed_commits`, `public_not_acknowledged`,
+  `no_github_remote`, `gh_not_ready`; 500 `git_failed` (git could not read
+  the repository), `io_error`, `store_error`. Every one of these comes before
+  the commit to push is recorded. A failed push or `gh` call is 502 with the
+  step's own code: `push_rejected`, `push_auth`, `push_no_remote`,
+  `push_timeout`, `push_failed`, `commit_missing` (the push), `gh_failed`,
+  `gh_timeout`, `gh_bad_answer`, `gh_not_ready`, `pr_unconfirmed`, or
+  `io_error` when the pull request's body could not be written (`gh`); what
+  succeeded before it stays done. (On this route `unpushed_commits` and
+  `no_github_remote` are 409, and `git_failed` is 500.)
+- `POST /v1/intents/{id}/implementation`: `bad_request` (400, a malformed
+  body or id); `intent_not_found`, `repo_not_found` (404); 409
+  `not_an_idea`, `invalid_state`, `idea_agent_missing`,
+  `idea_branch_missing`, `idea_origin_invalid`, `public_not_acknowledged`
+  (its repository's `origin` is on GitHub, the body does not acknowledge, and
+  `gh` does not say it is private; checked before anything is made); 500
+  `git_failed`, `io_error` (git could not read the repository or the agent's
+  branch), `store_error`; the intent service's codes when the intent cannot
+  be made.
 - `PUT /v1/settings/feedback`: `repo_not_found` (404), `bad_request` (400).
 
 The two `unpushed_commits` sentences: "The default branch has commits that
@@ -632,11 +650,17 @@ feedback." and, when the repository has no `refs/remotes/origin/*` at all,
 "This repository has never been fetched from origin, so it is not known what
 is already published. Run git fetch first." The two `public_not_acknowledged`
 sentences: "This repository is public. The screenshots will be visible to
-anyone. Confirm that before sending." and, when `gh` cannot tell, "This
-repository may be public. The screenshots will be visible to anyone. Confirm
-that before sending." An issue submission is asked for the acknowledgement
-only before its commit; a recorded submission that is continued or retried
-is not asked again. The pull-request route is asked on every call.
+anyone. Confirm that before sending." and, when `gh` cannot tell (also when
+it is not installed or not signed in), "This repository may be public. The
+screenshots will be visible to anyone. Confirm that before sending." A
+request that acknowledges is not asked of `gh` at all. A submission is asked
+for the acknowledgement only before its commit (or before a commit a stopped
+daemon left is taken up); a recorded submission that is continued or retried
+is not asked again. The pull-request route is asked on every call, the
+implementation route on every call until its intent is made. An intent
+whose agent's worktree cannot be made from its base branch is refused at
+Send with 409 `base_branch_failed`, "The intent's base branch could not be
+checked out."
 
 Limits: see [limits](#limits).
 

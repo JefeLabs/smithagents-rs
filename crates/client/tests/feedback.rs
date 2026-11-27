@@ -235,24 +235,57 @@ fn assert_the_fakes_come_first(bin: &Path, path: &OsString) {
     }
 }
 
-/// git, as the daemon runs it (this `HOME`, the system configuration),
-/// fetches from and pushes to `bare` for `origin`: nothing goes to GitHub.
+/// What the daemon's git never inherits: the server's `git::UNWANTED_ENV`
+/// and what `git_command` removes (the numbered `GIT_CONFIG_KEY_<n>` and
+/// `GIT_CONFIG_VALUE_<n>` are removed as well). Kept in step with it by
+/// hand: this crate does not depend on the server's.
+const DAEMON_UNWANTED_ENV: [&str; 21] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+    "SSH_ASKPASS",
+];
+
+/// git, as the daemon runs it (this `HOME`, the system configuration,
+/// nothing of [`DAEMON_UNWANTED_ENV`]), fetches from and pushes to `bare`
+/// for `origin`: nothing goes to GitHub.
 fn assert_origin_is_the_bare_repository(repo: &Path, bare: &Path, user_home: &Path) {
     for args in [
         &["remote", "get-url", "origin"][..],
         &["remote", "get-url", "--push", "origin"][..],
     ] {
-        let out = Command::new("git")
-            .args(args)
+        let mut cmd = Command::new("git");
+        cmd.args(args)
             .current_dir(repo)
             .env("HOME", user_home)
-            .env("XDG_CONFIG_HOME", user_home)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_CONFIG_GLOBAL")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG_COUNT")
-            .output()
-            .unwrap();
+            .env("XDG_CONFIG_HOME", user_home);
+        for name in DAEMON_UNWANTED_ENV {
+            cmd.env_remove(name);
+        }
+        for (name, _) in std::env::vars_os() {
+            let bytes = name.as_encoded_bytes();
+            if bytes.starts_with(b"GIT_CONFIG_KEY_") || bytes.starts_with(b"GIT_CONFIG_VALUE_") {
+                cmd.env_remove(&name);
+            }
+        }
+        let out = cmd.output().unwrap();
         assert!(out.status.success(), "git {args:?} failed");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
@@ -489,27 +522,42 @@ async fn nothing_leaks_and_nothing_is_left_behind(fx: Fx) {
         .collect();
     assert!(left.is_empty(), "left in the staging directory: {left:?}");
 
-    let home_path = home.path().to_str().unwrap().to_owned();
+    // pgrep's pattern is a regular expression: the path is matched as
+    // written.
+    let home_path: String = home
+        .path()
+        .to_str()
+        .unwrap()
+        .chars()
+        .flat_map(|c| {
+            let special = "\\.^$|?*+()[]{}".contains(c);
+            special.then_some('\\').into_iter().chain([c])
+        })
+        .collect();
+    let pattern = format!("--home {home_path}");
+    // Its exit status says whether a process matches: 1 is none (the
+    // printed lines differ between pgrep implementations).
+    let matching = || {
+        Command::new("pgrep")
+            .args(["-f", "--", &pattern])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .code()
+    };
+    assert_eq!(matching(), Some(0), "the pattern finds the daemon running");
     drop(client);
     drop(home);
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let out = Command::new("pgrep")
-            .args(["-fl", "smithagentsd"])
-            .output()
-            .unwrap();
-        let listed = String::from_utf8_lossy(&out.stdout).into_owned();
-        let ours: Vec<&str> = listed
-            .lines()
-            .filter(|line| line.contains(&home_path))
-            .collect();
-        if ours.is_empty() {
-            break;
+        match matching() {
+            Some(1) => break,
+            Some(0) => assert!(
+                Instant::now() < deadline,
+                "a daemon of this home still runs"
+            ),
+            other => panic!("pgrep failed: {other:?}"),
         }
-        assert!(
-            Instant::now() < deadline,
-            "a daemon of this home still runs: {ours:?}"
-        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -711,7 +759,10 @@ async fn feedback_becomes_a_github_issue_and_a_failed_push_is_retried() {
     );
     let pushed = format!("refs/heads/{}", first.branch);
     assert_eq!(git(&fx.bare, &["rev-parse", &pushed]), first.commit);
-    assert_eq!(fx.gh_calls("issue create").len(), 1);
+    let creates = fx.gh_calls("issue create");
+    assert_eq!(creates.len(), 1);
+    // A bug, and the repository has the label.
+    assert!(creates[0].ends_with("--label=bug"), "{creates:?}");
     fx.assert_the_fake_ran("issue create");
     let body = fs::read_to_string(fx.gh_dir.join("issue-body.md")).unwrap();
     let link = format!(

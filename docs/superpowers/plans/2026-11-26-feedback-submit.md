@@ -859,7 +859,7 @@ With a scratch `SMITHAGENTS_HOME` and a throwaway private GitHub repository of t
 - **Feedback about SmithAgents itself**: the design disables Demo video there; this plan offers it whenever the tool is ready and says what it is for. A rule that knows the app's own repository can replace the helper text.
 - **GitHub Enterprise and other hosts**: only `github.com` is a GitHub remote; a remote other than `origin` cannot be chosen.
 - **Cleaning up**: feedback and idea branches, and the rows of `feedback_submissions`, are never deleted; "Start over" leaves its branch behind.
-- **Signed commits and hooks**: the commit uses the user's signing settings (a signing program that needs a prompt fails the commit) and skips hooks with `--no-verify`.
+- **Signed commits and hooks** (corrected 2026-11-27; this note first said the commit used the user's signing settings): the commit is never signed (`commit.gpgSign=false`, `--no-gpg-sign`) and runs no hook (`core.hooksPath=/dev/null`, `--no-verify`). Honouring the user's signing settings would need a way to answer a signing program's prompt.
 - **The daemon on another machine**: uploads already travel as bytes; the upload has no progress bar and no resume.
 - **Visibility** is cached for 10 minutes and asked only for `github.com`; a repository made public in between is reported as private until the cache ends.
 - **Idea package extras**: rendering Mermaid to images in the daemon; checking `demo.mp4` against 50 MB before the pull request; a pull request for a plain feedback intent.

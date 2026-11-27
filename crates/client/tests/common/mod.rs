@@ -164,8 +164,9 @@ pub fn pid_alive(pid: u32) -> bool {
     !matches!(test_kill_process(pid), Err(Errno::SRCH))
 }
 
-/// Runs git with a fixed identity and C locale, panicking on failure; returns
-/// its trimmed stdout.
+/// Runs git with a fixed identity and C locale, and no hook (the machine
+/// user's global hooks never run on a test's own commits), panicking on
+/// failure; returns its trimmed stdout.
 pub fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args([
@@ -175,6 +176,8 @@ pub fn git(cwd: &Path, args: &[&str]) -> String {
             "user.email=test@example.com",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
         ])
         .args(args)
         .current_dir(cwd)
