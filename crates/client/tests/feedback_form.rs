@@ -205,6 +205,38 @@ async fn a_file_that_cannot_be_opened_is_an_error_before_anything_is_sent() {
 }
 
 #[tokio::test]
+async fn a_retry_posts_to_the_submission_and_decodes_its_outcome() {
+    let req = request();
+    let mut expected = outcome(&req);
+    expected.pushed = true;
+    expected.issue_url =
+        Some("https://github.com/smithagents-test-invalid/widgets/issues/7".into());
+    let (port, server) = answer_once(200, serde_json::to_value(&expected).unwrap()).await;
+
+    let got = tokio::time::timeout(PATIENCE, client(port).retry_feedback(req.submission_id))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(got, expected);
+    let (head, body) = server.await.unwrap();
+    let line = format!("post /v1/feedback/{}/retry http/1.1\r\n", req.submission_id);
+    assert!(head.starts_with(&line), "{head}");
+    assert!(body.is_empty());
+
+    let refusal = json!({"error": "submission_not_found", "message": "no such submission"});
+    let (port, _server) = answer_once(404, refusal).await;
+    let err = client(port)
+        .retry_feedback(SubmissionId::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ClientError::Api { status: 404, code, .. } if code == "submission_not_found"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn targets_and_refusals_decode() {
     let targets = json!({
         "repos": [{"repo_id": RepoId::new(), "has_github_remote": true, "is_public": null}],

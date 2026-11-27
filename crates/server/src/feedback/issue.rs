@@ -212,7 +212,7 @@ fn escape_md(text: &str) -> String {
 }
 
 /// A name for a heading or a link text: cleaned, without `[ ] ( ) ` #`,
-/// without its leading path, `attachment` when empty.
+/// without its leading path, mentioning no one, `attachment` when empty.
 fn display_name(original: &str) -> String {
     let cleaned: String = one_line(original, 4 * NAME_MAX_CHARS)
         .chars()
@@ -232,7 +232,7 @@ fn display_name(original: &str) -> String {
     if name.is_empty() {
         "attachment".to_string()
     } else {
-        escape_md(name)
+        no_mentions(&escape_md(name))
     }
 }
 
@@ -308,7 +308,15 @@ fn comment_line(comment: &str) -> String {
     one_line(comment, 500)
 }
 
-/// `issue.md`.
+/// `text` with a zero-width space after every `@`, so GitHub turns no
+/// `@name` in it into a mention that notifies someone.
+pub fn no_mentions(text: &str) -> String {
+    text.replace('@', "@\u{200b}")
+}
+
+/// `issue.md`. The title, the names of images and videos and the comments
+/// mention no one (see [`no_mentions`]); the main idea's own text is the
+/// owner's and stays as written.
 pub fn render_issue(input: &IssueInput<'_>) -> String {
     let mut out = String::new();
     out.push_str("---\n");
@@ -335,7 +343,7 @@ pub fn render_issue(input: &IssueInput<'_>) -> String {
     out.push_str("---\n\n");
     out.push_str(&format!(
         "# {}\n",
-        escape_md(&one_line(input.title, TITLE_MAX_CHARS))
+        no_mentions(&escape_md(&one_line(input.title, TITLE_MAX_CHARS)))
     ));
 
     let body = idea_body(input.main_idea);
@@ -361,7 +369,7 @@ pub fn render_issue(input: &IssueInput<'_>) -> String {
                 if !a.boxes.is_empty() {
                     out.push('\n');
                     for (j, b) in a.boxes.iter().enumerate() {
-                        let c = escape_md(&comment_line(&b.comment));
+                        let c = no_mentions(&escape_md(&comment_line(&b.comment)));
                         out.push_str(format!("{}. {c}", j + 1).trim_end());
                         out.push('\n');
                     }

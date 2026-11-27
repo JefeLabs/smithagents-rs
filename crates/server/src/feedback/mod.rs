@@ -3,27 +3,34 @@ pub mod issue;
 pub mod repo;
 pub mod upload;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-#[cfg(feature = "test-util")]
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{
     effective_meta_repo, FeedbackFailure, FeedbackOrigin, FeedbackOutcome, FeedbackSettings,
-    FeedbackStep, FeedbackTarget, FeedbackTargets, SendAs,
+    FeedbackStep, FeedbackTarget, FeedbackTargets, SendAs, SubmissionId,
 };
 use smithagents_core::ids::RepoId;
 use smithagents_core::intent::{CreateIntentRequest, Intent, SeedInput};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use self::github::{tool_readiness, AGENT_BROWSER, GH, NOT_INSTALLED};
-use self::issue::{file_names, github_repo, render_issue, seed_tail, seed_text, IssueInput};
+use self::github::{
+    create_issue, gh_readiness, is_public, label_for, not_ready_sentence, tool_readiness, Gh,
+    GithubRepo, AGENT_BROWSER, GH_TIMEOUT, NOT_INSTALLED, VISIBILITY_TIMEOUT,
+};
+use self::issue::{
+    file_names, issue_body, marker, no_mentions, permalink_base, render_issue, seed_tail,
+    seed_text, IssueInput,
+};
 use self::repo::{find_committed, place_and_commit, FileSource, FolderFile};
-use self::upload::{Staged, UploadLimits};
+use self::upload::{Staged, StagingDir, UploadLimits};
 use crate::git::{self, exit_status_text};
 use crate::intents::{CreateExtras, IntentError, IntentService};
 use crate::paths::{ensure_private_real_dir, Paths};
@@ -35,6 +42,14 @@ use crate::store::{Store, StoreError, Submission};
 /// Settings key of [`FeedbackSettings`].
 const FEEDBACK_KEY: &str = "feedback";
 const ISSUE_MD: &str = "issue.md";
+/// The most of `issue.md` read back for the issue's body (far more than a
+/// maximal one; the body is cut to 60,000 characters anyway).
+const ISSUE_MD_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// The issue's body in its scratch directory.
+const BODY_FILE: &str = "body.md";
+/// How long an answer of [`is_public`] is used again.
+const VISIBILITY_TTL: Duration = Duration::from_secs(10 * 60);
+const ORIGIN_STEP: &str = "read the repository's origin";
 
 /// Where the service reads the time it writes into `issue.md`, the names and
 /// the submission.
@@ -51,7 +66,8 @@ pub enum FeedbackError {
     DefaultBranchMissing(String),
     #[error("git has no user.name and user.email set for this repository")]
     GitIdentityMissing,
-    /// `step` is `create the worktree` or `commit the files`.
+    /// `step` is `create the worktree`, `commit the files` or `read the
+    /// repository's origin`.
     #[error("git could not {step} ({})", exit_status_text(.status))]
     Git {
         step: &'static str,
@@ -90,6 +106,15 @@ pub enum FeedbackError {
     /// A command-line tool the submission needs is not ready.
     #[error("{0}")]
     ToolMissing(String),
+    /// No submission is recorded under the id.
+    #[error("no such submission")]
+    SubmissionNotFound,
+    /// An issue submission's repository has no github.com `origin`.
+    #[error("the repository's origin is not a GitHub repository")]
+    NoGithubRemote,
+    /// `gh` cannot make an issue: one of [`not_ready_sentence`]'s.
+    #[error("{0}")]
+    GhNotReady(String),
     /// The intent service refused; its own code and status are kept.
     #[error(transparent)]
     Intent(IntentError),
@@ -112,20 +137,25 @@ impl FeedbackError {
             Self::UnsupportedFile(_) => "unsupported_file",
             Self::TooLarge(_) => "payload_too_large",
             Self::ToolMissing(_) => "tool_missing",
+            Self::SubmissionNotFound => "submission_not_found",
+            Self::NoGithubRemote => "no_github_remote",
+            Self::GhNotReady(_) => "gh_not_ready",
             Self::Intent(e) => e.status_and_code().1,
         }
     }
 
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::RepoNotFound => StatusCode::NOT_FOUND,
+            Self::RepoNotFound | Self::SubmissionNotFound => StatusCode::NOT_FOUND,
             Self::DefaultBranchMissing(_)
             | Self::GitIdentityMissing
             | Self::NoFreeName
             | Self::NameTaken
             | Self::FolderBlocked(_)
             | Self::BranchBlocked(_)
-            | Self::ToolMissing(_) => StatusCode::CONFLICT,
+            | Self::ToolMissing(_)
+            | Self::NoGithubRemote
+            | Self::GhNotReady(_) => StatusCode::CONFLICT,
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -138,16 +168,21 @@ impl FeedbackError {
 /// targets Submit can choose from, and submissions.
 ///
 /// A submission is staged by the route (see [`upload::stage`]) and handed to
-/// [`FeedbackService::submit`], which runs one submission at a time: a second
-/// request with the same submission id waits for the first and then answers
-/// with what it recorded, so one id never makes a second commit or intent.
-/// The commit names its submission (`Feedback-Id`), so a commit a stopped
-/// daemon left without its record is taken up again, not made twice.
+/// [`FeedbackService::submit`]. One submission id runs once at a time: a
+/// second request with the same id waits for the first and then answers with
+/// what it recorded, so one id never makes a second commit, push, intent or
+/// issue. Commits are made one at a time; the steps after a commit (the
+/// intent, or the push and the issue, which can take minutes) hold up no
+/// other submission. The commit names its submission (`Feedback-Id`), so a
+/// commit a stopped daemon left without its record is taken up again, not
+/// made twice. [`FeedbackService::retry`] runs what did not succeed.
 #[derive(Clone)]
 pub struct FeedbackService {
     store: Store,
     limits: UploadLimits,
     clock: Clock,
+    /// The limit of each `gh` call that makes or looks for an issue.
+    gh_timeout: Duration,
     parts: Arc<Parts>,
 }
 
@@ -158,12 +193,65 @@ struct Parts {
     agents: AgentService,
     plugins: PluginManager,
     paths: Paths,
-    /// Held for the whole of one submission.
+    /// Where `gh` runs: the daemon's home, absolute.
+    gh_dir: PathBuf,
+    /// Held while a submission is checked, committed and recorded.
     submitting: AsyncMutex<()>,
-    /// Submissions in [`FeedbackService::submit`], waiting or running.
+    /// Held by the one run of each submission id.
+    ids: IdLocks,
+    /// Submissions in [`FeedbackService::submit`] or
+    /// [`FeedbackService::retry`], waiting or running.
     running: AtomicUsize,
+    /// Issue addresses `gh` gave whose record could not be saved: a retry
+    /// takes them from here instead of looking (GitHub's search can take a
+    /// while to find a new issue) or creating another.
+    issues: Mutex<HashMap<SubmissionId, String>>,
+    /// [`is_public`]'s answers by [`GithubRepo::key`], with when they came.
+    visibility: Mutex<HashMap<String, (bool, DateTime<Utc>)>>,
     #[cfg(feature = "test-util")]
     faults: Mutex<Faults>,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One lock per submission id while a run of it waits or runs.
+#[derive(Default)]
+struct IdLocks(Mutex<HashMap<SubmissionId, Arc<AsyncMutex<()>>>>);
+
+impl IdLocks {
+    /// Waits until no other run of `id` holds its lock, and holds it.
+    async fn lock(&self, id: SubmissionId) -> IdGuard<'_> {
+        let lock = Arc::clone(locked(&self.0).entry(id).or_default());
+        // Made before waiting, so a run dropped while it waits lets go too.
+        let mut guard = IdGuard {
+            locks: self,
+            id,
+            lock: Arc::clone(&lock),
+            held: None,
+        };
+        guard.held = Some(lock.lock_owned().await);
+        guard
+    }
+}
+
+struct IdGuard<'a> {
+    locks: &'a IdLocks,
+    id: SubmissionId,
+    lock: Arc<AsyncMutex<()>>,
+    held: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for IdGuard<'_> {
+    fn drop(&mut self) {
+        self.held.take();
+        let mut map = locked(&self.locks.0);
+        // Only the map's and this one's: no other run waits for it.
+        if Arc::strong_count(&self.lock) == 2 {
+            map.remove(&self.id);
+        }
+    }
 }
 
 /// What the next steps fail with (tests only).
@@ -199,21 +287,37 @@ impl FeedbackService {
         plugins: PluginManager,
         paths: Paths,
     ) -> Self {
+        // A tool runs only in an absolute directory. The home is one unless
+        // no home directory was found; then it is made absolute here.
+        let gh_dir = std::path::absolute(&paths.home).unwrap_or_else(|_| PathBuf::from("/"));
         Self {
             store,
             limits: UploadLimits::default(),
             clock: Arc::new(Utc::now),
+            gh_timeout: GH_TIMEOUT,
             parts: Arc::new(Parts {
                 intents,
                 agents,
                 plugins,
                 paths,
+                gh_dir,
                 submitting: AsyncMutex::new(()),
+                ids: IdLocks::default(),
                 running: AtomicUsize::new(0),
+                issues: Mutex::default(),
+                visibility: Mutex::default(),
                 #[cfg(feature = "test-util")]
                 faults: Mutex::default(),
             }),
         }
+    }
+
+    /// Test hook: replaces [`GH_TIMEOUT`] (a real process ignores tokio's
+    /// paused clock).
+    #[cfg(feature = "test-util")]
+    pub fn with_gh_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.gh_timeout = timeout;
+        self
     }
 
     /// Test hook: replaces the upload limits (before the router is built,
@@ -251,11 +355,8 @@ impl FeedbackService {
     }
 
     #[cfg(feature = "test-util")]
-    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
-        self.parts
-            .faults
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn faults(&self) -> MutexGuard<'_, Faults> {
+        locked(&self.parts.faults)
     }
 
     /// Submissions being made now (waiting for their turn or running): the
@@ -307,32 +408,85 @@ impl FeedbackService {
     }
 
     /// One target per repository (in the store's order), the meta
-    /// repository, and whether `gh` and `agent-browser` are ready. Only the
-    /// configured `origin` is read, never contacted, and no URL is returned.
+    /// repository, and whether `gh` (signed in) and `agent-browser` are
+    /// ready. The configured `origin` is only read, and no URL is returned.
+    /// While `gh` is ready, it is asked whether each repository with a
+    /// GitHub remote is public, all at once; an answer is used again for 10
+    /// minutes.
     pub async fn targets(&self) -> Result<FeedbackTargets, FeedbackError> {
         let repos = self.store.list_repos().await?;
-        let mut targets = Vec::with_capacity(repos.len());
-        for repo in &repos {
-            let url = match git::origin_url(&repo.path).await {
-                Ok(url) => url,
-                Err(e) => {
-                    tracing::warn!(repo_id = %repo.id, "could not read the repository's origin: {}", git_failure(&e));
-                    None
-                }
-            };
-            targets.push(FeedbackTarget {
-                repo_id: repo.id,
-                has_github_remote: url.as_deref().and_then(github_repo).is_some(),
-                is_public: None,
-            });
-        }
+        let gh = self.gh(VISIBILITY_TIMEOUT);
+        let ready = gh_readiness(&gh).await;
+        let targets =
+            futures::future::join_all(repos.iter().map(|repo| self.target(repo, &gh, ready.ready)))
+                .await;
         let stored: Option<FeedbackSettings> = self.store.get_setting(FEEDBACK_KEY).await?;
         Ok(FeedbackTargets {
             repos: targets,
             meta_repo_id: effective_meta_repo(stored.and_then(|s| s.meta_repo_id), &repos),
-            gh: tool_readiness(&self.parts.plugins, GH).await,
+            gh: ready,
             agent_browser: tool_readiness(&self.parts.plugins, AGENT_BROWSER).await,
         })
+    }
+
+    async fn target(&self, repo: &Repo, gh: &Gh<'_>, gh_ready: bool) -> FeedbackTarget {
+        let github = match self.github_of(repo).await {
+            Ok(github) => github,
+            Err(e) => {
+                tracing::warn!(repo_id = %repo.id, code = e.code(), "{e}");
+                None
+            }
+        };
+        let is_public = match &github {
+            Some(github) if gh_ready => self.visibility(gh, github).await,
+            _ => None,
+        };
+        FeedbackTarget {
+            repo_id: repo.id,
+            has_github_remote: github.is_some(),
+            is_public,
+        }
+    }
+
+    /// [`is_public`], or its answer of the last 10 minutes; a failure is not
+    /// kept, so the next call asks again.
+    async fn visibility(&self, gh: &Gh<'_>, github: &GithubRepo) -> Option<bool> {
+        let key = github.key();
+        let now = (self.clock)();
+        let fresh = |at: DateTime<Utc>| (now - at).to_std().is_ok_and(|age| age < VISIBILITY_TTL);
+        if let Some(&(public, at)) = locked(&self.parts.visibility).get(&key) {
+            if fresh(at) {
+                return Some(public);
+            }
+        }
+        let public = is_public(gh, github).await?;
+        locked(&self.parts.visibility).insert(key, (public, now));
+        Some(public)
+    }
+
+    /// How `gh` runs for this service, each issue call limited to `timeout`.
+    fn gh(&self, timeout: Duration) -> Gh<'_> {
+        Gh {
+            plugins: &self.parts.plugins,
+            cwd: &self.parts.gh_dir,
+            timeout,
+        }
+    }
+
+    /// The github.com repository `origin` names, as configured; `None` when
+    /// there is no `origin` or it is elsewhere.
+    async fn github_of(&self, repo: &Repo) -> Result<Option<GithubRepo>, FeedbackError> {
+        let url = git::origin_url(&repo.path).await.map_err(|e| {
+            let status = match e {
+                git::GitError::Failed { status } => status,
+                _ => None,
+            };
+            FeedbackError::Git {
+                step: ORIGIN_STEP,
+                status,
+            }
+        })?;
+        Ok(url.as_deref().and_then(GithubRepo::from_remote))
     }
 
     /// Removes everything under [`Paths::feedback_tmp_dir`]: what a run that
@@ -374,22 +528,58 @@ impl FeedbackService {
         }
     }
 
-    /// Commits the staged submission's issue folder on a new branch and, for
-    /// an intent, creates the intent. A submission already recorded under
-    /// this id is continued instead (its uploads are not used): only a step
-    /// that has not succeeded runs again. So is one whose commit is on a
-    /// branch without its record (the daemon stopped in between): that
-    /// commit is recorded, not made again. A record that cannot be stored
-    /// takes its new branch back. A failure of the intent step after the
-    /// commit is in the answer's `failed`, not an error.
+    /// Commits the staged submission's issue folder on a new branch, then
+    /// creates the intent, or pushes the branch and creates the GitHub
+    /// issue. A submission already recorded under this id is continued
+    /// instead (its uploads are not used): only a step that has not
+    /// succeeded runs again. So is one whose commit is on a branch without
+    /// its record (the daemon stopped in between): that commit is recorded,
+    /// not made again. A record that cannot be stored takes its new branch
+    /// back. An issue submission is refused before anything is written when
+    /// `origin` is not on github.com or `gh` is not ready. A failure of a
+    /// step after the commit is in the answer's `failed`, not an error, and
+    /// undoes nothing.
     pub async fn submit(&self, staged: Staged) -> Result<FeedbackOutcome, FeedbackError> {
         let _running = Running::start(&self.parts.running);
-        let _turn = self.parts.submitting.lock().await;
+        let id = staged.request.submission_id;
+        let _own = self.parts.ids.lock(id).await;
+        // Before the turn, since `gh` can take seconds. A recorded
+        // submission is continued, never refused.
+        let gh_checked = staged.request.send_as == SendAs::GithubIssue
+            && self.store.get_submission(id).await?.is_none();
+        if gh_checked {
+            self.require_github(staged.request.repo_id).await?;
+        }
+        let submission = {
+            let _turn = self.parts.submitting.lock().await;
+            self.record(staged).await?
+        };
+        self.finish(submission, gh_checked).await
+    }
+
+    /// Runs the steps of the recorded submission `id` that have not
+    /// succeeded: the intent, or the push and then the issue. A complete
+    /// submission is answered as it is; nothing is committed again.
+    pub async fn retry(&self, id: SubmissionId) -> Result<FeedbackOutcome, FeedbackError> {
+        let _running = Running::start(&self.parts.running);
+        let _own = self.parts.ids.lock(id).await;
+        let recorded = self
+            .store
+            .get_submission(id)
+            .await?
+            .ok_or(FeedbackError::SubmissionNotFound)?;
+        tracing::info!(submission_id = %id, "retrying a feedback submission");
+        self.finish(recorded, false).await
+    }
+
+    /// The submission's record: the stored one, the one of a commit made
+    /// before, or a new commit's.
+    async fn record(&self, staged: Staged) -> Result<Submission, FeedbackError> {
         let id = staged.request.submission_id;
         if let Some(recorded) = self.store.get_submission(id).await? {
             drop(staged);
             tracing::info!(submission_id = %id, "continuing a recorded feedback submission");
-            return self.finish(recorded).await;
+            return Ok(recorded);
         }
         let request = &staged.request;
         let repo = self
@@ -418,12 +608,7 @@ impl FeedbackService {
             drop(staged);
             // Nothing to undo when it fails: the commit stays findable.
             self.insert_record(&submission).await?;
-            return self.finish(submission).await;
-        }
-        if request.send_as == SendAs::GithubIssue {
-            return Err(FeedbackError::Invalid(
-                "sending feedback as a GitHub issue is not available yet".into(),
-            ));
+            return Ok(submission);
         }
         if request.idea.is_some_and(|idea| idea.demo_video) {
             self.require_tool(AGENT_BROWSER).await?;
@@ -471,7 +656,24 @@ impl FeedbackService {
             }
             return Err(e);
         }
-        self.finish(submission).await
+        Ok(submission)
+    }
+
+    /// `NoGithubRemote` unless the repository's `origin` is on github.com,
+    /// then `GhNotReady` unless `gh` is ready and signed in.
+    async fn require_github(&self, repo_id: RepoId) -> Result<(), FeedbackError> {
+        let repo = self
+            .store
+            .get_repo(repo_id)
+            .await?
+            .ok_or(FeedbackError::RepoNotFound)?;
+        if self.github_of(&repo).await?.is_none() {
+            return Err(FeedbackError::NoGithubRemote);
+        }
+        match gh_readiness(&self.gh(VISIBILITY_TIMEOUT)).await.reason {
+            None => Ok(()),
+            Some(reason) => Err(FeedbackError::GhNotReady(not_ready_sentence(&reason))),
+        }
     }
 
     /// Stores a new submission; a failure is logged with its step and code.
@@ -488,23 +690,30 @@ impl FeedbackService {
         })
     }
 
-    /// Saves what a submission got to; a failure is logged with its step and
-    /// code.
-    async fn save_record(&self, s: &Submission) -> Result<(), FeedbackError> {
+    /// Saves what a submission got to; a failure is logged with `step` and
+    /// its code.
+    async fn save_record(&self, s: &Submission, step: &'static str) -> Result<(), FeedbackError> {
         #[cfg(feature = "test-util")]
         {
             let mut faults = self.faults();
             if faults.saves > 0 {
                 faults.saves -= 1;
-                tracing::warn!(submission_id = %s.id, step = "record_intent", code = "store_error", "the feedback submission was not saved");
+                tracing::warn!(submission_id = %s.id, step, code = "store_error", "the feedback submission was not saved");
                 return Err(StoreError::Conflict("a test failed this save".into()).into());
             }
         }
         self.store.save_submission(s).await.map_err(|e| {
             let e = FeedbackError::from(e);
-            tracing::warn!(submission_id = %s.id, step = "record_intent", code = e.code(), "the feedback submission was not saved");
+            tracing::warn!(submission_id = %s.id, step, code = e.code(), "the feedback submission was not saved");
             e
         })
+    }
+
+    /// [`Self::save_record`], tried twice: for a result that exists either
+    /// way, so not saving it must not turn into a failure. Whether it was
+    /// saved.
+    async fn save_result(&self, s: &Submission, step: &'static str) -> bool {
+        self.save_record(s, step).await.is_ok() || self.save_record(s, step).await.is_ok()
     }
 
     /// `ToolMissing` unless the feedback plugin's `tool` is ready.
@@ -521,8 +730,13 @@ impl FeedbackService {
     }
 
     /// The steps after the commit, each skipped when its result is stored:
-    /// for an intent, creating it.
-    async fn finish(&self, mut s: Submission) -> Result<FeedbackOutcome, FeedbackError> {
+    /// for an intent, creating it; for an issue, the push and then the
+    /// issue. `gh_checked`: `gh` was found ready a moment ago.
+    async fn finish(
+        &self,
+        mut s: Submission,
+        gh_checked: bool,
+    ) -> Result<FeedbackOutcome, FeedbackError> {
         let mut failed = None;
         let intent = match (s.request.send_as, s.intent_id) {
             (SendAs::Intent, Some(intent_id)) => Some(
@@ -537,9 +751,9 @@ impl FeedbackService {
                     tracing::info!(submission_id = %s.id, step = "create_intent", "feedback intent created");
                     s.intent_id = Some(intent.id);
                     s.updated_at = (self.clock)();
-                    // Tried twice; the intent exists either way, so it is the
-                    // answer (a 500 now would invite a second one).
-                    if self.save_record(&s).await.is_err() && self.save_record(&s).await.is_err() {
+                    // The intent exists either way, so it is the answer (a
+                    // 500 now would invite a second one).
+                    if !self.save_result(&s, "record_intent").await {
                         tracing::error!(submission_id = %s.id, step = "record_intent", code = "store_error", "the feedback intent was made but not recorded");
                     }
                     Some(intent)
@@ -555,7 +769,10 @@ impl FeedbackService {
                     None
                 }
             },
-            (SendAs::GithubIssue, _) => None,
+            (SendAs::GithubIssue, _) => {
+                failed = self.send_issue(&mut s, gh_checked).await?;
+                None
+            }
         };
         Ok(FeedbackOutcome {
             submission_id: s.id,
@@ -609,6 +826,160 @@ impl FeedbackService {
             ..CreateExtras::default()
         };
         self.parts.intents.create_with(req, extras).await
+    }
+
+    /// For an issue: `git push origin <branch>:<branch>`, then the issue,
+    /// each skipped when its result is stored. The first that fails is the
+    /// answer's `failed`; nothing is undone. The issue's address is kept in
+    /// memory until its record is saved, so a retry never makes a second one
+    /// while the daemon runs (after a restart, `gh`'s search finds it).
+    async fn send_issue(
+        &self,
+        s: &mut Submission,
+        gh_checked: bool,
+    ) -> Result<Option<FeedbackFailure>, FeedbackError> {
+        let id = s.id;
+        if s.issue_url.is_none() {
+            let remembered = locked(&self.parts.issues).get(&id).cloned();
+            if let Some(url) = remembered {
+                // An issue exists only once its branch was pushed.
+                s.pushed = true;
+                s.issue_url = Some(url);
+                s.updated_at = (self.clock)();
+                if self.save_result(s, "record_issue").await {
+                    locked(&self.parts.issues).remove(&id);
+                }
+            }
+        }
+        if s.issue_url.is_some() {
+            return Ok(None);
+        }
+        let repo = self
+            .store
+            .get_repo(s.repo_id)
+            .await?
+            .ok_or(FeedbackError::RepoNotFound)?;
+        let step = if s.pushed {
+            FeedbackStep::CreateIssue
+        } else {
+            FeedbackStep::Push
+        };
+        let github = match self.github_of(&repo).await {
+            Ok(Some(github)) => github,
+            Ok(None) => return Ok(Some(step_failure(step, &FeedbackError::NoGithubRemote))),
+            Err(e) => return Ok(Some(step_failure(step, &e))),
+        };
+
+        if !s.pushed {
+            if let Err(failure) = repo::push(&repo, &s.branch, &s.branch).await {
+                tracing::warn!(submission_id = %id, step = "push", code = %failure.code, "the feedback branch was not pushed");
+                return Ok(Some(failure));
+            }
+            tracing::info!(submission_id = %id, step = "push", "feedback branch pushed");
+            s.pushed = true;
+            s.updated_at = (self.clock)();
+            // Not saved, the next retry pushes the same commit again, which
+            // changes nothing.
+            let _ = self.save_record(s, "record_push").await;
+        }
+
+        match self.make_issue(s, &repo, &github, gh_checked).await {
+            Ok(url) => {
+                tracing::info!(submission_id = %id, step = "create_issue", "feedback issue created or found");
+                locked(&self.parts.issues).insert(id, url.clone());
+                s.issue_url = Some(url);
+                s.updated_at = (self.clock)();
+                if self.save_result(s, "record_issue").await {
+                    locked(&self.parts.issues).remove(&id);
+                } else {
+                    tracing::error!(submission_id = %id, step = "record_issue", code = "store_error", "the feedback issue was made but not recorded");
+                }
+                Ok(None)
+            }
+            Err(failure) => {
+                tracing::warn!(submission_id = %id, step = "create_issue", code = %failure.code, "the feedback issue was not created");
+                Ok(Some(failure))
+            }
+        }
+    }
+
+    /// The issue of a pushed submission: `gh` checked (unless it was a
+    /// moment ago), the body written to a scratch directory of its own
+    /// (removed afterwards), then [`create_issue`].
+    async fn make_issue(
+        &self,
+        s: &Submission,
+        repo: &Repo,
+        github: &GithubRepo,
+        gh_checked: bool,
+    ) -> Result<String, FeedbackFailure> {
+        let gh = self.gh(self.gh_timeout);
+        if !gh_checked {
+            if let Some(reason) = gh_readiness(&gh).await.reason {
+                return Err(FeedbackFailure {
+                    step: FeedbackStep::CreateIssue,
+                    code: "gh_not_ready".to_owned(),
+                    message: not_ready_sentence(&reason),
+                });
+            }
+        }
+        let body = issue_text(s, repo, github).await?;
+        let scratch = StagingDir::scratch(&self.staging_root(), s.id).map_err(|e| {
+            tracing::warn!(submission_id = %s.id, step = "create_issue", kind = ?e.kind(), "could not write the issue's body");
+            body_failure()
+        })?;
+        let body_file = scratch.path().join(BODY_FILE);
+        tokio::fs::write(&body_file, body).await.map_err(|e| {
+            tracing::warn!(submission_id = %s.id, step = "create_issue", kind = ?e.kind(), "could not write the issue's body");
+            body_failure()
+        })?;
+        let title = no_mentions(&s.title);
+        let label = label_for(s.request.kind);
+        create_issue(&gh, github, &title, &body_file, label, s.id).await
+    }
+}
+
+/// The body of a submission's issue: its `issue.md` as committed, without
+/// front matter, links to the folder's files as permalinks to the commit,
+/// and the submission's marker last.
+async fn issue_text(
+    s: &Submission,
+    repo: &Repo,
+    github: &GithubRepo,
+) -> Result<String, FeedbackFailure> {
+    let path = format!("{}/{ISSUE_MD}", s.folder);
+    let issue_md = git::show_file(&repo.path, &s.commit, &path, ISSUE_MD_MAX_BYTES).await;
+    let files = git::list_folder(&repo.path, &s.commit, &s.folder).await;
+    match (issue_md, files) {
+        (Ok(Some(issue_md)), Ok(files)) => {
+            let base = permalink_base(&github.owner, &github.name, &s.commit, &s.folder);
+            Ok(issue_body(&issue_md, &files, &base, Some(&marker(s.id))))
+        }
+        _ => {
+            tracing::warn!(submission_id = %s.id, step = "create_issue", code = "git_failed", "could not read the committed issue folder");
+            Err(FeedbackFailure {
+                step: FeedbackStep::CreateIssue,
+                code: "git_failed".to_owned(),
+                message: "git could not read the committed issue folder".to_owned(),
+            })
+        }
+    }
+}
+
+fn body_failure() -> FeedbackFailure {
+    FeedbackFailure {
+        step: FeedbackStep::CreateIssue,
+        code: "io_error".to_owned(),
+        message: "could not write the issue's body".to_owned(),
+    }
+}
+
+/// A refusal at `step` after the commit, as a failure.
+fn step_failure(step: FeedbackStep, e: &FeedbackError) -> FeedbackFailure {
+    FeedbackFailure {
+        step,
+        code: e.code().to_owned(),
+        message: e.to_string(),
     }
 }
 
@@ -667,15 +1038,6 @@ fn folder_files(staged: &Staged, created: DateTime<Utc>) -> Result<Vec<FolderFil
 /// checks every part).
 fn missing_upload(attachment: usize) -> FeedbackError {
     FeedbackError::Invalid(format!("attachment {attachment} was not sent"))
-}
-
-/// What a failed git command is called in a log: its exit status at most.
-fn git_failure(e: &git::GitError) -> String {
-    match e {
-        git::GitError::Failed { status } => exit_status_text(status),
-        git::GitError::TimedOut => "timed out".to_owned(),
-        _ => "git failed".to_owned(),
-    }
 }
 
 /// Removes a directory with everything in it, or a file or link (never

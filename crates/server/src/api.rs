@@ -28,7 +28,9 @@ use serde::Deserialize;
 use serde_json::json;
 use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo};
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::feedback::{FeedbackOutcome, FeedbackSettings, FeedbackTargets};
+use smithagents_core::feedback::{
+    FeedbackOutcome, FeedbackSettings, FeedbackTargets, SubmissionId,
+};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, MessageId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentState,
@@ -106,6 +108,7 @@ pub fn router(state: AppState) -> Router {
             post(submit_feedback)
                 .layer(DefaultBodyLimit::max(state.feedback.limits().body_limit())),
         )
+        .route("/v1/feedback/{submission_id}/retry", post(retry_feedback))
         .route("/v1/plugins", get(list_plugins))
         .route("/v1/plugins/{id}", get(get_plugin))
         .route("/v1/plugins/{id}/enable", post(enable_plugin))
@@ -1084,6 +1087,17 @@ async fn submit_feedback(
         .map(Json)
 }
 
+/// Detached as a submission is: a client that goes away does not stop a
+/// push or `gh` half-way.
+async fn retry_feedback(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<FeedbackOutcome>, ApiError> {
+    let id: SubmissionId = path_id(&id, "submission")?;
+    let svc = s.feedback;
+    detached(async move { svc.retry(id).await }).await.map(Json)
+}
+
 // ------------------------------------------------------------- websocket
 
 #[derive(Deserialize)]
@@ -1324,6 +1338,9 @@ mod tests {
             FeedbackError::UnsupportedFile(_) => "UnsupportedFile",
             FeedbackError::TooLarge(_) => "TooLarge",
             FeedbackError::ToolMissing(_) => "ToolMissing",
+            FeedbackError::SubmissionNotFound => "SubmissionNotFound",
+            FeedbackError::NoGithubRemote => "NoGithubRemote",
+            FeedbackError::GhNotReady(_) => "GhNotReady",
             FeedbackError::Intent(_) => "Intent",
         }
     }
@@ -1415,6 +1432,24 @@ mod tests {
                 "tool_missing",
                 "agent-browser is not installed",
             ),
+            (
+                FeedbackError::SubmissionNotFound,
+                S::NOT_FOUND,
+                "submission_not_found",
+                "no such submission",
+            ),
+            (
+                FeedbackError::NoGithubRemote,
+                S::CONFLICT,
+                "no_github_remote",
+                "the repository's origin is not a GitHub repository",
+            ),
+            (
+                FeedbackError::GhNotReady("GitHub CLI (gh) is not installed".into()),
+                S::CONFLICT,
+                "gh_not_ready",
+                "GitHub CLI (gh) is not installed",
+            ),
             // The intent service's own code and status, also of an error it wraps.
             (
                 FeedbackError::Intent(IntentError::NotFound),
@@ -1431,7 +1466,7 @@ mod tests {
         ];
         let covered: std::collections::BTreeSet<&str> =
             cases.iter().map(|(e, ..)| feedback_variant(e)).collect();
-        assert_eq!(covered.len(), 15, "{covered:?}");
+        assert_eq!(covered.len(), 18, "{covered:?}");
 
         for (e, status, code, message) in cases {
             assert_eq!((e.status(), e.code()), (status, code), "{message}");

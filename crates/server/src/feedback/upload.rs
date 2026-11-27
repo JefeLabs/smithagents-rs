@@ -239,14 +239,20 @@ impl StagingDir {
     /// Creates a new one directly under `root` (made owner-only; a symbolic
     /// link or another user's directory is refused).
     fn create(root: &Path, id: SubmissionId) -> io::Result<StagingDir> {
+        let dir = StagingDir::scratch(root, id)?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.upload_dir())?;
+        Ok(dir)
+    }
+
+    /// An empty one, for files the daemon writes itself (an issue's body);
+    /// made as [`StagingDir::create`] makes one.
+    pub(crate) fn scratch(root: &Path, id: SubmissionId) -> io::Result<StagingDir> {
         ensure_private_real_dir(root)?;
         let path = root.join(format!("{id}-{}", uuid::Uuid::new_v4().simple()));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(&path)?;
-        let dir = StagingDir { path };
-        builder.create(dir.upload_dir())?;
-        Ok(dir)
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(StagingDir { path })
     }
 
     /// The scratch directory itself.

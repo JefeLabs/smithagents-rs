@@ -520,11 +520,12 @@ async fn targets_list_repositories_tools_and_the_meta_repository() {
 
     let (status, body) = fx.call(Method::GET, "/v1/feedback/targets", None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // The fake `gh` says every repository is private.
     assert_eq!(
         body,
         json!({
             "repos": [
-                {"repo_id": a.id, "has_github_remote": true, "is_public": null},
+                {"repo_id": a.id, "has_github_remote": true, "is_public": false},
                 {"repo_id": b.id, "has_github_remote": false, "is_public": null},
             ],
             "meta_repo_id": null,
@@ -540,10 +541,12 @@ async fn targets_list_repositories_tools_and_the_meta_repository() {
     assert_eq!(status, StatusCode::OK);
     let (_, body) = fx.call(Method::GET, "/v1/feedback/targets", None).await;
     assert_eq!(body["meta_repo_id"], json!(b.id));
-    // No tool ran to answer (only looked up).
-    assert!(fx.fake.calls().is_empty(), "{:?}", fx.fake.calls());
+    // gh was asked whether it is signed in each time, and once whether the
+    // GitHub repository is public; agent-browser was only looked up.
+    let view = "repo view --json=visibility --jq=.visibility -- github.com/smithagents-test-invalid/widgets";
+    assert_eq!(fx.fake.calls(), ["auth status", view, "auth status"]);
 
-    // A plugin that is turned off has no tool ready.
+    // A plugin that is turned off has no tool ready, and none runs.
     let (status, _) = fx
         .call(Method::POST, "/v1/plugins/feedback/disable", None)
         .await;
@@ -552,6 +555,8 @@ async fn targets_list_repositories_tools_and_the_meta_repository() {
     let off = json!({"ready": false, "reason": "turned off or not running"});
     assert_eq!(body["gh"], off);
     assert_eq!(body["agent_browser"], off);
+    assert_eq!(body["repos"][0]["is_public"], Value::Null);
+    assert_eq!(fx.fake.calls().len(), 3);
 }
 
 #[tokio::test]
@@ -1276,24 +1281,6 @@ async fn blocked_folders_and_branches_are_refused_with_their_sentences() {
     assert_eq!(git_out(&b.path, &["branch", "--list", "feedback/*"]), "");
     assert!(fx.feedback_tmp_is_empty());
     assert!(fx.intents().await.is_empty());
-}
-
-#[tokio::test]
-async fn an_issue_submission_is_refused_until_the_issue_path_exists() {
-    let fx = fixture().await;
-    let repo = fx.add_repo("r1").await;
-    common::git(&repo.path, &["remote", "add", "origin", GITHUB_URL]);
-    fx.refused(
-        &repo.path,
-        &request_json(repo.id, "github_issue"),
-        &[],
-        (
-            StatusCode::BAD_REQUEST,
-            "invalid",
-            "sending feedback as a GitHub issue is not available yet",
-        ),
-    )
-    .await;
 }
 
 #[tokio::test]

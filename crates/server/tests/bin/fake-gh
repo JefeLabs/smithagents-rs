@@ -5,22 +5,24 @@
 # `<directory of this script>/../gh`: the layout `tests/common/feedback.rs`
 # (`FakeTools`) makes, so a test needs no process-wide variable.
 #
-# Every run appends "$*" as one line to `calls.log` and its environment to
-# `env.log`. Then:
+# Every run appends "$*" as one line to `calls.log`, its environment to
+# `env.log` and its working directory (physical) to `cwd.log`. Then:
 #   - `fail` holds exactly "$1 $2": prints LEAK-gh-stdout to stdout and
 #     LEAK-gh-stderr to stderr, and exits 1;
-#   - `hang` holds exactly "$1 $2": sleeps 600 s;
+#   - `hang` holds exactly "$1 $2": writes its process id to `hang.pid` and
+#     sleeps 600 s (as the same process);
 #   - `auth status`: exits 1 when the file `signed-out` exists, else 0;
 #   - `repo view`: prints the file `visibility`, else PRIVATE;
 #   - `label list`: prints the file `label`, else true;
 #   - `issue list`, `pr list`: print the file `existing`, else nothing;
 #   - `issue create`: copies the file named by `--body-file=` to
-#     `issue-body.md` and prints an issue URL;
+#     `issue-body.md` and prints the file `issue-url`, else an issue URL;
 #   - `pr create`: copies it to `pr-body.md` and prints a pull request URL;
 #   - anything else exits 0.
 dir="${FAKE_GH_DIR:-$(dirname "$0")/../gh}"
 printf '%s\n' "$*" >> "$dir/calls.log"
 env >> "$dir/env.log"
+pwd -P >> "$dir/cwd.log"
 
 holds() {
   [ -f "$dir/$1" ] && [ "$(cat "$dir/$1")" = "$2" ]
@@ -32,6 +34,7 @@ if holds fail "$1 $2"; then
   exit 1
 fi
 if holds hang "$1 $2"; then
+  printf '%s\n' "$$" > "$dir/hang.pid"
   exec sleep 600
 fi
 
@@ -73,7 +76,8 @@ case "$1 $2" in
   "issue create")
     find_body "$@"
     cp "$body" "$dir/issue-body.md" || exit 1
-    echo "https://github.com/smithagents-test-invalid/widgets/issues/7"
+    print_or issue-url "https://github.com/smithagents-test-invalid/widgets/issues/7"
+    echo
     ;;
   "pr create")
     find_body "$@"

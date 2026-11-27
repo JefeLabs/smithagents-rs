@@ -20,7 +20,7 @@ use smithagents_core::agent::{Agent, ChatMessage, Repo};
 use smithagents_core::daemon::DaemonInfo;
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::feedback::{
-    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets,
+    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets, SubmissionId,
 };
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
@@ -365,6 +365,15 @@ impl Client {
         }
         self.fetch(self.http.post(self.url("/v1/feedback")).multipart(form))
             .await
+    }
+
+    /// `POST /v1/feedback/{id}/retry`: runs the steps of a recorded
+    /// submission that did not succeed (the intent, or the push and the
+    /// issue) and answers as Submit does. No timeout: a push and `gh` can
+    /// take minutes.
+    pub async fn retry_feedback(&self, id: SubmissionId) -> Result<FeedbackOutcome, ClientError> {
+        let url = self.url(&format!("/v1/feedback/{id}/retry"));
+        self.fetch(self.http.post(url)).await
     }
 
     /// `/v1/plugins/<segments>?<params>`, each segment percent-encoded, so an
