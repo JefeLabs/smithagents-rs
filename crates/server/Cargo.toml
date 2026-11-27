@@ -44,6 +44,10 @@ path = "tests/api.rs"
 required-features = ["test-util"]
 
 [dev-dependencies]
+# The crate's own test hooks, for every test target that needs them (see
+# `required-features`): a plain `cargo test` then builds and runs them all
+# instead of silently skipping them.
+smithagents-server = { path = ".", features = ["test-util"] }
 # On in test builds so the daemon's logging test means something (see
 # `init_logging` in src/bin/smithagentsd.rs).
 tracing-subscriber = { workspace = true, features = ["tracing-log"] }

@@ -7972,6 +7972,7 @@ dependencies = [
  "smithagents-plugin-host",
  "smithagents-plugin-protocol",
  "smithagents-plugins-tool",
+ "smithagents-server",
  "sqlx",
  "subtle",
  "tempfile",
