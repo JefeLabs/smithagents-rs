@@ -7,6 +7,8 @@
 #   FAKE_CLAUDE_EXIT         exit code (default 0)
 #   FAKE_CLAUDE_SLEEP        seconds to sleep before exiting
 #   FAKE_CLAUDE_PID_FILE     receives this process's pid
+#   FAKE_CLAUDE_TERM_FILE    written when this process is asked to stop (SIGTERM),
+#                            after which it exits on its own
 #   FAKE_CLAUDE_GRANDCHILD_SECS  background grandchild holding stderr open this long
 #   FAKE_CLAUDE_GRANDCHILD_PID_FILE  receives that grandchild's pid
 #   FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS  background grandchild holding stdout open this long
@@ -17,6 +19,10 @@
 #                            trimmed content overrides the values above (re-read per
 #                            run); `structured` holds the path of a JSON file that
 #                            replaces FAKE_CLAUDE_STRUCTURED_FILE
+# Before the pid file says this process runs: a test may ask it to stop at once.
+if [ -n "$FAKE_CLAUDE_TERM_FILE" ]; then
+  trap 'echo stopped > "$FAKE_CLAUDE_TERM_FILE"; exit 0' TERM
+fi
 if [ -n "$FAKE_CLAUDE_PID_FILE" ]; then
   echo "$$" > "$FAKE_CLAUDE_PID_FILE"
 fi

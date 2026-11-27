@@ -2,8 +2,8 @@
 //!
 //! Startup: take the instance lock (exit 3 if another daemon holds it), open
 //! the store, bind 127.0.0.1 on a random port, generate the token, write the
-//! lockfile, then serve until idle, SIGTERM or ctrl-c. On the way out the
-//! lockfile is removed and the process exits 0.
+//! lockfile, then serve until idle, SIGTERM, SIGHUP or ctrl-c. On the way
+//! out the lockfile is removed and the process exits 0.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -392,16 +392,21 @@ async fn serve(
     }
 }
 
-/// Resolves with the signal's name on SIGTERM or SIGINT (ctrl-c).
+/// Resolves with the signal's name on SIGTERM, SIGINT (ctrl-c) or SIGHUP
+/// (the terminal it was started from closed). An agent's claude leads a
+/// process group of its own and so does not get the terminal's signals
+/// itself: the daemon must stop in order, which stops its agents.
 #[cfg(unix)]
 fn shutdown_signal() -> io::Result<impl Future<Output = &'static str> + Send + 'static> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut hangup = signal(SignalKind::hangup())?;
     Ok(async move {
         tokio::select! {
             _ = term.recv() => "SIGTERM",
             _ = interrupt.recv() => "SIGINT",
+            _ = hangup.recv() => "SIGHUP",
         }
     })
 }

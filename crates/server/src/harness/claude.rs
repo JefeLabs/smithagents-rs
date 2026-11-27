@@ -163,6 +163,13 @@ fn build_structured_args(req: &StructuredRequest) -> Vec<String> {
     args
 }
 
+/// A turn is given up on while claude may still run: claude is asked to stop
+/// first, so it can stop what it started itself (see [`GroupKiller::stop`]).
+/// What is left then is killed when the guard is dropped.
+async fn give_up(group: &GroupKiller) {
+    group.stop().await;
+}
+
 impl ClaudeCodeHarness {
     /// claude with `args` in `cwd`, its stdio piped, killed when dropped,
     /// leading a process group of its own (so it can be stopped together
@@ -222,11 +229,17 @@ impl Harness for ClaudeCodeHarness {
                 // a consumer that was slow to take the lines before it.
                 let line = tokio::select! {
                     biased;
-                    () = tx.closed() => return,
+                    () = tx.closed() => {
+                        give_up(&group).await;
+                        return;
+                    }
                     () = tokio::time::sleep_until(since_exit(READ_AFTER_EXIT_MAX)),
                         if exited_at.is_some() => break,
                     exited = child.wait(), if status.is_none() => {
-                        group.disarm();
+                        // Reaped only when the wait succeeded.
+                        if exited.is_ok() {
+                            group.disarm();
+                        }
                         status = Some(exited);
                         exited_at = Some(Instant::now());
                         continue;
@@ -247,6 +260,7 @@ impl Harness for ClaudeCodeHarness {
                             Ok(events) => {
                                 for ev in events {
                                     if tx.send(ev).await.is_err() {
+                                        give_up(&group).await;
                                         return;
                                     }
                                 }
@@ -274,9 +288,14 @@ impl Harness for ClaudeCodeHarness {
                     let status = match status {
                         Some(status) => status,
                         None => tokio::select! {
-                            () = tx.closed() => return,
+                            () = tx.closed() => {
+                                give_up(&group).await;
+                                return;
+                            }
                             s = child.wait() => {
-                                group.disarm();
+                                if s.is_ok() {
+                                    group.disarm();
+                                }
                                 s
                             }
                         },
@@ -347,7 +366,9 @@ impl Harness for ClaudeCodeHarness {
                 return Err(HarnessError::Timeout);
             }
             Ok(status) => {
-                group.disarm();
+                if status.is_ok() {
+                    group.disarm();
+                }
                 status?
             }
         };

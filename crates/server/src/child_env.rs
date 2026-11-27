@@ -1,7 +1,16 @@
 //! What the processes the daemon starts (agents, git) inherit from it, and
 //! how one is stopped together with what it started.
 
+use std::time::Duration;
+
 use tokio::process::Command;
+
+/// The longest a process group that was asked to stop ([`GroupKiller::stop`])
+/// gets before it is killed: enough for git to remove its lock files and for
+/// an agent to stop what it started, short enough not to hold anything up.
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(2);
+/// How often [`GroupKiller::stop`] looks whether the leader has ended.
+const STOP_POLL: Duration = Duration::from_millis(20);
 
 /// The variables that hold plugin secrets: `SMITHAGENTS_SECRET_<PLUGIN>__<KEY>`.
 const PLUGIN_SECRET_PREFIX: &[u8] = b"SMITHAGENTS_SECRET_";
@@ -45,6 +54,22 @@ impl GroupKiller {
         self.0 = None;
     }
 
+    /// Asks the group to stop (SIGTERM), then waits until its leader has
+    /// ended, for at most [`STOP_GRACE`]. The leader is looked at without
+    /// being reaped, so the group's id stays its own. The guard stays armed:
+    /// what is left when it is dropped is killed. Nothing happens once it
+    /// is disarmed.
+    pub(crate) async fn stop(&self) {
+        let Some(leader) = self.0 else {
+            return;
+        };
+        signal_group(Some(leader), rustix::process::Signal::TERM);
+        let deadline = tokio::time::Instant::now() + STOP_GRACE;
+        while !has_ended(leader) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(STOP_POLL).await;
+        }
+    }
+
     /// Kills the group now, once.
     pub(crate) fn kill(&mut self) {
         kill_group(self.0.take());
@@ -59,13 +84,36 @@ impl Drop for GroupKiller {
 
 /// Sends SIGKILL to every process of the group led by `leader`.
 pub(crate) fn kill_group(leader: Option<u32>) {
+    signal_group(leader, rustix::process::Signal::KILL);
+}
+
+/// Whether the child process with this id has ended, without reaping it.
+/// One that cannot be looked at (not ours, or gone) counts as ended.
+fn has_ended(leader: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+        let Some(pid) = i32::try_from(leader).ok().and_then(Pid::from_raw) else {
+            return true;
+        };
+        let peek = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        !matches!(waitid(WaitId::Pid(pid), peek), Ok(None))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = leader;
+        true
+    }
+}
+
+fn signal_group(leader: Option<u32>, signal: rustix::process::Signal) {
     #[cfg(unix)]
     if let Some(pid) = leader
         .and_then(|id| i32::try_from(id).ok())
         .and_then(rustix::process::Pid::from_raw)
     {
         // The group may be gone already.
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        let _ = rustix::process::kill_process_group(pid, signal);
     }
 }
 

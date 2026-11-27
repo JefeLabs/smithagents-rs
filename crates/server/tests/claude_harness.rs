@@ -369,6 +369,37 @@ async fn dropping_stream_kills_what_claude_started_too() {
 }
 
 #[tokio::test]
+async fn a_turn_given_up_on_asks_claude_to_stop_before_it_is_killed() {
+    // Asked first, claude can stop what it started itself, whatever process
+    // group that is in.
+    let dir = tempfile::tempdir().unwrap();
+    let (claude_pid, asked) = (dir.path().join("pid"), dir.path().join("asked"));
+    let env = setup(&[
+        ("FAKE_CLAUDE_SLEEP", "30"),
+        ("FAKE_CLAUDE_PID_FILE", claude_pid.to_str().unwrap()),
+        ("FAKE_CLAUDE_TERM_FILE", asked.to_str().unwrap()),
+    ]);
+    let stream = env
+        .harness
+        .run_turn(req(env.dir.path(), None))
+        .await
+        .unwrap();
+    let claude = pid_from(&claude_pid).await;
+
+    drop(stream);
+
+    let start = Instant::now();
+    while !asked.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "claude was never asked to stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_dies(&claude, "claude").await;
+}
+
+#[tokio::test]
 async fn what_claude_left_running_survives_a_turn_that_ended_on_its_own() {
     // claude exits by itself, leaving a process behind on purpose: the
     // harness only stops what a turn it gave up on had started.
@@ -376,7 +407,7 @@ async fn what_claude_left_running_survives_a_turn_that_ended_on_its_own() {
     let started_pid = dir.path().join("started");
     let env = setup(&[
         ("FAKE_CLAUDE_FIXTURE", FIXTURE),
-        ("FAKE_CLAUDE_GRANDCHILD_SECS", "5"),
+        ("FAKE_CLAUDE_GRANDCHILD_SECS", "60"),
         (
             "FAKE_CLAUDE_GRANDCHILD_PID_FILE",
             started_pid.to_str().unwrap(),
@@ -390,7 +421,10 @@ async fn what_claude_left_running_survives_a_turn_that_ended_on_its_own() {
         "{events:?}"
     );
     let started = pid_from(&started_pid).await;
-    assert!(pid_alive(&started), "the process claude left was stopped");
+    let survived = pid_alive(&started);
+    // The test stops it itself; it outlives any slow run until here.
+    let _ = std::process::Command::new("kill").arg(&started).status();
+    assert!(survived, "the process claude left was stopped");
 }
 
 /// Collects a turn's events, failing instead of hanging past `limit`.

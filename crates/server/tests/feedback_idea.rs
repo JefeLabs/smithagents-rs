@@ -1161,10 +1161,13 @@ async fn the_polish_prompts_know_an_idea_package() {
 
     let calls = fx.harness.structured_calls();
     assert_eq!(calls.len(), 4);
+    // Outside the fenced blocks, and inside them (pass 2 has one per part).
     let split = |prompt: &str| {
         let parts: Vec<&str> = prompt.split("=====").collect();
-        assert_eq!(parts.len(), 5, "{prompt}");
-        (format!("{}{}", parts[0], parts[4]), parts[2].to_owned())
+        assert_eq!(parts.len() % 4, 1, "{prompt}");
+        let every_fourth =
+            |from: usize| -> String { parts.iter().skip(from).step_by(4).copied().collect() };
+        (every_fourth(0), every_fourth(2))
     };
     let (outside, inside) = split(&calls[0].prompt);
     assert!(outside.contains(IDEA_PASS1_NOTE), "{}", calls[0].prompt);

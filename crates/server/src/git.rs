@@ -297,14 +297,19 @@ pub async fn create_worktree(
     Err(worktree_add_failure(stderr_of(&out), branch, &dir))
 }
 
-/// Whether `git worktree add` would refuse `dir`: a file, or a folder that
-/// holds anything. Nothing there, or an empty folder, is free.
+/// Whether `git worktree add` would refuse `dir`: a file, a link to nothing,
+/// a folder that cannot be read, or one that holds anything. Nothing there,
+/// or an empty folder, is free.
 async fn is_taken(dir: &Path) -> Result<bool, GitError> {
+    // The entry itself, not what a link points to: a dangling link is there.
+    match tokio::fs::symlink_metadata(dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
     match tokio::fs::read_dir(dir).await {
         Ok(mut entries) => Ok(entries.next_entry().await?.is_some()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(true),
-        Err(e) => Err(e.into()),
+        Err(_) => Ok(true),
     }
 }
 
@@ -315,9 +320,13 @@ async fn is_taken(dir: &Path) -> Result<bool, GitError> {
 fn worktree_add_failure(stderr: String, branch: &str, dir: &Path) -> GitError {
     if stderr.contains("not a git repository") {
         GitError::NotAGitRepo
-    } else if stderr.contains("a branch named") && stderr.contains("already exists") {
+    // "a branch named", or "A branch named" from an older git.
+    } else if stderr.contains("branch named") && stderr.contains("already exists") {
         GitError::BranchExists(branch.to_string())
-    } else if stderr.contains(&format!("'{}' already exists", dir.display())) {
+    // The folder holds something, or is gone but still registered.
+    } else if stderr.contains(&format!("'{}' already exists", dir.display()))
+        || stderr.contains("is a missing but")
+    {
         GitError::WorktreeExists(dir.to_path_buf())
     } else {
         GitError::Command { stderr }
@@ -341,7 +350,14 @@ async fn discard_unfinished_worktree(repo_root: &Path, dir: &Path, branch: &str,
         // git does not know the folder (yet): it was free before this
         // checkout, so what is in it now is the checkout's.
         let _ = tokio::fs::remove_dir_all(dir).await;
-        let _ = git_ok(repo_root, &["worktree", "prune"]).await;
+        // Then this one registration, should there be one after all. Never
+        // `prune`: it would drop every worktree whose folder is missing, a
+        // user's on a volume that is not mounted included.
+        let _ = git_ok(
+            repo_root,
+            &["worktree", "remove", "--force", "--force", "--", &dir_arg],
+        )
+        .await;
     }
     if let Ok(Some(commit)) = rev_parse(repo_root, base).await {
         let _ = delete_branch_at(repo_root, branch, &commit).await;
@@ -533,9 +549,16 @@ impl Ran {
     }
 }
 
+/// How long the pipes of a git that has ended are still read. Everything git
+/// wrote is in them by then; only something it left running (a process a
+/// hook started) can keep them open, and that is not waited for.
+const PIPES_AFTER_EXIT: Duration = Duration::from_secs(2);
+
 /// Runs `cmd` in a process group of its own for at most `timeout`, with
-/// `input` (or nothing) on stdin. The whole group is killed when the time is
-/// up (`TimedOut`) or the future is dropped.
+/// `input` (or nothing) on stdin. When the time is up (`TimedOut`) the whole
+/// group is asked to stop, so git removes its lock files, then killed; when
+/// the future is dropped it is killed at once. Once git has ended on its
+/// own, what it left running is left alone and not waited for.
 async fn run(
     mut cmd: Command,
     timeout: Duration,
@@ -562,37 +585,62 @@ async fn run(
             let _ = pipe.write_all(bytes).await;
         }
     };
-    let finish = async {
-        let (_, stdout, stderr, status) = tokio::join!(
-            write,
-            read_capped(stdout, stdout_max),
-            read_capped(stderr, ERROR_OUTPUT_MAX),
-            child.wait()
-        );
-        status.map(|status| Ran {
-            status,
-            stdout,
-            stderr,
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = {
+        let pipes = async {
+            tokio::join!(
+                write,
+                read_capped(stdout, stdout_max, &mut out),
+                read_capped(stderr, ERROR_OUTPUT_MAX, &mut err),
+            );
+        };
+        tokio::pin!(pipes);
+        let mut read = false;
+        // The limit is on git itself: the pipes are read meanwhile, but
+        // their end is not what is waited for.
+        let ended = tokio::time::timeout(timeout, async {
+            loop {
+                tokio::select! {
+                    () = &mut pipes, if !read => read = true,
+                    status = child.wait() => break status,
+                }
+            }
         })
-    };
-    match tokio::time::timeout(timeout, finish).await {
-        Ok(Ok(ran)) => {
-            group.disarm();
-            Ok(ran)
+        .await;
+        match ended {
+            Err(_) => {
+                // Asked to stop first, so git removes its lock files. It is
+                // not reaped meanwhile, so the group's id stays its own;
+                // dropping `group` then kills whatever did not stop.
+                group.stop().await;
+                return Err(GitError::TimedOut);
+            }
+            Ok(Err(e)) => return Err(GitError::Io(e)),
+            Ok(Ok(status)) => {
+                // Reaped: the group's id may be reused from here on.
+                group.disarm();
+                if !read {
+                    let _ = tokio::time::timeout(PIPES_AFTER_EXIT, &mut pipes).await;
+                }
+                status
+            }
         }
-        Ok(Err(e)) => Err(GitError::Io(e)),
-        Err(_) => Err(GitError::TimedOut),
-    }
+    };
+    Ok(Ran {
+        status,
+        stdout: out,
+        stderr: err,
+    })
 }
 
-async fn read_capped<R: AsyncRead + Unpin>(pipe: Option<R>, max: u64) -> Vec<u8> {
+/// Reads `pipe` to its end into `kept`, keeping at most `max` bytes. What
+/// was read so far is in `kept` even when this is dropped before the end.
+async fn read_capped<R: AsyncRead + Unpin>(pipe: Option<R>, max: u64, kept: &mut Vec<u8>) {
     let Some(mut pipe) = pipe else {
-        return Vec::new();
+        return;
     };
-    let mut kept = Vec::new();
-    let _ = (&mut pipe).take(max).read_to_end(&mut kept).await;
+    let _ = (&mut pipe).take(max).read_to_end(kept).await;
     let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
-    kept
 }
 
 /// [`run`] for a `Drop`: blocking, output discarded, at most `timeout`; only
@@ -2533,6 +2581,20 @@ mod tests {
             "{:?}",
             classify(branch_taken)
         );
+        // Older gits start the sentence with a capital.
+        assert!(matches!(
+            classify("fatal: A branch named 'intent/x' already exists."),
+            GitError::BranchExists(_)
+        ));
+        // A folder that is gone but still registered as a worktree is taken too.
+        let registered = "Preparing worktree (new branch 'intent/x')\n\
+                          fatal: '/home/worktrees/app/intent-x' is a missing but already \
+                          registered worktree;\nuse 'add -f' to override, or 'prune' or 'remove' to clear";
+        assert!(
+            matches!(classify(registered), GitError::WorktreeExists(d) if d == dir),
+            "{:?}",
+            classify(registered)
+        );
         assert!(matches!(
             classify("fatal: not a git repository (or any of the parent directories): .git"),
             GitError::NotAGitRepo
@@ -2541,6 +2603,148 @@ mod tests {
             classify("fatal: invalid reference: nope"),
             GitError::Command { stderr } if stderr == "fatal: invalid reference: nope"
         ));
+    }
+
+    /// The pid a hook wrote to `file`, once it is there.
+    async fn pid_in(file: &Path) -> String {
+        for _ in 0..100 {
+            if let Ok(pid) = std::fs::read_to_string(file) {
+                if !pid.trim().is_empty() {
+                    return pid.trim().to_owned();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{} was never written", file.display());
+    }
+
+    /// Makes `script` the repository's hook `name`, in a hooks folder of the
+    /// test's own (whatever the user's git is configured to use).
+    fn hook(tmp: &Path, repo: &Path, name: &str, script: &str) {
+        let hooks = tmp.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let file = hooks.join(name);
+        std::fs::write(&file, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        g(repo, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn discarding_an_unfinished_worktree_leaves_other_registrations_alone() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        // A worktree of the user's whose folder is missing (moved, or on a
+        // volume that is not mounted): git would prune it, with what was
+        // staged there.
+        let theirs = tmp.path().join("elsewhere").join("theirs");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "theirs",
+                theirs.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(&theirs).unwrap();
+        // What a checkout that was stopped before git knew the folder left.
+        let wts = tmp.path().join("wts");
+        let ours = wts.join("agent-x");
+        std::fs::create_dir_all(&ours).unwrap();
+        std::fs::write(ours.join("half.txt"), "half a checkout").unwrap();
+
+        discard_unfinished_worktree(&repo, &ours, "agent/x", "main").await;
+
+        assert!(!ours.exists());
+        let listed = g(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(listed.contains("branch refs/heads/theirs"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn a_process_a_hook_left_holding_the_pipes_does_not_hold_up_the_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        // The hook returns at once, but what it started keeps git's stderr.
+        let pid_file = tmp.path().join("left.pid");
+        hook(
+            tmp.path(),
+            &repo,
+            "post-checkout",
+            &format!("sleep 30 &\necho $! > '{}'", pid_file.display()),
+        );
+        let wts = tmp.path().join("wts");
+
+        let started = std::time::Instant::now();
+        let made = TIMEOUT_OVERRIDE
+            .scope(
+                Duration::from_secs(12),
+                create_worktree(&repo, &wts, "agent/x", "main"),
+            )
+            .await;
+        let took = started.elapsed();
+        let left = pid_in(&pid_file).await;
+        // What git left running is left alone; the test stops it itself.
+        let was_alive = alive(&left);
+        let _ = std::process::Command::new("kill").arg(&left).status();
+
+        let dir = made.expect("git itself had finished");
+        assert!(took < Duration::from_secs(8), "{took:?}");
+        assert_eq!(g(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "agent/x");
+        assert!(was_alive, "the process git left was stopped");
+    }
+
+    #[tokio::test]
+    async fn a_git_that_is_stopped_gets_to_remove_its_lock_files() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        // git holds `refs/heads/agent/x.lock` while this hook runs.
+        hook(
+            tmp.path(),
+            &repo,
+            "reference-transaction",
+            "if [ \"$1\" = prepared ]; then sleep 30; fi",
+        );
+        let wts = tmp.path().join("wts");
+
+        let err = TIMEOUT_OVERRIDE
+            .scope(
+                Duration::from_secs(3),
+                create_worktree(&repo, &wts, "agent/x", "main"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, GitError::TimedOut), "{err:?}");
+        let lock = repo.join(".git/refs/heads/agent/x.lock");
+        assert!(!lock.exists(), "git was killed holding its lock");
+        // So the same branch can be made once the hook is out of the way.
+        g(&repo, &["config", "--unset", "core.hooksPath"]);
+        create_worktree(&repo, &wts, "agent/x", "main")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_worktree_refuses_a_dangling_link_before_git_makes_a_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        let wts = tmp.path().join("wts");
+        std::fs::create_dir_all(&wts).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), wts.join("intent-x")).unwrap();
+
+        let err = create_worktree(&repo, &wts, "intent/x", "main")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, GitError::WorktreeExists(_)), "{err:?}");
+        assert_eq!(g(&repo, &["branch", "--list", "intent/x"]), "");
     }
 
     /// Whether a process with this id exists.
@@ -2579,7 +2783,7 @@ mod tests {
         let started = std::time::Instant::now();
         let err = TIMEOUT_OVERRIDE
             .scope(
-                Duration::from_secs(2),
+                Duration::from_secs(5),
                 create_worktree(&repo, &wts, "agent/x", "main"),
             )
             .await
@@ -2587,13 +2791,13 @@ mod tests {
 
         assert!(matches!(err, GitError::TimedOut), "{err:?}");
         assert!(
-            started.elapsed() < Duration::from_secs(20),
+            started.elapsed() < Duration::from_secs(25),
             "{:?}",
             started.elapsed()
         );
         // The hook was stopped with git, not left running on its own.
-        let pid = std::fs::read_to_string(&pid_file).unwrap();
-        let pid = pid.trim();
+        let pid = pid_in(&pid_file).await;
+        let pid = pid.as_str();
         for _ in 0..50 {
             if !alive(pid) {
                 break;
