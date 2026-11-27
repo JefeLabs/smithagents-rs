@@ -11,6 +11,13 @@
 //! file reference. What `gh` prints is never kept: an answer is used only
 //! when it is what it must be, and a failure is a fixed sentence with an
 //! exit status at most.
+//!
+//! Before an issue is created, the issues are searched for one made before
+//! (`gh` made it but its answer was lost). The search looks only at issues
+//! the signed-in user opened (`--author=@me`): the submission id is public
+//! once the branch is pushed (the commit's `Feedback-Id` trailer), so on a
+//! public repository anyone could open an issue that names it, which would
+//! otherwise be taken for this submission's.
 
 use std::path::Path;
 use std::time::Duration;
@@ -108,23 +115,48 @@ impl GithubRepo {
         format!("--repo={}", self.full_name())
     }
 
-    /// Whether `url` is exactly `https://github.com/<owner>/<name>/issues/<n>`
-    /// for this repository (its names in any case).
+    /// Whether `url` is an issue's address (see [`is_github_issue_url`])
+    /// of this repository (its names in any case).
     pub fn is_issue_url(&self, url: &str) -> bool {
-        let Some(path) = url.strip_prefix("https://github.com/") else {
-            return false;
-        };
-        let parts: Vec<&str> = path.split('/').collect();
-        match parts.as_slice() {
-            [owner, name, "issues", number] => {
-                owner.eq_ignore_ascii_case(&self.owner)
-                    && name.eq_ignore_ascii_case(&self.name)
-                    && (1..=20).contains(&number.len())
-                    && number.bytes().all(|b| b.is_ascii_digit())
-            }
-            _ => false,
-        }
+        issue_url_parts(url).is_some_and(|(owner, name)| {
+            owner.eq_ignore_ascii_case(&self.owner) && name.eq_ignore_ascii_case(&self.name)
+        })
     }
+}
+
+/// Whether `url` is exactly `https://github.com/<owner>/<name>/issues/<n>`,
+/// of any repository: what `gh issue create` prints for a repository that
+/// was renamed or moved is its name now.
+pub fn is_github_issue_url(url: &str) -> bool {
+    issue_url_parts(url).is_some()
+}
+
+/// `(owner, name)` of `https://github.com/<owner>/<name>/issues/<n>`: names
+/// of the characters GitHub allows (ASCII letters and digits, `_`, `.`,
+/// `-`; never `.` or `..`), a number of 1 to 20 digits, nothing after it.
+fn issue_url_parts(url: &str) -> Option<(&str, &str)> {
+    let path = url.strip_prefix("https://github.com/")?;
+    let parts: Vec<&str> = path.split('/').collect();
+    match parts.as_slice() {
+        [owner, name, "issues", number]
+            if plain_name(owner)
+                && plain_name(name)
+                && (1..=20).contains(&number.len())
+                && number.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Some((*owner, *name))
+        }
+        _ => None,
+    }
+}
+
+fn plain_name(name: &str) -> bool {
+    (1..=100).contains(&name.len())
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 /// How `gh` runs: through the plugin manager (only the feedback plugin's
@@ -137,6 +169,9 @@ pub struct Gh<'a> {
     pub cwd: &'a Path,
     /// The limit of each call that makes or looks for an issue.
     pub timeout: Duration,
+    /// The limit of a quick check (`gh auth status`, `gh repo view`):
+    /// [`VISIBILITY_TIMEOUT`].
+    pub check_timeout: Duration,
 }
 
 impl Gh<'_> {
@@ -161,15 +196,17 @@ fn args<const N: usize>(fixed: [&str; N]) -> Vec<String> {
 }
 
 /// `gh` as Submit needs it: the plugin's tool ready (see
-/// [`tool_readiness`]) and signed in, which is `gh auth status` succeeding
-/// within [`VISIBILITY_TIMEOUT`]; otherwise the reason, `not signed in` when
-/// that check failed.
+/// [`tool_readiness`]) and signed in to github.com, which is `gh auth status
+/// --hostname=github.com` succeeding within `gh.check_timeout` (a login on
+/// another host does not count either way); otherwise the reason, `not
+/// signed in` when that check failed.
 pub async fn gh_readiness(gh: &Gh<'_>) -> ToolReadiness {
     let ready = tool_readiness(gh.plugins, GH).await;
     if !ready.ready {
         return ready;
     }
-    match gh.run(&args(["auth", "status"]), VISIBILITY_TIMEOUT).await {
+    let check = args(["auth", "status", "--hostname=github.com"]);
+    match gh.run(&check, gh.check_timeout).await {
         Ok(_) => ready,
         Err(ManagerError::Tool(ToolRunError::NotFound)) => not_ready(Some(NOT_INSTALLED)),
         Err(ManagerError::Disabled) => not_ready(Some(TURNED_OFF)),
@@ -189,7 +226,7 @@ pub fn not_ready_sentence(reason: &str) -> String {
 
 /// Whether `repo` is public, by `gh repo view --json=visibility
 /// --jq=.visibility -- github.com/<owner>/<name>` within
-/// [`VISIBILITY_TIMEOUT`]: `PUBLIC` is `true`, `PRIVATE` and `INTERNAL` are
+/// `gh.check_timeout`: `PUBLIC` is `true`, `PRIVATE` and `INTERNAL` are
 /// `false`; anything else or a failure is `None`.
 pub async fn is_public(gh: &Gh<'_>, repo: &GithubRepo) -> Option<bool> {
     let mut view = args([
@@ -200,7 +237,7 @@ pub async fn is_public(gh: &Gh<'_>, repo: &GithubRepo) -> Option<bool> {
         "--",
     ]);
     view.push(repo.full_name());
-    match gh.run(&view, VISIBILITY_TIMEOUT).await {
+    match gh.run(&view, gh.check_timeout).await {
         Ok(line) => match line.as_deref() {
             Some("PUBLIC") => Some(true),
             Some("PRIVATE" | "INTERNAL") => Some(false),
@@ -225,51 +262,86 @@ pub fn label_for(kind: FeedbackKind) -> &'static str {
     }
 }
 
-/// The issue of submission `id` on `repo`, its address as `gh` printed it.
-///
-/// First the issues are searched for the id (the last line of every body
-/// Submit sends names it): a first line that is an issue of `repo` is that
-/// issue, and nothing is created; a first line that is anything else is
-/// `gh_bad_answer`, and nothing is created either. Then, only when `repo`
-/// has the label `label`, the issue gets it (a failed check means no
-/// label). Then `gh issue create --title=<title> --body-file=<body_file>`.
-/// Its answer must be an issue of `repo`, else `gh_bad_answer` (the issue
-/// may exist then, and a retry's search finds it). Each call is limited to
-/// `gh.timeout`.
+/// The issue of submission `id` on `repo` that the signed-in user opened,
+/// found by the id the last line of every body Submit sends names: `gh
+/// issue list --repo=… --author=@me --state=all --search=<id> in:body
+/// --json=url --jq=.[0].url // ""`, within `gh.timeout`. A first line that
+/// is an issue of `repo` is that issue; an empty one is none; anything else
+/// is `gh_bad_answer` (and nothing may be created then).
+pub async fn find_issue(
+    gh: &Gh<'_>,
+    repo: &GithubRepo,
+    id: SubmissionId,
+) -> Result<Option<String>, FeedbackFailure> {
+    let mut search = args(["issue", "list"]);
+    search.push(repo.repo_arg());
+    search.extend(args(["--author=@me", "--state=all"]));
+    search.push(format!("--search={id} in:body"));
+    search.extend(args(["--json=url", r#"--jq=.[0].url // """#]));
+    match gh.run(&search, gh.timeout).await {
+        Ok(None) => Ok(None),
+        Ok(Some(url)) if repo.is_issue_url(&url) => Ok(Some(url)),
+        Ok(Some(_)) => Err(bad_answer()),
+        Err(e) => Err(issue_failure(e).failure),
+    }
+}
+
+/// Why [`create_issue`] gave no issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotCreated {
+    pub failure: FeedbackFailure,
+    /// `gh issue create` ran and may have made the issue all the same: it
+    /// was stopped (out of time, or by a signal) or printed no issue's
+    /// address.
+    pub unconfirmed: bool,
+}
+
+/// `gh issue create --title=<title> --body-file=<body_file> --repo=…
+/// [--label=<label>]` within `gh.timeout`, the label only when `repo` has it
+/// (a failed check means none). Its first line must be the address of an
+/// issue on github.com, of `repo` or (renamed or moved) of the name it has
+/// now ([`is_github_issue_url`]).
 pub async fn create_issue(
     gh: &Gh<'_>,
     repo: &GithubRepo,
     title: &str,
     body_file: &Path,
     label: &str,
-    id: SubmissionId,
-) -> Result<String, FeedbackFailure> {
+) -> Result<String, NotCreated> {
+    let body_file = body_file_arg(body_file).map_err(|failure| NotCreated {
+        failure,
+        unconfirmed: false,
+    })?;
     let repo_arg = repo.repo_arg();
-    let mut search = args(["issue", "list", "--state=all"]);
-    search.push(format!("--search={id} in:body"));
-    search.extend(args(["--json=url", r#"--jq=.[0].url // """#]));
-    search.push(repo_arg.clone());
-    match gh.run(&search, gh.timeout).await.map_err(issue_failure)? {
-        None => {}
-        Some(url) if repo.is_issue_url(&url) => return Ok(url),
-        Some(_) => return Err(bad_answer()),
-    }
-
     let labelled = has_label(gh, &repo_arg, label).await;
-    let Some(body_file) = body_file.to_str() else {
-        return Err(failed(None));
-    };
     let mut create = args(["issue", "create"]);
     create.push(format!("--title={title}"));
-    create.push(format!("--body-file={body_file}"));
+    create.push(body_file);
     create.push(repo_arg);
     if labelled {
         create.push(format!("--label={label}"));
     }
-    match gh.run(&create, gh.timeout).await.map_err(issue_failure)? {
-        Some(url) if repo.is_issue_url(&url) => Ok(url),
-        _ => Err(bad_answer()),
+    match gh.run(&create, gh.timeout).await {
+        Ok(Some(url)) if is_github_issue_url(&url) => Ok(url),
+        Ok(_) => Err(NotCreated {
+            failure: bad_answer(),
+            unconfirmed: true,
+        }),
+        Err(e) => Err(issue_failure(e)),
     }
+}
+
+/// `--body-file=<path>`; a path that is not UTF-8 cannot be passed, which
+/// is the daemon's own failure ([`body_failure`]).
+fn body_file_arg(path: &Path) -> Result<String, FeedbackFailure> {
+    path.to_str()
+        .map(|path| format!("--body-file={path}"))
+        .ok_or_else(body_failure)
+}
+
+/// The issue's body could not be written or named: `io_error`.
+pub fn body_failure() -> FeedbackFailure {
+    failure("io_error", "could not write the issue's body".to_owned())
 }
 
 /// Whether the repository has the label `label` (lower-case letters, digits
@@ -329,23 +401,37 @@ fn bad_answer() -> FeedbackFailure {
     )
 }
 
-/// The failure of the step `create_issue` for a `gh` run that failed.
-fn issue_failure(e: ManagerError) -> FeedbackFailure {
-    match e {
-        ManagerError::Tool(ToolRunError::Timeout) => failure(
-            "gh_timeout",
-            format!("gh did not finish within {} seconds", GH_TIMEOUT.as_secs()),
+/// The failure of the step `create_issue` for a `gh` run that failed, and
+/// whether `gh` may have done its work all the same (stopped while it ran).
+fn issue_failure(e: ManagerError) -> NotCreated {
+    let (failure, unconfirmed) = match e {
+        ManagerError::Tool(ToolRunError::Timeout) => (
+            failure(
+                "gh_timeout",
+                format!("gh did not finish within {} seconds", GH_TIMEOUT.as_secs()),
+            ),
+            true,
         ),
-        ManagerError::Tool(ToolRunError::Failed { status }) => failed(status),
-        ManagerError::Tool(ToolRunError::TooMuchOutput) => bad_answer(),
-        ManagerError::Tool(ToolRunError::NotFound) => {
-            failure("gh_not_ready", not_ready_sentence(NOT_INSTALLED))
-        }
-        ManagerError::Disabled => failure("gh_not_ready", not_ready_sentence(TURNED_OFF)),
+        // Ended by a signal.
+        ManagerError::Tool(ToolRunError::Failed { status: None }) => (failed(None), true),
+        ManagerError::Tool(ToolRunError::Failed { status }) => (failed(status), false),
+        ManagerError::Tool(ToolRunError::TooMuchOutput) => (bad_answer(), true),
+        ManagerError::Tool(ToolRunError::NotFound) => (
+            failure("gh_not_ready", not_ready_sentence(NOT_INSTALLED)),
+            false,
+        ),
+        ManagerError::Disabled => (
+            failure("gh_not_ready", not_ready_sentence(TURNED_OFF)),
+            false,
+        ),
         e => {
             tracing::error!(step = "create_issue", "gh could not be run: {e}");
-            failed(None)
+            (failed(None), false)
         }
+    };
+    NotCreated {
+        failure,
+        unconfirmed,
     }
 }
 
@@ -409,51 +495,109 @@ mod tests {
 
     #[test]
     fn failures_are_fixed_sentences() {
+        // The error, its code and sentence, and whether gh may have made the
+        // issue all the same.
         let cases = [
             (
                 ManagerError::Tool(ToolRunError::Failed { status: Some(1) }),
                 "gh_failed",
                 "gh could not create the issue (exit status 1)",
+                false,
             ),
             (
                 ManagerError::Tool(ToolRunError::Failed { status: None }),
                 "gh_failed",
                 "gh could not create the issue (no exit status)",
+                true,
             ),
             (
                 ManagerError::Tool(ToolRunError::Timeout),
                 "gh_timeout",
                 "gh did not finish within 60 seconds",
+                true,
             ),
             (
                 ManagerError::Tool(ToolRunError::TooMuchOutput),
                 "gh_bad_answer",
                 "gh did not print the issue's address",
+                true,
             ),
             (
                 ManagerError::Tool(ToolRunError::NotFound),
                 "gh_not_ready",
                 "GitHub CLI (gh) is not installed",
+                false,
             ),
             (
                 ManagerError::Disabled,
                 "gh_not_ready",
                 "GitHub CLI (gh) is not ready: turned off or not running",
+                false,
             ),
             (
                 ManagerError::Tool(ToolRunError::NotStarted),
                 "gh_failed",
                 "gh could not create the issue (no exit status)",
+                false,
             ),
         ];
-        for (error, code, message) in cases {
-            let f = issue_failure(error);
+        for (error, code, message, unconfirmed) in cases {
+            let NotCreated {
+                failure: f,
+                unconfirmed: maybe,
+            } = issue_failure(error);
             assert_eq!(f.step, FeedbackStep::CreateIssue);
             assert_eq!((f.code.as_str(), f.message.as_str()), (code, message));
+            assert_eq!(maybe, unconfirmed, "{message}");
         }
         assert_eq!(
             not_ready_sentence(NOT_SIGNED_IN),
             "GitHub CLI (gh) is not signed in; run: gh auth login"
+        );
+    }
+
+    #[test]
+    fn an_issue_of_any_repository_is_an_issue_url_for_create() {
+        for good in [
+            "https://github.com/smithagents-test-invalid/widgets/issues/7",
+            "https://github.com/someone-else/widgets/issues/7",
+            "https://github.com/o/gadgets.rs/issues/1",
+            "https://github.com/o_o/r-r/issues/12345678901234567890",
+        ] {
+            assert!(is_github_issue_url(good), "{good}");
+        }
+        for bad in [
+            "",
+            "https://example.com/o/r/issues/1",
+            "http://github.com/o/r/issues/1",
+            "https://github.com.evil.example/o/r/issues/1",
+            "https://github.com/../r/issues/1",
+            "https://github.com/o/./issues/1",
+            "https://github.com/o r/r/issues/1",
+            "https://github.com/o/r%2F/issues/1",
+            "https://github.com//r/issues/1",
+            "https://github.com/o/r/pull/1",
+            "https://github.com/o/r/issues/1/x",
+            "https://github.com/o/r/issues/1#c",
+        ] {
+            assert!(!is_github_issue_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_body_path_that_is_not_utf8_is_the_daemons_failure() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(OsStr::from_bytes(b"/tmp/feedback/\xff/body.md"));
+        let f = body_file_arg(path).unwrap_err();
+        assert_eq!(f.step, FeedbackStep::CreateIssue);
+        assert_eq!(
+            (f.code.as_str(), f.message.as_str()),
+            ("io_error", "could not write the issue's body")
+        );
+        assert_eq!(
+            body_file_arg(Path::new("/tmp/feedback/x/body.md")).unwrap(),
+            "--body-file=/tmp/feedback/x/body.md"
         );
     }
 }

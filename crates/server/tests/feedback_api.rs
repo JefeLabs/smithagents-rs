@@ -544,7 +544,8 @@ async fn targets_list_repositories_tools_and_the_meta_repository() {
     // gh was asked whether it is signed in each time, and once whether the
     // GitHub repository is public; agent-browser was only looked up.
     let view = "repo view --json=visibility --jq=.visibility -- github.com/smithagents-test-invalid/widgets";
-    assert_eq!(fx.fake.calls(), ["auth status", view, "auth status"]);
+    let auth = "auth status --hostname=github.com";
+    assert_eq!(fx.fake.calls(), [auth, view, auth]);
 
     // A plugin that is turned off has no tool ready, and none runs.
     let (status, _) = fx

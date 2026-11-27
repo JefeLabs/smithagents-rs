@@ -141,15 +141,15 @@ impl FakeTools {
             .unwrap_or_default()
     }
 
-    /// Writes the control file `file` (`fail`, `hang`, `signed-out`,
-    /// `visibility`, `label`, `existing`, `issue-url`).
+    /// Writes the control file `file` (`fail`, `hang`, `wait`, `go`,
+    /// `signed-out`, `visibility`, `label`, `existing`, `issue-url`).
     pub fn set(&self, file: &str, text: &str) {
         fs::write(self.dir.join(file), text).unwrap();
     }
 
     /// A file of the control directory (a control file, `calls.log`,
-    /// `env.log`, `cwd.log`, `hang.pid`, `issue-body.md`, `pr-body.md`), if
-    /// it exists.
+    /// `env.log`, `cwd.log`, `hang.pid`, `wait.pid`, `issue-body.md`,
+    /// `pr-body.md`), if it exists.
     pub fn read(&self, file: &str) -> Option<String> {
         fs::read_to_string(self.dir.join(file)).ok()
     }

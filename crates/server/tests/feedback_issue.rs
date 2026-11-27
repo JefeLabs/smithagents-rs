@@ -459,3 +459,59 @@ fn the_not_done_section_is_found() {
         Some("A B")
     );
 }
+
+#[test]
+fn mentions_are_neutralised_only_where_a_mention_starts() {
+    let z = '\u{200b}';
+    for (text, want) in [
+        ("@name", format!("@{z}name")),
+        ("(@name)", format!("(@{z}name)")),
+        ("cc @org/team", format!("cc @{z}org/team")),
+        ("line\n@name", format!("line\n@{z}name")),
+        ("x, @a and @b", format!("x, @{z}a and @{z}b")),
+        ("\u{e9}@name", format!("\u{e9}@{z}name")),
+    ] {
+        assert_eq!(no_mentions(text), want, "{text:?}");
+    }
+    // Not where GitHub reads a mention: kept as typed.
+    for kept in [
+        "a@b.com",
+        "photo@2x.png",
+        "pkg/@scope",
+        "x.@y",
+        "x-@y",
+        "x_@y",
+        "@@y",
+        "@ y",
+        "@-y",
+        "@",
+        "@\u{e9}",
+        "",
+    ] {
+        assert_eq!(no_mentions(kept), kept, "{kept:?}");
+    }
+}
+
+#[test]
+fn issue_md_keeps_mentions_as_written() {
+    let attachments = [FeedbackAttachment {
+        kind: AttachmentKind::Image,
+        original_name: "@team.png".into(),
+        boxes: vec![],
+    }];
+    let names = file_names(&[(AttachmentKind::Image, FileKind::Png)]);
+    let md = render_issue(&IssueInput {
+        title: "@octocat the zoom",
+        main_idea: "@octocat the zoom\n\nping @hubot",
+        kind: FeedbackKind::Bug,
+        created: Utc.with_ymd_and_hms(2026, 11, 26, 14, 15, 0).unwrap(),
+        app_version: "0.1.0",
+        platform: "macos",
+        attachments: &attachments,
+        names: &names,
+    });
+    assert!(md.contains("# @octocat the zoom\n"), "{md}");
+    assert!(md.contains("## @team.png\n"), "{md}");
+    assert!(md.contains("ping @hubot"), "{md}");
+    assert!(!md.contains('\u{200b}'), "{md}");
+}

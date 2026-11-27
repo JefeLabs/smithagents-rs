@@ -11,6 +11,8 @@
 #     LEAK-gh-stderr to stderr, and exits 1;
 #   - `hang` holds exactly "$1 $2": writes its process id to `hang.pid` and
 #     sleeps 600 s (as the same process);
+#   - `wait` holds exactly "$1 $2": writes its process id to `wait.pid`,
+#     waits until the file `go` exists (60 s at most), then goes on below;
 #   - `auth status`: exits 1 when the file `signed-out` exists, else 0;
 #   - `repo view`: prints the file `visibility`, else PRIVATE;
 #   - `label list`: prints the file `label`, else true;
@@ -36,6 +38,14 @@ fi
 if holds hang "$1 $2"; then
   printf '%s\n' "$$" > "$dir/hang.pid"
   exec sleep 600
+fi
+if holds wait "$1 $2"; then
+  printf '%s\n' "$$" > "$dir/wait.pid"
+  i=0
+  while [ ! -f "$dir/go" ] && [ "$i" -lt 1200 ]; do
+    sleep 0.05
+    i=$((i + 1))
+  done
 fi
 
 # Prints the file `$1` of the control directory, or `$2` when it is absent.

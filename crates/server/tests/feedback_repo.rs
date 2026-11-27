@@ -19,8 +19,8 @@ use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{FeedbackStep, SubmissionId};
 use smithagents_core::ids::RepoId;
 use smithagents_server::feedback::repo::{
-    commit_folder, find_committed, place, place_and_commit, push, Committed, FileSource,
-    FolderFile, Placement,
+    commit_folder, find_committed, place, place_and_commit, push, push_commit, Committed,
+    FileSource, FolderFile, Placement,
 };
 use smithagents_server::feedback::FeedbackError;
 use smithagents_server::git::{self, CommitError, GitError, PushError};
@@ -1097,6 +1097,69 @@ async fn a_failed_push_keeps_the_commit_and_a_retry_does_not_commit_again() {
         "1"
     );
     assert_eq!(git(&bare, &["rev-list", "--count", BRANCH]), "3");
+}
+
+#[tokio::test]
+async fn push_commit_sends_that_commit_whatever_the_branch_is_now() {
+    let fx = Fixture::new();
+    let (placement, commit) = fx.submit("s").await;
+    let bare = fx.origin();
+    // The branch moved on: the commit is pushed, not the branch's tip.
+    let later = git(
+        fx.root(),
+        &[
+            "commit-tree",
+            &format!("{commit}^{{tree}}"),
+            "-p",
+            &commit,
+            "-m",
+            "later",
+        ],
+    );
+    git(
+        fx.root(),
+        &["update-ref", &format!("refs/heads/{BRANCH}"), &later],
+    );
+    push_commit(&fx.repo, &commit, &placement.branch)
+        .await
+        .unwrap();
+    assert_eq!(git(&bare, &["rev-parse", BRANCH]), commit);
+    assert!(!git_succeeds(&bare, &["cat-file", "-e", &later]));
+
+    // Without the local branch, too, under another name.
+    git(fx.root(), &["branch", "-D", BRANCH]);
+    push_commit(&fx.repo, &commit, "idea/fix-the-zoom")
+        .await
+        .unwrap();
+    assert_eq!(git(&bare, &["rev-parse", "idea/fix-the-zoom"]), commit);
+
+    // Not a commit of this repository: nothing is pushed.
+    let missing = "The feedback commit is no longer in this repository, so it cannot be pushed.";
+    for bad in [
+        "0123456789abcdef0123456789abcdef01234567",
+        "main",
+        "-x",
+        "HEAD",
+        "",
+        &later[..12],
+    ] {
+        let failure = push_commit(&fx.repo, bad, "feedback/other")
+            .await
+            .unwrap_err();
+        assert_eq!(failure.step, FeedbackStep::Push, "{bad}");
+        assert_eq!(
+            (failure.code.as_str(), failure.message.as_str()),
+            ("commit_missing", missing),
+            "{bad}"
+        );
+    }
+    assert!(!git_succeeds(
+        &bare,
+        &["rev-parse", "--verify", "--quiet", "feedback/other"]
+    ));
+    // An option-like branch name is refused before git runs.
+    let failure = push_commit(&fx.repo, &commit, "-f").await.unwrap_err();
+    assert_eq!(failure.code, "push_failed");
 }
 
 #[tokio::test]

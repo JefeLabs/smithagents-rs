@@ -212,7 +212,7 @@ fn escape_md(text: &str) -> String {
 }
 
 /// A name for a heading or a link text: cleaned, without `[ ] ( ) ` #`,
-/// without its leading path, mentioning no one, `attachment` when empty.
+/// without its leading path, `attachment` when empty.
 fn display_name(original: &str) -> String {
     let cleaned: String = one_line(original, 4 * NAME_MAX_CHARS)
         .chars()
@@ -232,7 +232,7 @@ fn display_name(original: &str) -> String {
     if name.is_empty() {
         "attachment".to_string()
     } else {
-        no_mentions(&escape_md(name))
+        escape_md(name)
     }
 }
 
@@ -308,15 +308,34 @@ fn comment_line(comment: &str) -> String {
     one_line(comment, 500)
 }
 
-/// `text` with a zero-width space after every `@`, so GitHub turns no
-/// `@name` in it into a mention that notifies someone.
+/// `text` with a zero-width space after each `@` where GitHub would read a
+/// mention (and notify whoever it names): an `@` at the start or after a
+/// character that is not an ASCII letter or digit, `_`, `.`, `-`, `/` or
+/// `@`, and followed by an ASCII letter or digit. So `@name`, `(@name)` and
+/// `@org/team` mention no one, and `a@b.com`, `photo@2x.png` and
+/// `pkg/@scope` stay as typed. For what is sent to GitHub only; files keep
+/// the user's text.
 pub fn no_mentions(text: &str) -> String {
-    text.replace('@', "@\u{200b}")
+    let mut out = String::with_capacity(text.len());
+    let mut before: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '@' {
+            let starts = before.is_none_or(|b| {
+                !(b.is_ascii_alphanumeric() || matches!(b, '_' | '.' | '-' | '/' | '@'))
+            });
+            let names = chars.peek().is_some_and(char::is_ascii_alphanumeric);
+            if starts && names {
+                out.push('\u{200b}');
+            }
+        }
+        before = Some(c);
+    }
+    out
 }
 
-/// `issue.md`. The title, the names of images and videos and the comments
-/// mention no one (see [`no_mentions`]); the main idea's own text is the
-/// owner's and stays as written.
+/// `issue.md`.
 pub fn render_issue(input: &IssueInput<'_>) -> String {
     let mut out = String::new();
     out.push_str("---\n");
@@ -343,7 +362,7 @@ pub fn render_issue(input: &IssueInput<'_>) -> String {
     out.push_str("---\n\n");
     out.push_str(&format!(
         "# {}\n",
-        no_mentions(&escape_md(&one_line(input.title, TITLE_MAX_CHARS)))
+        escape_md(&one_line(input.title, TITLE_MAX_CHARS))
     ));
 
     let body = idea_body(input.main_idea);
@@ -369,7 +388,7 @@ pub fn render_issue(input: &IssueInput<'_>) -> String {
                 if !a.boxes.is_empty() {
                     out.push('\n');
                     for (j, b) in a.boxes.iter().enumerate() {
-                        let c = no_mentions(&escape_md(&comment_line(&b.comment)));
+                        let c = escape_md(&comment_line(&b.comment));
                         out.push_str(format!("{}. {c}", j + 1).trim_end());
                         out.push('\n');
                     }

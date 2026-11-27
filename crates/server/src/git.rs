@@ -555,8 +555,7 @@ fn refuse_option_like(value: &str) -> Result<(), GitError> {
 /// name is read as `refs/heads/<name>`, so a tag of the same name never wins.
 fn branch_or_commit(rev: &str) -> Result<String, GitError> {
     refuse_option_like(rev)?;
-    let is_id = matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit());
-    Ok(if is_id || rev.starts_with("refs/heads/") {
+    Ok(if is_commit_id(rev) || rev.starts_with("refs/heads/") {
         rev.to_string()
     } else {
         format!("refs/heads/{rev}")
@@ -1046,14 +1045,61 @@ pub async fn push_branch(
     timeout: Duration,
 ) -> Result<(), PushError> {
     for name in [local, remote_branch] {
-        let valid = !name.starts_with(['-', '+'])
-            && bounded(is_valid_branch_name(repo_root, name))
-                .await
-                .unwrap_or(false);
-        if !valid {
-            return Err(PushError::Failed { status: None });
-        }
+        require_push_name(repo_root, name).await?;
     }
+    push_refspec(
+        repo_root,
+        &format!("refs/heads/{local}:refs/heads/{remote_branch}"),
+        timeout,
+    )
+    .await
+}
+
+/// `git push origin <commit>:refs/heads/<remote_branch>`, at most `timeout`
+/// long: that commit, whatever any local branch points at now, as
+/// [`push_branch`] pushes (never forced, nothing of the repository's
+/// settings added). `commit` must be a full commit id (40 or 64 hex digits)
+/// and `remote_branch` a valid branch name that starts with neither `-` nor
+/// `+`, else `Failed` with no exit status before git runs.
+pub async fn push_commit(
+    repo_root: &Path,
+    commit: &str,
+    remote_branch: &str,
+    timeout: Duration,
+) -> Result<(), PushError> {
+    if !is_commit_id(commit) {
+        return Err(PushError::Failed { status: None });
+    }
+    require_push_name(repo_root, remote_branch).await?;
+    push_refspec(
+        repo_root,
+        &format!("{commit}:refs/heads/{remote_branch}"),
+        timeout,
+    )
+    .await
+}
+
+/// A full commit id: 40 (SHA-1) or 64 (SHA-256) hex digits.
+pub fn is_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `Failed` with no exit status unless `name` is a branch name git takes
+/// that starts with neither `-` nor `+`.
+async fn require_push_name(repo_root: &Path, name: &str) -> Result<(), PushError> {
+    let valid = !name.starts_with(['-', '+'])
+        && bounded(is_valid_branch_name(repo_root, name))
+            .await
+            .unwrap_or(false);
+    if valid {
+        Ok(())
+    } else {
+        Err(PushError::Failed { status: None })
+    }
+}
+
+/// `git push origin <refspec>` once `origin` has a URL to push to.
+async fn push_refspec(repo_root: &Path, refspec: &str, timeout: Duration) -> Result<(), PushError> {
     match isolated(repo_root, &["remote", "get-url", "--push", "origin"]).await {
         Ok(ran) if ran.status.success() => {}
         // "No such remote".
@@ -1066,9 +1112,8 @@ pub async fn push_branch(
         Err(GitError::TimedOut) => return Err(PushError::Timeout),
         Err(_) => return Err(PushError::Failed { status: None }),
     }
-    let refspec = format!("refs/heads/{local}:refs/heads/{remote_branch}");
     match run(
-        push_command(repo_root, &refspec),
+        push_command(repo_root, refspec),
         timeout,
         None,
         ERROR_OUTPUT_MAX,

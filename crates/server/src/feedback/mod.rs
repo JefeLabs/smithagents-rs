@@ -22,8 +22,9 @@ use smithagents_core::intent::{CreateIntentRequest, Intent, SeedInput};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use self::github::{
-    create_issue, gh_readiness, is_public, label_for, not_ready_sentence, tool_readiness, Gh,
-    GithubRepo, AGENT_BROWSER, GH_TIMEOUT, NOT_INSTALLED, VISIBILITY_TIMEOUT,
+    body_failure, create_issue, find_issue, gh_readiness, is_public, label_for, not_ready_sentence,
+    tool_readiness, Gh, GithubRepo, NotCreated, AGENT_BROWSER, GH_TIMEOUT, NOT_INSTALLED,
+    VISIBILITY_TIMEOUT,
 };
 use self::issue::{
     file_names, issue_body, marker, no_mentions, permalink_base, render_issue, seed_tail,
@@ -50,6 +51,10 @@ const BODY_FILE: &str = "body.md";
 /// How long an answer of [`is_public`] is used again.
 const VISIBILITY_TTL: Duration = Duration::from_secs(10 * 60);
 const ORIGIN_STEP: &str = "read the repository's origin";
+/// How long after `gh issue create` ran without a usable answer a search
+/// that finds nothing does not lead to another create: GitHub's search can
+/// take a while to find a new issue.
+const UNCONFIRMED_WAIT_SECS: i64 = 60;
 
 /// Where the service reads the time it writes into `issue.md`, the names and
 /// the submission.
@@ -183,6 +188,8 @@ pub struct FeedbackService {
     clock: Clock,
     /// The limit of each `gh` call that makes or looks for an issue.
     gh_timeout: Duration,
+    /// The limit of `gh auth status` and `gh repo view`.
+    check_timeout: Duration,
     parts: Arc<Parts>,
 }
 
@@ -208,6 +215,10 @@ struct Parts {
     issues: Mutex<HashMap<SubmissionId, String>>,
     /// [`is_public`]'s answers by [`GithubRepo::key`], with when they came.
     visibility: Mutex<HashMap<String, (bool, DateTime<Utc>)>>,
+    /// When `gh issue create` last ran for a submission without a usable
+    /// answer (it may have made the issue): for [`UNCONFIRMED_WAIT_SECS`]
+    /// after that, a search that finds nothing creates nothing.
+    unconfirmed: Mutex<HashMap<SubmissionId, DateTime<Utc>>>,
     #[cfg(feature = "test-util")]
     faults: Mutex<Faults>,
 }
@@ -295,6 +306,7 @@ impl FeedbackService {
             limits: UploadLimits::default(),
             clock: Arc::new(Utc::now),
             gh_timeout: GH_TIMEOUT,
+            check_timeout: VISIBILITY_TIMEOUT,
             parts: Arc::new(Parts {
                 intents,
                 agents,
@@ -306,6 +318,7 @@ impl FeedbackService {
                 running: AtomicUsize::new(0),
                 issues: Mutex::default(),
                 visibility: Mutex::default(),
+                unconfirmed: Mutex::default(),
                 #[cfg(feature = "test-util")]
                 faults: Mutex::default(),
             }),
@@ -317,6 +330,14 @@ impl FeedbackService {
     #[cfg(feature = "test-util")]
     pub fn with_gh_timeout_for_test(mut self, timeout: Duration) -> Self {
         self.gh_timeout = timeout;
+        self
+    }
+
+    /// Test hook: replaces [`VISIBILITY_TIMEOUT`], the limit of `gh auth
+    /// status` and `gh repo view`.
+    #[cfg(feature = "test-util")]
+    pub fn with_check_timeout_for_test(mut self, timeout: Duration) -> Self {
+        self.check_timeout = timeout;
         self
     }
 
@@ -415,7 +436,7 @@ impl FeedbackService {
     /// minutes.
     pub async fn targets(&self) -> Result<FeedbackTargets, FeedbackError> {
         let repos = self.store.list_repos().await?;
-        let gh = self.gh(VISIBILITY_TIMEOUT);
+        let gh = self.gh();
         let ready = gh_readiness(&gh).await;
         let targets =
             futures::future::join_all(repos.iter().map(|repo| self.target(repo, &gh, ready.ready)))
@@ -464,12 +485,13 @@ impl FeedbackService {
         Some(public)
     }
 
-    /// How `gh` runs for this service, each issue call limited to `timeout`.
-    fn gh(&self, timeout: Duration) -> Gh<'_> {
+    /// How `gh` runs for this service.
+    fn gh(&self) -> Gh<'_> {
         Gh {
             plugins: &self.parts.plugins,
             cwd: &self.parts.gh_dir,
-            timeout,
+            timeout: self.gh_timeout,
+            check_timeout: self.check_timeout,
         }
     }
 
@@ -670,7 +692,7 @@ impl FeedbackService {
         if self.github_of(&repo).await?.is_none() {
             return Err(FeedbackError::NoGithubRemote);
         }
-        match gh_readiness(&self.gh(VISIBILITY_TIMEOUT)).await.reason {
+        match gh_readiness(&self.gh()).await.reason {
             None => Ok(()),
             Some(reason) => Err(FeedbackError::GhNotReady(not_ready_sentence(&reason))),
         }
@@ -871,7 +893,8 @@ impl FeedbackService {
         };
 
         if !s.pushed {
-            if let Err(failure) = repo::push(&repo, &s.branch, &s.branch).await {
+            // The recorded commit itself, whatever the branch is now.
+            if let Err(failure) = repo::push_commit(&repo, &s.commit, &s.branch).await {
                 tracing::warn!(submission_id = %id, step = "push", code = %failure.code, "the feedback branch was not pushed");
                 return Ok(Some(failure));
             }
@@ -904,8 +927,12 @@ impl FeedbackService {
     }
 
     /// The issue of a pushed submission: `gh` checked (unless it was a
-    /// moment ago), the body written to a scratch directory of its own
-    /// (removed afterwards), then [`create_issue`].
+    /// moment ago); one the signed-in user made before ([`find_issue`]);
+    /// else, unless a create ran without a usable answer less than a minute
+    /// ago (`issue_unconfirmed`), a new one ([`create_issue`]) from a body
+    /// written to a scratch directory of its own (removed afterwards).
+    /// GitHub gets the title and the body mentioning no one
+    /// ([`no_mentions`]).
     async fn make_issue(
         &self,
         s: &Submission,
@@ -913,13 +940,28 @@ impl FeedbackService {
         github: &GithubRepo,
         gh_checked: bool,
     ) -> Result<String, FeedbackFailure> {
-        let gh = self.gh(self.gh_timeout);
+        let gh = self.gh();
         if !gh_checked {
             if let Some(reason) = gh_readiness(&gh).await.reason {
                 return Err(FeedbackFailure {
                     step: FeedbackStep::CreateIssue,
                     code: "gh_not_ready".to_owned(),
                     message: not_ready_sentence(&reason),
+                });
+            }
+        }
+        if let Some(url) = find_issue(&gh, github, s.id).await? {
+            locked(&self.parts.unconfirmed).remove(&s.id);
+            return Ok(url);
+        }
+        let last = locked(&self.parts.unconfirmed).get(&s.id).copied();
+        if let Some(at) = last {
+            // A clock that went back counts as no time passed.
+            if (self.clock)() - at < chrono::TimeDelta::seconds(UNCONFIRMED_WAIT_SECS) {
+                return Err(FeedbackFailure {
+                    step: FeedbackStep::CreateIssue,
+                    code: "issue_unconfirmed".to_owned(),
+                    message: "GitHub has not confirmed whether the issue was created. Try again in a minute.".to_owned(),
                 });
             }
         }
@@ -935,13 +977,28 @@ impl FeedbackService {
         })?;
         let title = no_mentions(&s.title);
         let label = label_for(s.request.kind);
-        create_issue(&gh, github, &title, &body_file, label, s.id).await
+        match create_issue(&gh, github, &title, &body_file, label).await {
+            Ok(url) => {
+                locked(&self.parts.unconfirmed).remove(&s.id);
+                Ok(url)
+            }
+            Err(NotCreated {
+                failure,
+                unconfirmed,
+            }) => {
+                if unconfirmed {
+                    locked(&self.parts.unconfirmed).insert(s.id, (self.clock)());
+                }
+                Err(failure)
+            }
+        }
     }
 }
 
 /// The body of a submission's issue: its `issue.md` as committed, without
 /// front matter, links to the folder's files as permalinks to the commit,
-/// and the submission's marker last.
+/// mentioning no one ([`no_mentions`]: `issue.md` itself keeps the user's
+/// text), and the submission's marker last.
 async fn issue_text(
     s: &Submission,
     repo: &Repo,
@@ -953,7 +1010,9 @@ async fn issue_text(
     match (issue_md, files) {
         (Ok(Some(issue_md)), Ok(files)) => {
             let base = permalink_base(&github.owner, &github.name, &s.commit, &s.folder);
-            Ok(issue_body(&issue_md, &files, &base, Some(&marker(s.id))))
+            // Before the body is cut to its length, so what is added counts.
+            let text = no_mentions(&issue_md);
+            Ok(issue_body(&text, &files, &base, Some(&marker(s.id))))
         }
         _ => {
             tracing::warn!(submission_id = %s.id, step = "create_issue", code = "git_failed", "could not read the committed issue folder");
@@ -963,14 +1022,6 @@ async fn issue_text(
                 message: "git could not read the committed issue folder".to_owned(),
             })
         }
-    }
-}
-
-fn body_failure() -> FeedbackFailure {
-    FeedbackFailure {
-        step: FeedbackStep::CreateIssue,
-        code: "io_error".to_owned(),
-        message: "could not write the issue's body".to_owned(),
     }
 }
 

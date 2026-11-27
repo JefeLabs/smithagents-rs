@@ -24,11 +24,12 @@ use common::feedback::{multipart, png, request_json, FakeTools};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use smithagents_core::agent::Repo;
-use smithagents_core::feedback::SubmissionId;
+use smithagents_core::feedback::{AttachmentKind, FeedbackRequest, SubmissionId};
 use smithagents_core::ids::IntentId;
 use smithagents_plugin_host::StaticSecrets;
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
+use smithagents_server::feedback::issue::{file_names, render_issue, FileKind, IssueInput};
 use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
@@ -44,6 +45,8 @@ const TOKEN: &str = "test-token-123";
 const GITHUB_URL: &str = "https://github.com/smithagents-test-invalid/widgets.git";
 const ISSUE_URL: &str = "https://github.com/smithagents-test-invalid/widgets/issues/7";
 const REPO_ARG: &str = "--repo=github.com/smithagents-test-invalid/widgets";
+/// The sign-in check, for github.com only.
+const AUTH: &str = "auth status --hostname=github.com";
 const BRANCH: &str = "feedback/2026-11-26-fix-the-zoom";
 const FOLDER: &str = "docs/issues/2026-11-26-fix-the-zoom";
 /// A plugin secret in the test process's environment, which `gh` must never
@@ -81,6 +84,8 @@ impl PolishRunner for NoPolish {
 struct Opts {
     gh: bool,
     gh_timeout: Option<Duration>,
+    /// Replaces the 5 s limit of `gh auth status` and `gh repo view`.
+    check_timeout: Option<Duration>,
 }
 
 impl Default for Opts {
@@ -88,6 +93,7 @@ impl Default for Opts {
         Opts {
             gh: true,
             gh_timeout: None,
+            check_timeout: None,
         }
     }
 }
@@ -160,6 +166,9 @@ async fn fixture_with(opts: Opts) -> Fx {
     .with_clock(clock);
     if let Some(timeout) = opts.gh_timeout {
         feedback = feedback.with_gh_timeout_for_test(timeout);
+    }
+    if let Some(timeout) = opts.check_timeout {
+        feedback = feedback.with_check_timeout_for_test(timeout);
     }
     let state = AppState {
         service,
@@ -522,7 +531,7 @@ async fn an_issue_submission_pushes_and_creates_the_issue() {
 
     let calls = fx.fake.calls();
     assert_eq!(calls.len(), 4, "{calls:?}");
-    assert_eq!(calls[0], "auth status");
+    assert_eq!(calls[0], AUTH);
     assert!(calls[1].starts_with("issue list"), "{calls:?}");
     assert!(
         calls[2].starts_with("label list --search=enhancement"),
@@ -533,12 +542,15 @@ async fn an_issue_submission_pushes_and_creates_the_issue() {
         "{calls:?}"
     );
     assert!(calls[3].ends_with("--label=enhancement"), "{calls:?}");
-    // The search looks for the submission's id; every call on the
-    // repository names it, joined to its option.
+    // The search looks for the submission's id among the issues the
+    // signed-in user opened; every call on the repository names it, joined
+    // to its option.
     let id = req["submission_id"].as_str().unwrap();
-    assert!(
-        calls[1].contains(&format!("--search={id} in:body")),
-        "{calls:?}"
+    assert_eq!(
+        calls[1],
+        format!(
+            r#"issue list {REPO_ARG} --author=@me --state=all --search={id} in:body --json=url --jq=.[0].url // """#
+        )
     );
     for call in &calls[1..] {
         assert!(call.contains(REPO_ARG), "{call}");
@@ -699,47 +711,111 @@ async fn a_title_that_looks_like_a_flag_stays_a_title() {
     );
 }
 
+/// What only GitHub gets: `@name` with a zero-width space after the `@`.
+const ZWSP: char = '\u{200b}';
+
 #[tokio::test]
-async fn mentions_in_the_title_and_comments_notify_no_one() {
+async fn mentions_are_neutralised_only_in_what_github_gets() {
     let fx = fixture().await;
     let (repo, _bare) = fx.github_repo("r1").await;
     let mut req = issue_request(&repo);
-    req["main_idea"] = json!("@octocat the zoom\n\nThe owner's own words: ping @hubot.");
+    req["main_idea"] = json!(
+        "@octocat the zoom\n\n@hubot, see (@reviewer) and @org/team.\nMail a@b.com or pkg/@scope."
+    );
     req["attachments"] = json!([
-        screenshot("cc @someone"),
-        {"kind": "image", "original_name": "@team.png"},
+        screenshot("cc @someone and me@example.com"),
+        {"kind": "image", "original_name": "photo@2x.png"},
     ]);
     let (shot, annotated, image) = (png(300), png(400), png(200));
+    let files: [(&str, &[u8]); 3] = [
+        ("file-1", &shot),
+        ("annotated-1", &annotated),
+        ("file-2", &image),
+    ];
 
-    let (status, out) = fx
-        .submit(
-            &req,
-            &[
-                ("file-1", &shot),
-                ("annotated-1", &annotated),
-                ("file-2", &image),
-            ],
-        )
-        .await;
+    let (status, out) = fx.submit(&req, &files).await;
 
     assert_eq!(status, StatusCode::OK, "{out}");
+    // The committed issue.md is the user's text as written.
+    let request: FeedbackRequest = serde_json::from_value(req.clone()).unwrap();
+    let names = file_names(&[
+        (AttachmentKind::Screenshot, FileKind::Png),
+        (AttachmentKind::Image, FileKind::Png),
+    ]);
+    let raw = render_issue(&IssueInput {
+        title: "@octocat the zoom",
+        main_idea: &request.main_idea,
+        kind: request.kind,
+        created: start(),
+        app_version: "0.1.0",
+        platform: "macos",
+        attachments: &request.attachments,
+        names: &names,
+    });
+    let branch = out["branch"].as_str().unwrap();
+    let folder = out["folder"].as_str().unwrap();
+    let committed = git_out(
+        &repo.path,
+        &["show", &format!("{branch}:{folder}/issue.md")],
+    );
+    assert_eq!(committed, raw.trim_end());
+    assert!(!committed.contains(ZWSP), "{committed}");
+
+    // The title and the whole body GitHub gets mention no one.
     let create = fx.calls_starting("issue create").pop().unwrap();
     assert!(
-        create.starts_with("issue create --title=@\u{200b}octocat the zoom --body-file="),
+        create.starts_with(&format!(
+            "issue create --title=@{ZWSP}octocat the zoom --body-file="
+        )),
         "{create}"
     );
     let body = fx.fake.read("issue-body.md").unwrap();
-    assert!(body.starts_with("# @\u{200b}octocat the zoom\n"), "{body}");
-    assert!(body.contains("cc @\u{200b}someone"), "{body}");
-    assert!(body.contains("## @\u{200b}team.png"), "{body}");
-    for raw in ["@octocat", "@someone", "@team"] {
+    for neutral in [
+        format!("# @{ZWSP}octocat the zoom\n"),
+        format!("@{ZWSP}hubot, see (@{ZWSP}reviewer) and @{ZWSP}org/team."),
+        format!("cc @{ZWSP}someone and me@example.com"),
+    ] {
+        assert!(body.contains(&neutral), "{neutral:?} in {body}");
+    }
+    for raw in ["@octocat", "@hubot", "@reviewer", "@org", "@someone"] {
         assert!(!body.contains(raw), "{raw} in {body}");
     }
-    // The main idea's own text is the owner's and stays as written.
-    assert!(
-        body.contains("The owner's own words: ping @hubot."),
-        "{body}"
+    // An `@` that is not where a mention starts stays as typed.
+    for kept in [
+        "Mail a@b.com or pkg/@scope.",
+        "## photo@2x.png",
+        "me@example.com",
+    ] {
+        assert!(body.contains(kept), "{kept} in {body}");
+    }
+
+    // The intent path seeds from the same text as its issue.md.
+    let other = fx.add_repo("r2").await;
+    let mut intent = req.clone();
+    intent["submission_id"] = json!(SubmissionId::new());
+    intent["repo_id"] = json!(other.id);
+    intent["send_as"] = json!("intent");
+    let (status, out) = fx.submit(&intent, &files).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let seed = out["intent"]["seed"]["text"].as_str().unwrap();
+    let issue_md = git_out(
+        &other.path,
+        &[
+            "show",
+            &format!(
+                "{}:{}/issue.md",
+                out["branch"].as_str().unwrap(),
+                out["folder"].as_str().unwrap()
+            ),
+        ],
     );
+    assert!(seed.starts_with(request.main_idea.as_str()), "{seed}");
+    assert!(seed.contains("cc @someone and me@example.com"), "{seed}");
+    assert!(
+        issue_md.contains("1. cc @someone and me@example.com"),
+        "{issue_md}"
+    );
+    assert!(!seed.contains(ZWSP) && !issue_md.contains(ZWSP));
 }
 
 // --------------------------------------------------------------- refusals
@@ -772,7 +848,7 @@ async fn the_issue_path_is_refused_before_anything_is_written() {
         ),
     )
     .await;
-    assert_eq!(fx.fake.calls(), ["auth status"]);
+    assert_eq!(fx.fake.calls(), [AUTH]);
 
     let fx = fixture_with(Opts {
         gh: false,
@@ -844,6 +920,107 @@ async fn a_failed_push_keeps_the_commit_and_retry_pushes_and_creates() {
     assert!(fx.feedback_tmp_is_empty());
 }
 
+/// A `pre-receive` hook in `bare` that refuses every push; its path.
+fn refuse_pushes(bare: &Path) -> PathBuf {
+    let hook = bare.join("hooks/pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    hook
+}
+
+/// Whether `bare` holds the object `id`.
+fn has_object(bare: &Path, id: &str) -> bool {
+    git_cmd(bare, &["cat-file", "-e", &format!("{id}^{{commit}}")])
+        .status
+        .success()
+}
+
+#[tokio::test]
+async fn a_retry_pushes_the_recorded_commit_not_the_branch_tip() {
+    let fx = fixture().await;
+
+    // The local branch moved on before the retry: only the recorded commit
+    // goes to origin.
+    let (repo, bare) = fx.github_repo("moved").await;
+    let hook = refuse_pushes(&bare);
+    let req = issue_request(&repo);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["failed"]["code"], "push_rejected", "{out}");
+    let commit = out["commit"].as_str().unwrap().to_string();
+    let extra = git_out(
+        &repo.path,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit-tree",
+            &format!("{commit}^{{tree}}"),
+            "-p",
+            &commit,
+            "-m",
+            "not part of the submission",
+        ],
+    );
+    git_out(
+        &repo.path,
+        &["update-ref", &format!("refs/heads/{BRANCH}"), &extra],
+    );
+    std::fs::remove_file(&hook).unwrap();
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["pushed"], true);
+    assert_eq!(again["failed"], Value::Null);
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), commit);
+    assert!(
+        !has_object(&bare, &extra),
+        "the extra commit reached origin"
+    );
+
+    // The local branch was deleted: the recorded commit is still pushed.
+    let (repo, bare) = fx.github_repo("deleted").await;
+    let hook = refuse_pushes(&bare);
+    let req = issue_request(&repo);
+    let (_, out) = fx.submit_shot(&req).await;
+    assert_eq!(out["failed"]["code"], "push_rejected", "{out}");
+    let commit = out["commit"].as_str().unwrap().to_string();
+    common::git(&repo.path, &["branch", "-D", BRANCH]);
+    std::fs::remove_file(&hook).unwrap();
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["pushed"], true);
+    assert_eq!(again["issue_url"], ISSUE_URL);
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), commit);
+
+    // The commit is gone from the repository: nothing is pushed.
+    let (repo, bare) = fx.github_repo("gone").await;
+    let hook = refuse_pushes(&bare);
+    let req = issue_request(&repo);
+    let (_, out) = fx.submit_shot(&req).await;
+    assert_eq!(out["failed"]["code"], "push_rejected", "{out}");
+    let commit = out["commit"].as_str().unwrap().to_string();
+    common::git(&repo.path, &["branch", "-D", BRANCH]);
+    common::git(&repo.path, &["reflog", "expire", "--expire=now", "--all"]);
+    common::git(&repo.path, &["gc", "-q", "--prune=now"]);
+    assert!(!has_object(&repo.path, &commit));
+    std::fs::remove_file(&hook).unwrap();
+    let creates = fx.calls_starting("issue create").len();
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["pushed"], false);
+    assert_eq!(
+        again["failed"],
+        json!({
+            "step": "push",
+            "code": "commit_missing",
+            "message": "The feedback commit is no longer in this repository, so it cannot be pushed.",
+        })
+    );
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "");
+    assert_eq!(fx.calls_starting("issue create").len(), creates);
+}
+
 #[tokio::test]
 async fn a_failed_gh_keeps_the_push_and_retry_only_creates_the_issue() {
     let fx = fixture().await;
@@ -910,9 +1087,75 @@ async fn a_hanging_gh_times_out() {
         out["failed"]["message"],
         "gh did not finish within 60 seconds"
     );
-    let pid = fx.fake.read("hang.pid").unwrap();
-    let pid = pid.trim().to_string();
-    until("the hanging gh is still running", || !process_alive(&pid)).await;
+    // Stopped before it got to hang, it is gone already.
+    if let Some(pid) = fx.fake.read("hang.pid") {
+        let pid = pid.trim().to_string();
+        until("the hanging gh is still running", || !process_alive(&pid)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_unconfirmed_issue_is_not_created_again_for_a_minute() {
+    let fx = fixture_with(Opts {
+        gh_timeout: Some(Duration::from_millis(300)),
+        ..Opts::default()
+    })
+    .await;
+    let (repo, _bare) = fx.github_repo("r1").await;
+    let unconfirmed = json!({
+        "step": "create_issue",
+        "code": "issue_unconfirmed",
+        "message": "GitHub has not confirmed whether the issue was created. Try again in a minute.",
+    });
+
+    // `gh issue create` timed out: it may have made the issue.
+    fx.fake.set("hang", "issue create");
+    let req = issue_request(&repo);
+    let (_, out) = fx.submit_shot(&req).await;
+    assert_eq!(out["failed"]["code"], "gh_timeout", "{out}");
+    fx.clear("hang");
+    // Retried at once: the search finds nothing yet, and nothing is created.
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["failed"], unconfirmed);
+    assert_eq!(fx.calls_starting("issue create").len(), 1);
+    let searches = fx.calls_starting("issue list").len();
+    assert_eq!(searches, 2, "{:?}", fx.fake.calls());
+    // A minute later the search finds it: it is that issue.
+    fx.minutes.store(2, Ordering::SeqCst);
+    fx.fake.set("existing", ISSUE_URL);
+    let (_, found) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(found["issue_url"], ISSUE_URL, "{found}");
+    assert_eq!(found["failed"], Value::Null);
+    assert_eq!(fx.calls_starting("issue create").len(), 1);
+    fx.clear("existing");
+
+    // gh answered something that is not an issue's address: the same.
+    fx.fake.set("issue-url", "LEAK-not-a-url");
+    let mut req = issue_request(&repo);
+    req["main_idea"] = json!("A strange answer");
+    let (_, out) = fx.submit_shot(&req).await;
+    assert_eq!(out["failed"]["code"], "gh_bad_answer", "{out}");
+    fx.clear("issue-url");
+    let (_, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(again["failed"], unconfirmed);
+    assert_eq!(fx.calls_starting("issue create").len(), 2);
+    // A minute later the search still finds nothing: it is created once.
+    fx.minutes.store(4, Ordering::SeqCst);
+    let (_, made) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(made["issue_url"], ISSUE_URL, "{made}");
+    assert_eq!(made["failed"], Value::Null);
+    assert_eq!(fx.calls_starting("issue create").len(), 3);
+
+    // gh said it failed (an exit status): a retry may create at once.
+    fx.fake.set("fail", "issue create");
+    let mut req = issue_request(&repo);
+    req["main_idea"] = json!("A plain failure");
+    let (_, out) = fx.submit_shot(&req).await;
+    assert_eq!(out["failed"]["code"], "gh_failed", "{out}");
+    fx.clear("fail");
+    let (_, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(again["issue_url"], ISSUE_URL, "{again}");
 }
 
 #[tokio::test]
@@ -975,12 +1218,13 @@ async fn a_wrong_answer_from_gh_is_refused() {
     for (i, answer) in [
         "https://example.com/x",
         "http://github.com/smithagents-test-invalid/widgets/issues/7",
-        "https://github.com/someone-else/widgets/issues/7",
-        "https://github.com/smithagents-test-invalid/gadgets/issues/7",
+        "https://github.com.evil.example/smithagents-test-invalid/widgets/issues/7",
         "https://github.com/smithagents-test-invalid/widgets/pull/7",
         "https://github.com/smithagents-test-invalid/widgets/issues/7x",
         "https://github.com/smithagents-test-invalid/widgets/issues/",
         "https://github.com/smithagents-test-invalid/widgets/issues/7/LEAK",
+        "https://github.com/../widgets/issues/7",
+        "https://github.com/LEAK owner/widgets/issues/7",
         "LEAK-not-a-url",
     ]
     .into_iter()
@@ -1000,28 +1244,44 @@ async fn a_wrong_answer_from_gh_is_refused() {
         assert_eq!(fx.row(&req["submission_id"]).await.unwrap().issue_url, None);
     }
 
-    // The same name in another case is the same repository.
-    fx.fake.set(
-        "issue-url",
+    // What `issue create` prints for a renamed or moved repository (its
+    // name now) is an issue all the same, and is kept.
+    for (i, answer) in [
         "https://github.com/Smithagents-Test-Invalid/Widgets/issues/12",
-    );
-    let mut req = issue_request(&repo);
-    req["main_idea"] = json!("Another case");
-    let (_, out) = fx.submit_shot(&req).await;
-    assert_eq!(
-        out["issue_url"],
-        "https://github.com/Smithagents-Test-Invalid/Widgets/issues/12"
-    );
+        "https://github.com/someone-else/widgets/issues/13",
+        "https://github.com/smithagents-test-invalid/gadgets.rs/issues/14",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fx.fake.set("issue-url", answer);
+        let mut req = issue_request(&repo);
+        req["main_idea"] = json!(format!("Moved {i}"));
+        let (_, out) = fx.submit_shot(&req).await;
+        assert_eq!(out["issue_url"], answer, "{out}");
+        assert_eq!(out["failed"], Value::Null, "{out}");
+        let row = fx.row(&req["submission_id"]).await.unwrap();
+        assert_eq!(row.issue_url.as_deref(), Some(answer));
+    }
 
-    // A search that answers something else creates nothing.
+    // A search must answer an issue of this repository; anything else
+    // creates nothing.
     fx.clear("issue-url");
-    fx.fake.set("existing", "https://example.com/x");
-    let creates = fx.calls_starting("issue create").len();
-    let mut req = issue_request(&repo);
-    req["main_idea"] = json!("A strange search");
-    let (_, out) = fx.submit_shot(&req).await;
-    assert_eq!(out["failed"]["code"], "gh_bad_answer", "{out}");
-    assert_eq!(fx.calls_starting("issue create").len(), creates);
+    for (i, answer) in [
+        "https://example.com/x",
+        "https://github.com/someone-else/widgets/issues/7",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fx.fake.set("existing", answer);
+        let creates = fx.calls_starting("issue create").len();
+        let mut req = issue_request(&repo);
+        req["main_idea"] = json!(format!("A strange search {i}"));
+        let (_, out) = fx.submit_shot(&req).await;
+        assert_eq!(out["failed"]["code"], "gh_bad_answer", "{out}");
+        assert_eq!(fx.calls_starting("issue create").len(), creates);
+    }
 }
 
 #[tokio::test]
@@ -1133,29 +1393,52 @@ async fn a_long_push_holds_up_neither_other_submissions_nor_its_own_client() {
 
 #[tokio::test]
 async fn a_slow_sign_in_check_holds_up_no_other_submission() {
-    let fx = Arc::new(fixture().await);
-    let (repo, bare) = fx.github_repo("r1").await;
-    // `gh auth status` never answers: the check gives up after 5 seconds.
-    fx.fake.set("hang", "auth status");
+    // The check may take a minute here, so only the gate decides when it ends.
+    let fx = Arc::new(
+        fixture_with(Opts {
+            check_timeout: Some(Duration::from_secs(60)),
+            ..Opts::default()
+        })
+        .await,
+    );
+    let (repo, _bare) = fx.github_repo("r1").await;
+    // `gh auth status` waits until the test opens the gate.
+    fx.fake.set("wait", "auth status");
     let req = issue_request(&repo);
     let call = {
         let (fx, req) = (Arc::clone(&fx), req.clone());
         tokio::spawn(async move { fx.submit_shot(&req).await })
     };
     until("the check never began", || {
-        fx.fake.read("hang.pid").is_some()
+        fx.fake.read("wait.pid").is_some()
     })
     .await;
 
+    // Another submission is made while the check waits.
     let other = fx.add_repo("r2").await;
-    let (status, out) = fx.submit(&request_json(other.id, "intent"), &[]).await;
+    let (status, out) =
+        tokio::time::timeout(PATIENCE, fx.submit(&request_json(other.id, "intent"), &[]))
+            .await
+            .expect("another submission waited for the sign-in check");
     assert_eq!(status, StatusCode::OK, "{out}");
-    assert!(
-        !call.is_finished(),
-        "the check ended before the other submission"
-    );
+    assert!(!call.is_finished(), "the check ended without the gate");
 
+    fx.fake.set("go", "");
     let (status, body) = tokio::time::timeout(PATIENCE, call).await.unwrap().unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["issue_url"], ISSUE_URL);
+
+    // A check that does not answer in its time is "not signed in", and
+    // nothing is written (however far the fake got before it was stopped).
+    let fx = fixture_with(Opts {
+        check_timeout: Some(Duration::from_secs(1)),
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    fx.fake.set("hang", "auth status");
+    let req = issue_request(&repo);
+    let (status, body) = fx.submit_shot(&req).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "gh_not_ready");
     assert_eq!(
@@ -1164,9 +1447,11 @@ async fn a_slow_sign_in_check_holds_up_no_other_submission() {
     );
     assert_eq!(fx.row(&req["submission_id"]).await, None);
     assert_eq!(git_out(&bare, &["for-each-ref"]), "");
-    let pid = fx.fake.read("hang.pid").unwrap();
-    let pid = pid.trim().to_string();
-    until("the hanging gh is still running", || !process_alive(&pid)).await;
+    // Stopped before it got to hang, it is gone already.
+    if let Some(pid) = fx.fake.read("hang.pid") {
+        let pid = pid.trim().to_string();
+        until("the hanging gh is still running", || !process_alive(&pid)).await;
+    }
 }
 
 // ------------------------------------------------------------------- leaking
@@ -1305,5 +1590,5 @@ async fn targets_report_visibility_and_sign_in() {
         json!({"ready": false, "reason": "not signed in"})
     );
     assert_eq!(body["repos"][0]["is_public"], Value::Null);
-    assert_eq!(fx.fake.calls(), ["auth status"]);
+    assert_eq!(fx.fake.calls(), [AUTH]);
 }

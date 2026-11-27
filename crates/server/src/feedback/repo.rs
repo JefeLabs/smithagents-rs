@@ -387,6 +387,45 @@ pub async fn push(repo: &Repo, local: &str, remote_branch: &str) -> Result<(), F
         .map_err(push_failure)
 }
 
+/// Pushes the commit `commit` itself to `origin` as `remote_branch`, never
+/// forced, for at most [`PUSH_TIMEOUT`]: what a local branch points at now
+/// (moved on, deleted) does not matter, so nothing but that commit and its
+/// history leaves the machine. `commit_missing` when `commit` is not a full
+/// commit id of this repository; any other failure as for [`push`].
+pub async fn push_commit(
+    repo: &Repo,
+    commit: &str,
+    remote_branch: &str,
+) -> Result<(), FeedbackFailure> {
+    if !git::is_commit_id(commit) {
+        return Err(commit_missing());
+    }
+    match git::rev_parse(&repo.path, commit).await {
+        Ok(Some(found)) if found == commit => {}
+        Ok(_) => return Err(commit_missing()),
+        Err(GitError::TimedOut) => return Err(push_failure(PushError::Timeout)),
+        Err(e) => {
+            let status = match e {
+                GitError::Failed { status } => status,
+                _ => None,
+            };
+            return Err(push_failure(PushError::Failed { status }));
+        }
+    }
+    git::push_commit(&repo.path, commit, remote_branch, PUSH_TIMEOUT)
+        .await
+        .map_err(push_failure)
+}
+
+fn commit_missing() -> FeedbackFailure {
+    FeedbackFailure {
+        step: FeedbackStep::Push,
+        code: "commit_missing".to_string(),
+        message: "The feedback commit is no longer in this repository, so it cannot be pushed."
+            .to_string(),
+    }
+}
+
 fn push_failure(error: PushError) -> FeedbackFailure {
     let (code, message) = match error {
         PushError::NoRemote => (
@@ -966,6 +1005,15 @@ mod tests {
                 (code, message)
             );
         }
+        let failure = commit_missing();
+        assert_eq!(failure.step, FeedbackStep::Push);
+        assert_eq!(
+            (failure.code.as_str(), failure.message.as_str()),
+            (
+                "commit_missing",
+                "The feedback commit is no longer in this repository, so it cannot be pushed."
+            )
+        );
     }
 
     #[test]
