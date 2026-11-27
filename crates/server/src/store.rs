@@ -775,7 +775,9 @@ impl Store {
         after_seq: u64,
         limit: u32,
     ) -> Result<Vec<ChatMessage>, StoreError> {
-        let after = i64::try_from(after_seq).map_err(corrupt)?;
+        // The number is the client's. No stored seq is above `i64::MAX`, so
+        // nothing follows a larger one.
+        let after = i64::try_from(after_seq).unwrap_or(i64::MAX);
         let rows = sqlx::query(
             "SELECT * FROM messages WHERE agent_id = ? AND seq > ? ORDER BY seq LIMIT ?",
         )
@@ -1209,6 +1211,22 @@ impl Store {
 }
 
 #[cfg(test)]
+impl Store {
+    /// For a test of what a failed insert leaves behind: while `refused`,
+    /// the database turns every new agent row down, as it would with a full
+    /// disk.
+    pub(crate) async fn refuse_new_agents(&self, refused: bool) {
+        let sql = if refused {
+            "CREATE TRIGGER refuse_new_agents BEFORE INSERT ON agents \
+             BEGIN SELECT RAISE(ABORT, 'refused for a test'); END"
+        } else {
+            "DROP TRIGGER refuse_new_agents"
+        };
+        sqlx::query(sql).execute(&self.pool).await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use smithagents_core::palette::palette;
@@ -1337,6 +1355,20 @@ mod tests {
         assert_eq!(got.state, AgentState::Blocked);
         assert_eq!(got.harness_session_id.as_deref(), Some("new-session"));
         assert!(store.get_agent(AgentId::new()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn messages_after_a_seq_no_message_can_have_are_none() {
+        // A seq is kept as an i64; a client may ask for what follows a
+        // larger one. That is an empty page, not a corrupt store.
+        let store = Store::open_in_memory().await.unwrap();
+        let a = seeded(&store, &["Earth"]).await.remove(0);
+        store.append_message(a.id, Role::User, "one").await.unwrap();
+        let largest = i64::MAX.unsigned_abs();
+        for after in [largest, largest + 1, u64::MAX] {
+            let page = store.list_messages(a.id, after, 10).await.unwrap();
+            assert!(page.is_empty(), "after {after}: {page:?}");
+        }
     }
 
     #[tokio::test]

@@ -334,8 +334,8 @@ fn worktree_add_failure(stderr: String, branch: &str, dir: &Path) -> GitError {
 }
 
 /// Removes what a `git worktree add` that was stopped left behind: the
-/// folder, its registration, and the new branch while it still points at
-/// `base` (so nothing committed on it is lost). Best effort: what cannot be
+/// folder, its registration, and the new branch while it holds nothing that
+/// `base` does not (so nothing committed on it is lost). Best effort: what cannot be
 /// removed stays, and a later start uses another branch and folder.
 async fn discard_unfinished_worktree(repo_root: &Path, dir: &Path, branch: &str, base: &str) {
     let dir_arg = dir.to_string_lossy().into_owned();
@@ -359,9 +359,7 @@ async fn discard_unfinished_worktree(repo_root: &Path, dir: &Path, branch: &str,
         )
         .await;
     }
-    if let Ok(Some(commit)) = rev_parse(repo_root, base).await {
-        let _ = delete_branch_at(repo_root, branch, &commit).await;
-    }
+    let _ = delete_branch_made_from(repo_root, branch, base).await;
     tracing::warn!("a checkout for a new worktree did not finish in time and was stopped");
 }
 
@@ -860,6 +858,33 @@ pub async fn delete_branch_at(
     }
     let reference = format!("refs/heads/{branch}");
     isolated_ok(repo_root, &["update-ref", "-d", &reference, commit]).await
+}
+
+/// Deletes the local branch `branch`, made from `base` (a local branch or a
+/// full commit id) and not used since: only while everything on it is on
+/// `base` too, so that no commit is lost with it. `base` may have gained
+/// commits meanwhile. `false` when the branch was kept: it has a commit of
+/// its own, or `base` is gone, or the branch is.
+pub async fn delete_branch_made_from(
+    repo_root: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<bool, GitError> {
+    let Some(tip) = rev_parse(repo_root, &format!("refs/heads/{branch}")).await? else {
+        return Ok(false);
+    };
+    let Some(base_tip) = rev_parse(repo_root, base).await? else {
+        return Ok(false);
+    };
+    let ran = isolated(repo_root, &["merge-base", "--is-ancestor", &tip, &base_tip]).await?;
+    match ran.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(false),
+        status => return Err(GitError::Failed { status }),
+    }
+    // Only while it still points there: a commit made since is not lost.
+    delete_branch_at(repo_root, branch, &tip).await?;
+    Ok(true)
 }
 
 /// A local branch's tip and the values of one trailer of its message.

@@ -1744,6 +1744,9 @@ impl PassFailure {
             PassFailure::Harness(HarnessError::Spawn(_)) => format!(
                 "polish pass {pass} could not start the claude CLI; check that it is installed, then retry"
             ),
+            PassFailure::Harness(HarnessError::MissingCwd(_)) => format!(
+                "polish pass {pass} could not find the repository's folder; check that it is still there, then retry"
+            ),
             PassFailure::Harness(HarnessError::Failed(_)) => {
                 format!("polish pass {pass} failed in the claude CLI; retry")
             }

@@ -836,9 +836,10 @@ fn transport_errors_are_unreachable() {
 
 #[test]
 fn a_file_that_could_not_be_opened_is_not_a_daemon_error() {
-    let file = LinkError::Client(smithagents_client::ClientError::File(
-        std::io::ErrorKind::NotFound.into(),
-    ));
+    let file = LinkError::Client(smithagents_client::ClientError::File {
+        path: "/moved/shot.png".into(),
+        source: std::io::ErrorKind::NotFound.into(),
+    });
     assert_eq!(
         intent_error_text(&file),
         "A file to upload could not be opened"

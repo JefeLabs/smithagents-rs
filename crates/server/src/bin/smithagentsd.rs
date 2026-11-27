@@ -103,14 +103,23 @@ fn flag_value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<O
 
 /// `--home` when given, else `SMITHAGENTS_HOME` or `~/.smithagents`, made
 /// absolute so stored worktree paths do not depend on the working directory.
+///
+/// A home whose path is not UTF-8 is refused: the worktrees under it are
+/// stored as text and sent as JSON, in answers and in events, and neither
+/// can hold such a path.
 fn resolve_paths(home: Option<PathBuf>) -> io::Result<Paths> {
     let home = match home {
         Some(home) => home,
         None => Paths::from_env().home,
     };
-    Ok(Paths {
-        home: std::path::absolute(home)?,
-    })
+    let home = std::path::absolute(home)?;
+    if home.to_str().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the home directory must be a UTF-8 path",
+        ));
+    }
+    Ok(Paths { home })
 }
 
 fn main() -> ExitCode {
@@ -450,6 +459,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Invocation, String> {
         parse_args(args.iter().map(OsString::from))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = PathBuf::from(OsString::from_vec(b"/srv/home-\xff".to_vec()));
+        let err = resolve_paths(Some(home)).expect_err("the path is not UTF-8");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "the home directory must be a UTF-8 path");
     }
 
     #[test]

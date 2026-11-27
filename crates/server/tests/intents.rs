@@ -1281,6 +1281,30 @@ async fn harness_failure_text_does_not_reach_the_message() {
 }
 
 #[tokio::test]
+async fn a_pass_that_could_not_start_says_what_is_missing() {
+    // claude, or the folder to run it in: the person fixes different things.
+    let cases = [
+        (
+            HarnessError::Spawn(std::io::ErrorKind::NotFound.into()),
+            "polish pass 1 could not start the claude CLI; check that it is installed, then retry",
+        ),
+        (
+            HarnessError::MissingCwd("/moved/repo".into()),
+            "polish pass 1 could not find the repository's folder; check that it is still there, then retry",
+        ),
+    ];
+    for (error, sentence) in cases {
+        let f = real_fx().await;
+        let repo = f.repo("r1").await;
+        f.h.script(vec![Err(error)]);
+        let i = f.text_intent(&repo).await;
+        let failed = f.wait(i.id, is_failed).await;
+        assert_eq!(failure(&failed), (1, sentence.to_owned()));
+        assert_user_readable(sentence);
+    }
+}
+
+#[tokio::test]
 async fn panic_inside_the_harness_fails_and_retry_succeeds() {
     let f = real_fx().await;
     let repo = f.repo("r1").await;

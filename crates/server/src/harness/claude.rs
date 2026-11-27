@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -187,6 +187,33 @@ impl ClaudeCodeHarness {
         remove_plugin_secrets(&mut cmd);
         cmd
     }
+
+    /// Starts [`Self::command`]. A spawn fails with the same "not found"
+    /// whether claude is missing or the folder to run it in is, so a failed
+    /// one is told apart by looking at the folder.
+    async fn spawn(&self, args: Vec<String>, cwd: &Path) -> Result<Child, HarnessError> {
+        match self.command(args, cwd).spawn() {
+            Ok(child) => Ok(child),
+            Err(e) if folder_is_missing(&tokio::fs::metadata(cwd).await) => {
+                tracing::debug!("claude was not started, its working folder being gone: {e}");
+                Err(HarnessError::MissingCwd(cwd.to_owned()))
+            }
+            Err(e) => Err(HarnessError::Spawn(e)),
+        }
+    }
+}
+
+/// Whether a look at the working folder (`fs::metadata` of it) shows that it
+/// is not there: nothing at the path, something on the way to it that is not
+/// a folder, or something there that is not one. A folder that could not be
+/// looked at for another reason is not known to be missing.
+fn folder_is_missing(looked: &std::io::Result<std::fs::Metadata>) -> bool {
+    use std::io::ErrorKind;
+
+    match looked {
+        Ok(meta) => !meta.is_dir(),
+        Err(e) => matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory),
+    }
 }
 
 #[async_trait]
@@ -195,7 +222,7 @@ impl Harness for ClaudeCodeHarness {
         &self,
         req: TurnRequest,
     ) -> Result<BoxStream<'static, HarnessEvent>, HarnessError> {
-        let mut child = self.command(build_args(&req), &req.cwd).spawn()?;
+        let mut child = self.spawn(build_args(&req), &req.cwd).await?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -329,9 +356,7 @@ impl Harness for ClaudeCodeHarness {
         &self,
         req: StructuredRequest,
     ) -> Result<StructuredResult, HarnessError> {
-        let mut child = self
-            .command(build_structured_args(&req), &req.cwd)
-            .spawn()?;
+        let mut child = self.spawn(build_structured_args(&req), &req.cwd).await?;
         // A timeout, or dropping this call, takes down whatever claude started.
         let mut group = GroupKiller::of(child.id());
         let stdin = child.stdin.take().expect("stdin piped");
@@ -369,7 +394,9 @@ impl Harness for ClaudeCodeHarness {
                 if status.is_ok() {
                     group.disarm();
                 }
-                status?
+                // claude did start: this is not a failure to start it.
+                status
+                    .map_err(|e| HarnessError::Failed(format!("failed to wait for claude: {e}")))?
             }
         };
         // Everything claude printed was in the pipe when it exited.
@@ -400,6 +427,30 @@ impl Harness for ClaudeCodeHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_folder_known_to_be_missing_is_called_missing() {
+        // After a failed spawn the folder is looked at. Not there, or not a
+        // folder: that is why. Anything else about it (no permission on a
+        // parent, a disk error) is not known to be the reason, and the
+        // spawn's own error is what gets reported.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let kind = |kind: std::io::ErrorKind| Err(std::io::Error::from(kind));
+
+        assert!(!folder_is_missing(&std::fs::metadata(dir.path())));
+        assert!(folder_is_missing(&std::fs::metadata(&file)));
+        assert!(folder_is_missing(&std::fs::metadata(
+            dir.path().join("gone")
+        )));
+        assert!(folder_is_missing(&kind(std::io::ErrorKind::NotFound)));
+        assert!(folder_is_missing(&kind(std::io::ErrorKind::NotADirectory)));
+        assert!(!folder_is_missing(&kind(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!folder_is_missing(&kind(std::io::ErrorKind::Other)));
+    }
 
     #[test]
     fn claude_does_not_inherit_plugin_secrets() {

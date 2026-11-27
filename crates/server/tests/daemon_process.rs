@@ -491,6 +491,31 @@ async fn unknown_flag_is_a_usage_error() {
     assert!(!home.exists(), "nothing is created on a usage error");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_home_that_is_not_utf8_is_refused_at_startup() {
+    // Worktree paths under it could not be written as JSON, in events or
+    // answers, so the daemon does not start there at all.
+    use std::os::unix::ffi::OsStringExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"home-\xff".to_vec()));
+    let mut daemon = Daemon::spawn(tmp.path(), "daemon", &home, &[], None);
+    let status = daemon
+        .wait_exit(PATIENCE)
+        .await
+        .expect("the daemon started in a home whose path is not UTF-8");
+    assert_eq!(status.code(), Some(1), "log:\n{}", daemon.log_text());
+    let log = daemon.log_text();
+    assert!(
+        log.contains("the home directory must be a UTF-8 path"),
+        "log:\n{log}"
+    );
+    assert!(!home.exists(), "nothing is created");
+}
+
 #[tokio::test]
 async fn agents_left_running_by_a_previous_daemon_start_dead() {
     let tmp = tempfile::tempdir().unwrap();

@@ -709,7 +709,7 @@ fn daemon_text(error: &LinkError) -> String {
         LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }
-        LinkError::Client(ClientError::File(_)) => FILE_UNREADABLE_TEXT.to_owned(),
+        LinkError::Client(ClientError::File { .. }) => FILE_UNREADABLE_TEXT.to_owned(),
         LinkError::Client(ClientError::Api { code, message, .. }) => {
             let line = one_line(message);
             if code.starts_with("http_") || line.is_empty() {

@@ -80,9 +80,10 @@ pub enum ClientError {
     /// The events WebSocket could not be opened.
     #[error("event stream failed: {0}")]
     Ws(#[from] tungstenite::Error),
-    /// A local file to upload could not be opened. Nothing was sent.
-    #[error("could not open a file to upload: {0}")]
-    File(#[source] io::Error),
+    /// The local file `path` could not be opened for an upload. Nothing was
+    /// sent.
+    #[error("could not open {} to upload: {source}", path.display())]
+    File { path: PathBuf, source: io::Error },
 }
 
 /// A file of a feedback upload: the local file at `path`, sent as the part
@@ -363,7 +364,10 @@ impl Client {
         for file in files {
             let part = Part::file(&file.path)
                 .await
-                .map_err(ClientError::File)?
+                .map_err(|source| ClientError::File {
+                    path: file.path.clone(),
+                    source,
+                })?
                 .file_name(file.part.clone());
             form = form.part(file.part.clone(), part);
         }

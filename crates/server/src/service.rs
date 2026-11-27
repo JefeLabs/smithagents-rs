@@ -76,6 +76,29 @@ impl ServiceError {
     }
 }
 
+/// Takes back what creating `agent` made in the user's repository, for an
+/// agent whose row could not be saved: its worktree, then its branch, while
+/// that holds no commit `base` does not. Left alone, the branch would take
+/// the name the next start wants. Best effort: what cannot be removed stays,
+/// and is logged.
+async fn discard_unsaved(repo_root: &Path, agent: &Agent, base: &str) {
+    let id = agent.id;
+    if let Err(e) = git::remove_worktree(repo_root, &agent.worktree_path).await {
+        // The branch is still checked out there, so it stays too.
+        tracing::warn!(agent_id = %id, "could not remove worktree of unsaved agent: {e}");
+        return;
+    }
+    match git::delete_branch_made_from(repo_root, &agent.branch, base).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(agent_id = %id, "the branch of an unsaved agent holds a commit of its own, and was kept");
+        }
+        Err(e) => {
+            tracing::warn!(agent_id = %id, "could not delete the branch of an unsaved agent: {e}");
+        }
+    }
+}
+
 /// Optional settings for `create_agent_with`.
 #[derive(Debug, Default, Clone)]
 pub struct CreateAgentOptions {
@@ -279,9 +302,7 @@ impl AgentService {
             .insert_agent_with_append(&agent, opts.system_prompt_append.as_deref())
             .await;
         if let Err(e) = inserted {
-            if let Err(cleanup) = git::remove_worktree(&repo.path, &agent.worktree_path).await {
-                tracing::warn!(agent_id = %id, "could not remove worktree of unsaved agent: {cleanup}");
-            }
+            discard_unsaved(&repo.path, &agent, &base).await;
             return Err(e.into());
         }
         self.inner
@@ -962,6 +983,93 @@ mod tests {
             .repo_worktrees_dir(&fx.repo)
             .join("intent-taken")
             .exists());
+    }
+
+    /// The local branches of the fixture's repository, sorted.
+    fn branches(fx: &Fx) -> Vec<String> {
+        git(
+            &fx.repo_dir,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_cannot_be_saved_leaves_no_worktree_and_no_branch() {
+        let fx = fixture(vec![]).await;
+        let opts = || CreateAgentOptions {
+            branch: Some("intent/unsaved".into()),
+            intent_id: Some(IntentId::new()),
+            system_prompt_append: Some("x".into()),
+            base: None,
+        };
+        fx.store.refuse_new_agents(true).await;
+
+        // A branch that was asked for, and one the daemon names itself.
+        let err = fx
+            .svc
+            .create_agent_with(fx.repo.id, opts())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Store(_)), "{err:?}");
+        let err = fx.svc.create_agent(fx.repo.id).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Store(_)), "{err:?}");
+
+        assert_eq!(
+            branches(&fx),
+            ["main"],
+            "only the user's own branch is left"
+        );
+        let worktrees = git(&fx.repo_dir, &["worktree", "list", "--porcelain"]);
+        assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+        let folder = fx.paths.repo_worktrees_dir(&fx.repo);
+        assert!(!folder.join("intent-unsaved").exists());
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+        assert!(fx.store.list_agents(true).await.unwrap().is_empty());
+
+        // So the same branch is free for the next try.
+        fx.store.refuse_new_agents(false).await;
+        let agent = fx.svc.create_agent_with(fx.repo.id, opts()).await.unwrap();
+        assert_eq!(agent.branch, "intent/unsaved");
+        assert_eq!(branches(&fx), ["intent/unsaved", "main"]);
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_agents_branch_is_kept_once_it_holds_work() {
+        // Only a branch with nothing of its own is deleted: one that moved
+        // on has commits nothing else may hold.
+        let fx = fixture(vec![]).await;
+        git(&fx.repo_dir, &["branch", "moved-on"]);
+        git(&fx.repo_dir, &["checkout", "-q", "moved-on"]);
+        git(&fx.repo_dir, &["commit", "--allow-empty", "-m", "work"]);
+        git(&fx.repo_dir, &["checkout", "-q", "main"]);
+
+        let made_from = |branch: &'static str, base: &'static str| {
+            let repo = fx.repo_dir.clone();
+            async move {
+                git::delete_branch_made_from(&repo, branch, base)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert!(!made_from("moved-on", "main").await, "it has a commit");
+        assert!(!made_from("moved-on", "no-such-base").await, "no base");
+        assert!(!made_from("no-such-branch", "main").await, "no branch");
+        assert_eq!(branches(&fx), ["main", "moved-on"]);
+
+        git(&fx.repo_dir, &["branch", "untouched"]);
+        assert!(made_from("untouched", "refs/heads/main").await);
+        assert_eq!(branches(&fx), ["main", "moved-on"]);
+
+        // The base gaining a commit since does not make the branch's own:
+        // everything on it is still on the base.
+        git(&fx.repo_dir, &["branch", "left-behind"]);
+        git(&fx.repo_dir, &["commit", "--allow-empty", "-m", "later"]);
+        assert!(made_from("left-behind", "main").await);
+        assert_eq!(branches(&fx), ["main", "moved-on"]);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::component::dock::{DockAreaState, DockPlacement, DockState, PanelInfo, PanelState};
-use gpui_kit::{px, rems, size, Bounds, Pixels, Size, WindowBounds};
+use gpui_kit::{point, px, rems, size, Bounds, Pixels, Size, WindowBounds};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -224,6 +224,12 @@ pub fn saved_window(
 /// placement: when its numbers are not finite, it is smaller than 640x400,
 /// or its top strip (where the title bar is) is not at least 100x15 px on
 /// the display (a smaller display, a window dragged almost off screen).
+///
+/// A window wider or taller than its display is fitted to it: a display
+/// keeps its UUID when its resolution changes, and a window that reaches
+/// past its edges cannot be resized by hand. In each direction it is too
+/// large in, it starts at the display's edge and is as large as the display
+/// (never smaller than 640x400). A direction it fits in is left as saved.
 pub fn restored_window_bounds(
     saved: &SavedWindow,
     display: Option<Bounds<Pixels>>,
@@ -237,6 +243,20 @@ pub fn restored_window_bounds(
     {
         return None;
     }
+    let (x, width) = fitted(
+        (b.origin.x, b.size.width),
+        (display.origin.x, display.size.width),
+        MIN_WINDOW_SIZE.width,
+    );
+    let (y, height) = fitted(
+        (b.origin.y, b.size.height),
+        (display.origin.y, display.size.height),
+        MIN_WINDOW_SIZE.height,
+    );
+    let b = Bounds {
+        origin: point(x, y),
+        size: size(width, height),
+    };
     let title_strip = Bounds {
         origin: b.origin,
         size: size(b.size.width, px(TITLE_STRIP_HEIGHT)),
@@ -255,6 +275,18 @@ pub fn restored_window_bounds(
     } else {
         WindowBounds::Windowed(b)
     })
+}
+
+/// One direction of a saved window, as (start, length), on a display that is
+/// `display` in that direction: as saved when it is no longer than the
+/// display, else from the display's start and as long as the display, but
+/// never shorter than `min`.
+fn fitted(saved: (Pixels, Pixels), display: (Pixels, Pixels), min: Pixels) -> (Pixels, Pixels) {
+    if saved.1 <= display.1 {
+        saved
+    } else {
+        (display.0, display.1.max(min))
+    }
 }
 
 /// The width the right dock is drawn at: the user's `preferred` width (clamped

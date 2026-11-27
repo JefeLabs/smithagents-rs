@@ -11,7 +11,7 @@ use smithagents_app::model::{Action, Connection};
 use smithagents_app::view_models::repo_error_text;
 use smithagents_client::{Client, ClientError, SpawnOptions};
 use smithagents_core::agent::{AgentState, Repo};
-use smithagents_core::daemon::read_lockfile;
+use smithagents_core::daemon::{lockfile_path, read_lockfile};
 use smithagents_core::event::EventKind;
 use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::IntentId;
@@ -396,6 +396,30 @@ async fn dropping_the_link_ends_its_thread_and_leaves_the_daemon_running() {
     drop_promptly(link).await;
     let info = read_lockfile(home.path()).unwrap().unwrap();
     assert!(Client::new(&info).health().await.is_ok());
+}
+
+#[tokio::test]
+async fn a_start_failure_names_what_failed_and_not_the_daemon_binary() {
+    // A folder where the lockfile belongs: the lockfile cannot be read, and
+    // the daemon binary has nothing to do with it.
+    let home = TestHome::new();
+    let lockfile = lockfile_path(home.path());
+    std::fs::create_dir_all(&lockfile).unwrap();
+    let cfg = config(&home);
+    let daemon = cfg.daemon_bin.display().to_string();
+    let (link, mut rx) = DaemonLink::start(cfg);
+    assert_eq!(
+        next(&mut rx, "reconnecting").await,
+        Action::ConnectionChanged(Connection::Reconnecting)
+    );
+    let error = link.last_error().expect("an error text");
+    assert!(
+        error.starts_with(&format!("could not read {}: ", lockfile.display())),
+        "{error}"
+    );
+    assert!(!error.contains(&daemon), "{error}");
+    assert_eq!(link.last_error_kind(), Some(LinkErrorKind::StartFailed));
+    drop_promptly(link).await;
 }
 
 async fn drop_promptly(link: DaemonLink) {

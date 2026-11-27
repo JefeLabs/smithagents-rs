@@ -126,7 +126,9 @@ pub fn asks_to_acknowledge(error: &LinkError) -> bool {
 
 pub fn send_failure(error: &LinkError) -> SendFailure {
     match error {
-        LinkError::NotConnected | LinkError::Client(ClientError::File(_)) => SendFailure::NotSent,
+        LinkError::NotConnected | LinkError::Client(ClientError::File { .. }) => {
+            SendFailure::NotSent
+        }
         LinkError::Client(ClientError::Http(e)) if e.is_connect() => SendFailure::NotSent,
         LinkError::Stopped | LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             SendFailure::MayExist
@@ -363,7 +365,7 @@ pub fn submit_error_text(error: &LinkError) -> String {
         LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }
-        LinkError::Client(ClientError::File(_)) => FILE_UNREADABLE_TEXT.to_owned(),
+        LinkError::Client(ClientError::File { .. }) => FILE_UNREADABLE_TEXT.to_owned(),
         LinkError::Client(ClientError::Api { code, message, .. }) => {
             if let Some(text) = feedback_code_text(code) {
                 return text.to_owned();

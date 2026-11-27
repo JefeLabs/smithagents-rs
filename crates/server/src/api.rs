@@ -679,10 +679,21 @@ async fn send_message(
     body: Bytes,
 ) -> Result<(StatusCode, Json<ChatMessage>), ApiError> {
     let id = agent_id(&id)?;
-    let SendMessageBody { text } = json_body(&body)?;
+    let text = message_text(&body)?;
     let svc = s.service;
     let msg = detached(async move { svc.send_message(id, text).await }).await?;
     Ok((StatusCode::ACCEPTED, Json(msg)))
+}
+
+/// The text of a message to an agent, from the body of either route that
+/// sends one. Text of nothing but white space is refused here, before a
+/// message is stored or a turn started.
+fn message_text(body: &Bytes) -> Result<String, ApiError> {
+    let SendMessageBody { text } = json_body(body)?;
+    if text.trim().is_empty() {
+        return Err(ApiError::bad_request("text must not be empty"));
+    }
+    Ok(text)
 }
 
 /// Sends a message and streams the reply as an AI SDK UI message stream.
@@ -696,10 +707,7 @@ async fn chat(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let id = agent_id(&id)?;
-    let SendMessageBody { text } = json_body(&body)?;
-    if text.trim().is_empty() {
-        return Err(ApiError::bad_request("text must not be empty"));
-    }
+    let text = message_text(&body)?;
     // `subscribe(None)` cannot fail (only resuming with `since` can).
     let sub = s
         .bus
@@ -1263,12 +1271,27 @@ async fn serve_socket(mut socket: WebSocket, sub: Subscription, clients: Arc<Ato
     }
 }
 
+/// Sends `event` as a text frame.
+///
+/// An event that cannot be written as JSON is left out, and logged: the only
+/// such value is a path that is not UTF-8, which the daemon refuses as its
+/// home when it starts. Ending the socket instead would not help the client,
+/// which would resume into the same event.
 async fn send_event(
     socket: &mut WebSocket,
     event: &smithagents_core::event::Event,
 ) -> Result<(), axum::Error> {
-    // Event is plain data; serialization cannot fail.
-    let text = serde_json::to_string(event).expect("event serializes");
+    let text = match serde_json::to_string(event) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::error!(
+                seq = event.seq,
+                kind = event.kind.type_name(),
+                "an event could not be written as JSON and was not sent: {e}"
+            );
+            return Ok(());
+        }
+    };
     socket.send(Message::Text(text.into())).await
 }
 

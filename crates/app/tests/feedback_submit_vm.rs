@@ -562,7 +562,10 @@ fn nothing_but_the_daemons_fixed_message_is_shown() {
         "{text}"
     );
     // A local file that could not be opened, and a broken connection.
-    let file = LinkError::Client(ClientError::File(std::io::Error::other("gone")));
+    let file = LinkError::Client(ClientError::File {
+        path: "/moved/shot.png".into(),
+        source: std::io::Error::other("gone"),
+    });
     assert_eq!(submit_error_text(&file), FILE_UNREADABLE_TEXT);
     let http = reqwest::Client::new()
         .get("not a url")
@@ -786,7 +789,10 @@ fn what_a_failed_send_leaves_under_its_id() {
 
     // The request provably never left.
     assert_eq!(send_failure(&LinkError::NotConnected), SendFailure::NotSent);
-    let file = LinkError::Client(ClientError::File(std::io::Error::other("gone")));
+    let file = LinkError::Client(ClientError::File {
+        path: "/moved/shot.png".into(),
+        source: std::io::Error::other("gone"),
+    });
     assert_eq!(send_failure(&file), SendFailure::NotSent);
     let refused = connect_error();
     assert!(refused.is_connect());

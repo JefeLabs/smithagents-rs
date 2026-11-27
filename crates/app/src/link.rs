@@ -782,8 +782,10 @@ async fn connect_and_forward(
             running,
             expected,
         } => Exit::Failed(LinkFailure::protocol_mismatch(&version, running, expected)),
+        // The error names what failed: the daemon binary, or a file or
+        // folder of the home that the start needs.
         e => Exit::Failed(LinkFailure::Other {
-            message: format!("could not start {}: {e}", config.daemon_bin.display()),
+            message: e.to_string(),
             kind: LinkErrorKind::StartFailed,
         }),
     })?;

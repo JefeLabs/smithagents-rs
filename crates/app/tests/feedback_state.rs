@@ -24,8 +24,8 @@ use smithagents_app::feedback::state::{Feedback, FeedbackEvent, FeedbackOptions,
 use smithagents_app::feedback::text::{
     capture_failed_text, more_files_text, more_notices_text, save_failed_text,
     CAPTURE_FRAMES_MISSED, CAPTURE_PICTURE_TIMEOUT, CAPTURE_TOO_SLOW, DRAFT_FULL_TEXT,
-    DRAFT_NOT_SET_ASIDE, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, PERMISSION_TEXT, UNSUPPORTED_TEXT,
-    WINDOW_NOT_FOUND_TEXT,
+    DRAFT_NOT_SET_ASIDE, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES, PERMISSION_TEXT,
+    UNSUPPORTED_TEXT, WINDOW_NOT_FOUND_TEXT,
 };
 use smithagents_app::shell::ShellOptions;
 use smithagents_capture::{CaptureError, FakeCapturer, Screenshot};
@@ -364,6 +364,50 @@ fn the_total_limit_counts_files_from_the_same_pick(cx: &mut TestAppContext) {
         notices(cx, &feedback),
         vec![Refusal::TotalTooLarge.sentence("c.mp4")]
     );
+}
+
+#[gpui_kit::test]
+fn the_total_limit_counts_a_screenshot_as_it_is_sent(cx: &mut TestAppContext) {
+    // A screenshot is uploaded twice, as the picture and as its annotated
+    // copy. The draft counts it that way when it admits anything, so the
+    // limit is met here and not at Submit, after the annotating.
+    let setup = FeedbackSetup::new();
+    let (window, _, feedback) = setup.open(cx);
+    capture_now(cx, window, &feedback, &setup);
+    act(cx, window, &feedback, |f, _, cx| f.finish_annotating(cx));
+    let shot = draft(cx, &feedback).attachments[0].size;
+    assert!(shot > 0 && shot < 1024 * 1024, "{shot}");
+
+    // Two videos that fill the draft to the byte, the screenshot at twice
+    // its size; then a file of one byte too many.
+    let fifty_mb = 50 * 1024 * 1024;
+    setup.pick(vec![
+        sized_file(&setup, "a.mp4", MP4_START, fifty_mb),
+        sized_file(&setup, "b.mp4", MP4_START, fifty_mb - 2 * shot),
+        sized_file(&setup, "c.png", PNG_SIGNATURE, 8),
+    ]);
+    act(cx, window, &feedback, |f, window, cx| {
+        f.add_files(window, cx)
+    });
+    let held = draft(cx, &feedback);
+    assert_eq!(held.attachments.len(), 3, "{:?}", notices(cx, &feedback));
+    assert_eq!(held.usage().bytes, MAX_TOTAL_BYTES);
+    assert_eq!(
+        notices(cx, &feedback),
+        vec![Refusal::TotalTooLarge.sentence("c.png")]
+    );
+
+    // And so is another screenshot, though the files in the draft are
+    // smaller than the limit by the size of one.
+    capture_now(cx, window, &feedback, &setup);
+    assert_eq!(draft(cx, &feedback).attachments.len(), 3);
+    assert_eq!(
+        notices(cx, &feedback),
+        vec![Refusal::TotalTooLarge.sentence("The screenshot")]
+    );
+    assert!(!file_names(&setup.draft_dir())
+        .iter()
+        .any(|name| name.starts_with("screenshot-2")));
 }
 
 #[gpui_kit::test]

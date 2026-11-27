@@ -79,7 +79,9 @@ impl Refusal {
             Refusal::Contents => "its contents are not a png, jpg, gif, webp or mp4 file.",
             Refusal::ImageTooLarge => "an image can be at most 10 MB.",
             Refusal::VideoTooLarge => "a video can be at most 50 MB.",
-            Refusal::TotalTooLarge => "the draft would be larger than 100 MB.",
+            Refusal::TotalTooLarge => {
+                "the draft would be larger than 100 MB to send (a screenshot counts twice)."
+            }
             Refusal::TooMany => "a draft holds at most 10 attachments.",
             Refusal::Unreadable => "it could not be read.",
         };
@@ -91,6 +93,8 @@ impl Refusal {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub count: usize,
+    /// The bytes its attachments take in an upload, where a screenshot
+    /// counts twice (`draft::upload_bytes`): what the total limit is about.
     pub bytes: u64,
 }
 

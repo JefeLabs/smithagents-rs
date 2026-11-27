@@ -768,7 +768,7 @@ pub fn repo_error_text(error: &LinkError) -> String {
         LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }
-        LinkError::Client(ClientError::File(_)) => FILE_UNREADABLE_TEXT.to_owned(),
+        LinkError::Client(ClientError::File { .. }) => FILE_UNREADABLE_TEXT.to_owned(),
     }
 }
 
