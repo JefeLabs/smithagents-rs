@@ -508,7 +508,9 @@ install = { mise = "npm:agent-browser" }
   GitHub issue", and `gh pr list` and `gh pr create --draft` for "Open pull
   request". It runs from the daemon's home, never inside a repository, always
   with `--repo=github.com/<owner>/<name>`, and with `GH_PROMPT_DISABLED=1`,
-  `GH_NO_UPDATE_NOTIFIER=1` and `NO_COLOR=1`. Its searches for an issue or a
+  `GH_NO_UPDATE_NOTIFIER=1`, `NO_COLOR=1`, `CLICOLOR_FORCE=0` and an empty
+  `GH_FORCE_TTY`, set over any the daemon inherited, so `gh` always writes
+  plain, unindented output. Its searches for an issue or a
   pull request made before look only at the signed-in user's own
   (`--author=@me`).
 - **`agent-browser`** is only looked up: "Demo video" is offered while it is

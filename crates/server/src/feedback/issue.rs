@@ -403,8 +403,8 @@ fn may_start_address(before: Option<char>) -> bool {
 }
 
 /// The length in bytes of the web address `text` starts with, when it is
-/// one [`no_mentions_in_body`] leaves alone: `http://` or `https://` (any
-/// case), a host of ASCII letters, digits, `-` and `.` that begins and ends
+/// one inside which [`no_mentions_in_body`] writes a mention-shaped `@` as
+/// `%40`: `http://` or `https://` (any case), a host of ASCII letters, digits, `-` and `.` that begins and ends
 /// with a letter or digit and holds a `.`, optionally `:` and digits, then
 /// `/`, `?` or `#`, and from there every character in [`in_address`].
 fn web_address_len(text: &str) -> Option<usize> {

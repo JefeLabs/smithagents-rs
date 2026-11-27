@@ -71,7 +71,10 @@ pub enum FeedbackError {
     DefaultBranchMissing(String),
     #[error("git has no user.name and user.email set for this repository")]
     GitIdentityMissing,
-    /// `step` is `create the worktree` or `commit the files`.
+    /// `step` is what git was doing, a fixed phrase: `create the worktree`,
+    /// `commit the files`, `look for this submission's commit` or `check what
+    /// origin already has` (in `repo`), or `read the idea agent's branch` (in
+    /// `idea`).
     #[error("git could not {step} ({})", exit_status_text(.status))]
     Git {
         step: &'static str,
