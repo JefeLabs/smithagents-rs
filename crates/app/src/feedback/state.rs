@@ -45,7 +45,8 @@ use smithagents_core::ids::RepoId;
 
 use super::annotation::Annotation;
 use super::draft::{
-    annotated_name, Attachment, AttachmentId, AttachmentKind, Draft, DraftStore, Loaded,
+    annotated_name, upload_bytes, Attachment, AttachmentId, AttachmentKind, Draft, DraftStore,
+    Loaded,
 };
 use super::files::{FileKind, Refusal};
 use super::render::decode;
@@ -574,7 +575,9 @@ impl Feedback {
         if size > MAX_IMAGE_BYTES {
             return Err(Refusal::ImageTooLarge.sentence("The screenshot"));
         }
-        if usage.bytes.saturating_add(size) > MAX_TOTAL_BYTES {
+        // Counted as it will be sent: with its annotated copy.
+        let sent = upload_bytes(AttachmentKind::Screenshot, size);
+        if usage.bytes.saturating_add(sent) > MAX_TOTAL_BYTES {
             return Err(Refusal::TotalTooLarge.sentence("The screenshot"));
         }
         let stored_name = self
@@ -712,7 +715,7 @@ impl Feedback {
                 let usage = self.draft.usage();
                 let late_refusal = if usage.count >= MAX_ATTACHMENTS {
                     Some(Refusal::TooMany)
-                } else if usage.bytes.saturating_add(attachment.size) > MAX_TOTAL_BYTES {
+                } else if usage.bytes.saturating_add(attachment.upload_bytes()) > MAX_TOTAL_BYTES {
                     Some(Refusal::TotalTooLarge)
                 } else {
                     None

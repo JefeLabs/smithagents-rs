@@ -3,12 +3,13 @@ use std::path::Path;
 
 use smithagents_app::feedback::annotation::{Annotation, FracRect};
 use smithagents_app::feedback::draft::{
-    annotated_name, thumb_name, Attachment, AttachmentId, AttachmentKind, Draft, DraftStore,
+    annotated_name, thumb_name, upload_bytes, Attachment, AttachmentId, AttachmentKind, Draft,
+    DraftStore,
 };
 use smithagents_app::feedback::files::{FileKind, Usage};
 use smithagents_app::feedback::text::{
     removed_attachments_text, save_failed_text, BROKEN_DRAFT_TEXT, DRAFT_FOLDER_NOT_A_FOLDER,
-    DRAFT_NOT_SET_ASIDE,
+    DRAFT_NOT_SET_ASIDE, MAX_TOTAL_BYTES,
 };
 
 fn note(x: f32, y: f32, w: f32, h: f32) -> Annotation {
@@ -551,15 +552,40 @@ fn screenshot_numbers_follow_position() {
     assert_eq!(draft.screenshot_number(&AttachmentId::new()), None);
     assert_eq!(draft.screenshot_count(), 2);
     assert_eq!(draft.get(&ii).unwrap().stored_name, "image-1.png");
+    // Each 100-byte screenshot is sent twice, the 40-byte image once.
     assert_eq!(
         draft.usage(),
         Usage {
             count: 3,
-            bytes: 240
+            bytes: 440
         }
     );
     assert!(!draft.is_empty());
     assert!(Draft::default().is_empty());
+}
+
+#[test]
+fn the_draft_counts_its_bytes_as_the_upload_does() {
+    // A screenshot goes out as two parts, the picture and its annotated
+    // copy; an added image or video as one.
+    const MB: u64 = 1024 * 1024;
+    assert_eq!(upload_bytes(AttachmentKind::Screenshot, 9 * MB), 18 * MB);
+    assert_eq!(upload_bytes(AttachmentKind::Image, 9 * MB), 9 * MB);
+    assert_eq!(upload_bytes(AttachmentKind::Video, 40 * MB), 40 * MB);
+    assert_eq!(upload_bytes(AttachmentKind::Screenshot, u64::MAX), u64::MAX);
+
+    // Six 9 MB screenshots are 108 MB to send: the draft says so before
+    // Submit does.
+    let mut six = Vec::new();
+    for n in 1..=6 {
+        let mut screenshot = shot(&format!("screenshot-{n}.png"), vec![]);
+        screenshot.size = 9 * MB;
+        six.push(screenshot);
+    }
+    let usage = draft_of(six).usage();
+    assert_eq!(usage.count, 6);
+    assert_eq!(usage.bytes, 108 * MB);
+    assert!(usage.bytes > MAX_TOTAL_BYTES);
 }
 
 #[test]

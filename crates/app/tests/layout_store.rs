@@ -263,6 +263,48 @@ fn a_saved_window_reopens_only_where_it_can_be_seen_and_grabbed() {
     assert_eq!(restored_window_bounds(&nan, display), None, "not finite");
 }
 
+#[test]
+fn a_saved_window_larger_than_its_display_is_fitted_to_it() {
+    // A display keeps its UUID when its resolution changes, so a window
+    // saved on it can be larger than it is now.
+    let display = Some(bounds(0., 0., 1512., 982.));
+    let large = windowed(0., 30., 2500., 1400.);
+    assert_eq!(
+        restored_window_bounds(&large, display),
+        Some(WindowBounds::Windowed(bounds(0., 30., 1512., 982.)))
+    );
+    let wide = windowed(40., 60., 2500., 700.);
+    assert_eq!(
+        restored_window_bounds(&wide, display),
+        Some(WindowBounds::Windowed(bounds(40., 60., 1512., 700.))),
+        "only what is too large changes, and the place is kept"
+    );
+    let mut maximized = large.clone();
+    maximized.maximized = true;
+    assert_eq!(
+        restored_window_bounds(&maximized, display),
+        Some(WindowBounds::Maximized(bounds(0., 30., 1512., 982.)))
+    );
+    // A size nobody saved: finite, and no window or drawable could be it.
+    let absurd = windowed(0., 0., 1e30, 1e30);
+    assert_eq!(
+        restored_window_bounds(&absurd, display),
+        Some(WindowBounds::Windowed(bounds(0., 0., 1512., 982.)))
+    );
+    // On a display smaller than the smallest window, the minimum stands.
+    let small = Some(bounds(0., 0., 600., 380.));
+    assert_eq!(
+        restored_window_bounds(&windowed(0., 0., 1200., 760.), small),
+        Some(WindowBounds::Windowed(bounds(0., 0., 640., 400.)))
+    );
+    // A window that fits is given back as it was saved.
+    let fits = windowed(100., 80., 1512., 982.);
+    assert_eq!(
+        restored_window_bounds(&fits, display),
+        Some(WindowBounds::Windowed(bounds(100., 80., 1512., 982.)))
+    );
+}
+
 fn left(mode: LeftPaneMode, width: f32) -> LeftPaneLayout {
     LeftPaneLayout {
         mode,

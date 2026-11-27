@@ -91,6 +91,8 @@ impl Refusal {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub count: usize,
+    /// The bytes its attachments take in an upload, where a screenshot
+    /// counts twice (`draft::upload_bytes`): what the total limit is about.
     pub bytes: u64,
 }
 

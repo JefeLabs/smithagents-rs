@@ -224,6 +224,11 @@ pub fn saved_window(
 /// placement: when its numbers are not finite, it is smaller than 640x400,
 /// or its top strip (where the title bar is) is not at least 100x15 px on
 /// the display (a smaller display, a window dragged almost off screen).
+///
+/// A window larger than its display is made as large as the display, and
+/// never smaller than 640x400: a display keeps its UUID when its resolution
+/// changes, and a window that reaches past its edges cannot be resized by
+/// hand. Its place is kept.
 pub fn restored_window_bounds(
     saved: &SavedWindow,
     display: Option<Bounds<Pixels>>,
@@ -237,6 +242,19 @@ pub fn restored_window_bounds(
     {
         return None;
     }
+    let b = Bounds {
+        origin: b.origin,
+        size: size(
+            b.size
+                .width
+                .min(display.size.width)
+                .max(MIN_WINDOW_SIZE.width),
+            b.size
+                .height
+                .min(display.size.height)
+                .max(MIN_WINDOW_SIZE.height),
+        ),
+    };
     let title_strip = Bounds {
         origin: b.origin,
         size: size(b.size.width, px(TITLE_STRIP_HEIGHT)),

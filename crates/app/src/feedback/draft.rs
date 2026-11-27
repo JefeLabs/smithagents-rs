@@ -117,6 +117,28 @@ impl Default for Draft {
     }
 }
 
+/// What a stored file of `size` bytes adds to an upload. A screenshot is
+/// sent twice, as the picture and as its annotated copy; an added image or
+/// video is sent once. The draft counts bytes this way wherever it admits
+/// something, so that it meets the total limit when the upload would.
+///
+/// The annotated copy is counted at the picture's size, which is an
+/// estimate: it is the same picture with boxes drawn on it, encoded again.
+/// Submit and the daemon count the files themselves.
+pub fn upload_bytes(kind: AttachmentKind, size: u64) -> u64 {
+    match kind {
+        AttachmentKind::Screenshot => size.saturating_mul(2),
+        AttachmentKind::Image | AttachmentKind::Video => size,
+    }
+}
+
+impl Attachment {
+    /// What this attachment adds to an upload: see [`upload_bytes`].
+    pub fn upload_bytes(&self) -> u64 {
+        upload_bytes(self.kind, self.size)
+    }
+}
+
 impl Draft {
     /// No attachments (a main idea may still be there: see [`Draft::is_blank`]).
     pub fn is_empty(&self) -> bool {
@@ -129,13 +151,15 @@ impl Draft {
         self.attachments.is_empty() && self.main_idea.trim().is_empty()
     }
 
+    /// What the draft holds, its bytes counted as an upload counts them
+    /// ([`upload_bytes`]).
     pub fn usage(&self) -> Usage {
         Usage {
             count: self.attachments.len(),
             bytes: self
                 .attachments
                 .iter()
-                .fold(0u64, |sum, a| sum.saturating_add(a.size)),
+                .fold(0u64, |sum, a| sum.saturating_add(a.upload_bytes())),
         }
     }
 
