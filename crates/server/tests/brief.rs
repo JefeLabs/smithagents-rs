@@ -243,6 +243,8 @@ fn an_idea_intent_gets_no_evidence_section() {
         pr_url: None,
         not_done: None,
         implementation_intent_id: None,
+        pr_commit: None,
+        pr_pushed: false,
     });
     i.origin = Some(o);
     let msg = compose(&i, &[]).first_message;
@@ -257,6 +259,8 @@ fn idea(explainer: bool, diagrams: bool, demo_video: bool) -> IdeaPackage {
         pr_url: None,
         not_done: None,
         implementation_intent_id: None,
+        pr_commit: None,
+        pr_pushed: false,
     }
 }
 

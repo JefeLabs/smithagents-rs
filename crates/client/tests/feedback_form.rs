@@ -279,3 +279,95 @@ async fn targets_and_refusals_decode() {
         other => panic!("{other:?}"),
     }
 }
+
+/// An idea intent as the daemon answers one, with a pull request.
+fn idea_intent() -> smithagents_core::intent::Intent {
+    use smithagents_core::feedback::{FeedbackOrigin, IdeaPackage};
+    use smithagents_core::intent::{
+        Content, Intent, IntentKind, IntentState, Phase, Seed, SeedSource,
+    };
+    let at = chrono::Utc::now();
+    Intent {
+        id: smithagents_core::ids::IntentId::new(),
+        repo_id: RepoId::new(),
+        slug: "fix-the-zoom".into(),
+        state: IntentState::Resolved,
+        phase: Phase::Review,
+        seed: Seed {
+            source: SeedSource::Text,
+            text: "Fix the zoom".into(),
+            kind: Some(IntentKind::Bug),
+        },
+        content: Content {
+            title: "Fix the zoom".into(),
+            kind: IntentKind::Bug,
+            current_behavior: String::new(),
+            questions: vec![],
+            preconditions: vec![],
+            criteria: vec![],
+            stories: vec![],
+            depends_on: vec![],
+        },
+        agent_id: None,
+        created_at: at,
+        updated_at: at,
+        queued_at: None,
+        sent_at: Some(at),
+        resolved_at: Some(at),
+        last_start_error: None,
+        base_branch: Some("idea/fix-the-zoom".into()),
+        origin: Some(FeedbackOrigin {
+            folder: "docs/issues/2026-11-26-fix-the-zoom".into(),
+            branch: "idea/fix-the-zoom".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            idea: Some(IdeaPackage {
+                explainer: true,
+                diagrams: false,
+                demo_video: false,
+                pr_url: Some("https://github.com/smithagents-test-invalid/widgets/pull/8".into()),
+                not_done: None,
+                implementation_intent_id: None,
+                pr_commit: Some("89abcdef0123456789abcdef0123456789abcdef".into()),
+                pr_pushed: true,
+            }),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn the_idea_actions_post_to_the_intent_and_decode_it() {
+    let intent = idea_intent();
+    for route in ["pull-request", "implementation"] {
+        let status = if route == "implementation" { 201 } else { 200 };
+        let (port, server) = answer_once(status, serde_json::to_value(&intent).unwrap()).await;
+        let c = client(port);
+        let got = tokio::time::timeout(PATIENCE, async {
+            if route == "pull-request" {
+                c.open_pull_request(intent.id).await
+            } else {
+                c.create_implementation_intent(intent.id).await
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, intent, "{route}");
+        let (head, body) = server.await.unwrap();
+        let line = format!("post /v1/intents/{}/{route} http/1.1\r\n", intent.id);
+        assert!(head.starts_with(&line), "{head}");
+        assert!(
+            head.contains(&format!("authorization: bearer {TOKEN}")),
+            "{head}"
+        );
+        assert!(body.is_empty(), "{route}");
+    }
+
+    // A failed step decodes with its own code.
+    let refusal = json!({"error": "push_rejected", "message": "git could not push to origin: the remote rejected the branch"});
+    let (port, _server) = answer_once(502, refusal).await;
+    let err = client(port).open_pull_request(intent.id).await.unwrap_err();
+    assert!(
+        matches!(&err, ClientError::Api { status: 502, code, .. } if code == "push_rejected"),
+        "{err:?}"
+    );
+}

@@ -250,6 +250,14 @@ pub fn partial_text(branch: &str, sha7: &str, message: &str) -> String {
 }
 
 pub const NOTHING_CREATED_TEXT: &str = "Nothing was created. Submit again.";
+
+/// An idea intent's actions in its detail, and the question "Open pull
+/// request…" asks first (the public-repository warning is part of it).
+pub const OPEN_PR_LABEL: &str = "Open pull request…";
+pub const PR_TITLE: &str = "Open a pull request?";
+pub const PR_DESCRIPTION: &str = "Pushes the idea branch to origin and opens a draft pull request. If the repository is public, the screenshots will be visible to anyone.";
+pub const OPEN_PR_CONFIRM_LABEL: &str = "Open pull request";
+pub const IMPLEMENT_LABEL: &str = "Create implementation intent";
 pub const REPO_GONE_TEXT: &str = "That repository no longer exists.";
 pub const LINK_STOPPED_TEXT: &str = "The daemon link has stopped";
 /// "Start over"'s tooltip.

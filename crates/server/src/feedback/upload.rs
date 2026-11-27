@@ -246,9 +246,10 @@ impl StagingDir {
         Ok(dir)
     }
 
-    /// An empty one, for files the daemon writes itself (an issue's body);
-    /// made as [`StagingDir::create`] makes one.
-    pub(crate) fn scratch(root: &Path, id: SubmissionId) -> io::Result<StagingDir> {
+    /// An empty one, for files the daemon writes itself (an issue's or a
+    /// pull request's body), named after `id` (a submission's, an idea
+    /// intent's); made as [`StagingDir::create`] makes one.
+    pub(crate) fn scratch(root: &Path, id: impl std::fmt::Display) -> io::Result<StagingDir> {
         ensure_private_real_dir(root)?;
         let path = root.join(format!("{id}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;

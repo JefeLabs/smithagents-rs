@@ -806,3 +806,54 @@ fn queue_limit_labels() {
     assert_eq!(queue_limit_label(Some(3)), "3");
     assert_eq!(QUEUE_LIMIT_CHOICES, 1..=16);
 }
+
+#[test]
+fn idea_actions_are_shown_once_the_agent_is_done() {
+    use common::feedback_submit::idea_intent;
+    for (state, agent, shown) in [
+        (IntentState::Resolved, None, true),
+        (IntentState::Resolved, Some(AgentState::Working), true),
+        (IntentState::Sent, Some(AgentState::Done), true),
+        (IntentState::Sent, Some(AgentState::Working), false),
+        (IntentState::Sent, Some(AgentState::Idle), false),
+        (IntentState::Sent, None, false),
+        (IntentState::Complete, None, false),
+        (IntentState::Queued, None, false),
+        (IntentState::Draft, None, false),
+    ] {
+        let idea = idea_intent(state, None);
+        assert_eq!(
+            idea_actions_shown(&idea, agent),
+            shown,
+            "{state:?} {agent:?}"
+        );
+        // Never for an intent that is no idea package.
+        let plain = intent("plain", state, Phase::Review);
+        assert!(!idea_actions_shown(&plain, agent), "{state:?} {agent:?}");
+    }
+}
+
+#[test]
+fn only_a_github_pull_request_address_is_shown() {
+    assert!(shows_pull_request_url(
+        "https://github.com/smithagents-test-invalid/widgets/pull/8"
+    ));
+    for bad in [
+        "",
+        "javascript:alert(1)",
+        "http://github.com/o/r/pull/8",
+        "https://github.com.evil.example/o/r/pull/8",
+        "https://github.com/o/r/issues/8",
+        "https://github.com/o/r/pull/8/files",
+        "https://github.com/o/r/pull/8?x=1",
+        "https://github.com/o/r/pull/x",
+        "https://github.com/../r/pull/8",
+        "file:///etc/passwd",
+    ] {
+        assert!(!shows_pull_request_url(bad), "{bad}");
+    }
+    assert_eq!(
+        not_done_text("The demo video:\nthe project did not start."),
+        "Not done: The demo video: the project did not start."
+    );
+}

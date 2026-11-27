@@ -48,7 +48,7 @@ use chrono::{TimeDelta, Utc};
 use futures::FutureExt;
 use smithagents_core::agent::AgentState;
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::feedback::FeedbackOrigin;
+use smithagents_core::feedback::{FeedbackOrigin, IdeaPackage};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     slugify, AgentDefaults, Answer, AnswerInput, Content, CreateIntentRequest, Intent,
@@ -1185,6 +1185,30 @@ impl IntentService {
                 tracing::error!(intent_id = %intent.id, "could not record a start failure: {e}");
             }
         }
+    }
+
+    /// Changes what an idea intent's origin records about its package
+    /// (what "Open pull request" and "Create implementation intent" made)
+    /// under the intent's reservation, then saves and publishes the intent;
+    /// nothing else of it changes. `Invalid` for an intent that is not an
+    /// idea package.
+    pub async fn update_idea(
+        &self,
+        id: IntentId,
+        change: impl FnOnce(&mut IdeaPackage),
+    ) -> Result<Intent, IntentError> {
+        let _reservation = self.reserve(id).await;
+        let mut intent = self.get(id).await?;
+        let idea = intent
+            .origin
+            .as_mut()
+            .and_then(|origin| origin.idea.as_mut())
+            .ok_or_else(|| IntentError::Invalid("this intent is not an idea package".into()))?;
+        change(idea);
+        touch(&mut intent);
+        self.inner.store.save_intent(&intent).await?;
+        self.publish_updated(&intent);
+        Ok(intent)
     }
 
     /// Marks a `Sent` intent `Resolved` (whatever its agent is doing), which

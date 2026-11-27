@@ -376,6 +376,21 @@ impl Client {
         self.fetch(self.http.post(url)).await
     }
 
+    /// `POST /v1/intents/{id}/pull-request`: an idea intent's "Open pull
+    /// request" (the push and `gh`), answered with the intent. No timeout: a
+    /// push and `gh` can take minutes.
+    pub async fn open_pull_request(&self, id: IntentId) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/pull-request"));
+        self.fetch(self.http.post(url)).await
+    }
+
+    /// `POST /v1/intents/{id}/implementation`: an idea intent's "Create
+    /// implementation intent", answered with the new (or the earlier) one.
+    pub async fn create_implementation_intent(&self, id: IntentId) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/implementation"));
+        self.fetch(self.http.post(url)).await
+    }
+
     /// `/v1/plugins/<segments>?<params>`, each segment percent-encoded, so an
     /// id with `/`, `..`, `?` or `#` names no other route.
     ///

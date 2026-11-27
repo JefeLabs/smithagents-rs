@@ -454,6 +454,8 @@ fn idea_intent(seed: &str) -> Intent {
             pr_url: None,
             not_done: None,
             implementation_intent_id: None,
+            pr_commit: None,
+            pr_pushed: false,
         }),
     });
     let mut model = fixed("The model's own criterion.", None);

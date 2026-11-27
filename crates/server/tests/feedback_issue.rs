@@ -515,3 +515,28 @@ fn issue_md_keeps_mentions_as_written() {
     assert!(md.contains("ping @hubot"), "{md}");
     assert!(!md.contains('\u{200b}'), "{md}");
 }
+
+#[test]
+fn a_pull_request_body_is_the_issue_then_the_explainer() {
+    let base = permalink_base("o", "r", "abc123", "docs/issues/2026-11-26-x");
+    let files = vec!["issue.md".to_owned(), "diagram-1.png".to_owned()];
+    let issue = "---\ntitle: \"X\"\n---\n\n# X\n\nBody.\n";
+    let explainer = "# Explainer\n\n![d](diagram-1.png) and [other](elsewhere.png)\n";
+
+    let body = pull_request_body(issue, Some(explainer), &files, &base);
+
+    assert_eq!(
+        body,
+        "# X\n\nBody.\n\n---\n\n# Explainer\n\n![d](https://github.com/o/r/blob/abc123/docs/issues/2026-11-26-x/diagram-1.png?raw=true) and [other](elsewhere.png)\n"
+    );
+    assert!(!body.contains("smithagents-feedback:"), "no marker");
+    // Without an explainer, the issue alone.
+    assert_eq!(
+        pull_request_body(issue, None, &files, &base),
+        "# X\n\nBody.\n"
+    );
+    // Together never longer than an issue's body may be.
+    let long = "x".repeat(50_000);
+    let body = pull_request_body(&long, Some(&long), &files, &base);
+    assert_eq!(body.chars().count(), 60_000);
+}

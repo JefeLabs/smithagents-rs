@@ -6,6 +6,7 @@
 //! disconnects, which would otherwise abort the call midway and leave partial
 //! state (a created worktree without an agent, a message without a turn).
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
@@ -93,6 +94,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/intents/{id}/items/{iid}/edit", post(edit_item))
         .route("/v1/intents/{id}/send", post(send_intent))
         .route("/v1/intents/{id}/resolve", post(resolve_intent))
+        .route("/v1/intents/{id}/pull-request", post(open_pull_request))
+        .route(
+            "/v1/intents/{id}/implementation",
+            post(create_implementation_intent),
+        )
         .route(
             "/v1/settings/agent-defaults",
             get(get_agent_defaults).put(put_agent_defaults),
@@ -159,15 +165,20 @@ fn cors_layer() -> CorsLayer {
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
-    code: &'static str,
+    /// One of the daemon's own codes (a feedback step's is a `String`).
+    code: Cow<'static, str>,
     message: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    fn new(
+        status: StatusCode,
+        code: impl Into<Cow<'static, str>>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             status,
-            code,
+            code: code.into(),
             message: message.into(),
         }
     }
@@ -218,7 +229,7 @@ impl From<FeedbackError> for ApiError {
         if status.is_server_error() {
             tracing::error!("request failed: {e}");
         }
-        Self::new(status, e.code(), e.to_string())
+        Self::new(status, e.code().to_owned(), e.to_string())
     }
 }
 
@@ -1035,6 +1046,32 @@ async fn resolve_intent(
         .map(Json)
 }
 
+/// An idea intent's "Open pull request". Detached, so a client that goes
+/// away does not stop a push or `gh` half-way.
+async fn open_pull_request(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Intent>, ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    let svc = s.feedback;
+    detached(async move { svc.open_pull_request(id).await })
+        .await
+        .map(Json)
+}
+
+/// An idea intent's "Create implementation intent": 201 with the intent
+/// (also when it was made before). Detached like the other mutating routes.
+async fn create_implementation_intent(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Intent>), ApiError> {
+    let id: IntentId = path_id(&id, "intent")?;
+    let svc = s.feedback;
+    detached(async move { svc.create_implementation_intent(id).await })
+        .await
+        .map(|intent| (StatusCode::CREATED, Json(intent)))
+}
+
 async fn get_agent_defaults(State(s): State<AppState>) -> Result<Json<AgentDefaults>, ApiError> {
     Ok(Json(s.intents.agent_defaults().await?))
 }
@@ -1323,7 +1360,7 @@ mod tests {
         for (e, status, code) in cases {
             let message = e.to_string();
             let api = ApiError::from(e);
-            assert_eq!((api.status, api.code), (status, code), "{message}");
+            assert_eq!((api.status, api.code.as_ref()), (status, code), "{message}");
             assert_eq!(api.message, message);
         }
     }
@@ -1349,6 +1386,10 @@ mod tests {
             FeedbackError::NoGithubRemote => "NoGithubRemote",
             FeedbackError::GhNotReady(_) => "GhNotReady",
             FeedbackError::Intent(_) => "Intent",
+            FeedbackError::NotAnIdea => "NotAnIdea",
+            FeedbackError::NotReady(_) => "NotReady",
+            FeedbackError::OutOfScope(_) => "OutOfScope",
+            FeedbackError::Step(_) => "Step",
         }
     }
 
@@ -1470,15 +1511,44 @@ mod tests {
                 "turn_in_progress",
                 &ServiceError::TurnInProgress.to_string(),
             ),
+            (
+                FeedbackError::NotAnIdea,
+                S::CONFLICT,
+                "not_an_idea",
+                "this intent is not an idea package",
+            ),
+            (
+                FeedbackError::NotReady("the agent is still working".into()),
+                S::CONFLICT,
+                "invalid_state",
+                "the agent is still working",
+            ),
+            (
+                FeedbackError::OutOfScope("nothing was pushed"),
+                S::CONFLICT,
+                "idea_out_of_scope",
+                "nothing was pushed",
+            ),
+            // A step's own code and sentence.
+            (
+                FeedbackError::Step(smithagents_core::feedback::FeedbackFailure {
+                    step: smithagents_core::feedback::FeedbackStep::OpenPullRequest,
+                    code: "gh_failed".into(),
+                    message: "gh could not open the pull request (exit status 1)".into(),
+                }),
+                S::BAD_GATEWAY,
+                "gh_failed",
+                "gh could not open the pull request (exit status 1)",
+            ),
         ];
         let covered: std::collections::BTreeSet<&str> =
             cases.iter().map(|(e, ..)| feedback_variant(e)).collect();
-        assert_eq!(covered.len(), 18, "{covered:?}");
+        assert_eq!(covered.len(), 22, "{covered:?}");
 
         for (e, status, code, message) in cases {
             assert_eq!((e.status(), e.code()), (status, code), "{message}");
             let api = ApiError::from(e);
-            assert_eq!((api.status, api.code), (status, code), "{message}");
+            assert_eq!((api.status, api.code.as_ref()), (status, code), "{message}");
             assert_eq!(api.message, message);
         }
     }
@@ -1497,7 +1567,7 @@ mod tests {
             let message = e.to_string();
             let api = ApiError::from(ManagerError::Tool(e));
             assert_eq!(
-                (api.status, api.code),
+                (api.status, api.code.as_ref()),
                 (StatusCode::BAD_GATEWAY, "tool_failed"),
                 "{message}"
             );

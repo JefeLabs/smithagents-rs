@@ -96,6 +96,8 @@ fn origin(pr: Option<&str>) -> FeedbackOrigin {
             pr_url: pr.map(Into::into),
             not_done: None,
             implementation_intent_id: None,
+            pr_commit: None,
+            pr_pushed: false,
         }),
     }
 }

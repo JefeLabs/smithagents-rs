@@ -2,7 +2,7 @@
 //! with the next result queued for its kind, or else wait until the test
 //! answers it (or forever), like `FakeIntents`. As there, the link's `Action`
 //! for an answer is left to the test. Plus builders for the targets and the
-//! outcomes the Submit tests answer with.
+//! outcomes the Submit tests answer with, and for an idea intent.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -10,14 +10,14 @@ use std::collections::VecDeque;
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
-use smithagents_app::link::{FeedbackCommands, LinkError};
+use smithagents_app::link::{FeedbackCommands, IntentAnswer, LinkError};
 use smithagents_client::FeedbackFile;
 use smithagents_core::feedback::{
-    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTarget, FeedbackTargets,
-    SubmissionId, ToolReadiness,
+    FeedbackOrigin, FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTarget,
+    FeedbackTargets, IdeaPackage, SubmissionId, ToolReadiness,
 };
-use smithagents_core::ids::RepoId;
-use smithagents_core::intent::Intent;
+use smithagents_core::ids::{IntentId, RepoId};
+use smithagents_core::intent::{Intent, IntentState, Phase};
 
 /// The branch every outcome built here names.
 pub const BRANCH: &str = "feedback/2026-11-26-fix-the-zoom";
@@ -33,11 +33,14 @@ pub enum FeedbackCall {
     Targets,
     Submit(FeedbackRequest, Vec<FeedbackFile>),
     Retry(SubmissionId),
+    OpenPullRequest(IntentId),
+    Implement(IntentId),
 }
 
 type Reply = Result<FeedbackSettings, LinkError>;
 type TargetsReply = Result<FeedbackTargets, LinkError>;
 type OutcomeReply = Result<FeedbackOutcome, LinkError>;
+type IntentReply = Result<Intent, LinkError>;
 
 /// Answers of one kind: queued ones first, else the calls wait.
 struct Answers<T> {
@@ -79,6 +82,7 @@ pub struct FakeFeedback {
     settings: RefCell<Answers<Reply>>,
     targets: RefCell<Answers<TargetsReply>>,
     outcomes: RefCell<Answers<OutcomeReply>>,
+    intents: RefCell<Answers<IntentReply>>,
 }
 
 impl FakeFeedback {
@@ -115,6 +119,17 @@ impl FakeFeedback {
     /// How many submits and retries wait for an answer.
     pub fn outcomes_waiting(&self) -> usize {
         self.outcomes.borrow().waiting.len()
+    }
+
+    /// The answer of the next idea action (Open pull request, Create
+    /// implementation intent).
+    pub fn queue_intent(&self, result: IntentReply) {
+        self.intents.borrow_mut().queued.push_back(result);
+    }
+
+    /// Answers the oldest idea action still waiting.
+    pub fn answer_intent(&self, result: IntentReply) {
+        self.intents.borrow_mut().answer(result, "idea action");
     }
 
     /// The submits sent, in order.
@@ -176,6 +191,40 @@ impl FeedbackCommands for FakeFeedback {
         self.record(FeedbackCall::Retry(id));
         self.outcomes.borrow_mut().reply(|| Err(LinkError::Stopped))
     }
+
+    fn open_pull_request(&self, id: IntentId) -> IntentAnswer {
+        self.record(FeedbackCall::OpenPullRequest(id));
+        self.intents.borrow_mut().reply(|| Err(LinkError::Stopped))
+    }
+
+    fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer {
+        self.record(FeedbackCall::Implement(id));
+        self.intents.borrow_mut().reply(|| Err(LinkError::Stopped))
+    }
+}
+
+/// An idea intent ("fix-zoom", as `common::intents::intent` builds it) in
+/// `state`, whose pull request is `pr_url`: its origin is an idea package
+/// with an explainer and diagrams, nothing done yet.
+pub fn idea_intent(state: IntentState, pr_url: Option<&str>) -> Intent {
+    let mut idea = super::intents::intent("fix-zoom", state, Phase::Review);
+    idea.base_branch = Some("idea/fix-zoom".to_owned());
+    idea.origin = Some(FeedbackOrigin {
+        folder: FOLDER.to_owned(),
+        branch: "idea/fix-zoom".to_owned(),
+        commit: COMMIT.to_owned(),
+        idea: Some(IdeaPackage {
+            explainer: true,
+            diagrams: true,
+            demo_video: false,
+            pr_url: pr_url.map(str::to_owned),
+            not_done: None,
+            implementation_intent_id: None,
+            pr_commit: None,
+            pr_pushed: false,
+        }),
+    });
+    idea
 }
 
 /// Targets for these repositories, each `(id, has a GitHub remote, is

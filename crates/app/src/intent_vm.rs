@@ -623,6 +623,34 @@ pub fn start_error_text(message: &str) -> String {
     format!("The agent could not start: {kept}")
 }
 
+// ---- Idea intents ------------------------------------------------------------
+
+/// Whether an idea intent's actions ("Open pull request…", "Create
+/// implementation intent") are offered: `intent`'s origin is an idea package,
+/// and it is Resolved, or Sent with its agent (`agent`: its state, when the
+/// model has it) Done.
+pub fn idea_actions_shown(intent: &Intent, agent: Option<AgentState>) -> bool {
+    let idea = intent.origin.as_ref().is_some_and(|o| o.idea.is_some());
+    idea && match intent.state {
+        IntentState::Resolved => true,
+        IntentState::Sent => agent == Some(AgentState::Done),
+        IntentState::Draft | IntentState::Complete | IntentState::Queued => false,
+    }
+}
+
+/// What an idea's agent could not do, as its line says it: "Not done: …",
+/// on one line.
+pub fn not_done_text(not_done: &str) -> String {
+    format!("Not done: {}", one_line(not_done))
+}
+
+/// Whether the detail shows (and opens) `url` as an idea's pull request:
+/// exactly `https://github.com/<owner>/<name>/pull/<number>`, as the daemon
+/// checks it, and a link that opens ([`body_link_opens`]).
+pub fn shows_pull_request_url(url: &str) -> bool {
+    crate::feedback::submit_vm::is_github_address(url, "pull") && body_link_opens(url)
+}
+
 // ---- Create and settings -----------------------------------------------------
 
 /// The repository the create screen starts with: `last_used` while it still

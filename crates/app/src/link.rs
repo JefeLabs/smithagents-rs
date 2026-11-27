@@ -415,6 +415,24 @@ impl DaemonLink {
         self.feedback_command(move |c| async move { c.retry_feedback(id).await })
     }
 
+    /// An idea intent's "Open pull request"; the answer reaches the UI as
+    /// `Action::IntentUpserted` too, as for every intent command.
+    pub fn open_pull_request(
+        &self,
+        id: IntentId,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.open_pull_request(id).await })
+    }
+
+    /// An idea intent's "Create implementation intent"; the new intent
+    /// reaches the UI as `Action::IntentUpserted` too.
+    pub fn create_implementation_intent(
+        &self,
+        id: IntentId,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move { c.create_implementation_intent(id).await })
+    }
+
     /// Runs one submission or retry; an intent in its outcome reaches the UI
     /// as `Action::IntentUpserted` first.
     fn feedback_command<F, Fut>(
@@ -558,12 +576,13 @@ impl IntentCommands for DaemonLink {
     }
 }
 
-/// The commands the Feedback tool and Settings → Source repositories send to
-/// the daemon. [`DaemonLink`] is the production implementation; headless tests
-/// inject a fake through `ShellOptions::feedback_commands`. As for
-/// [`IntentCommands`], the link tells the model of each answer itself: the
-/// settings, and the intent an outcome carries (`Action::IntentUpserted`,
-/// before the outcome is answered).
+/// The commands the Feedback tool, Settings → Source repositories and an idea
+/// intent's detail send to the daemon. [`DaemonLink`] is the production
+/// implementation; headless tests inject a fake through
+/// `ShellOptions::feedback_commands`. As for [`IntentCommands`], the link
+/// tells the model of each answer itself: the settings, the intent an
+/// outcome carries (`Action::IntentUpserted`, before the outcome is
+/// answered), and the intent an idea action answers with.
 pub trait FeedbackCommands {
     fn set_feedback_settings(
         &self,
@@ -580,6 +599,12 @@ pub trait FeedbackCommands {
         &self,
         id: SubmissionId,
     ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>>;
+    /// Pushes the idea intent's work as its idea branch and opens a draft
+    /// pull request; the link upserts the answer.
+    fn open_pull_request(&self, id: IntentId) -> IntentAnswer;
+    /// Creates the idea intent's implementation intent (once); the link
+    /// upserts the answer.
+    fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer;
 }
 
 impl FeedbackCommands for DaemonLink {
@@ -607,6 +632,14 @@ impl FeedbackCommands for DaemonLink {
         id: SubmissionId,
     ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>> {
         DaemonLink::retry_feedback(self, id).boxed_local()
+    }
+
+    fn open_pull_request(&self, id: IntentId) -> IntentAnswer {
+        DaemonLink::open_pull_request(self, id).boxed_local()
+    }
+
+    fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer {
+        DaemonLink::create_implementation_intent(self, id).boxed_local()
     }
 }
 

@@ -1,6 +1,7 @@
 //! The command-line tools of the feedback plugin as Submit sees them (is a
 //! tool ready, and if not, why) and the GitHub side of a submission, done
-//! with `gh`: is it signed in, is a repository public, and the issue.
+//! with `gh`: is it signed in, is a repository public, the issue, and an idea
+//! intent's draft pull request.
 //!
 //! Tools are only looked up and run through the plugin manager, so a plugin
 //! that is turned off or not running has no tool ready, and nothing runs.
@@ -17,7 +18,8 @@
 //! the signed-in user opened (`--author=@me`): the submission id is public
 //! once the branch is pushed (the commit's `Feedback-Id` trailer), so on a
 //! public repository anyone could open an issue that names it, which would
-//! otherwise be taken for this submission's.
+//! otherwise be taken for this submission's. A pull request is looked for the
+//! same way before one is opened: the signed-in user's, of the idea branch.
 
 use std::path::Path;
 use std::time::Duration;
@@ -118,28 +120,50 @@ impl GithubRepo {
     /// Whether `url` is an issue's address (see [`is_github_issue_url`])
     /// of this repository (its names in any case).
     pub fn is_issue_url(&self, url: &str) -> bool {
-        issue_url_parts(url).is_some_and(|(owner, name)| {
+        self.owns(github_url_parts(url, ISSUES))
+    }
+
+    /// Whether `url` is a pull request's address (see
+    /// [`is_github_pull_request_url`]) of this repository (its names in any
+    /// case).
+    pub fn is_pull_request_url(&self, url: &str) -> bool {
+        self.owns(github_url_parts(url, PULLS))
+    }
+
+    fn owns(&self, parts: Option<(&str, &str)>) -> bool {
+        parts.is_some_and(|(owner, name)| {
             owner.eq_ignore_ascii_case(&self.owner) && name.eq_ignore_ascii_case(&self.name)
         })
     }
 }
 
+/// The path segment of an issue's address, and of a pull request's.
+const ISSUES: &str = "issues";
+const PULLS: &str = "pull";
+
 /// Whether `url` is exactly `https://github.com/<owner>/<name>/issues/<n>`,
 /// of any repository: what `gh issue create` prints for a repository that
 /// was renamed or moved is its name now.
 pub fn is_github_issue_url(url: &str) -> bool {
-    issue_url_parts(url).is_some()
+    github_url_parts(url, ISSUES).is_some()
 }
 
-/// `(owner, name)` of `https://github.com/<owner>/<name>/issues/<n>`: names
+/// Whether `url` is exactly `https://github.com/<owner>/<name>/pull/<n>`, of
+/// any repository, as [`is_github_issue_url`] is for issues.
+pub fn is_github_pull_request_url(url: &str) -> bool {
+    github_url_parts(url, PULLS).is_some()
+}
+
+/// `(owner, name)` of `https://github.com/<owner>/<name>/<kind>/<n>`: names
 /// of the characters GitHub allows (ASCII letters and digits, `_`, `.`,
 /// `-`; never `.` or `..`), a number of 1 to 20 digits, nothing after it.
-fn issue_url_parts(url: &str) -> Option<(&str, &str)> {
+fn github_url_parts<'a>(url: &'a str, kind: &str) -> Option<(&'a str, &'a str)> {
     let path = url.strip_prefix("https://github.com/")?;
     let parts: Vec<&str> = path.split('/').collect();
     match parts.as_slice() {
-        [owner, name, "issues", number]
-            if plain_name(owner)
+        [owner, name, segment, number]
+            if *segment == kind
+                && plain_name(owner)
                 && plain_name(name)
                 && (1..=20).contains(&number.len())
                 && number.bytes().all(|b| b.is_ascii_digit()) =>
@@ -281,8 +305,75 @@ pub async fn find_issue(
     match gh.run(&search, gh.timeout).await {
         Ok(None) => Ok(None),
         Ok(Some(url)) if repo.is_issue_url(&url) => Ok(Some(url)),
-        Ok(Some(_)) => Err(bad_answer()),
+        Ok(Some(_)) => Err(bad_answer(ISSUE)),
         Err(e) => Err(issue_failure(e).failure),
+    }
+}
+
+/// The pull request of the branch `head` on `repo` that the signed-in user
+/// opened: `gh pr list --repo=… --head=<head> --author=@me --state=all
+/// --json=url --jq=.[0].url // ""`, within `gh.timeout`. A first line that
+/// is a pull request of `repo` is that pull request; an empty one is none;
+/// anything else is `gh_bad_answer` (and nothing may be opened then).
+/// `head` must be a branch name the caller checked.
+pub async fn find_pull_request(
+    gh: &Gh<'_>,
+    repo: &GithubRepo,
+    head: &str,
+) -> Result<Option<String>, FeedbackFailure> {
+    let mut list = args(["pr", "list"]);
+    list.push(repo.repo_arg());
+    list.push(format!("--head={head}"));
+    list.extend(args([
+        "--author=@me",
+        "--state=all",
+        "--json=url",
+        r#"--jq=.[0].url // """#,
+    ]));
+    match gh.run(&list, gh.timeout).await {
+        Ok(None) => Ok(None),
+        Ok(Some(url)) if repo.is_pull_request_url(&url) => Ok(Some(url)),
+        Ok(Some(_)) => Err(bad_answer(PULL_REQUEST)),
+        Err(e) => Err(run_failure(PULL_REQUEST, e).failure),
+    }
+}
+
+/// What [`create_pull_request`] opens: a draft from `head` into `base` (both
+/// branch names the caller checked), titled `title`, its body in `body_file`.
+pub struct DraftPullRequest<'a> {
+    pub base: &'a str,
+    pub head: &'a str,
+    pub title: &'a str,
+    pub body_file: &'a Path,
+}
+
+/// `gh pr create --draft --base=<base> --head=<head> --title=<title>
+/// --body-file=<body_file> --repo=…` within `gh.timeout`. Its first line
+/// must be the address of a pull request on github.com, of `repo` or
+/// (renamed or moved) of the name it has now
+/// ([`is_github_pull_request_url`]).
+pub async fn create_pull_request(
+    gh: &Gh<'_>,
+    repo: &GithubRepo,
+    pr: &DraftPullRequest<'_>,
+) -> Result<String, NotCreated> {
+    let body_file = body_file_arg(pr.body_file).map_err(|_| NotCreated {
+        failure: body_failure_at(FeedbackStep::OpenPullRequest),
+        unconfirmed: false,
+    })?;
+    let mut create = args(["pr", "create", "--draft"]);
+    create.push(format!("--base={}", pr.base));
+    create.push(format!("--head={}", pr.head));
+    create.push(format!("--title={}", pr.title));
+    create.push(body_file);
+    create.push(repo.repo_arg());
+    match gh.run(&create, gh.timeout).await {
+        Ok(Some(url)) if is_github_pull_request_url(&url) => Ok(url),
+        Ok(_) => Err(NotCreated {
+            failure: bad_answer(PULL_REQUEST),
+            unconfirmed: true,
+        }),
+        Err(e) => Err(run_failure(PULL_REQUEST, e)),
     }
 }
 
@@ -324,7 +415,7 @@ pub async fn create_issue(
     match gh.run(&create, gh.timeout).await {
         Ok(Some(url)) if is_github_issue_url(&url) => Ok(url),
         Ok(_) => Err(NotCreated {
-            failure: bad_answer(),
+            failure: bad_answer(ISSUE),
             unconfirmed: true,
         }),
         Err(e) => Err(issue_failure(e)),
@@ -341,7 +432,22 @@ fn body_file_arg(path: &Path) -> Result<String, FeedbackFailure> {
 
 /// The issue's body could not be written or named: `io_error`.
 pub fn body_failure() -> FeedbackFailure {
-    failure("io_error", "could not write the issue's body".to_owned())
+    body_failure_at(FeedbackStep::CreateIssue)
+}
+
+/// The body of the issue or pull request of `step` could not be written or
+/// named: `io_error`.
+pub fn body_failure_at(step: FeedbackStep) -> FeedbackFailure {
+    let what = if step == FeedbackStep::OpenPullRequest {
+        "pull request"
+    } else {
+        "issue"
+    };
+    failure_at(
+        step,
+        "io_error",
+        format!("could not write the {what}'s body"),
+    )
 }
 
 /// Whether the repository has the label `label` (lower-case letters, digits
@@ -376,57 +482,90 @@ async fn has_label(gh: &Gh<'_>, repo_arg: &str, label: &str) -> bool {
     }
 }
 
-fn failure(code: &str, message: String) -> FeedbackFailure {
+/// What a `gh` step makes, for its failures' sentences.
+#[derive(Clone, Copy)]
+struct Making {
+    step: FeedbackStep,
+    /// For a log.
+    name: &'static str,
+    /// "create the issue", as in "gh could not create the issue".
+    action: &'static str,
+    /// "the issue's address", as in "gh did not print the issue's address".
+    address: &'static str,
+}
+
+const ISSUE: Making = Making {
+    step: FeedbackStep::CreateIssue,
+    name: "create_issue",
+    action: "create the issue",
+    address: "the issue's address",
+};
+
+const PULL_REQUEST: Making = Making {
+    step: FeedbackStep::OpenPullRequest,
+    name: "open_pull_request",
+    action: "open the pull request",
+    address: "the pull request's address",
+};
+
+fn failure_at(step: FeedbackStep, code: &str, message: String) -> FeedbackFailure {
     FeedbackFailure {
-        step: FeedbackStep::CreateIssue,
+        step,
         code: code.to_owned(),
         message,
     }
 }
 
-fn failed(status: Option<i32>) -> FeedbackFailure {
-    failure(
+fn failed(making: Making, status: Option<i32>) -> FeedbackFailure {
+    failure_at(
+        making.step,
         "gh_failed",
         format!(
-            "gh could not create the issue ({})",
+            "gh could not {} ({})",
+            making.action,
             exit_status_text(&status)
         ),
     )
 }
 
-fn bad_answer() -> FeedbackFailure {
-    failure(
+fn bad_answer(making: Making) -> FeedbackFailure {
+    failure_at(
+        making.step,
         "gh_bad_answer",
-        "gh did not print the issue's address".to_owned(),
+        format!("gh did not print {}", making.address),
     )
 }
 
 /// The failure of the step `create_issue` for a `gh` run that failed, and
 /// whether `gh` may have done its work all the same (stopped while it ran).
 fn issue_failure(e: ManagerError) -> NotCreated {
+    run_failure(ISSUE, e)
+}
+
+/// The failure of the step that makes `making` for a `gh` run that failed,
+/// and whether `gh` may have done its work all the same (stopped while it
+/// ran).
+fn run_failure(making: Making, e: ManagerError) -> NotCreated {
+    let at = |code: &str, message: String| failure_at(making.step, code, message);
     let (failure, unconfirmed) = match e {
         ManagerError::Tool(ToolRunError::Timeout) => (
-            failure(
+            at(
                 "gh_timeout",
                 format!("gh did not finish within {} seconds", GH_TIMEOUT.as_secs()),
             ),
             true,
         ),
         // Ended by a signal.
-        ManagerError::Tool(ToolRunError::Failed { status: None }) => (failed(None), true),
-        ManagerError::Tool(ToolRunError::Failed { status }) => (failed(status), false),
-        ManagerError::Tool(ToolRunError::TooMuchOutput) => (bad_answer(), true),
-        ManagerError::Tool(ToolRunError::NotFound) => (
-            failure("gh_not_ready", not_ready_sentence(NOT_INSTALLED)),
-            false,
-        ),
-        ManagerError::Disabled => (
-            failure("gh_not_ready", not_ready_sentence(TURNED_OFF)),
-            false,
-        ),
+        ManagerError::Tool(ToolRunError::Failed { status: None }) => (failed(making, None), true),
+        ManagerError::Tool(ToolRunError::Failed { status }) => (failed(making, status), false),
+        ManagerError::Tool(ToolRunError::TooMuchOutput) => (bad_answer(making), true),
+        ManagerError::Tool(ToolRunError::NotFound) => {
+            (at("gh_not_ready", not_ready_sentence(NOT_INSTALLED)), false)
+        }
+        ManagerError::Disabled => (at("gh_not_ready", not_ready_sentence(TURNED_OFF)), false),
         e => {
-            tracing::error!(step = "create_issue", "gh could not be run: {e}");
-            (failed(None), false)
+            tracing::error!(step = making.name, "gh could not be run: {e}");
+            (failed(making, None), false)
         }
     };
     NotCreated {
@@ -582,6 +721,82 @@ mod tests {
         ] {
             assert!(!is_github_issue_url(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn only_a_pull_request_address_is_a_pull_request_url() {
+        let repo = widgets();
+        let ours = "https://github.com/smithagents-test-invalid/widgets/pull/8";
+        assert!(repo.is_pull_request_url(ours));
+        assert!(repo.is_pull_request_url(
+            "https://github.com/Smithagents-Test-Invalid/WIDGETS/pull/123456"
+        ));
+        assert!(is_github_pull_request_url(
+            "https://github.com/someone-else/widgets/pull/1"
+        ));
+        assert!(!repo.is_pull_request_url("https://github.com/someone-else/widgets/pull/1"));
+        for bad in [
+            "",
+            "http://github.com/smithagents-test-invalid/widgets/pull/8",
+            "https://github.com.evil.example/smithagents-test-invalid/widgets/pull/8",
+            "https://github.com/smithagents-test-invalid/widgets/issues/8",
+            "https://github.com/smithagents-test-invalid/widgets/pulls/8",
+            "https://github.com/smithagents-test-invalid/widgets/pull/",
+            "https://github.com/smithagents-test-invalid/widgets/pull/8x",
+            "https://github.com/smithagents-test-invalid/widgets/pull/8/files",
+            "https://github.com/smithagents-test-invalid/widgets/pull/8#x",
+            "https://github.com/../widgets/pull/8",
+        ] {
+            assert!(!repo.is_pull_request_url(bad), "{bad}");
+            assert!(!is_github_pull_request_url(bad), "{bad}");
+        }
+        // An issue is not a pull request, nor the other way round.
+        assert!(!repo.is_issue_url(ours));
+        assert!(!is_github_issue_url(ours));
+    }
+
+    #[test]
+    fn pull_request_failures_are_fixed_sentences() {
+        let cases = [
+            (
+                ManagerError::Tool(ToolRunError::Failed { status: Some(1) }),
+                "gh_failed",
+                "gh could not open the pull request (exit status 1)",
+                false,
+            ),
+            (
+                ManagerError::Tool(ToolRunError::Timeout),
+                "gh_timeout",
+                "gh did not finish within 60 seconds",
+                true,
+            ),
+            (
+                ManagerError::Tool(ToolRunError::TooMuchOutput),
+                "gh_bad_answer",
+                "gh did not print the pull request's address",
+                true,
+            ),
+            (
+                ManagerError::Disabled,
+                "gh_not_ready",
+                "GitHub CLI (gh) is not ready: turned off or not running",
+                false,
+            ),
+        ];
+        for (error, code, message, unconfirmed) in cases {
+            let NotCreated {
+                failure: f,
+                unconfirmed: maybe,
+            } = run_failure(PULL_REQUEST, error);
+            assert_eq!(f.step, FeedbackStep::OpenPullRequest);
+            assert_eq!((f.code.as_str(), f.message.as_str()), (code, message));
+            assert_eq!(maybe, unconfirmed, "{message}");
+        }
+        let f = body_failure_at(FeedbackStep::OpenPullRequest);
+        assert_eq!(
+            (f.code.as_str(), f.message.as_str()),
+            ("io_error", "could not write the pull request's body")
+        );
     }
 
     #[test]

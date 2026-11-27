@@ -787,6 +787,85 @@ pub async fn commit_changed_paths(repo_root: &Path, commit: &str) -> Result<Vec<
         .collect())
 }
 
+/// What the commits on top of a base change: see [`changes_since`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Changes {
+    /// The paths, as many times as commits change them, in no useful order.
+    Paths(Vec<String>),
+    /// The head does not have the base in its history.
+    NotOnBase,
+    /// More commits than were to be looked at.
+    TooMany,
+}
+
+/// Every path a commit after `base` up to `head` (both full commit ids)
+/// changes: each commit of `git rev-list <base>..<head>` against each of its
+/// parents (`git diff-tree --stdin -r -m --root --name-only --no-renames
+/// -z`), so a file changed and changed back, or one a merge brings in, is
+/// there too. `NotOnBase` unless `git merge-base --is-ancestor <base>
+/// <head>` holds; `TooMany` past `max_commits` commits, or when the paths do
+/// not fit the output git may print here. Nothing is read through a filter.
+pub async fn changes_since(
+    repo_root: &Path,
+    base: &str,
+    head: &str,
+    max_commits: usize,
+) -> Result<Changes, GitError> {
+    if !is_commit_id(base) || !is_commit_id(head) {
+        return Err(GitError::UnsafeArgument);
+    }
+    let ancestor = isolated(repo_root, &["merge-base", "--is-ancestor", base, head]).await?;
+    match ancestor.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(Changes::NotOnBase),
+        status => return Err(GitError::Failed { status }),
+    }
+    let max = format!("--max-count={}", max_commits.saturating_add(1));
+    let range = format!("{base}..{head}");
+    let listed = isolated(repo_root, &["rev-list", &max, &range, "--"]).await?;
+    listed.ok()?;
+    let commits = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let commits: Vec<&str> = commits.lines().filter(|l| !l.is_empty()).collect();
+    if commits.len() > max_commits {
+        return Ok(Changes::TooMany);
+    }
+    if commits.is_empty() {
+        return Ok(Changes::Paths(Vec::new()));
+    }
+    let input = format!("{}\n", commits.join("\n"));
+    let ran = run(
+        isolated_command(
+            repo_root,
+            &[
+                "diff-tree",
+                "--stdin",
+                "-r",
+                "-m",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-z",
+            ],
+        ),
+        local_timeout(),
+        Some(input.as_bytes()),
+        OUTPUT_MAX + 1,
+    )
+    .await?;
+    ran.ok()?;
+    if ran.stdout.len() as u64 > OUTPUT_MAX {
+        return Ok(Changes::TooMany);
+    }
+    Ok(Changes::Paths(
+        ran.stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect(),
+    ))
+}
+
 /// Creates the local branch `branch` at `commit`, without tracking anything.
 /// Fails when the branch exists.
 pub async fn create_branch(repo_root: &Path, branch: &str, commit: &str) -> Result<(), GitError> {
@@ -1267,6 +1346,61 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         g(dir, &["init", "-b", branch]);
         g(dir, &["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    #[tokio::test]
+    async fn changes_since_lists_every_commits_paths_against_each_parent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("r");
+        init_repo(&dir, "main");
+        let commit = |path: &str, rm: bool| {
+            if rm {
+                g(&dir, &["rm", "-q", path]);
+            } else {
+                let file = dir.join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, path).unwrap();
+                g(&dir, &["add", "-A"]);
+            }
+            g(&dir, &["commit", "-q", "-m", path]);
+            g(&dir, &["rev-parse", "HEAD"])
+        };
+        let base = commit("f/a", false);
+        // Changed and changed back: still there.
+        commit("b", false);
+        commit("b", true);
+        g(&dir, &["checkout", "-q", "-b", "side", &base]);
+        commit("s", false);
+        g(&dir, &["checkout", "-q", "main"]);
+        g(&dir, &["merge", "-q", "--no-edit", "side"]);
+        let head = g(&dir, &["rev-parse", "HEAD"]);
+
+        let Changes::Paths(mut paths) = changes_since(&dir, &base, &head, 10).await.unwrap() else {
+            panic!("paths expected");
+        };
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths, ["b", "s"], "the base's own change is not listed");
+        assert_eq!(
+            changes_since(&dir, &head, &head, 10).await.unwrap(),
+            Changes::Paths(Vec::new())
+        );
+        assert_eq!(
+            changes_since(&dir, &base, &head, 3).await.unwrap(),
+            Changes::TooMany
+        );
+        // A head without the base in its history.
+        g(&dir, &["checkout", "-q", "--orphan", "other"]);
+        g(&dir, &["commit", "-q", "--allow-empty", "-m", "other"]);
+        let other = g(&dir, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            changes_since(&dir, &base, &other, 10).await.unwrap(),
+            Changes::NotOnBase
+        );
+        assert!(matches!(
+            changes_since(&dir, "main", &head, 10).await,
+            Err(GitError::UnsafeArgument)
+        ));
     }
 
     fn canon(p: &Path) -> PathBuf {

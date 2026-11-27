@@ -572,6 +572,30 @@ pub fn issue_body(
     body
 }
 
+/// An idea's pull request body: [`issue_body`] of `issue.md`, then, when
+/// there is an `explainer.md`, a line `---` and its [`issue_body`] (links to
+/// the folder's files turned into permalinks in both), no marker, all cut to
+/// 60,000 characters.
+pub fn pull_request_body(
+    issue_md: &str,
+    explainer_md: Option<&str>,
+    files: &[String],
+    permalink_base: &str,
+) -> String {
+    let mut body = issue_body(issue_md, files, permalink_base, None);
+    if let Some(explainer) = explainer_md {
+        body = format!(
+            "{}\n\n---\n\n{}",
+            body.trim_end(),
+            issue_body(explainer, files, permalink_base, None)
+        );
+    }
+    if body.chars().count() > BODY_MAX_CHARS {
+        body = body.chars().take(BODY_MAX_CHARS).collect();
+    }
+    body
+}
+
 fn strip_front_matter(md: &str) -> &str {
     let Some(rest) = md.strip_prefix("---\n") else {
         return md;

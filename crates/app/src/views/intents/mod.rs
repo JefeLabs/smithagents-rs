@@ -33,8 +33,10 @@ mod list;
 mod sections;
 
 pub use actions::{
-    OPEN_CHAT_ID, QUEUED_REASON_ID, RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID, RESOLVE_DESCRIPTION,
-    RESOLVE_DESCRIPTION_ID, RESOLVE_ID, RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
+    IMPLEMENT_ID, NOT_DONE_ID, OPEN_CHAT_ID, OPEN_PR_CANCEL_ID, OPEN_PR_CONFIRM_ID,
+    OPEN_PR_DESCRIPTION_ID, OPEN_PR_ID, OPEN_PR_TITLE_ID, PR_URL_ID, QUEUED_REASON_ID,
+    RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID, RESOLVE_DESCRIPTION, RESOLVE_DESCRIPTION_ID, RESOLVE_ID,
+    RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
 };
 pub use create::{
     create_repo_item_id, kind_row_id, ChooseBug, ChooseEnhancement, ChooseMaintenance,
@@ -150,6 +152,10 @@ pub enum Busy {
     Item(ItemId),
     Send,
     Resolve,
+    /// An idea intent's "Open pull request".
+    PullRequest,
+    /// An idea intent's "Create implementation intent".
+    Implementation,
 }
 
 pub struct IntentsPane {

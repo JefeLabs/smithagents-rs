@@ -18,7 +18,7 @@ use smithagents_core::feedback::{
     effective_meta_repo, FeedbackFailure, FeedbackOrigin, FeedbackOutcome, FeedbackSettings,
     FeedbackStep, FeedbackTarget, FeedbackTargets, SendAs, SubmissionId,
 };
-use smithagents_core::ids::RepoId;
+use smithagents_core::ids::{IntentId, RepoId};
 use smithagents_core::intent::{CreateIntentRequest, Intent, SeedInput};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -124,10 +124,25 @@ pub enum FeedbackError {
     /// The intent service refused; its own code and status are kept.
     #[error(transparent)]
     Intent(IntentError),
+    /// An idea action on an intent that is no idea package.
+    #[error("this intent is not an idea package")]
+    NotAnIdea,
+    /// An idea action before the idea intent's agent can be asked for its
+    /// work: a fixed sentence.
+    #[error("{0}")]
+    NotReady(String),
+    /// The idea agent's branch holds more than the idea package, so it is
+    /// not pushed: a fixed sentence.
+    #[error("{0}")]
+    OutOfScope(&'static str),
+    /// A step of "Open pull request" failed: the push or `gh`, with the
+    /// failure's own code and fixed sentence.
+    #[error("{}", .0.message)]
+    Step(FeedbackFailure),
 }
 
 impl FeedbackError {
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
             Self::RepoNotFound => "repo_not_found",
             Self::Store(_) => "store_error",
@@ -147,6 +162,10 @@ impl FeedbackError {
             Self::NoGithubRemote => "no_github_remote",
             Self::GhNotReady(_) => "gh_not_ready",
             Self::Intent(e) => e.status_and_code().1,
+            Self::NotAnIdea => "not_an_idea",
+            Self::NotReady(_) => "invalid_state",
+            Self::OutOfScope(_) => "idea_out_of_scope",
+            Self::Step(failure) => &failure.code,
         }
     }
 
@@ -161,17 +180,22 @@ impl FeedbackError {
             | Self::BranchBlocked(_)
             | Self::ToolMissing(_)
             | Self::NoGithubRemote
-            | Self::GhNotReady(_) => StatusCode::CONFLICT,
+            | Self::GhNotReady(_)
+            | Self::NotAnIdea
+            | Self::NotReady(_)
+            | Self::OutOfScope(_) => StatusCode::CONFLICT,
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Intent(e) => e.status_and_code().0,
+            Self::Step(_) => StatusCode::BAD_GATEWAY,
         }
     }
 }
 
 /// The feedback tool's daemon side: the meta repository setting, the
-/// targets Submit can choose from, and submissions.
+/// targets Submit can choose from, submissions, and an idea intent's "Open
+/// pull request" and "Create implementation intent" (see [`idea`]).
 ///
 /// A submission is staged by the route (see [`upload::stage`]) and handed to
 /// [`FeedbackService::submit`]. One submission id runs once at a time: a
@@ -196,8 +220,7 @@ pub struct FeedbackService {
 
 struct Parts {
     intents: IntentService,
-    /// For the idea package's steps.
-    #[allow(dead_code)]
+    /// Whether an idea intent's agent is still working.
     agents: AgentService,
     plugins: PluginManager,
     paths: Paths,
@@ -206,10 +229,19 @@ struct Parts {
     /// Held while a submission is checked, committed and recorded.
     submitting: AsyncMutex<()>,
     /// Held by the one run of each submission id.
-    ids: IdLocks,
+    ids: IdLocks<SubmissionId>,
+    /// Held by the one "Open pull request" or "Create implementation
+    /// intent" of each idea intent (see [`idea`]).
+    ideas: IdLocks<IntentId>,
     /// Submissions in [`FeedbackService::submit`] or
-    /// [`FeedbackService::retry`], waiting or running.
+    /// [`FeedbackService::retry`], and idea actions, waiting or running.
     running: AtomicUsize,
+    /// Pull request addresses `gh` gave whose record could not be saved,
+    /// by idea intent: the next "Open pull request" takes them from here.
+    pull_requests: Mutex<HashMap<IntentId, (String, Option<String>)>>,
+    /// When `gh pr create` last ran for an idea intent without a usable
+    /// answer: as for issues ([`UNCONFIRMED_WAIT_SECS`]).
+    unconfirmed_prs: Mutex<HashMap<IntentId, DateTime<Utc>>>,
     /// Issue addresses `gh` gave whose record could not be saved: a retry
     /// takes them from here instead of looking (GitHub's search can take a
     /// while to find a new issue) or creating another.
@@ -228,13 +260,19 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One lock per submission id while a run of it waits or runs.
-#[derive(Default)]
-struct IdLocks(Mutex<HashMap<SubmissionId, Arc<AsyncMutex<()>>>>);
+/// One lock per id (a submission's, an idea intent's) while a run of it
+/// waits or runs.
+struct IdLocks<K>(Mutex<HashMap<K, Arc<AsyncMutex<()>>>>);
 
-impl IdLocks {
+impl<K> Default for IdLocks<K> {
+    fn default() -> Self {
+        Self(Mutex::default())
+    }
+}
+
+impl<K: Copy + Eq + std::hash::Hash> IdLocks<K> {
     /// Waits until no other run of `id` holds its lock, and holds it.
-    async fn lock(&self, id: SubmissionId) -> IdGuard<'_> {
+    async fn lock(&self, id: K) -> IdGuard<'_, K> {
         let lock = Arc::clone(locked(&self.0).entry(id).or_default());
         // Made before waiting, so a run dropped while it waits lets go too.
         let mut guard = IdGuard {
@@ -248,14 +286,14 @@ impl IdLocks {
     }
 }
 
-struct IdGuard<'a> {
-    locks: &'a IdLocks,
-    id: SubmissionId,
+struct IdGuard<'a, K: Copy + Eq + std::hash::Hash> {
+    locks: &'a IdLocks<K>,
+    id: K,
     lock: Arc<AsyncMutex<()>>,
     held: Option<OwnedMutexGuard<()>>,
 }
 
-impl Drop for IdGuard<'_> {
+impl<K: Copy + Eq + std::hash::Hash> Drop for IdGuard<'_, K> {
     fn drop(&mut self) {
         self.held.take();
         let mut map = locked(&self.locks.0);
@@ -273,6 +311,10 @@ struct Faults {
     intent: Option<IntentError>,
     inserts: u32,
     saves: u32,
+    /// Saves of an idea intent's package that succeed before
+    /// `idea_saves_failed` fail.
+    idea_saves_kept: u32,
+    idea_saves_failed: u32,
 }
 
 /// Counts a submission in [`Parts::running`] while it lives.
@@ -316,7 +358,10 @@ impl FeedbackService {
                 gh_dir,
                 submitting: AsyncMutex::new(()),
                 ids: IdLocks::default(),
+                ideas: IdLocks::default(),
                 running: AtomicUsize::new(0),
+                pull_requests: Mutex::default(),
+                unconfirmed_prs: Mutex::default(),
                 issues: Mutex::default(),
                 visibility: Mutex::default(),
                 unconfirmed: Mutex::default(),
@@ -376,13 +421,37 @@ impl FeedbackService {
         self.faults().saves = n;
     }
 
+    /// Test hook: of the next saves of an idea intent's package, `kept`
+    /// succeed, then `failed` fail.
+    #[cfg(feature = "test-util")]
+    pub fn fail_idea_saves_for_test(&self, kept: u32, failed: u32) {
+        let mut faults = self.faults();
+        faults.idea_saves_kept = kept;
+        faults.idea_saves_failed = failed;
+    }
+
     #[cfg(feature = "test-util")]
     fn faults(&self) -> MutexGuard<'_, Faults> {
         locked(&self.parts.faults)
     }
 
-    /// Submissions being made now (waiting for their turn or running): the
-    /// daemon is not idle while there is one.
+    /// Whether this save of an idea intent's package fails (tests only).
+    #[cfg(feature = "test-util")]
+    fn idea_save_fails(&self) -> bool {
+        let mut faults = self.faults();
+        if faults.idea_saves_kept > 0 {
+            faults.idea_saves_kept -= 1;
+            false
+        } else if faults.idea_saves_failed > 0 {
+            faults.idea_saves_failed -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Submissions and idea actions being made now (waiting for their turn
+    /// or running): the daemon is not idle while there is one.
     pub fn running_submissions(&self) -> usize {
         self.parts.running.load(Ordering::SeqCst)
     }

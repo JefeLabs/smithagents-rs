@@ -330,6 +330,13 @@ fn sha7(commit: &str) -> String {
 /// `https://github.com/<owner>/<name>/issues/<number>`, names of the
 /// characters GitHub allows.
 pub fn shows_issue_url(url: &str) -> bool {
+    is_github_address(url, "issues")
+}
+
+/// Whether `url` is exactly `https://github.com/<owner>/<name>/<kind>/<number>`
+/// (`kind` is `issues` or `pull`), names of the characters GitHub allows, a
+/// number of 1 to 20 digits, nothing after it.
+pub(crate) fn is_github_address(url: &str, kind: &str) -> bool {
     let Some(path) = url.strip_prefix("https://github.com/") else {
         return false;
     };
@@ -342,7 +349,7 @@ pub fn shows_issue_url(url: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
     };
     match path.split('/').collect::<Vec<_>>().as_slice() {
-        [owner, repo, "issues", number] => {
+        [owner, repo, segment, number] if *segment == kind => {
             name(owner)
                 && name(repo)
                 && (1..=20).contains(&number.len())

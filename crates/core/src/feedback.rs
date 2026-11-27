@@ -91,6 +91,8 @@ pub enum FeedbackStep {
     CreateIntent,
     Push,
     CreateIssue,
+    /// An idea intent's "Open pull request", after its push.
+    OpenPullRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +124,13 @@ pub struct IdeaPackage {
     pub pr_url: Option<String>,
     pub not_done: Option<String>,
     pub implementation_intent_id: Option<IntentId>,
+    /// The commit "Open pull request" pushes as the idea branch: the agent's
+    /// work, chosen before the first push, so a retry pushes the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_commit: Option<String>,
+    /// Whether `pr_commit` is on `origin` (a retry does not push again).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pr_pushed: bool,
 }
 
 /// Where an intent created by Submit came from.
