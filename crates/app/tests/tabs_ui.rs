@@ -36,6 +36,7 @@ use smithagents_center_host::{
     TabKind, TabSpec,
 };
 use smithagents_core::agent::Agent;
+use smithagents_core::daemon::DaemonToken;
 use smithagents_core::event::{Event, EventKind};
 use smithagents_theme::state::{AppearanceSettings, ThemeChoice, ThemeState};
 use smithagents_theme::tokens::Appearance;
@@ -45,7 +46,7 @@ const TOKEN: &str = "tok-SECRET-first-4123";
 const NEW_PORT: u16 = 4999;
 const NEW_TOKEN: &str = "tok-SECRET-second-4999";
 
-type Conn = Rc<RefCell<Option<(u16, String)>>>;
+type Conn = Rc<RefCell<Option<(u16, DaemonToken)>>>;
 
 struct Harness {
     window: WindowHandle<Root>,
@@ -69,7 +70,7 @@ impl Harness {
     }
 
     fn set_conn(&self, conn: Option<(u16, &str)>) {
-        *self.conn.borrow_mut() = conn.map(|(port, token)| (port, token.to_owned()));
+        *self.conn.borrow_mut() = conn.map(|(port, token)| (port, token.into()));
     }
 }
 
@@ -99,7 +100,7 @@ fn open_with(
 ) -> Harness {
     let host = SharedHost::new(RecordingHost::default());
     let handle = host.handle();
-    let conn: Conn = Rc::new(RefCell::new(Some((PORT, TOKEN.to_owned()))));
+    let conn: Conn = Rc::new(RefCell::new(Some((PORT, TOKEN.into()))));
     let mut options = ShellOptions {
         model,
         tab_host: Some(Box::new(move |_: &mut gpui_kit::App| {
@@ -727,7 +728,7 @@ fn the_dev_origin_from_the_options_is_the_page_url(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn the_default_placeholder_host_opens_tabs(cx: &mut TestAppContext) {
     let mercury = agent("Mercury");
-    let conn: Conn = Rc::new(RefCell::new(Some((PORT, TOKEN.to_owned()))));
+    let conn: Conn = Rc::new(RefCell::new(Some((PORT, TOKEN.into()))));
     let (window, shell) = open_shell_options(
         cx,
         ShellOptions {

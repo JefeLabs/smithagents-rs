@@ -24,6 +24,7 @@ use chrono::{DateTime, FixedOffset};
 use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use raw_window_handle::HasWindowHandle;
 use smithagents_center_host::{validated_origin, CenterTabHost, PixelRect};
+use smithagents_core::daemon::DaemonToken;
 use smithagents_core::ids::{AgentId, IntentId, RepoId};
 use smithagents_theme::native::NativeTheme;
 use smithagents_theme::state::{AppearanceSettings, ThemeState};
@@ -76,7 +77,7 @@ pub type CenterBoundsListener = Rc<dyn Fn(PixelRect, &mut App)>;
 /// Answers the daemon's port and token for new web tabs, or `None` while not
 /// connected. The shell asks the [`DaemonLink`]; headless tests inject a fake.
 /// Keep the token out of logs.
-pub type ConnectionInfoSource = Rc<dyn Fn() -> Option<(u16, String)>>;
+pub type ConnectionInfoSource = Rc<dyn Fn() -> Option<(u16, DaemonToken)>>;
 
 /// Answers the link's last connect error, or `None`. The shell asks the
 /// [`DaemonLink`]; headless tests inject a fake.
@@ -531,7 +532,7 @@ impl ShellState {
             };
             let conn = opening.and_then(|_| self.connection_info());
             let agent = opening.and_then(|id| self.model.agent(id));
-            let conn = conn.as_ref().map(|(port, token)| (*port, token.as_str()));
+            let conn = conn.as_ref().map(|(port, token)| (*port, token));
             if let Err(error) = self.tabs.handle(effect, agent, conn) {
                 // Only an open fails.
                 if let Some(id) = opening {
@@ -546,10 +547,11 @@ impl ShellState {
     fn refresh_tab_connections(&mut self, cx: &mut Context<Self>) {
         let conn = self.connection_info();
         let model = &self.model;
-        let failed = self.tabs.on_connection(
-            conn.as_ref().map(|(port, token)| (*port, token.as_str())),
-            &|id| model.agent(id).cloned(),
-        );
+        let failed = self
+            .tabs
+            .on_connection(conn.as_ref().map(|(port, token)| (*port, token)), &|id| {
+                model.agent(id).cloned()
+            });
         for (id, error) in failed {
             self.tab_failed(id, error, cx);
         }
@@ -586,8 +588,8 @@ impl ShellState {
     }
 
     /// The daemon's port and token: from the injected source if any, else
-    /// the link; `None` while not connected. Never log it.
-    fn connection_info(&self) -> Option<(u16, String)> {
+    /// the link; `None` while not connected.
+    fn connection_info(&self) -> Option<(u16, DaemonToken)> {
         match &self.connection_info {
             Some(source) => source(),
             None => self.link.as_ref().and_then(DaemonLink::connection_info),

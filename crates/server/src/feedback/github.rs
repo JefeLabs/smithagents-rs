@@ -633,6 +633,8 @@ fn run_failure(making: Making, e: ManagerError) -> NotCreated {
         ),
         // Ended by a signal.
         ManagerError::Tool(ToolRunError::Failed { status: None }) => (failed(making, None), true),
+        // It ran; only its answer did not reach us.
+        ManagerError::Tool(ToolRunError::OutputLost) => (failed(making, None), true),
         ManagerError::Tool(ToolRunError::Failed { status }) => (failed(making, status), false),
         ManagerError::Tool(ToolRunError::TooMuchOutput) => (bad_answer(making), true),
         ManagerError::Tool(ToolRunError::NotFound) => {
@@ -754,6 +756,13 @@ mod tests {
                 "gh_failed",
                 "gh could not create the issue (no exit status)",
                 false,
+            ),
+            // gh ran, and may have made the issue before its answer was lost.
+            (
+                ManagerError::Tool(ToolRunError::OutputLost),
+                "gh_failed",
+                "gh could not create the issue (no exit status)",
+                true,
             ),
         ];
         for (error, code, message, unconfirmed) in cases {

@@ -7,24 +7,56 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// What the lockfile says of the running daemon. Its `Debug` prints
+/// `token: "<redacted>"` (see [`DaemonToken`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonInfo {
     pub pid: u32,
     pub port: u16,
-    pub token: String,
+    pub token: DaemonToken,
     pub version: String,
 }
 
-/// Prints `token: "<redacted>"`, so logging or a panic message never shows
-/// the token.
-impl fmt::Debug for DaemonInfo {
+/// The secret a client proves itself to the daemon with.
+///
+/// Its `Debug` prints `"<redacted>"` and it has no `Display`, so a log line,
+/// an error or a panic message cannot carry it by accident, whatever struct
+/// or tuple holds it. The only way to its text is [`DaemonToken::expose`].
+/// On the wire and in the lockfile it is the plain string.
+///
+/// `==` is not constant-time: it is for a client telling its own tokens
+/// apart. The daemon checks a request's token with a constant-time compare.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DaemonToken(String);
+
+impl DaemonToken {
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret itself: for the `Authorization` header and for the page a
+    /// tab boots with. Never for a log or a message.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DaemonToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DaemonInfo")
-            .field("pid", &self.pid)
-            .field("port", &self.port)
-            .field("token", &"<redacted>")
-            .field("version", &self.version)
-            .finish()
+        f.write_str("\"<redacted>\"")
+    }
+}
+
+impl From<String> for DaemonToken {
+    fn from(secret: String) -> Self {
+        Self(secret)
+    }
+}
+
+impl From<&str> for DaemonToken {
+    fn from(secret: &str) -> Self {
+        Self(secret.to_owned())
     }
 }
 
@@ -64,6 +96,38 @@ pub fn read_lockfile(home: &Path) -> io::Result<Option<DaemonInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_is_redacted_whatever_holds_it() {
+        let token = DaemonToken::from("s3cr3t-t0ken-value");
+        assert_eq!(format!("{token:?}"), r#""<redacted>""#);
+        // A tuple, an option, a pretty print: nothing has to remember to hide it.
+        let held = (4123u16, token.clone());
+        for shown in [
+            format!("{held:?}"),
+            format!("{held:#?}"),
+            format!("{:?}", Some(&token)),
+        ] {
+            assert!(!shown.contains("s3cr3t"), "{shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+        }
+        // Its text is there for the one who asks for it by name.
+        assert_eq!(token.expose(), "s3cr3t-t0ken-value");
+        assert_eq!(token, DaemonToken::new(String::from("s3cr3t-t0ken-value")));
+    }
+
+    #[test]
+    fn a_token_is_a_plain_string_in_the_lockfile() {
+        let info = DaemonInfo {
+            pid: 1,
+            port: 2,
+            token: "tok".into(),
+            version: "v".into(),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["token"], "tok");
+        assert_eq!(serde_json::from_value::<DaemonInfo>(json).unwrap(), info);
+    }
 
     #[test]
     fn debug_output_redacts_the_token() {

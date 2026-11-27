@@ -203,7 +203,7 @@ fn mode(path: &Path) -> u32 {
 }
 
 fn invalid_input(err: &FeedbackError) -> bool {
-    matches!(err, FeedbackError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput)
+    matches!(err, FeedbackError::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput)
 }
 
 struct Fixture {
@@ -919,7 +919,7 @@ async fn the_scratch_directory_is_private_and_holds_the_only_worktree() {
     let err = commit_folder(&fx.repo, &placement, &files, "Other", id(), &link)
         .await
         .unwrap_err();
-    assert!(matches!(err, FeedbackError::Io(_)), "{err:?}");
+    assert!(matches!(err, FeedbackError::Io { .. }), "{err:?}");
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     assert!(!git::branch_exists(fx.root(), &placement.branch)
         .await

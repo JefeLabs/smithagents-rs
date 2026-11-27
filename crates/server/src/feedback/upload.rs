@@ -22,7 +22,7 @@ use smithagents_core::feedback::{
 use tokio::io::AsyncWriteExt;
 
 use super::issue::{title_of, FileKind, MAIN_IDEA_MAX_CHARS};
-use super::FeedbackError;
+use super::{FeedbackError, STORE_UPLOAD};
 use crate::paths::ensure_private_real_dir;
 use crate::plugins::clean_message;
 
@@ -333,7 +333,8 @@ pub async fn stage(
         .map_err(|_| invalid("the request part is not a valid feedback request"))?;
     let title = check_request(&request, limits)?;
 
-    let dir = StagingDir::create(root, request.submission_id)?;
+    let dir =
+        StagingDir::create(root, request.submission_id).map_err(FeedbackError::io(STORE_UPLOAD))?;
     let upload = dir.upload_dir();
     let mut expected = expected_parts(&request);
     let mut files = Vec::with_capacity(expected.len());
@@ -438,7 +439,8 @@ async fn receive(
         .create_new(true)
         .mode(0o600)
         .open(&path)
-        .await?;
+        .await
+        .map_err(FeedbackError::io(STORE_UPLOAD))?;
     let mut head = Vec::with_capacity(SNIFF_BYTES);
     let mut kind = None;
     let mut size = 0u64;
@@ -462,13 +464,17 @@ async fn receive(
                 kind = Some(file_kind(part, &head)?);
             }
         }
-        file.write_all(&chunk).await?;
+        file.write_all(&chunk)
+            .await
+            .map_err(FeedbackError::io(STORE_UPLOAD))?;
     }
     let kind = match kind {
         Some(kind) => kind,
         None => file_kind(part, &head)?,
     };
-    file.flush().await?;
+    file.flush()
+        .await
+        .map_err(FeedbackError::io(STORE_UPLOAD))?;
     Ok(StagedFile {
         attachment: part.attachment,
         annotated: part.annotated,

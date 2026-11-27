@@ -19,6 +19,7 @@ use smithagents_center_host::{
     TabKind, TabSpec,
 };
 use smithagents_core::agent::Agent;
+use smithagents_core::daemon::DaemonToken;
 use smithagents_core::ids::AgentId;
 use smithagents_theme::state::ThemeState;
 use smithagents_theme::tokens::Appearance;
@@ -37,8 +38,11 @@ fn manager() -> TabManager<RecordingHost> {
     )
 }
 
-fn conn() -> Option<(u16, &'static str)> {
-    Some((PORT, TOKEN))
+/// [`TOKEN`] as the manager takes it.
+static FIRST: std::sync::LazyLock<DaemonToken> = std::sync::LazyLock::new(|| TOKEN.into());
+
+fn conn() -> Option<(u16, &'static DaemonToken)> {
+    Some((PORT, &*FIRST))
 }
 
 fn rect(w: f64) -> PixelRect {
@@ -213,7 +217,7 @@ fn an_empty_token_is_a_host_error_with_no_host_call() {
         .handle(
             Effect::OpenCenterTab(mercury.id),
             Some(&mercury),
-            Some((PORT, "")),
+            Some((PORT, &"".into())),
         )
         .unwrap_err();
     assert!(
@@ -323,7 +327,7 @@ fn a_new_token_reopens_every_tab_with_it_and_reshows_the_shown_one() {
     let old: Vec<TabId> = agents.iter().map(|a| m.tab_id(a.id).unwrap()).collect();
     let before = calls(&m).len();
 
-    let failed = m.on_connection(Some((NEW_PORT, NEW_TOKEN)), &lookup(&agents));
+    let failed = m.on_connection(Some((NEW_PORT, &NEW_TOKEN.into())), &lookup(&agents));
     assert!(failed.is_empty(), "{failed:?}");
 
     let new: Vec<TabId> = agents.iter().map(|a| m.tab_id(a.id).unwrap()).collect();
@@ -359,7 +363,7 @@ fn a_new_token_reopens_every_tab_with_it_and_reshows_the_shown_one() {
     // The same identity again: nothing to do.
     let after = m.host().calls().len();
     assert!(m
-        .on_connection(Some((NEW_PORT, NEW_TOKEN)), &lookup(&agents))
+        .on_connection(Some((NEW_PORT, &NEW_TOKEN.into())), &lookup(&agents))
         .is_empty());
     assert_eq!(m.host().calls().len(), after);
 }
@@ -374,7 +378,7 @@ fn a_new_port_alone_reopens_the_tabs() {
     let before = calls(&m).len();
 
     assert!(m
-        .on_connection(Some((NEW_PORT, TOKEN)), &lookup(&agents))
+        .on_connection(Some((NEW_PORT, &TOKEN.into())), &lookup(&agents))
         .is_empty());
     let new = m.tab_id(mercury.id).unwrap();
     let calls = calls_since(&m, before);
@@ -406,7 +410,7 @@ fn the_same_connection_or_none_changes_nothing() {
 fn a_new_connection_with_no_tab_calls_nothing() {
     let mut m = manager();
     assert!(m
-        .on_connection(Some((NEW_PORT, NEW_TOKEN)), &|_| None)
+        .on_connection(Some((NEW_PORT, &NEW_TOKEN.into())), &|_| None)
         .is_empty());
     assert!(calls(&m).is_empty());
 }
@@ -422,7 +426,7 @@ fn a_tab_whose_agent_is_gone_is_closed_and_reported_on_reconnect() {
 
     // Only Mercury is still known.
     let known = vec![mercury.clone()];
-    let failed = m.on_connection(Some((NEW_PORT, NEW_TOKEN)), &lookup(&known));
+    let failed = m.on_connection(Some((NEW_PORT, &NEW_TOKEN.into())), &lookup(&known));
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].0, venus.id);
     assert!(matches!(failed[0].1, TabError::UnknownAgent));
@@ -622,12 +626,12 @@ fn errors_never_carry_the_token() {
         m.handle(Effect::OpenCenterTab(mercury.id), agent, conn)
             .expect_err("the open fails")
     };
-    let given = Some((PORT, TOKEN));
+    let given = conn();
     let mut errors = vec![
         // The open was given the token each time.
         open(&mut manager(), None, given),
         open(&mut manager(), Some(&agent("Venus")), given),
-        open(&mut manager(), Some(&mercury), Some((0, TOKEN))),
+        open(&mut manager(), Some(&mercury), Some((0, &*FIRST))),
         open(&mut manager(), Some(&mercury), None),
     ];
     let mut invalid = TabManager::new(RecordingHost::default(), "file:///x".into(), theme.clone());
@@ -643,7 +647,7 @@ fn errors_never_carry_the_token() {
     reopened
         .handle(Effect::OpenCenterTab(mercury.id), Some(&mercury), given)
         .unwrap();
-    let failed = reopened.on_connection(Some((NEW_PORT, NEW_TOKEN)), &|_| None);
+    let failed = reopened.on_connection(Some((NEW_PORT, &NEW_TOKEN.into())), &|_| None);
     errors.extend(failed.into_iter().map(|(_, error)| error));
 
     let kinds: Vec<String> = errors.iter().map(|e| format!("{e:?}")).collect();
@@ -719,7 +723,7 @@ fn the_placeholder_host_logs_the_page_and_the_redacted_script_never_the_token() 
         m.set_theme(theme_state(Appearance::Light));
         assert!(m.open_external("https://example.com/"));
         assert!(m
-            .on_connection(Some((NEW_PORT, NEW_TOKEN)), &lookup(&agents))
+            .on_connection(Some((NEW_PORT, &NEW_TOKEN.into())), &lookup(&agents))
             .is_empty());
         m.handle(Effect::CloseCenterTab(venus.id), None, None)
             .unwrap();

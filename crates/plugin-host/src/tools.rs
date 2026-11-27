@@ -103,9 +103,13 @@ pub enum ToolRunError {
     #[error("the tool is not installed")]
     NotFound,
     /// It could not be started (its directory is not absolute, or the
-    /// system refused), or its output could not be read or its end awaited.
+    /// system refused): nothing ran.
     #[error("the tool could not be started")]
     NotStarted,
+    /// It started, but its output could not be read or its end could not be
+    /// awaited: whatever it does may have been done all the same.
+    #[error("the tool started, but its answer was lost")]
+    OutputLost,
     #[error("the tool did not finish in time")]
     Timeout,
     /// It printed more than 64 KiB.
@@ -253,9 +257,9 @@ impl ToolFinder {
             Err(RunError::Status(status)) => Err(InstallError::Failed {
                 status: status.code(),
             }),
-            Err(RunError::Spawn(e)) => {
+            Err(RunError::Spawn(e) | RunError::Lost(e)) => {
                 // The kind only: the system's message may name paths.
-                tracing::warn!(kind = ?e.kind(), "mise could not be started");
+                tracing::warn!(kind = ?e.kind(), "mise could not be started or followed");
                 Err(InstallError::Failed { status: None })
             }
             Err(RunError::Timeout) => Err(InstallError::Timeout),
@@ -295,6 +299,10 @@ impl ToolFinder {
                 // The kind only: the system's message may name paths.
                 tracing::warn!(tool = %name, kind = ?e.kind(), "a tool could not be started");
                 Err(ToolRunError::NotStarted)
+            }
+            Err(RunError::Lost(e)) => {
+                tracing::warn!(tool = %name, kind = ?e.kind(), "a tool's answer was lost after it started");
+                Err(ToolRunError::OutputLost)
             }
             Err(RunError::Timeout) => Err(ToolRunError::Timeout),
             Err(RunError::TooMuchOutput) => Err(ToolRunError::TooMuchOutput),

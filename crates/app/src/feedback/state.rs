@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 use futures::future::{Either, LocalBoxFuture};
 use futures::FutureExt as _;
 use gpui_kit::{
-    App, AppContext as _, Context, EventEmitter, PathPromptOptions, RenderImage, Task, Window,
+    App, AppContext as _, Context, EventEmitter, PathPromptOptions, RenderImage, Subscription,
+    Task, Window,
 };
 use serde::{Deserialize, Serialize};
 use smithagents_capture::{CaptureError, Capturer, Frame, WindowTarget};
@@ -83,6 +84,11 @@ pub struct Pending {
     /// connection, a quit while sending): the daemon may still be making it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub awaiting: bool,
+    /// `sent` was read only in part (see [`read_pending`]): it names the
+    /// repository, and how it was sent is a guess. Enough to keep the draft
+    /// locked and to ask the daemon by id; never enough to upload it again.
+    #[serde(skip)]
+    pub sent_guessed: bool,
 }
 
 /// The repository and the kind of result a submission was sent for, and the
@@ -93,6 +99,52 @@ pub struct SentTo {
     pub send_as: SendAs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idea: Option<IdeaOptions>,
+}
+
+/// A `submission.json` as this build reads it. One it cannot read in full
+/// (another version of the app wrote it, say) still gives its id, and where
+/// it was sent when that part reads: the id is what keeps a re-send from
+/// being made a second time, and the daemon knows what became of it. Sent
+/// somewhere with no readable answer, it awaits one.
+///
+/// A `sent` of which only the repository reads still counts as sent
+/// ([`Pending::sent_guessed`]): something may exist under the id, so the
+/// draft stays locked. Only when not even that reads is the draft open
+/// again, under the same id.
+fn read_pending(bytes: &[u8]) -> Option<Pending> {
+    match serde_json::from_slice::<Pending>(bytes) {
+        Ok(pending) => return Some(pending),
+        Err(e) => {
+            tracing::warn!(error = %e, "the pending feedback submission could not be read in full");
+        }
+    }
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let submission_id = serde_json::from_value(json.get("submission_id")?.clone()).ok()?;
+    let (sent, sent_guessed) = match json.get("sent").filter(|sent| !sent.is_null()) {
+        None => (None, false),
+        Some(sent) => match serde_json::from_value::<SentTo>(sent.clone()) {
+            Ok(sent) => (Some(sent), false),
+            Err(e) => {
+                tracing::warn!(error = %e, "where the pending feedback submission was sent could not be read in full");
+                let repo_id = sent
+                    .get("repo_id")
+                    .and_then(|id| serde_json::from_value(id.clone()).ok());
+                let guessed = repo_id.map(|repo_id| SentTo {
+                    repo_id,
+                    send_as: SendAs::Intent,
+                    idea: None,
+                });
+                (guessed, guessed.is_some())
+            }
+        },
+    };
+    Some(Pending {
+        submission_id,
+        outcome: None,
+        sent,
+        awaiting: sent.is_some(),
+        sent_guessed,
+    })
 }
 
 /// A box as the daemon takes it.
@@ -237,7 +289,17 @@ pub struct Feedback {
     submitting: bool,
     /// The last success sentence, until the draft changes.
     result: Option<String>,
+    /// A typed main idea that waits [`IDEA_SAVE_DELAY`] to be written.
+    idea_save: Option<Task<()>>,
+    /// Write a waiting main idea when the app quits or the draft goes away.
+    _write_on_exit: [Subscription; 2],
 }
+
+/// How long a typed main idea waits for more typing before it is written.
+/// Writing the draft is a full flush to disk on the thread that draws the
+/// window, so it is done once per pause, not once per key. A crash within
+/// the pause loses that much typing; a quit does not.
+pub const IDEA_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 impl EventEmitter<FeedbackEvent> for Feedback {}
 
@@ -258,15 +320,9 @@ impl Feedback {
             None => Files::Memory(Arc::default()),
         };
         let Loaded { draft, notices } = files.load();
-        let pending = files.read_submission().and_then(|bytes| {
-            match serde_json::from_slice::<Pending>(&bytes) {
-                Ok(pending) => Some(pending),
-                Err(e) => {
-                    tracing::warn!(error = %e, "the pending feedback submission could not be read");
-                    None
-                }
-            }
-        });
+        let pending = files
+            .read_submission()
+            .and_then(|bytes| read_pending(&bytes));
         let mut this = Self {
             files,
             capturer,
@@ -288,6 +344,14 @@ impl Feedback {
             thumbnails: HashMap::new(),
             retired: Vec::new(),
             pending,
+            idea_save: None,
+            _write_on_exit: [
+                cx.on_app_quit(|this, _| {
+                    this.write_waiting_idea();
+                    async {}
+                }),
+                cx.on_release(|this, _| this.write_waiting_idea()),
+            ],
             submitting: false,
             result: None,
         };
@@ -716,6 +780,8 @@ impl Feedback {
         self.retired
             .extend(self.thumbnails.drain().map(|(_, thumbnail)| thumbnail));
         self.draft = Draft::default();
+        // A main idea still waiting to be written goes with its draft.
+        self.idea_save = None;
         if let Err(e) = self.files.clear() {
             tracing::warn!(error = %e, "could not delete the feedback draft");
             self.add_notice(io_text(&e));
@@ -845,13 +911,33 @@ impl Feedback {
     // ---- Submitting ------------------------------------------------------
 
     /// Keeps the main idea (the first line is the title). Not while locked.
+    /// The draft holds it at once; it is written when the typing has paused
+    /// for [`IDEA_SAVE_DELAY`], or sooner with anything else that writes the
+    /// draft, before a submission begins, and when the app quits.
     pub fn set_main_idea(&mut self, text: String, cx: &mut Context<Self>) {
         if self.locked() || self.draft.main_idea == text {
             return;
         }
         self.draft.main_idea = text;
-        self.save();
+        // The draft changed, so the last success sentence goes, as in `save`.
+        self.result = None;
+        // Replacing the task cancels the previous wait: a debounce.
+        self.idea_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(IDEA_SAVE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                this.write_waiting_idea();
+                cx.notify();
+            });
+        }));
         cx.notify();
+    }
+
+    /// Writes the draft now if a typed main idea is still waiting to be
+    /// written (a failure is said).
+    fn write_waiting_idea(&mut self) {
+        if self.idea_save.is_some() {
+            self.save();
+        }
     }
 
     /// Keeps the kind, by its wire name. Not while locked.
@@ -902,6 +988,8 @@ impl Feedback {
     /// `submission.json` (a failed write is said; the id still holds for
     /// this run).
     pub fn begin_submission(&mut self, cx: &mut Context<Self>) -> SubmissionId {
+        // What is sent is what a restart finds in the draft.
+        self.write_waiting_idea();
         if let Some(pending) = &self.pending {
             return pending.submission_id;
         }
@@ -912,6 +1000,7 @@ impl Feedback {
             outcome: None,
             sent: None,
             awaiting: false,
+            sent_guessed: false,
         });
         self.save_pending();
         cx.notify();
@@ -921,8 +1010,21 @@ impl Feedback {
     /// The pending submission's request is about to leave for `to`: written
     /// first, so a quit or a lost connection meanwhile leaves the draft
     /// locked. It is awaiting an answer until one comes.
-    pub fn mark_sent(&mut self, to: SentTo, cx: &mut Context<Self>) {
-        self.set_sent(Some(to), true, cx);
+    ///
+    /// Whether it is written. When it is not (a failure is said), the
+    /// request must not leave, and the draft is as it was before.
+    #[must_use = "a submission that is not written down must not be sent"]
+    pub fn mark_sent(&mut self, to: SentTo, cx: &mut Context<Self>) -> bool {
+        let before = self.pending.as_ref().map(|p| (p.sent, p.awaiting));
+        if self.set_sent(Some(to), true, cx) {
+            return true;
+        }
+        if let (Some(pending), Some((sent, awaiting))) = (self.pending.as_mut(), before) {
+            pending.sent = sent;
+            pending.awaiting = awaiting;
+        }
+        cx.notify();
+        false
     }
 
     /// The daemon answered the pending submission (and something may exist
@@ -935,18 +1037,27 @@ impl Feedback {
     /// Where the pending submission was sent, and whether it awaits an
     /// answer, as they were or are again: `None` when nothing exists under
     /// its id (the draft can change again, under the same id).
-    pub fn set_sent(&mut self, sent: Option<SentTo>, awaiting: bool, cx: &mut Context<Self>) {
+    ///
+    /// Whether `submission.json` says so now: `false` when there is no
+    /// pending submission or the file could not be written (which is said).
+    pub fn set_sent(
+        &mut self,
+        sent: Option<SentTo>,
+        awaiting: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(pending) = self.pending.as_mut() else {
-            return;
+            return false;
         };
         let awaiting = awaiting && sent.is_some();
         if pending.sent == sent && pending.awaiting == awaiting {
-            return;
+            return true;
         }
         pending.sent = sent;
         pending.awaiting = awaiting;
-        self.save_pending();
+        let written = self.save_pending();
         cx.notify();
+        written
     }
 
     /// Keeps the daemon's answer of a submission whose step failed: sent to
@@ -1042,17 +1153,21 @@ impl Feedback {
         true
     }
 
-    /// Writes `submission.json` (a failure is said).
-    fn save_pending(&mut self) {
+    /// Writes `submission.json`; whether it was written (a failure is said).
+    fn save_pending(&mut self) -> bool {
         let Some(pending) = &self.pending else {
-            return;
+            return false;
         };
         let written = serde_json::to_vec_pretty(pending)
             .map_err(std::io::Error::other)
             .and_then(|json| self.files.write_submission(&json));
-        if let Err(e) = written {
-            tracing::warn!(error = %e, "could not save the pending feedback submission");
-            self.add_notice(io_text(&e));
+        match written {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not save the pending feedback submission");
+                self.add_notice(io_text(&e));
+                false
+            }
         }
     }
 
@@ -1066,7 +1181,13 @@ impl Feedback {
     fn save(&mut self) -> bool {
         self.result = None;
         match self.files.save(&self.draft) {
-            Ok(()) => true,
+            Ok(()) => {
+                // The whole draft is written, a waiting main idea with it.
+                // After a failure the idea is still owed to the disk: the
+                // next save, send, close or quit writes it.
+                self.idea_save = None;
+                true
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "could not save the feedback draft");
                 self.add_notice(io_text(&e));

@@ -149,8 +149,8 @@ async fn daemon_writes_lockfile_and_serves_health() {
 
     assert_eq!(info.version, smithagents_core::VERSION);
     assert_ne!(info.port, 0);
-    assert_eq!(info.token.len(), 64);
-    assert!(info.token.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(info.token.expose().len(), 64);
+    assert!(info.token.expose().chars().all(|c| c.is_ascii_hexdigit()));
     assert!(!env_home.exists(), "--home must win over SMITHAGENTS_HOME");
     #[cfg(unix)]
     {
@@ -170,7 +170,7 @@ async fn daemon_writes_lockfile_and_serves_health() {
     assert_eq!(http_get(info.port, "/v1/health", None).await.0, 401);
     let wrong = "0".repeat(64);
     assert_eq!(http_get(info.port, "/v1/health", Some(&wrong)).await.0, 401);
-    let (status, body) = http_get(info.port, "/v1/health", Some(&info.token)).await;
+    let (status, body) = http_get(info.port, "/v1/health", Some(info.token.expose())).await;
     assert_eq!(status, 200, "{body}");
     let health: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(health["pid"], daemon.pid());
@@ -181,11 +181,14 @@ async fn daemon_writes_lockfile_and_serves_health() {
     let instance_id = health["instance_id"].as_str().unwrap();
     assert_eq!(instance_id.len(), 16, "{health}");
     assert!(instance_id.chars().all(|c| c.is_ascii_hexdigit()));
-    assert!(!info.token.contains(instance_id), "derived from the token");
+    assert!(
+        !info.token.expose().contains(instance_id),
+        "derived from the token"
+    );
 
     assert!(daemon.exited().is_none(), "daemon stopped serving");
     assert!(
-        !daemon.log_text().contains(&info.token),
+        !daemon.log_text().contains(info.token.expose()),
         "the token must never be logged"
     );
 }
@@ -221,7 +224,7 @@ async fn concurrent_start_single_instance() {
     );
 
     let info = winner.wait_for_lockfile(&home).await;
-    let (code, _) = http_get(info.port, "/v1/health", Some(&info.token)).await;
+    let (code, _) = http_get(info.port, "/v1/health", Some(info.token.expose())).await;
     assert_eq!(code, 200);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
@@ -272,7 +275,8 @@ async fn connected_websocket_client_keeps_idle_daemon_alive() {
     let info = daemon.wait_for_lockfile(&home).await;
     let url = format!(
         "ws://127.0.0.1:{}/v1/events?token={}",
-        info.port, info.token
+        info.port,
+        info.token.expose()
     );
     let (ws, _) = tokio::time::timeout(PATIENCE, tokio_tungstenite::connect_async(url))
         .await
@@ -286,7 +290,7 @@ async fn connected_websocket_client_keeps_idle_daemon_alive() {
         "daemon exited with a client connected; log:\n{}",
         daemon.log_text()
     );
-    let (_, body) = http_get(info.port, "/v1/health", Some(&info.token)).await;
+    let (_, body) = http_get(info.port, "/v1/health", Some(info.token.expose())).await;
     let health: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(health["ws_clients"], 1);
 
@@ -520,7 +524,7 @@ async fn agents_left_running_by_a_previous_daemon_start_dead() {
 
     let mut daemon = Daemon::spawn(tmp.path(), "daemon", &home, &[], None);
     let info = daemon.wait_for_lockfile(&home).await;
-    let (status, body) = http_get(info.port, "/v1/agents", Some(&info.token)).await;
+    let (status, body) = http_get(info.port, "/v1/agents", Some(info.token.expose())).await;
     assert_eq!(status, 200, "{body}");
     let agents: Vec<Agent> = serde_json::from_str(&body).unwrap();
     assert_eq!(agents.len(), 1);

@@ -18,7 +18,7 @@ use smithagents_client::{
     ensure_daemon_with, Client, ClientError, EnsureError, FeedbackFile, SpawnOptions,
 };
 use smithagents_core::agent::{Agent, Repo};
-use smithagents_core::daemon::read_lockfile;
+use smithagents_core::daemon::{read_lockfile, DaemonToken};
 use smithagents_core::feedback::{
     FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets, SubmissionId,
 };
@@ -148,20 +148,11 @@ fn clamp_backoff(min: Duration, max: Duration) -> (Duration, Duration) {
     (min.clamp(Duration::from_millis(1), max), max)
 }
 
-/// The port and token of the connected daemon. Never printed.
-#[derive(Clone)]
+/// The port and token of the connected daemon.
+#[derive(Clone, Debug)]
 struct Endpoint {
     port: u16,
-    token: String,
-}
-
-impl std::fmt::Debug for Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Endpoint")
-            .field("port", &self.port)
-            .field("token", &"<redacted>")
-            .finish()
-    }
+    token: DaemonToken,
 }
 
 #[derive(Default)]
@@ -265,9 +256,8 @@ impl DaemonLink {
         self.thread.as_ref().is_none_or(|t| t.is_finished())
     }
 
-    /// Port and token of the connected daemon, for the web tabs. Keep the
-    /// token out of logs.
-    pub fn connection_info(&self) -> Option<(u16, String)> {
+    /// Port and token of the connected daemon, for the web tabs.
+    pub fn connection_info(&self) -> Option<(u16, DaemonToken)> {
         lock(&self.shared.connected)
             .as_ref()
             .map(|(_, e)| (e.port, e.token.clone()))

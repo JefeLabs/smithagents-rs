@@ -76,7 +76,7 @@ use crate::feedback::text::{
     MAIN_IDEA_HINT, MAIN_IDEA_LABEL, MAY_HAVE_BEEN_SENT_TEXT, PUBLIC_CONFIRM_CANCEL,
     PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL, SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL,
     START_OVER_CANCEL, START_OVER_LABEL, START_OVER_RISK_TEXT, START_OVER_TITLE,
-    START_OVER_TOOLTIP, SUBMIT_BUSY_TEXT,
+    START_OVER_TOOLTIP, SUBMISSION_NOT_SAVED_TEXT, SUBMIT_BUSY_TEXT,
 };
 use crate::intent_vm::kind_label;
 use crate::link::LinkError;
@@ -725,9 +725,16 @@ impl FeedbackPane {
             }
         };
         // On disk before the request leaves: a quit or a lost connection
-        // from here on leaves the draft locked.
-        self.feedback
+        // from here on leaves the draft locked. Not written, nothing leaves.
+        let written = self
+            .feedback
             .update(cx, |feedback, cx| feedback.mark_sent(to, cx));
+        if !written {
+            tracing::warn!("the feedback submission could not be written down; nothing is sent");
+            self.submit.error = Some(SUBMISSION_NOT_SAVED_TEXT.to_owned());
+            cx.notify();
+            return;
+        }
         let Some(command) = self
             .state
             .read(cx)
@@ -856,9 +863,13 @@ impl FeedbackPane {
                         }
                         Some(submit_error_text(&e))
                     }
+                    // Not from a target that is partly a guess: that one
+                    // starts over below.
                     SendFailure::NotRecorded
                         if attempt == Attempt::Retry
-                            && pending.as_ref().is_some_and(|p| p.outcome.is_none()) =>
+                            && pending
+                                .as_ref()
+                                .is_some_and(|p| p.outcome.is_none() && !p.sent_guessed) =>
                     {
                         tracing::info!(
                             "no record of a submission whose answer never came; sending it again"

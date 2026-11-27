@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smithagents_core::agent::{Agent, ChatMessage, Repo};
-use smithagents_core::daemon::DaemonInfo;
+use smithagents_core::daemon::{DaemonInfo, DaemonToken};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::feedback::{
     FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets, SubmissionId,
@@ -102,7 +102,7 @@ pub struct FeedbackFile {
 pub struct Client {
     http: reqwest::Client,
     port: u16,
-    token: String,
+    token: DaemonToken,
 }
 
 impl fmt::Debug for Client {
@@ -547,7 +547,7 @@ impl Client {
             url.push_str(&format!("?since={since}"));
         }
         let mut request = url.into_client_request()?;
-        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.token))
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.token.expose()))
             .map_err(tungstenite::Error::from)?;
         auth.set_sensitive(true);
         request.headers_mut().insert(AUTHORIZATION, auth);
@@ -590,7 +590,7 @@ impl Client {
 
     /// Sends `request` with the token; a non-2xx answer becomes `ClientError::Api`.
     async fn send(&self, request: RequestBuilder) -> Result<reqwest::Response, ClientError> {
-        let response = request.bearer_auth(&self.token).send().await?;
+        let response = request.bearer_auth(self.token.expose()).send().await?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);

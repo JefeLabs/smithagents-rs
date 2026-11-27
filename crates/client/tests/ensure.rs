@@ -741,7 +741,7 @@ async fn client_covers_the_api() {
         assert!(all[0].closed_at.is_some());
 
         let mut wrong = read_lockfile(home.path()).unwrap().unwrap();
-        wrong.token = "0".repeat(64);
+        wrong.token = "0".repeat(64).into();
         let denied = Client::new(&wrong).health().await.unwrap_err();
         assert!(
             matches!(&denied, ClientError::Api { status: 401, code, .. } if code == "unauthorized"),

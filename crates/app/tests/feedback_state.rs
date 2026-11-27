@@ -20,7 +20,7 @@ use smithagents_app::feedback::annotation::{Annotation, FracRect};
 use smithagents_app::feedback::draft::{AttachmentId, AttachmentKind, Draft};
 use smithagents_app::feedback::files::Refusal;
 use smithagents_app::feedback::render::{decode, BOX_RGB};
-use smithagents_app::feedback::state::{Feedback, FeedbackEvent, FeedbackOptions};
+use smithagents_app::feedback::state::{Feedback, FeedbackEvent, FeedbackOptions, IDEA_SAVE_DELAY};
 use smithagents_app::feedback::text::{
     capture_failed_text, more_files_text, more_notices_text, save_failed_text,
     CAPTURE_FRAMES_MISSED, CAPTURE_PICTURE_TIMEOUT, CAPTURE_TOO_SLOW, DRAFT_FULL_TEXT,
@@ -967,6 +967,128 @@ fn a_screenshot_that_does_not_decode_says_it_could_not_be_drawn(cx: &mut TestApp
     );
     assert_eq!(*events.borrow(), vec![FeedbackEvent::CloseAnnotator]);
     assert!(!busy(cx, &feedback));
+}
+
+/// The main idea in `draft.json` (empty while there is no file).
+fn idea_on_disk(setup: &FeedbackSetup) -> String {
+    setup.store().load().draft.main_idea
+}
+
+#[gpui_kit::test]
+fn typing_the_main_idea_writes_it_once_after_a_pause(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _shell, feedback) = setup.open(cx);
+
+    // Three keys, each sooner than the pause: the draft holds them at once,
+    // but nothing is written per key.
+    for text in ["F", "Fi", "Fix"] {
+        act(cx, window, &feedback, |f, _, cx| {
+            f.set_main_idea(text.to_owned(), cx)
+        });
+        assert_eq!(draft(cx, &feedback).main_idea, text);
+        cx.executor().advance_clock(IDEA_SAVE_DELAY / 5);
+        cx.run_until_parked();
+        assert_eq!(idea_on_disk(&setup), "", "written after {text:?}");
+    }
+
+    // The typing pauses: written, with the last text.
+    cx.executor().advance_clock(IDEA_SAVE_DELAY);
+    cx.run_until_parked();
+    assert_eq!(idea_on_disk(&setup), "Fix");
+}
+
+#[gpui_kit::test]
+fn another_change_to_the_draft_writes_a_waiting_main_idea_with_it(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _shell, feedback) = setup.open(cx);
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_main_idea("Fix the zoom".to_owned(), cx)
+    });
+    assert_eq!(idea_on_disk(&setup), "");
+
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_kind(smithagents_core::feedback::FeedbackKind::Bug, cx)
+    });
+
+    assert_eq!(idea_on_disk(&setup), "Fix the zoom");
+}
+
+#[gpui_kit::test]
+fn a_main_idea_still_waiting_is_written_when_the_window_closes(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, shell, feedback) = setup.open(cx);
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_main_idea("Fix the zoom".to_owned(), cx)
+    });
+    assert_eq!(idea_on_disk(&setup), "");
+
+    drop((shell, feedback));
+    cx.update_window(window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(idea_on_disk(&setup), "Fix the zoom");
+}
+
+#[gpui_kit::test]
+fn a_main_idea_that_could_not_be_written_is_written_at_the_next_chance(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let setup = FeedbackSetup::new();
+    let (window, shell, feedback) = setup.open(cx);
+    // A draft exists, so its folder does; then the folder cannot be written.
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_kind(smithagents_core::feedback::FeedbackKind::Bug, cx)
+    });
+    fs::set_permissions(setup.draft_dir(), fs::Permissions::from_mode(0o500)).unwrap();
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_main_idea("Fix the zoom".to_owned(), cx)
+    });
+    cx.executor().advance_clock(IDEA_SAVE_DELAY * 2);
+    cx.run_until_parked();
+    assert_eq!(idea_on_disk(&setup), "", "the write failed");
+    fs::set_permissions(setup.draft_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    // The typing is still owed to the disk: closing the window writes it.
+    drop((shell, feedback));
+    cx.update_window(window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(idea_on_disk(&setup), "Fix the zoom");
+}
+
+#[gpui_kit::test]
+fn a_discard_forgets_a_main_idea_that_was_still_waiting(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _shell, feedback) = setup.open(cx);
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_main_idea("Fix the zoom".to_owned(), cx)
+    });
+
+    act(cx, window, &feedback, |f, _, cx| f.discard_all(cx));
+    cx.executor().advance_clock(IDEA_SAVE_DELAY * 2);
+    cx.run_until_parked();
+
+    // The pause ended after the discard: no draft comes back.
+    assert!(!setup.draft_dir().join("draft.json").exists());
+}
+
+#[gpui_kit::test]
+fn a_main_idea_still_waiting_is_written_before_it_is_sent(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _shell, feedback) = setup.open(cx);
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_main_idea("Fix the zoom".to_owned(), cx)
+    });
+
+    // What is sent is what a restart finds: the draft is written before a
+    // submission of it begins.
+    act(cx, window, &feedback, |f, _, cx| {
+        f.begin_submission(cx);
+    });
+
+    assert_eq!(idea_on_disk(&setup), "Fix the zoom");
 }
 
 #[gpui_kit::test]

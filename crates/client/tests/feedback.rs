@@ -503,7 +503,7 @@ async fn nothing_leaks_and_nothing_is_left_behind(fx: Fx) {
         log.contains("smithagents_server::feedback"),
         "the daemon's log has the feedback lines:\n{log}"
     );
-    for secret in ["LEAK", "smithagents-test-invalid", token.as_str(), COMMENT] {
+    for secret in ["LEAK", "smithagents-test-invalid", token.expose(), COMMENT] {
         assert!(
             !log.contains(secret),
             "the daemon's log holds {secret:?}:\n{log}"
