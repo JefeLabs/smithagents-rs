@@ -98,6 +98,20 @@ fn a_blank_error_adds_no_line_and_the_error_is_trimmed() {
 }
 
 #[test]
+fn a_protocol_mismatch_reads_as_a_version_mismatch_that_names_both_protocols() {
+    // Builds share a version; what differs between them is the protocol.
+    let failure = LinkFailure::protocol_mismatch("0.1.0", 0, 1);
+    assert_eq!(failure.kind(), LinkErrorKind::VersionMismatch);
+    let banner = connection_banner(&Connection::Reconnecting, Some(&failure)).unwrap();
+    assert_eq!(
+        banner.text,
+        "A different SmithAgents daemon version is running (0.1.0, protocol 0; this app \
+         needs 0.1.0, protocol 1). Quit it to continue."
+    );
+    assert_eq!(banner.severity, BannerSeverity::Error);
+}
+
+#[test]
 fn a_version_mismatch_names_both_versions_and_is_an_error_not_a_reconnect() {
     let failure = LinkFailure::VersionMismatch {
         running: "0.0.9".into(),

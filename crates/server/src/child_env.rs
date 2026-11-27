@@ -1,4 +1,5 @@
-//! What the processes the daemon starts (agents, git) inherit from it.
+//! What the processes the daemon starts (agents, git) inherit from it, and
+//! how one is stopped together with what it started.
 
 use tokio::process::Command;
 
@@ -20,6 +21,52 @@ pub(crate) fn remove_plugin_secrets(cmd: &mut Command) -> &mut Command {
         cmd.env_remove(name);
     }
     cmd
+}
+
+/// Kills the process group led by the process it names when dropped, unless
+/// disarmed first. The process must have been started as the leader of a
+/// group of its own (`process_group(0)`).
+///
+/// Declare it after the child it guards, so it is dropped first: the group
+/// is then killed while its leader is not yet reaped and the id cannot have
+/// been given to another process. For the same reason, disarm it once the
+/// leader has been waited for.
+pub(crate) struct GroupKiller(Option<u32>);
+
+impl GroupKiller {
+    /// A guard for the group led by the process with this id (`None`: the
+    /// process is already gone, and nothing is killed).
+    pub(crate) fn of(leader: Option<u32>) -> Self {
+        Self(leader)
+    }
+
+    /// Leaves the group alone from here on.
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    /// Kills the group now, once.
+    pub(crate) fn kill(&mut self) {
+        kill_group(self.0.take());
+    }
+}
+
+impl Drop for GroupKiller {
+    fn drop(&mut self) {
+        kill_group(self.0);
+    }
+}
+
+/// Sends SIGKILL to every process of the group led by `leader`.
+pub(crate) fn kill_group(leader: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = leader
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        // The group may be gone already.
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
 }
 
 #[cfg(test)]

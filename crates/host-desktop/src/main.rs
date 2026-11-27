@@ -18,7 +18,9 @@ fn main() {
     let daemon_bin = daemon_bin();
     tracing::info!("home {}, daemon {}", home.display(), daemon_bin.display());
     // The daemon reports `smithagents_core::VERSION`; the link refuses any
-    // other version, so both sides use the same constant.
+    // other version, so both sides use the same constant. It refuses another
+    // `smithagents_core::PROTOCOL` as well, which is what tells two builds of
+    // one version apart.
     let config = LinkConfig::new(home, daemon_bin, smithagents_core::VERSION.to_owned());
     // The chat tabs' web engine, built once the GPUI app exists: a
     // placeholder that draws nothing and logs (at debug) until the real

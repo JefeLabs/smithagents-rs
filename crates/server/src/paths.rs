@@ -3,6 +3,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use smithagents_core::agent::Repo;
+
 /// The state root (`~/.smithagents` unless `SMITHAGENTS_HOME` is set) and
 /// everything placed under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,9 +38,26 @@ impl Paths {
         self.home.join("smithagents.db")
     }
 
-    /// Agent worktrees live in `worktrees_dir()/<repo dir name>/`.
+    /// Agent worktrees live under here, one folder per repository (see
+    /// [`Paths::repo_worktrees_dir`]).
     pub fn worktrees_dir(&self) -> PathBuf {
         self.home.join("worktrees")
+    }
+
+    /// Where `repo`'s agent worktrees are made:
+    /// `worktrees_dir()/<repository folder name>-<first 8 hex digits of its id>`.
+    /// The id keeps two repositories whose folders share a name apart.
+    ///
+    /// Worktrees made before the id was part of the name sit in
+    /// `<repository folder name>/` and stay where they are: an agent's row
+    /// holds its own path.
+    pub fn repo_worktrees_dir(&self, repo: &Repo) -> PathBuf {
+        let name = repo
+            .path
+            .file_name()
+            .map_or_else(|| "repo".into(), |name| name.to_string_lossy());
+        let id = repo.id.0.simple().to_string();
+        self.worktrees_dir().join(format!("{name}-{}", &id[..8]))
     }
 
     /// Installed plugins live in `plugins_dir()/<id>/`.
@@ -150,6 +169,39 @@ mod tests {
         assert_eq!(
             custom.feedback_tmp_dir(),
             PathBuf::from("/state/tmp/feedback")
+        );
+    }
+
+    #[test]
+    fn a_repositorys_worktree_folder_carries_its_id() {
+        use smithagents_core::ids::RepoId;
+
+        let paths = Paths {
+            home: PathBuf::from("/state"),
+        };
+        let repo = |path: &str| Repo {
+            id: RepoId::new(),
+            path: PathBuf::from(path),
+            default_branch: "main".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let (work, oss) = (repo("/work/app"), repo("/oss/app"));
+        let hex = work.id.0.simple().to_string();
+        assert_eq!(
+            paths.repo_worktrees_dir(&work),
+            PathBuf::from(format!("/state/worktrees/app-{}", &hex[..8]))
+        );
+        // The same folder name, another repository: another folder.
+        assert_ne!(
+            paths.repo_worktrees_dir(&work),
+            paths.repo_worktrees_dir(&oss)
+        );
+        // A path with no last part still gets a folder of its own.
+        let root = repo("/");
+        let hex = root.id.0.simple().to_string();
+        assert_eq!(
+            paths.repo_worktrees_dir(&root),
+            PathBuf::from(format!("/state/worktrees/repo-{}", &hex[..8]))
         );
     }
 

@@ -86,8 +86,9 @@ const CLOSE_RETRY: Duration = Duration::from_secs(30);
 
 const TITLE_MAX: usize = 120;
 const ITEM_MAX: usize = 2000;
-/// Characters allowed in a current behavior set through `update`.
-const BEHAVIOR_MAX: usize = 20_000;
+/// Characters allowed in a current behavior set through `update`: what
+/// polish holds the model to as well.
+const BEHAVIOR_MAX: usize = crate::polish::MAX_BEHAVIOR_CHARS;
 const DEFAULT_TITLE: &str = "Untitled intent";
 /// The length limit `slugify` applies; numbered slugs keep to it too.
 const SLUG_MAX: usize = 48;
@@ -1064,9 +1065,10 @@ impl IntentService {
         Ok(sent)
     }
 
-    /// Creates the intent's agent on `intent/<slug>` (or, if that branch
-    /// exists, `intent/<slug>-<6 hex of the id>`) from the intent's base
-    /// branch (else the repository's default branch) and sends it the brief.
+    /// Creates the intent's agent on `intent/<slug>` (or, if that branch or
+    /// its worktree folder is taken, `intent/<slug>-<6 hex of the id>`) from
+    /// the intent's base branch (else the repository's default branch) and
+    /// sends it the brief.
     /// An agent whose first message is refused is closed again.
     async fn launch_agent(&self, intent: &Intent) -> Result<AgentId, IntentError> {
         let base = self.checked_base_branch(intent).await?;
@@ -1083,7 +1085,7 @@ impl IntentService {
             .create_agent_with(intent.repo_id, options(branch.clone()))
             .await
         {
-            Err(ServiceError::Git(GitError::BranchExists(_))) => {
+            Err(ServiceError::Git(GitError::BranchExists(_) | GitError::WorktreeExists(_))) => {
                 let hex = intent.id.0.simple().to_string();
                 let suffixed = format!("{branch}-{}", &hex[..BRANCH_SUFFIX_HEX]);
                 agents

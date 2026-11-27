@@ -175,6 +175,7 @@ async fn daemon_writes_lockfile_and_serves_health() {
     let health: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(health["pid"], daemon.pid());
     assert_eq!(health["version"], smithagents_core::VERSION);
+    assert_eq!(health["protocol"], smithagents_core::PROTOCOL);
     assert_eq!(health["running_agents"], 0);
     assert_eq!(health["latest_seq"], 0);
     let instance_id = health["instance_id"].as_str().unwrap();

@@ -2463,8 +2463,12 @@ impl Fx {
         assert_eq!(git_out(dir, &["branch", "--list", "intent/*"]), "");
         let worktrees = git_out(dir, &["worktree", "list", "--porcelain"]);
         assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
-        let dirs = std::fs::read_dir(self.paths.worktrees_dir().join("r1"));
-        assert!(dirs.map_or(true, |mut d| d.next().is_none()));
+        // No repository has a worktree folder with anything in it.
+        for repo_dir in std::fs::read_dir(self.paths.worktrees_dir()).unwrap() {
+            let repo_dir = repo_dir.unwrap().path();
+            let left: Vec<_> = std::fs::read_dir(&repo_dir).unwrap().collect();
+            assert!(left.is_empty(), "{left:?} in {}", repo_dir.display());
+        }
     }
 }
 
@@ -2938,7 +2942,7 @@ async fn a_base_branch_that_cannot_be_checked_out_is_a_fixed_sentence() {
         "intent-fix-the-zoom".to_owned(),
         format!("intent-fix-the-zoom-{}", &hex[..6]),
     ] {
-        let taken = f.paths.worktrees_dir().join("r1").join(name);
+        let taken = f.paths.repo_worktrees_dir(&repo).join(name);
         std::fs::create_dir_all(&taken).unwrap();
         std::fs::write(taken.join("LEAK.txt"), "in the way").unwrap();
     }

@@ -309,6 +309,90 @@ async fn dropping_stream_kills_process() {
     }
 }
 
+/// The pid written to `file`, once it is there.
+async fn pid_from(file: &Path) -> String {
+    let start = Instant::now();
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(file) {
+            if !pid.trim().is_empty() {
+                return pid.trim().to_owned();
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{} was never written",
+            file.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Fails unless the process is gone within two seconds.
+async fn assert_dies(pid: &str, what: &str) {
+    let start = Instant::now();
+    while pid_alive(pid) {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{what} is still alive"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn dropping_stream_kills_what_claude_started_too() {
+    // claude is in the middle of a turn and has started a process of its
+    // own (a dev server, say) when the turn is given up.
+    let dir = tempfile::tempdir().unwrap();
+    let (claude_pid, started_pid) = (dir.path().join("pid"), dir.path().join("started"));
+    let env = setup(&[
+        ("FAKE_CLAUDE_SLEEP", "30"),
+        ("FAKE_CLAUDE_PID_FILE", claude_pid.to_str().unwrap()),
+        ("FAKE_CLAUDE_GRANDCHILD_SECS", "30"),
+        (
+            "FAKE_CLAUDE_GRANDCHILD_PID_FILE",
+            started_pid.to_str().unwrap(),
+        ),
+    ]);
+    let stream = env
+        .harness
+        .run_turn(req(env.dir.path(), None))
+        .await
+        .unwrap();
+    let (claude, started) = (pid_from(&claude_pid).await, pid_from(&started_pid).await);
+    assert!(pid_alive(&claude) && pid_alive(&started));
+
+    drop(stream);
+
+    assert_dies(&claude, "claude").await;
+    assert_dies(&started, "the process claude started").await;
+}
+
+#[tokio::test]
+async fn what_claude_left_running_survives_a_turn_that_ended_on_its_own() {
+    // claude exits by itself, leaving a process behind on purpose: the
+    // harness only stops what a turn it gave up on had started.
+    let dir = tempfile::tempdir().unwrap();
+    let started_pid = dir.path().join("started");
+    let env = setup(&[
+        ("FAKE_CLAUDE_FIXTURE", FIXTURE),
+        ("FAKE_CLAUDE_GRANDCHILD_SECS", "5"),
+        (
+            "FAKE_CLAUDE_GRANDCHILD_PID_FILE",
+            started_pid.to_str().unwrap(),
+        ),
+    ]);
+
+    let events = collect_within(&env, req(env.dir.path(), None), LINGER_LIMIT).await;
+
+    assert!(
+        matches!(events.last(), Some(HarnessEvent::TurnCompleted { .. })),
+        "{events:?}"
+    );
+    let started = pid_from(&started_pid).await;
+    assert!(pid_alive(&started), "the process claude left was stopped");
+}
+
 /// Collects a turn's events, failing instead of hanging past `limit`.
 async fn collect_within(env: &Env, r: TurnRequest, limit: Duration) -> Vec<HarnessEvent> {
     tokio::time::timeout(limit, collect(env, r))

@@ -8,6 +8,7 @@
 #   FAKE_CLAUDE_SLEEP        seconds to sleep before exiting
 #   FAKE_CLAUDE_PID_FILE     receives this process's pid
 #   FAKE_CLAUDE_GRANDCHILD_SECS  background grandchild holding stderr open this long
+#   FAKE_CLAUDE_GRANDCHILD_PID_FILE  receives that grandchild's pid
 #   FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS  background grandchild holding stdout open this long
 #   FAKE_CLAUDE_STRUCTURED_FILE  JSON file; when argv has --json-schema it is printed as the
 #                            `--output-format json` result's structured_output
@@ -44,6 +45,9 @@ fi
 if [ -n "$FAKE_CLAUDE_GRANDCHILD_SECS" ]; then
   # Grandchild keeps inheriting stderr (but not stdout) after we exit.
   sleep "$FAKE_CLAUDE_GRANDCHILD_SECS" >/dev/null </dev/null &
+  if [ -n "$FAKE_CLAUDE_GRANDCHILD_PID_FILE" ]; then
+    echo "$!" > "$FAKE_CLAUDE_GRANDCHILD_PID_FILE"
+  fi
 fi
 if [ -n "$FAKE_CLAUDE_GRANDCHILD_STDOUT_SECS" ]; then
   # Grandchild keeps inheriting stdout (but not stderr or stdin) after we exit.
