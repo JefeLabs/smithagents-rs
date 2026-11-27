@@ -21,9 +21,10 @@ use super::text::{
     result_issue_unnamed, summary_idea, summary_intent, summary_issue, COMMENT_TOO_LONG_REASON,
     CREATE_INTENT_LABEL, CREATE_ISSUE_LABEL, DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT,
     GH_MISSING_REASON, GH_SIGNED_OUT_REASON, GH_TURNED_OFF, IDEA_NEEDS_PART,
-    IMAGE_TOO_LARGE_REASON, ISSUE_UNCONFIRMED_TEXT, LINK_STOPPED_TEXT, MAIN_IDEA_MAX_CHARS,
-    MAIN_IDEA_TOO_LONG_TEXT, MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES,
-    MAX_TOTAL_BYTES, MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON,
+    IMAGE_TOO_LARGE_REASON, INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING,
+    ISSUE_UNCONFIRMED_TEXT, LINK_STOPPED_TEXT, MAIN_IDEA_MAX_CHARS, MAIN_IDEA_TOO_LONG_TEXT,
+    MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES,
+    MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON,
     PLUGIN_OFF_REASON, PUBLIC_WARNING, REPO_GONE_TEXT, TOO_MANY_BOXES_REASON,
     UPLOAD_TOO_LARGE_TEXT, VIDEO_TOO_LARGE_REASON,
 };
@@ -49,13 +50,16 @@ pub const KINDS: [FeedbackKind; 3] = [
 /// an idea package with no part or sent as an issue),
 /// `FeedbackService::require_github` (`no_github_remote`, `gh_not_ready`),
 /// `FeedbackService::require_tool` (`tool_missing`, also an idea package's
-/// demo video without `agent-browser`),
-/// `repo::require_published_default_branch` (`unpushed_commits`, for an
+/// demo video without `agent-browser`), `FeedbackService::check_publication`
+/// (which runs before a commit is made or one left by a stopped daemon is
+/// taken up, so nothing is recorded under the id when it refuses):
+/// `unpushed_commits` from `repo::require_published_default_branch` (for an
 /// issue: the default branch has commits `origin` has not got, or nothing
-/// was ever fetched), `FeedbackService::acknowledgement`
-/// (`public_not_acknowledged`, for an issue to a repository that is or may
-/// be public, sent without the user's acknowledgement) and
-/// `repo::place_and_commit` (`default_branch_missing`,
+/// was ever fetched; for an idea package to a GitHub repository: the same,
+/// once it was fetched) and `public_not_acknowledged` from
+/// `FeedbackService::acknowledgement` (for an issue, or a plain intent to a
+/// GitHub repository, that is or may be public, sent without the user's
+/// acknowledgement), and `repo::place_and_commit` (`default_branch_missing`,
 /// `git_identity_missing`, `no_free_name`, `name_taken`, `folder_blocked`,
 /// `branch_blocked`). They count only as a 4xx answer: the daemon sends
 /// `git_failed` and `io_error` as 500, and any 5xx locks. (Before a push,
@@ -77,10 +81,9 @@ pub const NOTHING_MADE_CODES: [&str; 14] = [
     PUBLIC_NOT_ACKNOWLEDGED,
 ];
 
-/// The daemon's code for a GitHub issue to a repository that is or may be
-/// public, sent without the user's acknowledgement: the app asks (with
-/// [`MAYBE_PUBLIC_WARNING`](crate::feedback::text::MAYBE_PUBLIC_WARNING))
-/// and sends again with it.
+/// The daemon's code for a GitHub issue or a plain intent to a repository
+/// that is or may be public, sent without the user's acknowledgement: the
+/// app asks ([`maybe_public_warning`]) and sends again with it.
 pub const PUBLIC_NOT_ACKNOWLEDGED: &str = "public_not_acknowledged";
 
 /// The daemon's code when a tool the submission needs is not ready: only
@@ -199,17 +202,43 @@ pub fn issue_reason(
     })
 }
 
-/// The warning shown for a GitHub issue: the repository is public, or its
-/// visibility is not known (also when nothing is known of it). An intent
-/// never leaves the machine, so it has none.
-pub fn public_warning(send_as: SendAs, target: Option<&FeedbackTarget>) -> Option<&'static str> {
-    if send_as != SendAs::GithubIssue {
-        return None;
+/// The warning shown (and asked about before a send) when the screenshots
+/// will reach GitHub: for a GitHub issue, unless the repository is known to
+/// be private (also when nothing is known of it); for a plain intent to a
+/// repository with a GitHub remote, whose agent opens a pull request there,
+/// unless it is known to be private. An idea package has none: nothing of
+/// it leaves the machine before "Open pull request…" or "Create
+/// implementation intent…", which ask themselves. Neither has one for a
+/// repository without a GitHub remote.
+pub fn public_warning(
+    send_as: SendAs,
+    idea: Option<IdeaOptions>,
+    target: Option<&FeedbackTarget>,
+) -> Option<&'static str> {
+    let known = target.and_then(|target| target.is_public);
+    match (send_as, idea) {
+        (SendAs::GithubIssue, _) => match known {
+            Some(true) => Some(PUBLIC_WARNING),
+            Some(false) => None,
+            None => Some(MAYBE_PUBLIC_WARNING),
+        },
+        (SendAs::Intent, Some(_)) => None,
+        (SendAs::Intent, None) => match known {
+            _ if !target.is_some_and(|target| target.has_github_remote) => None,
+            Some(true) => Some(INTENT_PUBLIC_WARNING),
+            Some(false) => None,
+            None => Some(INTENT_MAYBE_PUBLIC_WARNING),
+        },
     }
-    match target.and_then(|target| target.is_public) {
-        Some(true) => Some(PUBLIC_WARNING),
-        Some(false) => None,
-        None => Some(MAYBE_PUBLIC_WARNING),
+}
+
+/// What is asked when the daemon refuses a send to a repository the app
+/// took for private, or knew nothing of (`public_not_acknowledged`): that it
+/// may be public, in the words of `send_as`.
+pub fn maybe_public_warning(send_as: SendAs) -> &'static str {
+    match send_as {
+        SendAs::GithubIssue => MAYBE_PUBLIC_WARNING,
+        SendAs::Intent => INTENT_MAYBE_PUBLIC_WARNING,
     }
 }
 

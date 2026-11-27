@@ -394,9 +394,16 @@ impl Client {
 
     /// `POST /v1/intents/{id}/implementation`: an idea intent's "Create
     /// implementation intent", answered with the new (or the earlier) one.
-    pub async fn create_implementation_intent(&self, id: IntentId) -> Result<Intent, ClientError> {
+    /// `public_acknowledged` as for [`Self::open_pull_request`]: its agent's
+    /// pull request carries the idea's screenshots and explainer.
+    pub async fn create_implementation_intent(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> Result<Intent, ClientError> {
         let url = self.url(&format!("/v1/intents/{id}/implementation"));
-        self.fetch(self.http.post(url)).await
+        let body = json!({ "public_acknowledged": public_acknowledged });
+        self.fetch(self.http.post(url).json(&body)).await
     }
 
     /// `/v1/plugins/<segments>?<params>`, each segment percent-encoded, so an

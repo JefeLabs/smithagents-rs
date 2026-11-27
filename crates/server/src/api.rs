@@ -1046,11 +1046,22 @@ async fn resolve_intent(
         .map(Json)
 }
 
-/// The body of "Open pull request": none, or `{"public_acknowledged": …}`.
+/// The body of "Open pull request" and "Create implementation intent": none,
+/// or `{"public_acknowledged": …}`.
 #[derive(Default, Deserialize)]
-struct OpenPullRequestBody {
+struct IdeaActionBody {
     #[serde(default)]
     public_acknowledged: bool,
+}
+
+/// An idea action's body: none, or `{}`, is not acknowledged; a body that is
+/// not that JSON is the usual 400.
+fn idea_action_body(body: &Bytes) -> Result<IdeaActionBody, ApiError> {
+    if body.is_empty() {
+        Ok(IdeaActionBody::default())
+    } else {
+        json_body(body)
+    }
 }
 
 /// An idea intent's "Open pull request", with an optional body (no body, or
@@ -1062,30 +1073,34 @@ async fn open_pull_request(
     body: Bytes,
 ) -> Result<Json<Intent>, ApiError> {
     let id: IntentId = path_id(&id, "intent")?;
-    let OpenPullRequestBody {
+    let IdeaActionBody {
         public_acknowledged,
-    } = if body.is_empty() {
-        OpenPullRequestBody::default()
-    } else {
-        json_body(&body)?
-    };
+    } = idea_action_body(&body)?;
     let svc = s.feedback;
     detached(async move { svc.open_pull_request(id, public_acknowledged).await })
         .await
         .map(Json)
 }
 
-/// An idea intent's "Create implementation intent": 201 with the intent
-/// (also when it was made before). Detached like the other mutating routes.
+/// An idea intent's "Create implementation intent", with the same optional
+/// body as "Open pull request": 201 with the intent (also when it was made
+/// before). Detached like the other mutating routes.
 async fn create_implementation_intent(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<Intent>), ApiError> {
     let id: IntentId = path_id(&id, "intent")?;
+    let IdeaActionBody {
+        public_acknowledged,
+    } = idea_action_body(&body)?;
     let svc = s.feedback;
-    detached(async move { svc.create_implementation_intent(id).await })
-        .await
-        .map(|intent| (StatusCode::CREATED, Json(intent)))
+    detached(async move {
+        svc.create_implementation_intent(id, public_acknowledged)
+            .await
+    })
+    .await
+    .map(|intent| (StatusCode::CREATED, Json(intent)))
 }
 
 async fn get_agent_defaults(State(s): State<AppState>) -> Result<Json<AgentDefaults>, ApiError> {

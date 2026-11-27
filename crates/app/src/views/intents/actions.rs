@@ -16,9 +16,11 @@
 //! which asks first and then has the daemon push the idea branch and open a
 //! draft pull request, or once there is one its address (only a github.com
 //! pull request's, [`shows_pull_request_url`]), which opens in the browser;
-//! and "Create implementation intent", which opens the intent the daemon
-//! answers with. Both run through the feedback commands, disabled without
-//! them.
+//! and "Create implementation intent…", which asks first (its agent's pull
+//! request will carry the idea's files) and opens the intent the daemon
+//! answers with while the idea's detail is still on screen. Both run through
+//! the feedback commands, disabled without them, and both are sent with the
+//! user's acknowledgement once confirmed.
 //!
 //! The start error ("The agent could not start: …") is drawn in every state
 //! while the daemon keeps it. A Send the daemon refuses with that same error
@@ -56,8 +58,8 @@ use smithagents_core::intent::{Intent, IntentState};
 use super::detail::opens_a_link;
 use super::{Busy, IntentsPane, Paint, Screen};
 use crate::feedback::text::{
-    COPY_LINK_LABEL, IMPLEMENT_LABEL, OPEN_PR_CONFIRM_LABEL, OPEN_PR_LABEL, PR_DESCRIPTION,
-    PR_TITLE,
+    COPY_LINK_LABEL, IMPLEMENT_CONFIRM_LABEL, IMPLEMENT_DESCRIPTION, IMPLEMENT_LABEL,
+    IMPLEMENT_TITLE, OPEN_PR_CONFIRM_LABEL, OPEN_PR_LABEL, PR_DESCRIPTION, PR_TITLE,
 };
 use crate::intent_vm::{
     idea_actions_shown, not_done_text, queued_reason, shows_pull_request_url, start_error_text,
@@ -95,8 +97,13 @@ pub const OPEN_PR_CONFIRM_ID: &str = "intent-open-pr-confirm";
 pub const PR_URL_ID: &str = "intent-pr-url";
 /// Element id of "Not done: …" (a status).
 pub const NOT_DONE_ID: &str = "intent-not-done";
-/// Element id of the "Create implementation intent" button.
+/// Element id of the "Create implementation intent…" button (it opens the
+/// confirmation), and of the confirmation's title, text and buttons.
 pub const IMPLEMENT_ID: &str = "intent-implement";
+pub const IMPLEMENT_TITLE_ID: &str = "intent-implement-title";
+pub const IMPLEMENT_DESCRIPTION_ID: &str = "intent-implement-description";
+pub const IMPLEMENT_CANCEL_ID: &str = "intent-implement-cancel";
+pub const IMPLEMENT_CONFIRM_ID: &str = "intent-implement-confirm";
 /// Element id of the button that copies the pull request's address.
 pub const PR_COPY_ID: &str = "intent-pr-copy";
 /// Element id of the pull request address's clickable area.
@@ -199,7 +206,7 @@ impl IntentsPane {
                 .disabled(disabled)
                 .loading(self.busy == Some(Busy::Implementation))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.create_implementation(id, window, cx)
+                    this.ask_to_create_implementation(id, window, cx)
                 }))
                 .into_any_element(),
         );
@@ -355,14 +362,41 @@ impl IntentsPane {
         );
     }
 
-    /// Asks the daemon for the idea's implementation intent, and opens it;
-    /// nothing while another command is in flight.
+    /// Opens the implementation intent's confirmation; nothing while a
+    /// command is in flight or without feedback commands.
+    fn ask_to_create_implementation(
+        &mut self,
+        id: IntentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy.is_some() || self.state.read(cx).feedback_commands().is_none() {
+            return;
+        }
+        confirm(
+            cx.entity().downgrade(),
+            &IMPLEMENT_CONFIRMATION,
+            move |pane, window, cx| pane.create_implementation(id, window, cx),
+            window,
+            cx,
+        );
+    }
+
+    /// Asks the daemon for the idea's implementation intent, and opens it
+    /// while the idea's detail is still on screen (a user who went elsewhere
+    /// is not pulled away); nothing while another command is in flight. Only
+    /// sent from the confirmation, whose text says that its pull request may
+    /// show the idea's files to anyone: so it is acknowledged.
     fn create_implementation(&mut self, id: IntentId, window: &mut Window, cx: &mut Context<Self>) {
         tracing::debug!(%id, "creating an idea's implementation intent");
         self.feedback_command(
             Busy::Implementation,
-            move |commands| commands.create_implementation_intent(id),
-            |pane, created, window, cx| pane.open_screen(Screen::Detail(created.id), window, cx),
+            move |commands| commands.create_implementation_intent(id, true),
+            move |pane, created, window, cx| {
+                if pane.screen == Screen::Detail(id) {
+                    pane.open_screen(Screen::Detail(created.id), window, cx);
+                }
+            },
             window,
             cx,
         );
@@ -542,6 +576,18 @@ const OPEN_PR_CONFIRMATION: Confirmation = Confirmation {
     cancel_id: OPEN_PR_CANCEL_ID,
     confirm_id: OPEN_PR_CONFIRM_ID,
     confirm: OPEN_PR_CONFIRM_LABEL,
+};
+
+/// "Create an implementation intent?", which says that its agent's pull
+/// request will carry the idea's files (asked every time).
+const IMPLEMENT_CONFIRMATION: Confirmation = Confirmation {
+    title_id: IMPLEMENT_TITLE_ID,
+    title: IMPLEMENT_TITLE,
+    description_id: IMPLEMENT_DESCRIPTION_ID,
+    description: IMPLEMENT_DESCRIPTION,
+    cancel_id: IMPLEMENT_CANCEL_ID,
+    confirm_id: IMPLEMENT_CONFIRM_ID,
+    confirm: IMPLEMENT_CONFIRM_LABEL,
 };
 
 /// Asks first: `what`'s title and text, with Cancel (focused, and what

@@ -8,9 +8,11 @@
 //!
 //! One command at a time: while a submission or a retry is under way every
 //! control waits and the pressed button shows the spinner; nothing changes
-//! before the daemon answers. Sending to a repository that is (or may be)
-//! public asks first, every time. The limits the daemon checks are checked
-//! here first, so nothing is uploaded that it would refuse.
+//! before the daemon answers. Sending to GitHub a repository that is (or may
+//! be) public will show (an issue, or a plain intent whose agent opens a
+//! pull request there: see [`public_warning`]) asks first, every time. The
+//! limits the daemon checks are checked here first, so nothing is uploaded
+//! that it would refuse.
 //!
 //! The draft keeps one submission id ([`Pending`]) for every send of it. A
 //! success deletes the draft, says what was created on the draft screen and,
@@ -24,7 +26,9 @@
 //! submission; what was committed stays; asked first while no answer came).
 //! A request that never left, and a refusal after which the daemon made
 //! nothing, leave the form editable under the same id; the refusal's
-//! sentence stays until the next send.
+//! sentence stays until the next send. A refused re-upload (sent only after
+//! an earlier request under the id went unanswered, which may still make
+//! its commit) leaves the draft locked as it was.
 //!
 //! Escape and "Back" go back to the draft (not while a command is under way),
 //! and the focus returns to where it was when the screen opened.
@@ -63,15 +67,15 @@ use super::card::cards;
 use super::{confirm, Confirmation, FeedbackPane, FeedbackScreen, Paint};
 use crate::feedback::state::{Pending, SentTo, SUBMIT_TIMEOUT};
 use crate::feedback::submit_vm::{
-    asks_to_acknowledge, can_confirm, confirm_label, failure_text, issue_reason, public_warning,
-    result_text, send_failure, starting_repo, submit_error_text, summary, upload_problem,
-    SendFailure, KINDS,
+    asks_to_acknowledge, can_confirm, confirm_label, failure_text, issue_reason,
+    maybe_public_warning, public_warning, result_text, send_failure, starting_repo,
+    submit_error_text, summary, upload_problem, SendFailure, KINDS,
 };
 use crate::feedback::text::{
     BACK_LABEL, CHOOSE_REPO_TEXT, KIND_LABEL, MAIN_IDEA_HINT, MAIN_IDEA_LABEL,
-    MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE,
-    REPO_LABEL, RETRY_LABEL, SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL,
-    START_OVER_LABEL, START_OVER_RISK_TEXT, START_OVER_TITLE, START_OVER_TOOLTIP,
+    NOTHING_CREATED_TEXT, PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL,
+    SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL, START_OVER_LABEL,
+    START_OVER_RISK_TEXT, START_OVER_TITLE, START_OVER_TOOLTIP,
 };
 use crate::intent_vm::kind_label;
 use crate::link::LinkError;
@@ -564,9 +568,11 @@ impl FeedbackPane {
             .update(cx, |feedback, cx| feedback.forget_submission(cx));
     }
 
-    /// Sends now, or, for a GitHub issue in a repository that is or may be
-    /// public, after the user confirms (every time): only then does the
-    /// request carry `public_acknowledged`.
+    /// Sends now, or, when the screenshots will reach GitHub in a
+    /// repository that is or may be public ([`public_warning`]: an issue, or
+    /// a plain intent whose agent opens a pull request there), after the
+    /// user confirms (every time): only then does the request carry
+    /// `public_acknowledged`.
     fn ask_then_send(
         &mut self,
         to: SentTo,
@@ -574,7 +580,8 @@ impl FeedbackPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(warning) = public_warning(to.send_as, self.target(Some(to.repo_id))) else {
+        let target = self.target(Some(to.repo_id));
+        let Some(warning) = public_warning(to.send_as, to.idea, target) else {
             self.send(to, attempt, false, window, cx);
             return;
         };
@@ -789,11 +796,13 @@ impl FeedbackPane {
                         Some(submit_error_text(&e))
                     }
                     SendFailure::Refused => {
-                        // The daemon made nothing for this request; a
-                        // recorded submission stays as it was.
+                        // The daemon made nothing for this request. A
+                        // recorded submission stays as it was, and so does
+                        // one re-uploaded: an earlier request under its id
+                        // went unanswered and may still make its commit.
                         let (sent, awaiting) = match attempt {
-                            Attempt::Retry => before,
-                            Attempt::Submit | Attempt::Reupload => (None, false),
+                            Attempt::Retry | Attempt::Reupload => before,
+                            Attempt::Submit => (None, false),
                         };
                         self.feedback
                             .update(cx, |feedback, cx| feedback.set_sent(sent, awaiting, cx));
@@ -803,7 +812,8 @@ impl FeedbackPane {
                         // the same id once confirmed.
                         if !acknowledged && attempt != Attempt::Retry && asks_to_acknowledge(&e) {
                             tracing::info!("the daemon asks to confirm a public repository");
-                            self.ask_public(to, attempt, MAYBE_PUBLIC_WARNING, window, cx);
+                            let warning = maybe_public_warning(to.send_as);
+                            self.ask_public(to, attempt, warning, window, cx);
                         }
                         Some(submit_error_text(&e))
                     }
@@ -895,7 +905,7 @@ impl FeedbackPane {
         let reason = self.issue_reason(repo);
         let idea = self.chosen_idea(send_as, cx);
         let issue_disabled = frozen || self.submit.targets.is_none() || reason.is_some();
-        let warning = public_warning(send_as, self.target(repo));
+        let warning = public_warning(send_as, idea, self.target(repo));
         let cards = cards(self.feedback.read(cx));
         v_flex()
             .id(SCREEN_ID)

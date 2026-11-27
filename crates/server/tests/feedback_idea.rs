@@ -343,14 +343,28 @@ impl Fx {
         (status, serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
-    /// `POST /v1/intents/{id}/implementation`.
+    /// `POST /v1/intents/{id}/implementation` once the user confirmed that
+    /// its pull request may show the idea's files to anyone, as the app
+    /// sends it.
     async fn implement(&self, id: IntentId) -> (StatusCode, Value) {
         self.call(
             Method::POST,
             &format!("/v1/intents/{id}/implementation"),
-            None,
+            Some(json!({"public_acknowledged": true})),
         )
         .await
+    }
+
+    /// `POST /v1/intents/{id}/implementation` with this raw body (or none).
+    async fn implement_raw(&self, id: IntentId, body: Option<&str>) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/intents/{id}/implementation"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+            .unwrap();
+        self.send(req).await
     }
 
     /// [`Fx::add_repo`] whose `origin` is `url`, which git sends to the
@@ -1208,10 +1222,11 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
     let calls = fx.fake.calls();
     assert_eq!(calls.len(), 3, "{calls:?}");
     assert_eq!(calls[0], "auth status --hostname=github.com");
+    // Only a pull request for the commit pushed is looked for.
     assert_eq!(
         calls[1],
         format!(
-            r#"pr list {REPO_ARG} --head={BRANCH} --author=@me --state=all --json=url --jq=.[0].url // """#
+            r#"pr list {REPO_ARG} --head={BRANCH} --author=@me --state=all --json=url,headRefOid --jq=map(select(.headRefOid == "{head}")) | .[0].url // """#
         )
     );
     assert!(
@@ -1276,15 +1291,47 @@ async fn an_existing_pull_request_is_reused() {
     })
     .await;
     let (repo, _bare) = fx.github_repo("r1").await;
-    let (idea, _, _) = fx.sent_idea(&repo).await;
+    let (idea, _, head) = fx.sent_idea(&repo).await;
     let existing = "https://github.com/smithagents-test-invalid/widgets/pull/5";
     fx.fake.set("existing", existing);
+    fx.fake.set("existing-head", &head);
 
     let (status, body) = fx.open_pr(idea.id).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["origin"]["idea"]["pr_url"], existing);
     assert!(fx.calls_starting("pr create").is_empty());
+}
+
+#[tokio::test]
+async fn a_pull_request_for_another_commit_is_never_taken() {
+    // D-M5: the branch's pull request is the idea's only when its head is
+    // the commit pushed.
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, _bare) = fx.github_repo("r1").await;
+    let (idea, _, head) = fx.sent_idea(&repo).await;
+    fx.fake.set(
+        "existing",
+        "https://github.com/smithagents-test-invalid/widgets/pull/5",
+    );
+    fx.fake
+        .set("existing-head", "fedcba9876543210fedcba9876543210fedcba98");
+
+    let (status, body) = fx.open_pr(idea.id).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"]["idea"]["pr_url"], PR_URL, "a new one");
+    let listed = fx.calls_starting("pr list");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        listed[0].contains(&format!(r#"select(.headRefOid == "{head}")"#)),
+        "{listed:?}"
+    );
+    assert_eq!(fx.calls_starting("pr create").len(), 1);
 }
 
 #[tokio::test]
@@ -1950,16 +1997,40 @@ async fn unpushed_default_branch_commits_never_go_out_with_an_idea() {
     })
     .await;
     let (repo, bare) = fx.github_repo("r1").await;
-    // origin has M0; the local main has M1 on top when the idea is made.
-    common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
-    common::git(&repo.path, &["fetch", "-q", "origin"]);
+    // Never fetched when the idea is made on M1, a commit of main's own
+    // (Submit lets an idea through then: see the next test); origin then
+    // turns out to have only M0.
+    common::git(
+        &repo.path,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
     common::git(
         &repo.path,
         &["commit", "-q", "--allow-empty", "-m", "M1, not for anyone"],
     );
     let m1 = git_out(&repo.path, &["rev-parse", "main"]);
-    // The intent path pushes nothing, so the idea is made.
     let (idea, _, head) = fx.sent_idea(&repo).await;
+
+    // Never fetched: refused.
+    let (status, body) = fx.open_pr(idea.id).await;
+    assert_eq!(
+        refusal(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Some("unpushed_commits"),
+            Some(NEVER_FETCHED)
+        )
+    );
+    common::git(
+        &repo.path,
+        &[
+            "push",
+            "-q",
+            bare.to_str().unwrap(),
+            "main^:refs/heads/main",
+        ],
+    );
+    common::git(&repo.path, &["fetch", "-q", "origin"]);
 
     let (status, body) = fx.open_pr(idea.id).await;
 
@@ -1974,7 +2045,9 @@ async fn unpushed_default_branch_commits_never_go_out_with_an_idea() {
     assert_eq!(bare_branches(&bare), ["main"]);
     assert!(!has_object(&bare, &m1), "M1 stayed at home");
     assert!(fx.calls_starting("pr").is_empty(), "{:?}", fx.fake.calls());
-    assert_eq!(fx.idea_of(idea.id).await.pr_url, None);
+    let package = fx.idea_of(idea.id).await;
+    // D-C1: a refusal pins nothing.
+    assert_eq!((package.pr_url, package.pr_commit), (None, None));
 
     // Once M1 is on origin, the retry goes through.
     common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
@@ -1983,24 +2056,193 @@ async fn unpushed_default_branch_commits_never_go_out_with_an_idea() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["origin"]["idea"]["pr_url"], PR_URL);
     assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), head);
+}
 
-    // Never fetched: refused as well.
-    let (repo, bare) = fx.github_repo("r2").await;
-    let (idea, _, _) = fx.sent_idea(&repo).await;
+#[tokio::test]
+async fn an_idea_submission_meets_the_push_guard_before_its_commit() {
+    // D-I2.
+    let fx = fixture(false).await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    common::git(&repo.path, &["fetch", "-q", "origin"]);
     common::git(
         &repo.path,
-        &["update-ref", "-d", "refs/remotes/origin/main"],
+        &["commit", "-q", "--allow-empty", "-m", "M1, not for anyone"],
     );
-    let (status, body) = fx.open_pr(idea.id).await;
+
+    let (status, body) = fx.submit(&idea_request(&repo, true, false, false)).await;
+
     assert_eq!(
         refusal(status, &body),
         (
             StatusCode::CONFLICT,
             Some("unpushed_commits"),
-            Some(NEVER_FETCHED)
+            Some(UNPUSHED)
         )
     );
-    assert!(bare_branches(&bare).is_empty());
+    assert!(branches(&repo.path, "idea/*").is_empty(), "nothing made");
+    assert!(fx.intents().await.is_empty());
+    // Pushed and fetched: made.
+    common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    common::git(&repo.path, &["fetch", "-q", "origin"]);
+    let (status, body) = fx.submit(&idea_request(&repo, true, false, false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Never fetched: made all the same ("Open pull request" asks to fetch).
+    let (repo, _bare) = fx.github_repo("r2").await;
+    common::git(
+        &repo.path,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    common::git(
+        &repo.path,
+        &["commit", "-q", "--allow-empty", "-m", "M1, not for anyone"],
+    );
+    let (status, body) = fx.submit(&idea_request(&repo, true, false, false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // So is one without a GitHub remote, never pushed by the daemon.
+    let repo = fx.add_repo("r3").await;
+    common::git(
+        &repo.path,
+        &["commit", "-q", "--allow-empty", "-m", "M1, not for anyone"],
+    );
+    let (status, body) = fx.submit(&idea_request(&repo, true, false, false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // An idea submission is never asked for the acknowledgement.
+    assert!(
+        fx.calls_starting("repo view").is_empty(),
+        "{:?}",
+        fx.fake.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_commit_taken_off_the_agents_branch_is_never_pushed() {
+    // D-C1: the first press's push fails; the user amends the agent's
+    // branch to drop a file; the next press chooses again.
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, agent, head) = fx.sent_idea(&repo).await;
+    let hook = refuse_pushes(&bare);
+    let (status, body) = fx.open_pr(idea.id).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(
+        fx.idea_of(idea.id).await.pr_commit.as_deref(),
+        Some(head.as_str()),
+        "chosen before the push"
+    );
+    common::git(
+        &agent.worktree_path,
+        &["rm", "-q", &format!("{FOLDER}/diagram-1.png")],
+    );
+    common::git(
+        &agent.worktree_path,
+        &["commit", "-q", "--amend", "--no-edit"],
+    );
+    let amended = git_out(&agent.worktree_path, &["rev-parse", "HEAD"]);
+    assert_ne!(amended, head);
+    // The amended-away commit still resolves here.
+    assert_eq!(git_out(&repo.path, &["rev-parse", &head]), head);
+    std::fs::remove_file(&hook).unwrap();
+
+    let (status, body) = fx.open_pr(idea.id).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), amended);
+    assert!(!has_object(&bare, &head), "the old commit never left");
+    assert_eq!(
+        fx.idea_of(idea.id).await.pr_commit.as_deref(),
+        Some(amended.as_str())
+    );
+    let pr_body = fx.fake.read("pr-body.md").unwrap();
+    assert!(pr_body.contains(&format!("blob/{amended}/")), "{pr_body}");
+    assert!(!pr_body.contains(&head), "{pr_body}");
+}
+
+#[tokio::test]
+async fn an_idea_committed_through_git_lfs_is_refused() {
+    // D-I1: a pointer pushed with hooks off would never upload its object.
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, agent, _) = fx.sent_idea(&repo).await;
+    commit_in(
+        &agent.worktree_path,
+        &[(
+            "demo.mp4",
+            "version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n",
+        )],
+        "the demo video",
+    );
+
+    let (status, body) = fx.open_pr(idea.id).await;
+
+    assert_eq!(
+        refusal(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Some("idea_lfs"),
+            Some("The idea's files were committed through Git LFS, which this push does not upload. Turn Git LFS off for docs/issues and ask the agent to commit them again.")
+        )
+    );
+    assert!(bare_branches(&bare).is_empty(), "nothing pushed");
+    assert_eq!(fx.idea_of(idea.id).await.pr_commit, None, "nothing chosen");
+    assert!(fx.calls_starting("pr").is_empty(), "{:?}", fx.fake.calls());
+}
+
+#[tokio::test]
+async fn the_implementation_route_needs_the_acknowledgement_on_a_public_repository() {
+    // D-C3: its agent's pull request carries the idea's files.
+    let fx = fixture_with(Opts {
+        turns: 2,
+        ..Opts::default()
+    })
+    .await;
+    fx.fake.set("visibility", "PUBLIC");
+    let (repo, _bare) = fx.github_repo("r1").await;
+    let (idea, _, _) = fx.sent_idea(&repo).await;
+
+    for body in [None, Some("{}"), Some(r#"{"public_acknowledged": false}"#)] {
+        let (status, answer) = fx.implement_raw(idea.id, body).await;
+        assert_eq!(
+            refusal(status, &answer),
+            (
+                StatusCode::CONFLICT,
+                Some("public_not_acknowledged"),
+                Some(PUBLIC)
+            ),
+            "{body:?}"
+        );
+    }
+    assert_eq!(fx.intents().await.len(), 1, "nothing created");
+    assert_eq!(fx.idea_of(idea.id).await.implementation_intent_id, None);
+    let (status, answer) = fx.implement_raw(idea.id, Some("not json")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+
+    // Acknowledged: made, and gh is not asked again.
+    let views = fx.calls_starting("repo view").len();
+    let (status, answer) = fx.implement(idea.id).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
+    assert_eq!(fx.intents().await.len(), 2);
+    assert_eq!(fx.calls_starting("repo view").len(), views);
+
+    // A repository without a GitHub remote is not asked.
+    let (repo, _bare) = fx
+        .repo_with_origin(
+            "r2",
+            "https://gitlab.com/smithagents-test-invalid/widgets.git",
+        )
+        .await;
+    let (idea, _, _) = fx.sent_idea(&repo).await;
+    let (status, answer) = fx.implement_raw(idea.id, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{answer}");
 }
 
 #[tokio::test]

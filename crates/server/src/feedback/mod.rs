@@ -15,8 +15,8 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{
-    effective_meta_repo, FeedbackFailure, FeedbackOrigin, FeedbackOutcome, FeedbackSettings,
-    FeedbackStep, FeedbackTarget, FeedbackTargets, SendAs, SubmissionId,
+    effective_meta_repo, FeedbackFailure, FeedbackOrigin, FeedbackOutcome, FeedbackRequest,
+    FeedbackSettings, FeedbackStep, FeedbackTarget, FeedbackTargets, SendAs, SubmissionId,
 };
 use smithagents_core::ids::{IntentId, RepoId};
 use smithagents_core::intent::{CreateIntentRequest, Intent, SeedInput};
@@ -348,6 +348,17 @@ struct Faults {
 #[cfg(feature = "test-util")]
 pub type HeadHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// What [`FeedbackService::precheck`] found for a new submission, for
+/// [`FeedbackService::check_publication`].
+struct Precheck {
+    /// The github.com repository `origin` names; `None` when it names none.
+    github: Option<GithubRepo>,
+    /// [`FeedbackService::acknowledgement`]'s answer for a request whose
+    /// files are published (an issue; a plain intent to a GitHub
+    /// repository); `Ok` for any other.
+    acknowledged: Result<(), FeedbackError>,
+}
+
 /// Counts a submission in [`Parts::running`] while it lives.
 struct Running<'a>(&'a AtomicUsize);
 
@@ -673,33 +684,28 @@ impl FeedbackService {
     /// used): only a step that has not succeeded runs again. So is one whose
     /// commit is on a branch without its record (the daemon stopped in
     /// between): that commit is recorded, not made again. A record that
-    /// cannot be stored takes its new branch back. An issue submission is
-    /// refused before anything is written when `origin` is not on github.com
-    /// or `gh` is not ready. A failure of a step after the commit is in the
-    /// answer's `failed`, not an error, and undoes nothing.
+    /// cannot be stored takes its new branch back. Before anything is
+    /// written or taken up, a new submission is checked for what it
+    /// publishes ([`Self::check_publication`]): an issue is refused when
+    /// `origin` is not on github.com or `gh` is not ready. A failure of a
+    /// step after the commit is in the answer's `failed`, not an error, and
+    /// undoes nothing.
     pub async fn submit(&self, staged: Staged) -> Result<FeedbackOutcome, FeedbackError> {
         let _running = Running::start(&self.parts.running);
         let id = staged.request.submission_id;
         let _own = self.parts.ids.lock(id).await;
         // Before the turn, since `gh` can take seconds. A recorded
         // submission is continued, never refused.
-        let gh_checked = staged.request.send_as == SendAs::GithubIssue
-            && self.store.get_submission(id).await?.is_none();
-        // Asked here too (`gh` may be asked whether the repository is
-        // public); its answer counts only for a new commit, after the push
-        // check (see `record`).
-        let acknowledged = if gh_checked {
-            let github = self.require_github(staged.request.repo_id).await?;
-            Some(
-                self.acknowledgement(&github, staged.request.public_acknowledged)
-                    .await,
-            )
-        } else {
+        let recorded = self.store.get_submission(id).await?.is_some();
+        let precheck = if recorded {
             None
+        } else {
+            Some(self.precheck(&staged.request).await?)
         };
+        let gh_checked = !recorded && staged.request.send_as == SendAs::GithubIssue;
         let submission = {
             let _turn = self.parts.submitting.lock().await;
-            self.record(staged, acknowledged).await?
+            self.record(staged, precheck).await?
         };
         self.finish(submission, gh_checked).await
     }
@@ -720,12 +726,13 @@ impl FeedbackService {
     }
 
     /// The submission's record: the stored one, the one of a commit made
-    /// before, or a new commit's. `acknowledged`: for a GitHub issue, what
-    /// [`Self::acknowledgement`] answered; it refuses only a new commit.
+    /// before, or a new commit's. `precheck`: what [`Self::precheck`] found
+    /// for a submission not recorded then; a commit is made or taken up only
+    /// once [`Self::check_publication`] lets it.
     async fn record(
         &self,
         staged: Staged,
-        acknowledged: Option<Result<(), FeedbackError>>,
+        precheck: Option<Precheck>,
     ) -> Result<Submission, FeedbackError> {
         let id = staged.request.submission_id;
         if let Some(recorded) = self.store.get_submission(id).await? {
@@ -739,6 +746,18 @@ impl FeedbackService {
             .get_repo(request.repo_id)
             .await?
             .ok_or(FeedbackError::RepoNotFound)?;
+        let precheck = match precheck {
+            Some(precheck) => precheck,
+            None => self.precheck(request).await?,
+        };
+        // Before a commit is taken up as well: a request re-sent after a
+        // stop meets the same checks as a new one, and a refusal leaves the
+        // commit as it was, unrecorded.
+        self.check_publication(request, &repo, precheck)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(submission_id = %id, step = "commit", code = e.code(), "feedback was not committed");
+            })?;
         // A run that stopped after its commit and before its record.
         if let Some(found) = find_committed(&repo, id).await? {
             tracing::info!(submission_id = %id, step = "commit", "taking up a feedback commit made before");
@@ -764,19 +783,6 @@ impl FeedbackService {
         }
         if request.idea.is_some_and(|idea| idea.demo_video) {
             self.require_tool(AGENT_BROWSER).await?;
-        }
-        // An issue's branch is pushed: nothing it is built on may publish
-        // the user's unpushed work (checked again before the push).
-        if request.send_as == SendAs::GithubIssue {
-            repo::require_published_default_branch(&repo)
-                .await
-                .inspect_err(|e| {
-                    tracing::warn!(submission_id = %id, step = "commit", code = e.code(), "feedback was not committed");
-                })?;
-            if let Some(Err(e)) = acknowledged {
-                tracing::warn!(submission_id = %id, step = "commit", code = e.code(), "feedback was not committed");
-                return Err(e);
-            }
         }
 
         let created = (self.clock)();
@@ -825,6 +831,72 @@ impl FeedbackService {
         Ok(submission)
     }
 
+    /// What a new submission's request needs to know before anything is
+    /// committed, asked before its turn (`gh` can take seconds): for an
+    /// issue, [`Self::require_github`] (refused at once) and the
+    /// acknowledgement; for an intent, whether `origin` is a GitHub
+    /// repository and, for a plain intent (whose agent opens a pull request
+    /// there), the acknowledgement. An idea package is not asked: nothing
+    /// of it is published before "Open pull request", which asks itself.
+    async fn precheck(&self, request: &FeedbackRequest) -> Result<Precheck, FeedbackError> {
+        let acknowledged = request.public_acknowledged;
+        if request.send_as == SendAs::GithubIssue {
+            let github = self.require_github(request.repo_id).await?;
+            let answer = self.acknowledgement(&github, acknowledged).await;
+            return Ok(Precheck {
+                github: Some(github),
+                acknowledged: answer,
+            });
+        }
+        let repo = self
+            .store
+            .get_repo(request.repo_id)
+            .await?
+            .ok_or(FeedbackError::RepoNotFound)?;
+        let github = self.github_of(&repo).await?;
+        let answer = match &github {
+            Some(github) if request.idea.is_none() => {
+                self.acknowledgement(github, acknowledged).await
+            }
+            _ => Ok(()),
+        };
+        Ok(Precheck {
+            github,
+            acknowledged: answer,
+        })
+    }
+
+    /// Whether a commit may be made (or taken up) for `request`, by what it
+    /// publishes, now or through an agent later:
+    ///
+    /// - an issue (pushed now): nothing it is built on may publish the
+    ///   user's unpushed work ([`repo::require_published_default_branch`];
+    ///   checked again before every push), and the acknowledgement;
+    /// - a plain intent to a GitHub repository (its agent's pull request
+    ///   carries the folder): the acknowledgement;
+    /// - an idea package to a GitHub repository: the default branch must be
+    ///   on `origin` once this repository has fetched from it
+    ///   ([`repo::require_published_default_branch_once_fetched`]), so the
+    ///   agent's work is not wasted on a push that must be refused.
+    async fn check_publication(
+        &self,
+        request: &FeedbackRequest,
+        repo: &Repo,
+        precheck: Precheck,
+    ) -> Result<(), FeedbackError> {
+        match (request.send_as, request.idea) {
+            (SendAs::GithubIssue, _) => {
+                repo::require_published_default_branch(repo).await?;
+                precheck.acknowledged
+            }
+            (SendAs::Intent, Some(_)) if precheck.github.is_some() => {
+                repo::require_published_default_branch_once_fetched(repo).await
+            }
+            (SendAs::Intent, Some(_)) => Ok(()),
+            (SendAs::Intent, None) => precheck.acknowledged,
+        }
+    }
+
     /// The github.com repository `origin` names; `NoGithubRemote` when it is
     /// none, then `GhNotReady` unless `gh` is ready and signed in.
     async fn require_github(&self, repo_id: RepoId) -> Result<GithubRepo, FeedbackError> {
@@ -843,12 +915,15 @@ impl FeedbackService {
         }
     }
 
-    /// The one rule for sending the screenshots to GitHub (an issue, an
-    /// idea's pull request): `Ok` when the user acknowledged that they may
-    /// be public, or `github` is private ([`Self::visibility`]: `gh repo
-    /// view`, or its answer of the last 10 minutes); else
-    /// `PublicNotAcknowledged`, with [`PUBLIC_SENTENCE`] for a public
-    /// repository and [`MAYBE_PUBLIC_SENTENCE`] when `gh` cannot tell.
+    /// The one rule for sending the screenshots to GitHub (an issue, a plain
+    /// intent whose agent opens a pull request, an idea's pull request, an
+    /// idea's implementation intent): `Ok` when the user acknowledged that
+    /// they may be public (then `gh` is not asked at all), or `github` is
+    /// private ([`Self::visibility`]: `gh repo view`, or its answer of the
+    /// last 10 minutes); else `PublicNotAcknowledged`, with
+    /// [`PUBLIC_SENTENCE`] for a public repository and
+    /// [`MAYBE_PUBLIC_SENTENCE`] when `gh` cannot tell (not installed, not
+    /// signed in, no answer).
     async fn acknowledgement(
         &self,
         github: &GithubRepo,
@@ -1062,14 +1137,14 @@ impl FeedbackService {
         };
 
         if !s.pushed {
-            // Nothing the commit is built on may publish the user's unpushed
+            // The recorded commit itself, whatever the branch is now; never
+            // when what it is built on would publish the user's unpushed
             // work.
-            if let Err(e) = repo::require_published_parents(&repo, &s.commit).await {
-                tracing::warn!(submission_id = %id, step = "push", code = e.code(), "the feedback branch was not pushed");
-                return Ok(Some(step_failure(FeedbackStep::Push, &e)));
-            }
-            // The recorded commit itself, whatever the branch is now.
-            if let Err(failure) = repo::push_commit(&repo, &s.commit, &s.branch).await {
+            if let Err(e) = repo::push_commit(&repo, &s.commit, &s.commit, &s.branch).await {
+                let failure = match e {
+                    FeedbackError::Step(failure) => failure,
+                    e => step_failure(FeedbackStep::Push, &e),
+                };
                 tracing::warn!(submission_id = %id, step = "push", code = %failure.code, "the feedback branch was not pushed");
                 return Ok(Some(failure));
             }

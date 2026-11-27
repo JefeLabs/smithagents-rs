@@ -30,6 +30,7 @@ use smithagents_plugin_host::StaticSecrets;
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::feedback::issue::{file_names, render_issue, FileKind, IssueInput};
+use smithagents_server::feedback::repo::{place_and_commit, FileSource, FolderFile};
 use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
@@ -308,14 +309,19 @@ impl Fx {
     /// [`Fx::add_repo`] whose `origin` is [`GITHUB_URL`], which git sends to
     /// the returned bare repository (it logs every update of its refs).
     async fn github_repo(&self, name: &str) -> (Repo, PathBuf) {
-        let repo = self.add_repo_with_origin(name, GITHUB_URL).await;
+        self.github_repo_at(name, GITHUB_URL).await
+    }
+
+    /// [`Fx::github_repo`] whose `origin` is the GitHub repository `url`.
+    async fn github_repo_at(&self, name: &str, url: &str) -> (Repo, PathBuf) {
+        let repo = self.add_repo_with_origin(name, url).await;
         let bare = self.tmp.path().join(format!("{name}-origin.git"));
         common::git(
             self.tmp.path(),
             &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
         );
         common::git(&bare, &["config", "core.logAllRefUpdates", "always"]);
-        redirect(&repo, &bare);
+        redirect_url(&repo, &bare, url);
         (repo, bare)
     }
 
@@ -387,12 +393,17 @@ impl Fx {
 
 /// Points `repo`'s `origin` at `target` for git (the configured URL stays).
 fn redirect(repo: &Repo, target: &Path) {
+    redirect_url(repo, target, GITHUB_URL);
+}
+
+/// Sends git from `url` to `target` in `repo`.
+fn redirect_url(repo: &Repo, target: &Path, url: &str) {
     common::git(
         &repo.path,
         &[
             "config",
             &format!("url.{}.insteadOf", target.display()),
-            GITHUB_URL,
+            url,
         ],
     );
 }
@@ -1793,9 +1804,21 @@ async fn a_private_repository_is_not_asked_and_an_unknown_one_is() {
     );
     assert_eq!(fx.row(&req["submission_id"]).await, None);
     assert_eq!(git_out(&bare, &["for-each-ref"]), "");
-    // The intent path is never asked.
+    // A plain intent is asked as well (its agent's pull request carries the
+    // folder); an idea package is not.
     let mut intent = req.clone();
     intent["send_as"] = json!("intent");
+    let (status, body) = fx.submit_shot(&intent).await;
+    assert_eq!(
+        (status, body["error"].as_str(), body["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("public_not_acknowledged"),
+            Some(MAYBE_PUBLIC)
+        ),
+        "{body}"
+    );
+    intent["idea"] = json!({"explainer": true, "diagrams": false, "demo_video": false});
     let (status, out) = fx.submit_shot(&intent).await;
     assert_eq!(status, StatusCode::OK, "{out}");
 }
@@ -1830,4 +1853,245 @@ fn unacknowledged_issue_request_like(req: &Value) -> Value {
     let mut req = req.clone();
     req.as_object_mut().unwrap().remove("public_acknowledged");
     req
+}
+
+// ------------------------------- a plain intent publishes through its agent
+
+/// [`unacknowledged_issue_request`] sent as a plain intent.
+fn unacknowledged_intent_request(repo: &Repo) -> Value {
+    let mut req = unacknowledged_issue_request(repo);
+    req["send_as"] = json!("intent");
+    req
+}
+
+#[tokio::test]
+async fn a_plain_intent_to_a_public_repository_needs_the_acknowledgement() {
+    // D-C3.
+    let fx = fixture().await;
+    fx.fake.set("visibility", "PUBLIC");
+    let (repo, bare) = fx.github_repo("r1").await;
+    let mut req = unacknowledged_intent_request(&repo);
+
+    let (status, body) = fx.submit_shot(&req).await;
+
+    assert_eq!(
+        (status, body["error"].as_str(), body["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("public_not_acknowledged"),
+            Some(PUBLIC)
+        ),
+        "{body}"
+    );
+    assert_eq!(git_out(&repo.path, &["branch", "--list", "feedback/*"]), "");
+    assert_eq!(fx.row(&req["submission_id"]).await, None);
+    assert_eq!(fx.intent_count().await, 0);
+    assert!(fx.feedback_tmp_is_empty());
+
+    // Acknowledged, under the same id: the intent is made (and the daemon
+    // pushes nothing itself).
+    req["public_acknowledged"] = json!(true);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["intent"]["id"].is_string(), "{out}");
+    assert_eq!(fx.intent_count().await, 1);
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "");
+}
+
+#[tokio::test]
+async fn a_plain_intent_is_asked_only_for_a_github_repository_that_may_be_public() {
+    // D-C3.
+    let fx = fixture().await;
+    // Private (the fake's default): not asked.
+    let (repo, _bare) = fx.github_repo("r1").await;
+    let (status, out) = fx.submit_shot(&unacknowledged_intent_request(&repo)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(fx.calls_starting("repo view").len(), 1);
+    // No GitHub remote: not asked, and gh is not run for it.
+    let local = fx.add_repo("local").await;
+    let (status, out) = fx.submit_shot(&unacknowledged_intent_request(&local)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let elsewhere = fx
+        .add_repo_with_origin(
+            "elsewhere",
+            "https://gitlab.com/smithagents-test-invalid/widgets.git",
+        )
+        .await;
+    let (status, out) = fx
+        .submit_shot(&unacknowledged_intent_request(&elsewhere))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(fx.calls_starting("repo view").len(), 1);
+    // An idea package to a public one: not asked (its two actions are).
+    fx.fake.set("visibility", "PUBLIC");
+    fx.minutes.store(11, Ordering::SeqCst);
+    let (public, _bare) = fx.github_repo("r2").await;
+    let mut idea = unacknowledged_intent_request(&public);
+    idea["idea"] = json!({"explainer": true, "diagrams": false, "demo_video": false});
+    let (status, out) = fx.submit_shot(&idea).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(fx.calls_starting("repo view").len(), 1);
+}
+
+#[tokio::test]
+async fn without_gh_an_acknowledged_intent_is_made_and_gh_is_not_needed() {
+    // D-C3: no gh, or one not signed in, cannot tell: it may be public.
+    let fx = fixture_with(Opts {
+        gh: false,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, _bare) = fx.github_repo("r1").await;
+    let mut req = unacknowledged_intent_request(&repo);
+    let (status, body) = fx.submit_shot(&req).await;
+    assert_eq!(
+        (status, body["error"].as_str(), body["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("public_not_acknowledged"),
+            Some(MAYBE_PUBLIC)
+        ),
+        "{body}"
+    );
+    req["public_acknowledged"] = json!(true);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(out["intent"]["id"].is_string(), "{out}");
+    assert!(fx.fake.calls().is_empty(), "{:?}", fx.fake.calls());
+
+    // Signed out: the same.
+    let fx = fixture().await;
+    fx.fake.set("signed-out", "");
+    fx.fake.set("fail", "repo view");
+    let (repo, _bare) = fx.github_repo("r1").await;
+    let mut req = unacknowledged_intent_request(&repo);
+    let (status, body) = fx.submit_shot(&req).await;
+    assert_eq!(body["error"], "public_not_acknowledged", "{status} {body}");
+    req["public_acknowledged"] = json!(true);
+    let calls = fx.fake.calls().len();
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(fx.fake.calls().len(), calls, "no further gh call");
+}
+
+/// What a daemon stopped between its commit and its record leaves: the
+/// submission's commit on its branch, with no row; the branch and commit.
+async fn commit_without_record(fx: &Fx, repo: &Repo, id: &Value) -> (String, String) {
+    let id: SubmissionId = serde_json::from_value(id.clone()).unwrap();
+    let files = [FolderFile {
+        name: "issue.md".into(),
+        source: FileSource::Text("# Fix the zoom\n".into()),
+    }];
+    let scratch = fx.paths.feedback_tmp_dir().join("stopped-run");
+    let date = start().date_naive();
+    let (placement, commit) =
+        place_and_commit(repo, "Fix the zoom", date, false, &files, id, &scratch)
+            .await
+            .unwrap();
+    std::fs::remove_dir_all(&scratch).unwrap();
+    assert_eq!(fx.state.store.get_submission(id).await.unwrap(), None);
+    (placement.branch, commit)
+}
+
+#[tokio::test]
+async fn a_commit_taken_up_after_a_stop_meets_the_same_checks() {
+    // D-C2: a request re-sent after a stop between the commit and the
+    // record is checked as a new one before its commit is recorded.
+    let fx = fixture().await;
+    fx.fake.set("visibility", "PUBLIC");
+    let (repo, bare) = fx.github_repo("r1").await;
+    let mut req = unacknowledged_issue_request(&repo);
+    let (branch, commit) = commit_without_record(&fx, &repo, &req["submission_id"]).await;
+
+    let (status, body) = fx.submit_shot(&req).await;
+
+    assert_eq!(
+        (status, body["error"].as_str(), body["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("public_not_acknowledged"),
+            Some(PUBLIC)
+        ),
+        "{body}"
+    );
+    assert_eq!(fx.row(&req["submission_id"]).await, None, "not recorded");
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "", "nothing pushed");
+    assert!(fx.calls_starting("issue create").is_empty());
+    // The commit is left as it was.
+    assert_eq!(git_out(&repo.path, &["rev-parse", &branch]), commit);
+
+    // Acknowledged: that commit is taken up, not made again.
+    req["public_acknowledged"] = json!(true);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["commit"], commit);
+    assert_eq!(out["issue_url"], ISSUE_URL);
+    assert_eq!(
+        git_out(&repo.path, &["branch", "--list", "feedback/*"]),
+        branch
+    );
+    assert_eq!(commits_above_main(&repo.path, &branch), "1");
+
+    // The push guard too: main has a commit origin lacks.
+    let mut req = issue_request(&repo);
+    req["main_idea"] = json!("Another idea");
+    let (branch, commit) = commit_without_record(&fx, &repo, &req["submission_id"]).await;
+    common::git(
+        &repo.path,
+        &["commit", "-q", "--allow-empty", "-m", "M1, not for anyone"],
+    );
+    let (status, body) = fx.submit_shot(&req).await;
+    assert_eq!(
+        (status, body["error"].as_str(), body["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("unpushed_commits"),
+            Some(UNPUSHED)
+        ),
+        "{body}"
+    );
+    assert_eq!(fx.row(&req["submission_id"]).await, None);
+    assert_eq!(git_out(&repo.path, &["rev-parse", &branch]), commit);
+    assert_eq!(fx.calls_starting("issue create").len(), 1);
+}
+
+#[tokio::test]
+async fn each_github_repository_gets_its_own_answer() {
+    // D-I3 (124f): what gh said of one repository is never another's.
+    for public_first in [false, true] {
+        let fx = fixture().await;
+        fx.fake.set("visibility-widgets", "PUBLIC");
+        fx.fake.set("visibility-gadgets", "PRIVATE");
+        let (public, public_bare) = fx.github_repo("r1").await;
+        let (private, _bare) = fx
+            .github_repo_at(
+                "r2",
+                "https://github.com/smithagents-test-invalid/gadgets.git",
+            )
+            .await;
+        let (to_private, to_public) = (
+            unacknowledged_issue_request(&private),
+            unacknowledged_issue_request(&public),
+        );
+        let (private_answer, public_answer) = if public_first {
+            let p = fx.submit_shot_text(&to_public).await;
+            (fx.submit_shot_text(&to_private).await, p)
+        } else {
+            let p = fx.submit_shot_text(&to_private).await;
+            (p, fx.submit_shot_text(&to_public).await)
+        };
+        assert_eq!(private_answer.0, StatusCode::OK, "{}", private_answer.1);
+        assert_eq!(public_answer.0, StatusCode::CONFLICT, "{}", public_answer.1);
+        let body: Value = serde_json::from_str(&public_answer.1).unwrap();
+        assert_eq!(
+            (body["error"].as_str(), body["message"].as_str()),
+            (Some("public_not_acknowledged"), Some(PUBLIC))
+        );
+        assert_eq!(git_out(&public_bare, &["for-each-ref"]), "");
+        assert_eq!(
+            fx.calls_starting("repo view").len(),
+            2,
+            "public first: {public_first}"
+        );
+    }
 }

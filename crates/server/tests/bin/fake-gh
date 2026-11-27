@@ -14,9 +14,13 @@
 #   - `wait` holds exactly "$1 $2": writes its process id to `wait.pid`,
 #     waits until the file `go` exists (60 s at most), then goes on below;
 #   - `auth status`: exits 1 when the file `signed-out` exists, else 0;
-#   - `repo view`: prints the file `visibility`, else PRIVATE;
+#   - `repo view`: prints the file `visibility-<name>` for the repository
+#     `<owner>/<name>` its last argument names, else the file `visibility`,
+#     else PRIVATE;
 #   - `label list`: prints the file `label`, else true;
-#   - `issue list`, `pr list`: print the file `existing`, else nothing;
+#   - `issue list`, `pr list`: print the file `existing`, else nothing; for
+#     `pr list`, while the file `existing-head` exists, only when an
+#     argument names its commit (as the `--jq` filter on `headRefOid` would);
 #   - `issue create`: copies the file named by `--body-file=` to
 #     `issue-body.md` and prints the file `issue-url`, else an issue URL;
 #   - `pr create`: copies it to `pr-body.md` and prints a pull request URL;
@@ -73,15 +77,29 @@ case "$1 $2" in
     exit 0
     ;;
   "repo view")
-    print_or visibility PRIVATE
+    for a in "$@"; do last="$a"; done
+    if [ -f "$dir/visibility-${last##*/}" ]; then
+      cat "$dir/visibility-${last##*/}"
+    else
+      print_or visibility PRIVATE
+    fi
     echo
     ;;
   "label list")
     print_or label true
     echo
     ;;
-  "issue list" | "pr list")
+  "issue list")
     print_or existing ""
+    ;;
+  "pr list")
+    if [ -f "$dir/existing-head" ]; then
+      case "$*" in
+        *"\"$(cat "$dir/existing-head")\""*) print_or existing "" ;;
+      esac
+    else
+      print_or existing ""
+    fi
     ;;
   "issue create")
     find_body "$@"

@@ -311,25 +311,34 @@ pub async fn find_issue(
 }
 
 /// The pull request of the branch `head` on `repo` that the signed-in user
-/// opened: `gh pr list --repo=… --head=<head> --author=@me --state=all
-/// --json=url --jq=.[0].url // ""`, within `gh.timeout`. A first line that
-/// is a pull request of `repo` is that pull request; an empty one is none;
-/// anything else is `gh_bad_answer` (and nothing may be opened then).
-/// `head` must be a branch name the caller checked.
+/// opened for the commit `commit`: `gh pr list --repo=… --head=<head>
+/// --author=@me --state=all --json=url,headRefOid --jq=map(select(.headRefOid
+/// == "<commit>")) | .[0].url // ""`, within `gh.timeout`. A pull request of
+/// that branch whose head is another commit is never taken. A first line
+/// that is a pull request of `repo` is that pull request; an empty one is
+/// none; anything else is `gh_bad_answer` (and nothing may be opened then).
+/// `head` must be a branch name the caller checked; `commit` that is not a
+/// full commit id finds none.
 pub async fn find_pull_request(
     gh: &Gh<'_>,
     repo: &GithubRepo,
     head: &str,
+    commit: &str,
 ) -> Result<Option<String>, FeedbackFailure> {
+    if !crate::git::is_commit_id(commit) {
+        return Ok(None);
+    }
     let mut list = args(["pr", "list"]);
     list.push(repo.repo_arg());
     list.push(format!("--head={head}"));
     list.extend(args([
         "--author=@me",
         "--state=all",
-        "--json=url",
-        r#"--jq=.[0].url // """#,
+        "--json=url,headRefOid",
     ]));
+    list.push(format!(
+        r#"--jq=map(select(.headRefOid == "{commit}")) | .[0].url // """#
+    ));
     match gh.run(&list, gh.timeout).await {
         Ok(None) => Ok(None),
         Ok(Some(url)) if repo.is_pull_request_url(&url) => Ok(Some(url)),

@@ -16,15 +16,17 @@ use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
 use smithagents_core::agent::Repo;
+use smithagents_core::feedback::FeedbackFailure;
 use smithagents_core::feedback::{FeedbackStep, SubmissionId};
 use smithagents_core::ids::RepoId;
 use smithagents_server::feedback::repo::{
-    commit_folder, find_committed, place, place_and_commit, push, push_commit,
-    require_published_default_branch, require_published_parents, Committed, FileSource, FolderFile,
-    Placement, NEVER_FETCHED_SENTENCE, UNPUSHED_SENTENCE,
+    commit_folder, find_committed, place, place_and_commit, push_commit,
+    require_published_default_branch, require_published_default_branch_once_fetched,
+    require_published_parents, Committed, FileSource, FolderFile, Placement,
+    NEVER_FETCHED_SENTENCE, UNPUSHED_SENTENCE,
 };
 use smithagents_server::feedback::FeedbackError;
-use smithagents_server::git::{self, CommitError, GitError, PushError};
+use smithagents_server::git::{self, CommitError, GitError};
 use smithagents_server::paths::Paths;
 use tempfile::TempDir;
 
@@ -301,7 +303,8 @@ impl Fixture {
         git(self.root(), &["branch", "--list", "feedback/*", "idea/*"])
     }
 
-    /// A bare repository, made `origin`.
+    /// A bare repository, made `origin`, with `main` known to be on it
+    /// ([`Fixture::mark_fetched`]).
     fn origin(&self) -> PathBuf {
         let bare = self.tmp.path().join("origin.git");
         git(
@@ -312,7 +315,28 @@ impl Fixture {
             self.root(),
             &["remote", "add", "origin", bare.to_str().unwrap()],
         );
+        self.mark_fetched();
         bare
+    }
+
+    /// `refs/remotes/origin/main` at `main`, as a fetch would leave it
+    /// (nothing is fetched or pushed): what a folder commit is built on
+    /// counts as on `origin`, so a push may go.
+    fn mark_fetched(&self) {
+        git(
+            self.root(),
+            &["update-ref", "refs/remotes/origin/main", "main"],
+        );
+    }
+}
+
+/// [`push_commit`] of the folder commit `commit` as `branch`, as the issue
+/// path pushes it; a failed push as its failure (any other refusal panics).
+async fn push(repo: &Repo, commit: &str, branch: &str) -> Result<(), FeedbackFailure> {
+    match push_commit(repo, commit, commit, branch).await {
+        Ok(()) => Ok(()),
+        Err(FeedbackError::Step(failure)) => Err(failure),
+        Err(e) => panic!("not a failed push: {e:?}"),
     }
 }
 
@@ -665,9 +689,7 @@ async fn no_hook_editor_monitor_or_signing_program_runs() {
     git(fx.root(), &["tag", "-a", "-m", "tag", "v1"]);
 
     let (placement, commit) = fx.submit("s").await;
-    push(&fx.repo, &placement.branch, &placement.branch)
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, &placement.branch).await.unwrap();
 
     let ran: Vec<_> = std::fs::read_dir(&ran)
         .unwrap()
@@ -735,10 +757,8 @@ async fn the_users_checkout_is_untouched() {
         let before = checkout_state(fx.root());
         assert!(before.2.contains("untracked.txt") && before.2.contains("staged.txt"));
 
-        let (placement, _) = fx.submit("s").await;
-        push(&fx.repo, &placement.branch, &placement.branch)
-            .await
-            .unwrap();
+        let (placement, commit) = fx.submit("s").await;
+        push(&fx.repo, &commit, &placement.branch).await.unwrap();
 
         assert_eq!(checkout_state(fx.root()), before, "checked out: {checkout}");
         assert_eq!(fx.worktree_lines(), 1, "checked out: {checkout}");
@@ -839,9 +859,8 @@ async fn git_refuses_option_like_values() {
     let nowhere = fx.tmp.path().join("no-such-repository");
     let unsafe_arg = |r: Result<(), GitError>| matches!(r, Err(GitError::UnsafeArgument));
     assert!(unsafe_arg(git::rev_parse(&nowhere, "-h").await.map(drop)));
-    assert!(unsafe_arg(git::delete_branch(&nowhere, "-D").await));
     assert!(unsafe_arg(
-        git::path_in_branch(&nowhere, "-x", "p").await.map(drop)
+        git::tracking_branch_exists(&nowhere, "-x").await.map(drop)
     ));
     assert!(unsafe_arg(
         git::show_file(&nowhere, "--output=x", "p", 10)
@@ -856,12 +875,13 @@ async fn git_refuses_option_like_values() {
         matches!(&err, CommitError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
         "{err:?}"
     );
+    // (A push's names are checked in `git`'s own tests: only
+    // `feedback::repo::push_commit` may push.)
+    let tip = git(fx.root(), &["rev-parse", "main"]);
     let bare = fx.origin();
-    for (local, remote) in [("-f", "main"), ("main", "--force"), ("main", "+main")] {
-        let err = git::push_branch(fx.root(), local, remote, Duration::from_secs(30))
-            .await
-            .unwrap_err();
-        assert_eq!(err, PushError::Failed { status: None }, "{local} {remote}");
+    for remote in ["--force", "+main", "-f"] {
+        let failure = push(&fx.repo, &tip, remote).await.unwrap_err();
+        assert_eq!(failure.code, "push_failed", "{remote}");
     }
     assert_eq!(git(&bare, &["for-each-ref"]), "", "nothing was pushed");
 }
@@ -990,27 +1010,22 @@ async fn push_sends_the_branch_to_origin() {
     let fx = Fixture::new();
     let bare = fx.origin();
     let (placement, commit) = fx.submit("s").await;
-    push(&fx.repo, &placement.branch, &placement.branch)
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, &placement.branch).await.unwrap();
     assert_eq!(git(&bare, &["rev-parse", BRANCH]), commit);
-    push(&fx.repo, &placement.branch, &placement.branch)
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, &placement.branch).await.unwrap();
     // Under another name on the remote.
-    push(&fx.repo, &placement.branch, "idea/fix-the-zoom")
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, "idea/fix-the-zoom").await.unwrap();
     assert_eq!(git(&bare, &["rev-parse", "idea/fix-the-zoom"]), commit);
 }
 
 #[tokio::test]
 async fn push_failures_are_named_without_gits_words() {
     let fx = Fixture::new();
-    let (placement, _) = fx.submit("s").await;
+    fx.mark_fetched();
+    let (placement, commit) = fx.submit("s").await;
     let branch = placement.branch.as_str();
 
-    let failure = push(&fx.repo, branch, branch).await.unwrap_err();
+    let failure = push(&fx.repo, &commit, branch).await.unwrap_err();
     assert_eq!(failure.step, FeedbackStep::Push);
     assert_eq!(failure.code, "push_no_remote");
     assert_eq!(
@@ -1022,7 +1037,7 @@ async fn push_failures_are_named_without_gits_words() {
         fx.root(),
         &["remote", "add", "origin", "/nonexistent/LEAK-git-path"],
     );
-    let failure = push(&fx.repo, branch, branch).await.unwrap_err();
+    let failure = push(&fx.repo, &commit, branch).await.unwrap_err();
     assert!(
         ["push_failed", "push_no_remote"].contains(&failure.code.as_str()),
         "{failure:?}"
@@ -1051,7 +1066,7 @@ async fn push_failures_are_named_without_gits_words() {
         fx.root(),
         &["remote", "set-url", "origin", bare.to_str().unwrap()],
     );
-    let failure = push(&fx.repo, branch, branch).await.unwrap_err();
+    let failure = push(&fx.repo, &commit, branch).await.unwrap_err();
     assert_eq!(failure.code, "push_rejected");
     assert_eq!(
         failure.message,
@@ -1070,7 +1085,7 @@ async fn push_failures_are_named_without_gits_words() {
             &format!("{theirs}:refs/heads/{branch}"),
         ],
     );
-    let failure = push(&fx.repo, branch, branch).await.unwrap_err();
+    let failure = push(&fx.repo, &commit, branch).await.unwrap_err();
     assert_eq!(failure.code, "push_rejected");
     assert_eq!(git(&bare, &["rev-parse", branch]), theirs);
 }
@@ -1078,17 +1093,16 @@ async fn push_failures_are_named_without_gits_words() {
 #[tokio::test]
 async fn a_failed_push_keeps_the_commit_and_a_retry_does_not_commit_again() {
     let fx = Fixture::new();
+    fx.mark_fetched();
     let (placement, commit) = fx.submit("s").await;
-    let failure = push(&fx.repo, &placement.branch, &placement.branch)
+    let failure = push(&fx.repo, &commit, &placement.branch)
         .await
         .unwrap_err();
     assert_eq!(failure.code, "push_no_remote");
     assert_eq!(git(fx.root(), &["rev-parse", BRANCH]), commit);
 
     let bare = fx.origin();
-    push(&fx.repo, &placement.branch, &placement.branch)
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, &placement.branch).await.unwrap();
     assert_eq!(git(&bare, &["rev-parse", BRANCH]), commit);
     assert_eq!(
         git(
@@ -1121,17 +1135,13 @@ async fn push_commit_sends_that_commit_whatever_the_branch_is_now() {
         fx.root(),
         &["update-ref", &format!("refs/heads/{BRANCH}"), &later],
     );
-    push_commit(&fx.repo, &commit, &placement.branch)
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, &placement.branch).await.unwrap();
     assert_eq!(git(&bare, &["rev-parse", BRANCH]), commit);
     assert!(!git_succeeds(&bare, &["cat-file", "-e", &later]));
 
     // Without the local branch, too, under another name.
     git(fx.root(), &["branch", "-D", BRANCH]);
-    push_commit(&fx.repo, &commit, "idea/fix-the-zoom")
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, "idea/fix-the-zoom").await.unwrap();
     assert_eq!(git(&bare, &["rev-parse", "idea/fix-the-zoom"]), commit);
 
     // Not a commit of this repository: nothing is pushed.
@@ -1144,9 +1154,20 @@ async fn push_commit_sends_that_commit_whatever_the_branch_is_now() {
         "",
         &later[..12],
     ] {
-        let failure = push_commit(&fx.repo, bad, "feedback/other")
-            .await
-            .unwrap_err();
+        // As the commit to push, and as the folder commit it is built on.
+        for (to_push, folder_commit) in [(bad, commit.as_str()), (commit.as_str(), bad)] {
+            let refused = push_commit(&fx.repo, to_push, folder_commit, "feedback/other").await;
+            let Err(FeedbackError::Step(failure)) = refused else {
+                panic!("{bad}: {refused:?}");
+            };
+            assert_eq!(failure.step, FeedbackStep::Push, "{bad}");
+            assert_eq!(
+                (failure.code.as_str(), failure.message.as_str()),
+                ("commit_missing", missing),
+                "{bad}"
+            );
+        }
+        let failure = push(&fx.repo, bad, "feedback/other").await.unwrap_err();
         assert_eq!(failure.step, FeedbackStep::Push, "{bad}");
         assert_eq!(
             (failure.code.as_str(), failure.message.as_str()),
@@ -1159,40 +1180,12 @@ async fn push_commit_sends_that_commit_whatever_the_branch_is_now() {
         &["rev-parse", "--verify", "--quiet", "feedback/other"]
     ));
     // An option-like branch name is refused before git runs.
-    let failure = push_commit(&fx.repo, &commit, "-f").await.unwrap_err();
+    let failure = push(&fx.repo, &commit, "-f").await.unwrap_err();
     assert_eq!(failure.code, "push_failed");
 }
 
-#[tokio::test]
-async fn a_push_that_does_not_finish_is_stopped() {
-    let fx = Fixture::new();
-    let bare = fx.origin();
-    // The remote accepts the branch once its hook has slept for 2 seconds.
-    executable(&bare.join("hooks/pre-receive"), "#!/bin/sh\nsleep 2\n");
-    let (placement, _) = fx.submit("s").await;
-    let started = Instant::now();
-    let err = git::push_branch(
-        fx.root(),
-        &placement.branch,
-        &placement.branch,
-        Duration::from_secs(1),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err, PushError::Timeout);
-    assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "{:?}",
-        started.elapsed()
-    );
-    // The whole push was killed, the remote side included: the branch never
-    // arrives, even after the hook would have finished.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!git_succeeds(
-        &bare,
-        &["rev-parse", "--verify", "--quiet", BRANCH]
-    ));
-}
+// (A push that does not finish in its time is stopped: see `git`'s own
+// tests, which can give a push one second.)
 
 #[tokio::test]
 async fn origin_url_reads_the_configured_url_not_the_rewritten_one() {
@@ -1218,10 +1211,9 @@ async fn origin_url_reads_the_configured_url_not_the_rewritten_one() {
         Some(GITHUB_URL)
     );
 
+    fx.mark_fetched();
     let (placement, commit) = fx.submit("s").await;
-    push(&fx.repo, &placement.branch, &placement.branch)
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, &placement.branch).await.unwrap();
     assert_eq!(git(&bare, &["rev-parse", BRANCH]), commit);
 }
 
@@ -1317,7 +1309,7 @@ async fn list_folder_names_the_files_of_one_folder() {
 }
 
 #[tokio::test]
-async fn rev_parse_path_in_branch_and_delete_branch() {
+async fn rev_parse_and_worktrees() {
     let fx = Fixture::new();
     let root = fx.root();
     let tip = git(root, &["rev-parse", "main"]);
@@ -1333,23 +1325,6 @@ async fn rev_parse_path_in_branch_and_delete_branch() {
     assert_eq!(git::rev_parse(root, "no-such-branch").await.unwrap(), None);
     // A tree names no commit.
     assert_eq!(git::rev_parse(root, "main^{tree}").await.unwrap(), None);
-
-    assert!(git::path_in_branch(root, "main", "README.md")
-        .await
-        .unwrap());
-    assert!(!git::path_in_branch(root, "main", "docs").await.unwrap());
-    assert!(!git::path_in_branch(root, "no-such-branch", "README.md")
-        .await
-        .unwrap());
-
-    git(root, &["branch", "feedback/x"]);
-    git::delete_branch(root, "feedback/x").await.unwrap();
-    assert!(!git::branch_exists(root, "feedback/x").await.unwrap());
-    let err = git::delete_branch(root, "feedback/x").await.unwrap_err();
-    assert!(
-        matches!(err, GitError::Failed { status: Some(_) }),
-        "{err:?}"
-    );
 
     let locked = fx.tmp.path().join("locked");
     git(
@@ -1418,14 +1393,15 @@ async fn nothing_git_prints_reaches_an_error_or_a_log() {
     texts.push(err.to_string());
     git(fx.root(), &["config", "user.name", "Test User"]);
     // Pushes git and the remote explain at length.
-    let (placement, _) = fx.submit("s2").await;
+    let (placement, commit) = fx.submit("s2").await;
     for url in [
         "/nonexistent/LEAK-git-path",
         "file:///nonexistent/LEAK-token",
     ] {
         let _ = git_cmd(fx.root(), &["remote", "remove", "origin"]).output();
         git(fx.root(), &["remote", "add", "origin", url]);
-        let failure = push(&fx.repo, &placement.branch, &placement.branch)
+        fx.mark_fetched();
+        let failure = push(&fx.repo, &commit, &placement.branch)
             .await
             .unwrap_err();
         texts.push(failure.message);
@@ -1840,10 +1816,9 @@ async fn a_push_url_alone_is_a_remote() {
         git::origin_url(fx.root()).await.unwrap(),
         Some(bare.display().to_string())
     );
+    fx.mark_fetched();
     let (placement, commit) = fx.submit("s").await;
-    push(&fx.repo, &placement.branch, &placement.branch)
-        .await
-        .unwrap();
+    push(&fx.repo, &commit, &placement.branch).await.unwrap();
     assert_eq!(git(&bare, &["rev-parse", BRANCH]), commit);
 }
 
@@ -2222,6 +2197,7 @@ async fn only_what_origin_already_has_may_be_built_on() {
     };
     // Never fetched: nothing is known of origin.
     let bare = fx.origin();
+    git(fx.root(), &["update-ref", "-d", "refs/remotes/origin/main"]);
     assert_eq!(
         unpublished(require_published_default_branch(&fx.repo).await),
         Some(NEVER_FETCHED_SENTENCE)
@@ -2250,12 +2226,13 @@ async fn only_what_origin_already_has_may_be_built_on() {
         unpublished(require_published_parents(&fx.repo, &later).await),
         Some(UNPUSHED_SENTENCE)
     );
-    // A commit that is not here has nothing to publish.
-    assert_eq!(
-        unpublished(
-            require_published_parents(&fx.repo, "0123456789abcdef0123456789abcdef01234567").await
-        ),
-        None
+    // A folder commit that is not here is refused: what it was built on
+    // cannot be known.
+    let missing =
+        require_published_parents(&fx.repo, "0123456789abcdef0123456789abcdef01234567").await;
+    assert!(
+        matches!(&missing, Err(FeedbackError::Step(f)) if f.code == "commit_missing"),
+        "{missing:?}"
     );
     // A tracking branch of another remote does not count.
     git(fx.root(), &["update-ref", "-d", "refs/remotes/origin/main"]);
@@ -2268,4 +2245,199 @@ async fn only_what_origin_already_has_may_be_built_on() {
         Some(NEVER_FETCHED_SENTENCE)
     );
     drop(bare);
+}
+
+#[tokio::test]
+async fn another_remotes_tracking_branch_does_not_count_while_origin_has_some() {
+    // D-I3 (119d).
+    let fx = Fixture::new();
+    let bare = fx.origin();
+    git(fx.root(), &["push", "-q", "origin", "main"]);
+    git(fx.root(), &["fetch", "-q", "origin"]);
+    let mine = fx.commit_on_main("notes.md", "mine\n");
+    // `upstream` holds the new commit; `origin`'s refs exist but lack it.
+    git(
+        fx.root(),
+        &["update-ref", "refs/remotes/upstream/main", &mine],
+    );
+    let (_, commit) = fx.submit("s").await;
+    let refused = require_published_default_branch(&fx.repo).await;
+    assert!(
+        matches!(refused, Err(FeedbackError::Unpublished(s)) if s == UNPUSHED_SENTENCE),
+        "{refused:?}"
+    );
+    let refused = push_commit(&fx.repo, &commit, &commit, BRANCH).await;
+    assert!(
+        matches!(refused, Err(FeedbackError::Unpublished(s)) if s == UNPUSHED_SENTENCE),
+        "{refused:?}"
+    );
+    assert!(!git_succeeds(&bare, &["cat-file", "-e", &mine]));
+}
+
+#[tokio::test]
+async fn the_push_itself_refuses_what_would_publish_unpushed_work() {
+    // D-M2: no caller can push unguarded.
+    let fx = Fixture::new();
+    let bare = fx.origin();
+    let mine = fx.commit_on_main("notes.md", "mine\n");
+    let (placement, commit) = fx.submit("s").await;
+
+    let refused = push_commit(&fx.repo, &commit, &commit, &placement.branch).await;
+
+    assert!(
+        matches!(refused, Err(FeedbackError::Unpublished(s)) if s == UNPUSHED_SENTENCE),
+        "{refused:?}"
+    );
+    assert_eq!(git(&bare, &["for-each-ref"]), "", "nothing was pushed");
+    assert!(!git_succeeds(&bare, &["cat-file", "-e", &mine]));
+    // Nor when nothing is known of origin.
+    git(fx.root(), &["update-ref", "-d", "refs/remotes/origin/main"]);
+    let refused = push_commit(&fx.repo, &commit, &commit, &placement.branch).await;
+    assert!(
+        matches!(refused, Err(FeedbackError::Unpublished(s)) if s == NEVER_FETCHED_SENTENCE),
+        "{refused:?}"
+    );
+    assert_eq!(git(&bare, &["for-each-ref"]), "");
+}
+
+#[tokio::test]
+async fn a_graft_hides_nothing_from_the_check() {
+    // D-M1: the user's `git replace --graft` makes the folder commit look
+    // built on what origin has; the push would send its real parents.
+    let fx = Fixture::new();
+    let bare = fx.origin();
+    let published = git(fx.root(), &["rev-parse", "main"]);
+    let mine = fx.commit_on_main("notes.md", "mine\n");
+    let (placement, commit) = fx.submit("s").await;
+    git(fx.root(), &["replace", "--graft", &commit, &published]);
+    // As git shows it to the user, the folder commit's parent is published.
+    assert_eq!(
+        git(fx.root(), &["rev-parse", &format!("{commit}^")]),
+        published
+    );
+
+    let refused = require_published_parents(&fx.repo, &commit).await;
+    assert!(
+        matches!(refused, Err(FeedbackError::Unpublished(s)) if s == UNPUSHED_SENTENCE),
+        "{refused:?}"
+    );
+    let refused = push_commit(&fx.repo, &commit, &commit, &placement.branch).await;
+    assert!(
+        matches!(refused, Err(FeedbackError::Unpublished(_))),
+        "{refused:?}"
+    );
+    assert_eq!(git(&bare, &["for-each-ref"]), "");
+    assert!(!git_succeeds(&bare, &["cat-file", "-e", &mine]));
+}
+
+#[tokio::test]
+async fn a_push_onto_a_diverged_remote_branch_is_rejected_and_never_forced() {
+    // D-I3 (82).
+    let fx = Fixture::new();
+    let bare = fx.origin();
+    git(fx.root(), &["push", "-q", "origin", "main"]);
+    git(fx.root(), &["fetch", "-q", "origin"]);
+    let (placement, commit) = fx.submit("s").await;
+    // Someone else's commit on a branch of that name, not an ancestor.
+    let theirs = git(
+        fx.root(),
+        &["commit-tree", "main^{tree}", "-p", "main", "-m", "theirs"],
+    );
+    git(
+        fx.root(),
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{theirs}:refs/heads/{BRANCH}"),
+        ],
+    );
+
+    let failure = push(&fx.repo, &commit, &placement.branch)
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.step, FeedbackStep::Push);
+    assert_eq!(
+        (failure.code.as_str(), failure.message.as_str()),
+        (
+            "push_rejected",
+            "git could not push to origin: the remote rejected the branch"
+        )
+    );
+    assert_eq!(git(&bare, &["rev-parse", BRANCH]), theirs, "never forced");
+}
+
+#[tokio::test]
+async fn a_branch_name_origin_has_is_taken() {
+    // D-M5: a new submission never pushes onto a branch someone made there.
+    let fx = Fixture::new();
+    fx.origin();
+    git(
+        fx.root(),
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{BRANCH}"),
+            "main",
+        ],
+    );
+    git(
+        fx.root(),
+        &[
+            "update-ref",
+            "refs/remotes/origin/idea/fix-the-zoom",
+            "main",
+        ],
+    );
+
+    let placement = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    assert_eq!(placement.branch, format!("{BRANCH}-2"));
+    let idea = place(&fx.repo, "Fix the zoom", date(), true).await.unwrap();
+    assert_eq!(idea.branch, "idea/fix-the-zoom-2");
+    // Another remote's branch of that name does not count.
+    git(
+        fx.root(),
+        &["update-ref", "-d", &format!("refs/remotes/origin/{BRANCH}")],
+    );
+    git(
+        fx.root(),
+        &[
+            "update-ref",
+            &format!("refs/remotes/upstream/{BRANCH}"),
+            "main",
+        ],
+    );
+    let placement = place(&fx.repo, "Fix the zoom", date(), false)
+        .await
+        .unwrap();
+    assert_eq!(placement.branch, BRANCH);
+}
+
+#[tokio::test]
+async fn an_idea_meets_the_check_only_once_origin_was_fetched() {
+    // D-I2.
+    let fx = Fixture::new();
+    let unpublished = |r: Result<(), FeedbackError>| match r {
+        Err(FeedbackError::Unpublished(sentence)) => Some(sentence),
+        Err(e) => panic!("{e}"),
+        Ok(()) => None,
+    };
+    // Never fetched: passes (Open pull request asks to fetch).
+    git(fx.root(), &["remote", "add", "origin", GITHUB_URL]);
+    assert_eq!(
+        unpublished(require_published_default_branch_once_fetched(&fx.repo).await),
+        None
+    );
+    fx.mark_fetched();
+    assert_eq!(
+        unpublished(require_published_default_branch_once_fetched(&fx.repo).await),
+        None
+    );
+    fx.commit_on_main("notes.md", "mine\n");
+    assert_eq!(
+        unpublished(require_published_default_branch_once_fetched(&fx.repo).await),
+        Some(UNPUSHED_SENTENCE)
+    );
 }

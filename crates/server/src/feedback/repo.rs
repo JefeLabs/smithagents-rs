@@ -378,43 +378,45 @@ fn issue_folder_of(paths: &[String]) -> Option<String> {
     .then(|| folder.to_string())
 }
 
-/// Pushes the local branch `local` to `origin` as `remote_branch`, never
-/// forced, for at most [`PUSH_TIMEOUT`]. A failure is step `Push` with a
-/// fixed sentence; the branch and its commit stay for a retry.
-pub async fn push(repo: &Repo, local: &str, remote_branch: &str) -> Result<(), FeedbackFailure> {
-    git::push_branch(&repo.path, local, remote_branch, PUSH_TIMEOUT)
-        .await
-        .map_err(push_failure)
-}
-
 /// Pushes the commit `commit` itself to `origin` as `remote_branch`, never
 /// forced, for at most [`PUSH_TIMEOUT`]: what a local branch points at now
 /// (moved on, deleted) does not matter, so nothing but that commit and its
-/// history leaves the machine. `commit_missing` when `commit` is not a full
-/// commit id of this repository; any other failure as for [`push`].
+/// history leaves the machine. The only way the feedback tool pushes.
+///
+/// `folder_commit` is the daemon-made commit of the issue folder that
+/// `commit` is (an issue's) or is built on (an idea agent's work): first,
+/// [`require_published_parents`] refuses unless what it is built on is on
+/// `origin` already (`Unpublished`; a `folder_commit` not in this
+/// repository is `commit_missing`). A push that fails is `Step` with step
+/// `Push`, a code and a fixed sentence: `commit_missing` when `commit` is
+/// not a full commit id of this repository, else `push_no_remote`,
+/// `push_auth`, `push_rejected`, `push_timeout` or `push_failed`.
 pub async fn push_commit(
     repo: &Repo,
     commit: &str,
+    folder_commit: &str,
     remote_branch: &str,
-) -> Result<(), FeedbackFailure> {
+) -> Result<(), FeedbackError> {
+    let step = |failure| FeedbackError::Step(failure);
     if !git::is_commit_id(commit) {
-        return Err(commit_missing());
+        return Err(step(commit_missing()));
     }
     match git::rev_parse(&repo.path, commit).await {
         Ok(Some(found)) if found == commit => {}
-        Ok(_) => return Err(commit_missing()),
-        Err(GitError::TimedOut) => return Err(push_failure(PushError::Timeout)),
+        Ok(_) => return Err(step(commit_missing())),
+        Err(GitError::TimedOut) => return Err(step(push_failure(PushError::Timeout))),
         Err(e) => {
             let status = match e {
                 GitError::Failed { status } => status,
                 _ => None,
             };
-            return Err(push_failure(PushError::Failed { status }));
+            return Err(step(push_failure(PushError::Failed { status })));
         }
     }
+    require_published_parents(repo, folder_commit).await?;
     git::push_commit(&repo.path, commit, remote_branch, PUSH_TIMEOUT)
         .await
-        .map_err(push_failure)
+        .map_err(|e| step(push_failure(e)))
 }
 
 /// The code of a push refused because it would publish more than the
@@ -437,11 +439,25 @@ pub async fn require_published_default_branch(repo: &Repo) -> Result<(), Feedbac
     require_published(repo, &format!("refs/heads/{}", repo.default_branch)).await
 }
 
+/// [`require_published_default_branch`] for an idea submission, whose push
+/// waits for "Open pull request": a repository never fetched from `origin`
+/// passes (it is asked to fetch then); one whose default branch has
+/// commits its `origin` tracking branches lack does not.
+pub async fn require_published_default_branch_once_fetched(
+    repo: &Repo,
+) -> Result<(), FeedbackError> {
+    match require_published_default_branch(repo).await {
+        Err(FeedbackError::Unpublished(sentence)) if sentence == NEVER_FETCHED_SENTENCE => Ok(()),
+        other => other,
+    }
+}
+
 /// `Unpublished` unless the parents of the daemon-made folder commit
 /// `commit` (a full commit id), with their history, are on `origin` as far
 /// as this repository knows: checked right before every push of a feedback
-/// or idea branch. A commit that is not in the repository has nothing to
-/// publish (pushing it fails with `commit_missing`).
+/// or idea branch (see [`push_commit`]). A commit that is not in the
+/// repository is refused as `commit_missing` (step `Push`): what it was
+/// built on cannot be known.
 pub async fn require_published_parents(repo: &Repo, commit: &str) -> Result<(), FeedbackError> {
     let present = git::is_commit_id(commit)
         && git::rev_parse(&repo.path, commit)
@@ -449,7 +465,7 @@ pub async fn require_published_parents(repo: &Repo, commit: &str) -> Result<(), 
             .map_err(git_failed(PUBLISHED_STEP))?
             .is_some_and(|found| found == commit);
     if !present {
-        return Ok(());
+        return Err(FeedbackError::Step(commit_missing()));
     }
     require_published(repo, &format!("{commit}^@")).await
 }
@@ -525,13 +541,18 @@ async fn require_default_branch(repo: &Repo) -> Result<(), FeedbackError> {
     }
 }
 
-/// Whether the folder exists at `rev` or the branch exists.
+/// Whether the folder exists at `rev`, or the branch exists here or (as far
+/// as this repository knows) on `origin`: a push must never land on a
+/// branch someone else made there.
 async fn name_taken(root: &Path, rev: &str, placement: &Placement) -> Result<bool, FeedbackError> {
     let folder = git::path_kind(root, rev, &placement.folder)
         .await
         .map_err(git_failed(WORKTREE_STEP))?;
     Ok(folder.is_some()
         || git::bounded(git::branch_exists(root, &placement.branch))
+            .await
+            .map_err(git_failed(WORKTREE_STEP))?
+        || git::tracking_branch_exists(root, &placement.branch)
             .await
             .map_err(git_failed(WORKTREE_STEP))?)
 }

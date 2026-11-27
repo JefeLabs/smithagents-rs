@@ -346,7 +346,7 @@ async fn the_idea_actions_post_to_the_intent_and_decode_it() {
             if route == "pull-request" {
                 c.open_pull_request(intent.id, true).await
             } else {
-                c.create_implementation_intent(intent.id).await
+                c.create_implementation_intent(intent.id, true).await
             }
         })
         .await
@@ -360,14 +360,10 @@ async fn the_idea_actions_post_to_the_intent_and_decode_it() {
             head.contains(&format!("authorization: bearer {TOKEN}")),
             "{head}"
         );
-        if route == "pull-request" {
-            // The user's acknowledgement goes along.
-            let sent: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(sent, json!({"public_acknowledged": true}));
-            assert!(head.contains("content-type: application/json"), "{head}");
-        } else {
-            assert!(body.is_empty(), "{route}");
-        }
+        // The user's acknowledgement goes along, on both routes.
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent, json!({"public_acknowledged": true}), "{route}");
+        assert!(head.contains("content-type: application/json"), "{head}");
     }
 
     // A failed step decodes with its own code.

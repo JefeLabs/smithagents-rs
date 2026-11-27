@@ -70,7 +70,7 @@ pub enum CommitError {
     Io(std::io::Error),
 }
 
-/// Why [`push_branch`] failed, classified from git's C-locale messages, which
+/// Why [`push_commit`] failed, classified from git's C-locale messages, which
 /// are not kept.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PushError {
@@ -367,16 +367,19 @@ const INHERITED_CONFIG_PREFIXES: [&[u8]; 2] = [b"GIT_CONFIG_KEY_", b"GIT_CONFIG_
 
 /// [`git_command`] with [`ISOLATED_CONFIG`] and without [`UNWANTED_ENV`]; no
 /// editor (`GIT_EDITOR=:` is git's "start none"); paths are never patterns
-/// (`GIT_LITERAL_PATHSPECS`); and no program asks a person for a credential:
-/// an empty `GIT_ASKPASS` stops git looking for one, and Git Credential
-/// Manager is told not to open a window.
+/// (`GIT_LITERAL_PATHSPECS`); no replacement or graft the user made
+/// (`git replace`) changes what a commit's history is
+/// (`GIT_NO_REPLACE_OBJECTS`: a push always sends the real one); and no
+/// program asks a person for a credential: an empty `GIT_ASKPASS` stops git
+/// looking for one, and Git Credential Manager is told not to open a window.
 fn isolated_command(cwd: &Path, args: &[&str]) -> Command {
     let all: Vec<&str> = ISOLATED_CONFIG.iter().chain(args).copied().collect();
     let mut cmd = git_command(cwd, &all);
     cmd.env("GIT_EDITOR", ":")
         .env("GIT_ASKPASS", "")
         .env("GCM_INTERACTIVE", "never")
-        .env("GIT_LITERAL_PATHSPECS", "1");
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
     for name in UNWANTED_ENV {
         cmd.env_remove(name);
     }
@@ -562,15 +565,86 @@ fn branch_or_commit(rev: &str) -> Result<String, GitError> {
     })
 }
 
-/// Whether `path` (a file or a folder) exists on the local branch `branch`:
-/// `git cat-file -e refs/heads/<branch>:<path>`.
-pub async fn path_in_branch(repo_root: &Path, branch: &str, path: &str) -> Result<bool, GitError> {
+/// Whether `origin` has a branch `branch` as far as this repository knows:
+/// the remote-tracking branch `refs/remotes/origin/<branch>` exists. Nothing
+/// is fetched.
+pub async fn tracking_branch_exists(repo_root: &Path, branch: &str) -> Result<bool, GitError> {
     refuse_option_like(branch)?;
-    let object = format!("refs/heads/{branch}:{path}");
-    Ok(isolated(repo_root, &["cat-file", "-e", &object])
-        .await?
-        .status
-        .success())
+    let reference = format!("refs/remotes/origin/{branch}");
+    let ran = isolated(repo_root, &["show-ref", "--verify", "--quiet", &reference]).await?;
+    match ran.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        status => Err(GitError::Failed { status }),
+    }
+}
+
+/// What a Git LFS pointer file starts with.
+const LFS_POINTER_START: &[u8] = b"version https://git-lfs.github.com/spec/v1";
+/// The largest file Git LFS writes as a pointer.
+const LFS_POINTER_MAX: u64 = 1024;
+
+/// Whether any file under `folder` at `commit` (a full commit id) is a Git
+/// LFS pointer: a blob of at most 1024 bytes that starts with `version
+/// https://git-lfs.github.com/spec/v1`. The sizes come from `git ls-tree -r
+/// -l -z`; only the small blobs are read, each at most 1024 bytes, never
+/// through a filter.
+pub async fn has_lfs_pointer(
+    repo_root: &Path,
+    commit: &str,
+    folder: &str,
+) -> Result<bool, GitError> {
+    if !is_commit_id(commit) {
+        return Err(GitError::UnsafeArgument);
+    }
+    let ran = isolated(
+        repo_root,
+        &[
+            "ls-tree",
+            "-r",
+            "-l",
+            "-z",
+            "--full-tree",
+            commit,
+            "--",
+            folder,
+        ],
+    )
+    .await?;
+    ran.ok()?;
+    // Each entry: `<mode> SP <type> SP <id> SP+ <size> TAB <path>`, ended by
+    // NUL; a submodule's size is `-`.
+    let small: Vec<String> = ran
+        .stdout
+        .split(|b| *b == 0)
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|b| *b == b'\t')?;
+            let head = std::str::from_utf8(&entry[..tab]).ok()?;
+            let mut fields = head.split_ascii_whitespace();
+            let (_mode, kind, id, size) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            let size: u64 = size.parse().ok()?;
+            (kind == "blob" && size <= LFS_POINTER_MAX && is_commit_id(id)).then(|| id.to_owned())
+        })
+        .collect();
+    for id in small {
+        let read = run(
+            isolated_command(repo_root, &["cat-file", "blob", &id]),
+            local_timeout(),
+            None,
+            LFS_POINTER_MAX,
+        )
+        .await?;
+        read.ok()?;
+        if read.stdout.starts_with(LFS_POINTER_START) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// What `path` is at `rev` (a local branch or a commit id, see
@@ -660,6 +734,28 @@ pub async fn rev_parse(repo_root: &Path, rev: &str) -> Result<Option<String>, Gi
     }
 }
 
+/// Whether the commit `commit` (a full commit id) is the tip of the local
+/// branch `branch` or in its history: `git merge-base --is-ancestor <commit>
+/// <tip>`. `false` when the branch is gone, or the commit is not in the
+/// repository.
+pub async fn is_on_branch(repo_root: &Path, commit: &str, branch: &str) -> Result<bool, GitError> {
+    if !is_commit_id(commit) {
+        return Err(GitError::UnsafeArgument);
+    }
+    let Some(tip) = rev_parse(repo_root, &format!("refs/heads/{branch}")).await? else {
+        return Ok(false);
+    };
+    if rev_parse(repo_root, commit).await?.as_deref() != Some(commit) {
+        return Ok(false);
+    }
+    let ran = isolated(repo_root, &["merge-base", "--is-ancestor", commit, &tip]).await?;
+    match ran.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        status => Err(GitError::Failed { status }),
+    }
+}
+
 /// The repository's common git directory, absolute (where `refs/` is).
 pub async fn common_dir(repo_root: &Path) -> Result<PathBuf, GitError> {
     let ran = isolated(
@@ -669,12 +765,6 @@ pub async fn common_dir(repo_root: &Path) -> Result<PathBuf, GitError> {
     .await?;
     ran.ok()?;
     Ok(PathBuf::from(ran.stdout_text()))
-}
-
-/// Deletes the local branch `branch`, merged or not: `git branch -D`.
-pub async fn delete_branch(repo_root: &Path, branch: &str) -> Result<(), GitError> {
-    refuse_option_like(branch)?;
-    isolated_ok(repo_root, &["branch", "-D", "--", branch]).await
 }
 
 /// Deletes the local branch `branch` only while it points at `commit` (a
@@ -1162,40 +1252,20 @@ const PUSH_AUTH: [&str; 8] = [
 /// git takes a remote name it does not know for a path.
 const PUSH_NO_REMOTE: &str = "'origin' does not appear to be a git repository";
 
-/// `git push origin refs/heads/<local>:refs/heads/<remote_branch>`, at most
-/// `timeout` long.
+/// `git push origin <commit>:refs/heads/<remote_branch>`, at most `timeout`
+/// long: that commit, whatever any local branch points at now. Only for
+/// `feedback::repo::push_commit`, which first checks what the push would
+/// publish.
 ///
 /// Never forced, and the repository's settings add nothing: no hook,
 /// signature, tag or submodule. A credential that is not stored fails at once
 /// (`GIT_TERMINAL_PROMPT=0` and no askpass program) instead of waiting for a
 /// person. `origin` must have a URL to push to as git sees it (`git remote
-/// get-url --push`: a `pushurl` alone will do), else `NoRemote`. Both names
-/// must be valid branch names that start with neither `-` nor `+`, else
-/// `Failed` with no exit status before git runs.
-pub async fn push_branch(
-    repo_root: &Path,
-    local: &str,
-    remote_branch: &str,
-    timeout: Duration,
-) -> Result<(), PushError> {
-    for name in [local, remote_branch] {
-        require_push_name(repo_root, name).await?;
-    }
-    push_refspec(
-        repo_root,
-        &format!("refs/heads/{local}:refs/heads/{remote_branch}"),
-        timeout,
-    )
-    .await
-}
-
-/// `git push origin <commit>:refs/heads/<remote_branch>`, at most `timeout`
-/// long: that commit, whatever any local branch points at now, as
-/// [`push_branch`] pushes (never forced, nothing of the repository's
-/// settings added). `commit` must be a full commit id (40 or 64 hex digits)
-/// and `remote_branch` a valid branch name that starts with neither `-` nor
-/// `+`, else `Failed` with no exit status before git runs.
-pub async fn push_commit(
+/// get-url --push`: a `pushurl` alone will do), else `NoRemote`. `commit`
+/// must be a full commit id (40 or 64 hex digits) and `remote_branch` a
+/// valid branch name that starts with neither `-` nor `+`, else `Failed`
+/// with no exit status before git runs.
+pub(crate) async fn push_commit(
     repo_root: &Path,
     commit: &str,
     remote_branch: &str,
@@ -1551,6 +1621,7 @@ mod tests {
         assert_eq!(val("GCM_INTERACTIVE"), set("never"));
         assert_eq!(val("GIT_TERMINAL_PROMPT"), set("0"));
         assert_eq!(val("GIT_LITERAL_PATHSPECS"), set("1"));
+        assert_eq!(val("GIT_NO_REPLACE_OBJECTS"), set("1"));
         assert_eq!(val("LC_ALL"), set("C"));
         for name in [
             "SSH_ASKPASS",
@@ -1708,6 +1779,99 @@ mod tests {
             "d/i.md\nd/s.png"
         );
         assert!(!ran.exists(), "a filter of the repository ran");
+    }
+
+    /// A repository on `main` whose `origin` is a new bare repository; both.
+    fn repo_with_bare_origin(tmp: &Path) -> (PathBuf, PathBuf) {
+        let repo = tmp.join("repo");
+        init_repo(&repo, "main");
+        let bare = tmp.join("origin.git");
+        g(
+            tmp,
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        g(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        (repo, bare)
+    }
+
+    #[tokio::test]
+    async fn a_push_refuses_option_like_names_before_git_runs() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, bare) = repo_with_bare_origin(tmp.path());
+        let tip = g(&repo, &["rev-parse", "main"]);
+        for (commit, remote) in [
+            (tip.as_str(), "--force"),
+            (tip.as_str(), "+main"),
+            (tip.as_str(), "-f"),
+            ("-f", "main"),
+            ("main", "main"),
+        ] {
+            let err = push_commit(&repo, commit, remote, Duration::from_secs(30))
+                .await
+                .unwrap_err();
+            assert_eq!(err, PushError::Failed { status: None }, "{commit} {remote}");
+        }
+        assert_eq!(g(&bare, &["for-each-ref"]), "", "nothing was pushed");
+    }
+
+    #[tokio::test]
+    async fn a_push_that_does_not_finish_is_stopped() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, bare) = repo_with_bare_origin(tmp.path());
+        // The remote accepts the branch once its hook has slept for 2 seconds.
+        let hook = bare.join("hooks/pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 2\n").unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let tip = g(&repo, &["rev-parse", "main"]);
+        let started = std::time::Instant::now();
+        let err = push_commit(&repo, &tip, "feedback/x", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, PushError::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            started.elapsed()
+        );
+        // The whole push was killed, the remote side included: the branch
+        // never arrives, even after the hook would have finished.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(g(&bare, &["for-each-ref"]), "");
+    }
+
+    #[tokio::test]
+    async fn an_lfs_pointer_is_found_only_under_the_folder() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("r");
+        init_repo(&dir, "main");
+        let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 12345\n";
+        let write = |path: &str, text: &[u8]| {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        write("docs/issues/x/issue.md", b"# x\n");
+        write("docs/issues/x/sub/big.bin", &vec![b'v'; 4096]);
+        write("elsewhere/demo.mp4", pointer.as_bytes());
+        g(&dir, &["add", "-A"]);
+        g(&dir, &["commit", "-q", "-m", "files"]);
+        let clean = g(&dir, &["rev-parse", "HEAD"]);
+        assert!(!has_lfs_pointer(&dir, &clean, "docs/issues/x")
+            .await
+            .unwrap());
+        assert!(has_lfs_pointer(&dir, &clean, "elsewhere").await.unwrap());
+
+        // In a subfolder too, and whatever the file is called.
+        write("docs/issues/x/sub/demo.mp4", pointer.as_bytes());
+        g(&dir, &["add", "-A"]);
+        g(&dir, &["commit", "-q", "-m", "pointer"]);
+        let with = g(&dir, &["rev-parse", "HEAD"]);
+        assert!(has_lfs_pointer(&dir, &with, "docs/issues/x").await.unwrap());
+        assert!(matches!(
+            has_lfs_pointer(&dir, "main", "docs/issues/x").await,
+            Err(GitError::UnsafeArgument)
+        ));
     }
 
     #[test]

@@ -429,13 +429,18 @@ impl DaemonLink {
         )
     }
 
-    /// An idea intent's "Create implementation intent"; the new intent
-    /// reaches the UI as `Action::IntentUpserted` too.
+    /// An idea intent's "Create implementation intent" (`public_acknowledged`
+    /// as for [`Self::open_pull_request`]); the new intent reaches the UI as
+    /// `Action::IntentUpserted` too.
     pub fn create_implementation_intent(
         &self,
         id: IntentId,
+        public_acknowledged: bool,
     ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
-        self.intent_command(move |c| async move { c.create_implementation_intent(id).await })
+        self.intent_command(move |c| async move {
+            c.create_implementation_intent(id, public_acknowledged)
+                .await
+        })
     }
 
     /// Runs one submission or retry; an intent in its outcome reaches the UI
@@ -609,9 +614,12 @@ pub trait FeedbackCommands {
     /// public repository shows the screenshots to anyone. The link upserts
     /// the answer.
     fn open_pull_request(&self, id: IntentId, public_acknowledged: bool) -> IntentAnswer;
-    /// Creates the idea intent's implementation intent (once); the link
-    /// upserts the answer.
-    fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer;
+    /// Creates the idea intent's implementation intent (once);
+    /// `public_acknowledged` once the user confirmed that its agent's pull
+    /// request may show the idea's files to anyone. The link upserts the
+    /// answer.
+    fn create_implementation_intent(&self, id: IntentId, public_acknowledged: bool)
+        -> IntentAnswer;
 }
 
 impl FeedbackCommands for DaemonLink {
@@ -645,8 +653,12 @@ impl FeedbackCommands for DaemonLink {
         DaemonLink::open_pull_request(self, id, public_acknowledged).boxed_local()
     }
 
-    fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer {
-        DaemonLink::create_implementation_intent(self, id).boxed_local()
+    fn create_implementation_intent(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> IntentAnswer {
+        DaemonLink::create_implementation_intent(self, id, public_acknowledged).boxed_local()
     }
 }
 

@@ -207,6 +207,11 @@ pub const PUBLIC_WARNING: &str =
     "This repository is public. The screenshots will be visible to anyone.";
 pub const MAYBE_PUBLIC_WARNING: &str =
     "This repository may be public. The screenshots will be visible to anyone.";
+/// The same for a plain intent: its agent opens a pull request there.
+pub const INTENT_PUBLIC_WARNING: &str =
+    "This repository is public. The agent's pull request will include the screenshots, visible to anyone.";
+pub const INTENT_MAYBE_PUBLIC_WARNING: &str =
+    "This repository may be public. The agent's pull request will include the screenshots, visible to anyone.";
 /// The question asked before every send to a repository that is (or may
 /// be) public; the warning is its description.
 pub const PUBLIC_CONFIRM_TITLE: &str = "Send the screenshots to GitHub?";
@@ -257,7 +262,11 @@ pub const OPEN_PR_LABEL: &str = "Open pull request…";
 pub const PR_TITLE: &str = "Open a pull request?";
 pub const PR_DESCRIPTION: &str = "Pushes the idea branch to origin and opens a draft pull request. If the repository is public, the screenshots will be visible to anyone.";
 pub const OPEN_PR_CONFIRM_LABEL: &str = "Open pull request";
-pub const IMPLEMENT_LABEL: &str = "Create implementation intent";
+/// "Create implementation intent…" and the question it asks first.
+pub const IMPLEMENT_LABEL: &str = "Create implementation intent…";
+pub const IMPLEMENT_TITLE: &str = "Create an implementation intent?";
+pub const IMPLEMENT_DESCRIPTION: &str = "Creates an intent to build this idea. Its agent's pull request will include the idea's screenshots and explainer. If the repository is public, they will be visible to anyone.";
+pub const IMPLEMENT_CONFIRM_LABEL: &str = "Create implementation intent";
 /// The tooltip of the button that copies the pull request's address.
 pub const COPY_LINK_LABEL: &str = "Copy link";
 pub const REPO_GONE_TEXT: &str = "That repository no longer exists.";

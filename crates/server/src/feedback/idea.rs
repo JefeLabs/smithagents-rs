@@ -9,20 +9,25 @@
 //!
 //! - [`FeedbackService::open_pull_request`] pushes the agent's work to
 //!   `origin` as the idea branch and opens a draft pull request with `gh`.
-//!   What is pushed is one commit, chosen at the first press and recorded
-//!   before anything leaves the machine (a retry pushes the same one), and
-//!   only when every commit on top of the idea's own changes nothing outside
-//!   the issue folder: the agent was told to commit only there, and an idea
-//!   pull request must not publish code nobody reviewed as part of the idea.
+//!   What is pushed is one commit, chosen at a press and recorded once every
+//!   check passed, right before the push (a retry pushes the same one while
+//!   the agent's branch still holds it; one the branch no longer holds is
+//!   never pushed, and the branch is read again), and only when every commit
+//!   on top of the idea's own changes nothing outside the issue folder: the
+//!   agent was told to commit only there, and an idea pull request must not
+//!   publish code nobody reviewed as part of the idea. No file of the folder
+//!   may be a Git LFS pointer (the push uploads no LFS object).
 //!   Each finished step (the push, the pull request) is recorded, so a retry
 //!   after a failure runs only what is left. The pull request is looked for
 //!   (by the signed-in user, for that branch) before one is opened, and none
 //!   is opened for a minute after `gh` may have opened one without saying
-//!   so, as for issues.
+//!   so, as for issues. Only a pull request whose head is the commit pushed
+//!   is taken for the idea's.
 //! - [`FeedbackService::create_implementation_intent`] creates, once, the
 //!   intent that implements the idea: it starts from the idea agent's
 //!   branch, has the idea's folder as its origin, and depends (fixed) on the
-//!   idea intent.
+//!   idea intent. Its agent's pull request carries the idea's files, so it
+//!   is asked for the acknowledgement as a plain intent is.
 //!
 //! One action of an idea intent runs at a time; each counts as running work
 //! for the idle monitor. Nothing git, `gh` or the user wrote reaches a log,
@@ -186,6 +191,9 @@ pub enum IdeaBlocked {
     NotSubmits,
     /// `issue.md` is not in the agent's work (deleted, or unreadable).
     Incomplete,
+    /// A file of the issue folder is a Git LFS pointer: the push runs no
+    /// hook, so Git LFS would never upload what it points to.
+    Lfs,
 }
 
 impl IdeaBlocked {
@@ -195,6 +203,7 @@ impl IdeaBlocked {
             Self::BranchGone => "idea_branch_missing",
             Self::NotSubmits => "idea_origin_invalid",
             Self::Incomplete => "idea_incomplete",
+            Self::Lfs => "idea_lfs",
         }
     }
 
@@ -204,6 +213,7 @@ impl IdeaBlocked {
             Self::BranchGone => "the idea agent's branch no longer exists",
             Self::NotSubmits => "the idea intent's folder or branch is not one Submit made",
             Self::Incomplete => "The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.",
+            Self::Lfs => "The idea's files were committed through Git LFS, which this push does not upload. Turn Git LFS off for docs/issues and ask the agent to commit them again.",
         }
     }
 }
@@ -227,12 +237,13 @@ impl FeedbackService {
     /// branch, folder or `issue.md` is not there (`IdeaBlocked`); a
     /// repository whose `origin` is not on github.com (`NoGithubRemote`);
     /// `gh` not ready (`GhNotReady`); an agent's branch that changes more
-    /// than the issue folder (`OutOfScope`); a default branch with commits
-    /// `origin` has not got, or a repository never fetched (`Unpublished`).
-    /// A repository that is, or may be, public needs `public_acknowledged`
+    /// than the issue folder (`OutOfScope`); a folder holding a Git LFS
+    /// pointer (`IdeaBlocked(Lfs)`); a default branch with commits `origin`
+    /// has not got, or a repository never fetched (`Unpublished`). A
+    /// repository that is, or may be, public needs `public_acknowledged`
     /// (`PublicNotAcknowledged`), asked on every press that would publish.
-    /// A failed push or `gh` call is `Step`, and what succeeded before it
-    /// stays done.
+    /// Every refusal comes before the commit is recorded. A failed push or
+    /// `gh` call is `Step`, and what succeeded before it stays done.
     pub async fn open_pull_request(
         &self,
         id: IntentId,
@@ -278,58 +289,53 @@ impl FeedbackService {
                 return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
             }
         }
-        // The commit to push: the one chosen at an earlier press, else the
-        // agent's branch as it is now ([`Self::settled_head`]). One chosen
-        // before that was never pushed and is gone from the repository (the
-        // branch was reset and the commit pruned) cannot be pushed, so one
-        // is chosen again.
-        let chosen = match &idea.pr_commit {
-            Some(commit) if !idea.pr_pushed => {
-                let present = git::is_commit_id(commit)
-                    && git::rev_parse(&repo.path, commit)
-                        .await
-                        .map_err(read_failed)?
-                        .is_some_and(|found| found == *commit);
-                present.then(|| commit.clone())
-            }
-            chosen => chosen.clone(),
-        };
-        let (head, pushed, new) = match chosen {
-            Some(commit) => (commit, idea.pr_pushed, false),
+        // The commit to push: the one chosen at an earlier press while it
+        // may be on `origin` (see [`Self::pinned_commit`]), else the agent's
+        // branch as it is now ([`Self::settled_head`]).
+        let (head, pushed, new) = match self.pinned_commit(&repo, &agent, idea).await? {
+            Some((commit, pushed)) => (commit, pushed, false),
             None => (self.settled_head(&repo, &agent).await?, false, true),
         };
+        let refused = |step: &'static str| {
+            move |e: &FeedbackError| {
+                tracing::warn!(intent_id = %id, step, code = e.code(), "the idea branch was not pushed");
+            }
+        };
+        // Every refusal comes before the commit is recorded: a refusal
+        // pins nothing.
         if new {
-            check_scope(&repo, origin, &head).await.inspect_err(|e| {
-                tracing::warn!(intent_id = %id, step = "check_scope", code = e.code(), "the idea branch was not pushed");
-            })?;
+            check_scope(&repo, origin, &head)
+                .await
+                .inspect_err(refused("check_scope"))?;
         }
-        // Before anything is recorded or pushed: an idea without its
-        // issue.md opens no pull request.
+        if !pushed {
+            require_no_lfs_pointer(&repo, &origin.folder, &head)
+                .await
+                .inspect_err(refused("check_lfs"))?;
+        }
+        // An idea without its issue.md opens no pull request.
         let text = pull_request_text(&repo, &github, &origin.folder, &head)
             .await
-            .inspect_err(|e| {
-                tracing::warn!(intent_id = %id, step = "read_idea", code = e.code(), "the idea branch was not pushed");
-            })?;
+            .inspect_err(refused("read_idea"))?;
         let title =
             no_mentions(&title_of(&intent.content.title).unwrap_or_else(|| UNTITLED.to_owned()));
+        if !pushed {
+            // Nothing the idea's commit is built on may publish the user's
+            // unpushed work (the push checks it again).
+            repo::require_published_parents(&repo, &origin.commit)
+                .await
+                .inspect_err(refused("push"))?;
+        }
         if new {
+            // Only now may the commit reach `origin`: a retry pushes this
+            // one while it stays on the agent's branch.
             self.save_idea(id, |p| p.pr_commit = Some(head.clone()))
                 .await?;
         }
         if !pushed {
-            // Nothing the idea's commit is built on may publish the user's
-            // unpushed work.
-            repo::require_published_parents(&repo, &origin.commit)
+            repo::push_commit(&repo, &head, &origin.commit, &origin.branch)
                 .await
-                .inspect_err(|e| {
-                    tracing::warn!(intent_id = %id, step = "push", code = e.code(), "the idea branch was not pushed");
-                })?;
-            repo::push_commit(&repo, &head, &origin.branch)
-                .await
-                .map_err(|failure| {
-                    tracing::warn!(intent_id = %id, step = "push", code = failure.code.as_str(), "the idea branch was not pushed");
-                    FeedbackError::Step(failure)
-                })?;
+                .inspect_err(refused("push"))?;
             tracing::info!(intent_id = %id, step = "push", "idea branch pushed");
             // Not saved, the next press pushes the same commit again, which
             // changes nothing.
@@ -342,6 +348,7 @@ impl FeedbackService {
                 &gh,
                 &github,
                 (&repo.default_branch, &origin.branch),
+                &head,
                 &title,
                 &text.body,
             )
@@ -391,22 +398,49 @@ impl FeedbackService {
         }
     }
 
+    /// The commit an earlier press chose, and whether it was pushed: one
+    /// pushed is kept; one not pushed only while it is still on the agent's
+    /// branch (its tip, or in its history). One the branch no longer holds
+    /// (amended, reset, or gone from the repository) is dropped, so a
+    /// commit chosen again is checked as new and nothing taken off the
+    /// branch is ever pushed.
+    async fn pinned_commit(
+        &self,
+        repo: &Repo,
+        agent: &Agent,
+        idea: &IdeaPackage,
+    ) -> Result<Option<(String, bool)>, FeedbackError> {
+        let Some(commit) = &idea.pr_commit else {
+            return Ok(None);
+        };
+        if idea.pr_pushed {
+            return Ok(Some((commit.clone(), true)));
+        }
+        let kept = git::is_commit_id(commit)
+            && git::is_on_branch(&repo.path, commit, &agent.branch)
+                .await
+                .map_err(read_failed)?;
+        Ok(kept.then(|| (commit.clone(), false)))
+    }
+
     /// The pull request of the pushed idea branch `branches.1` into
-    /// `branches.0`: one the signed-in user opened before
-    /// ([`find_pull_request`]); else, unless `gh pr create` ran without a
-    /// usable answer less than a minute ago (`pr_unconfirmed`), a new draft
-    /// ([`create_pull_request`]) from a body written to a scratch directory
-    /// of its own (removed afterwards).
+    /// `branches.0` at the commit `commit`: one the signed-in user opened
+    /// before for that very commit ([`find_pull_request`]); else, unless `gh
+    /// pr create` ran without a usable answer less than a minute ago
+    /// (`pr_unconfirmed`), a new draft ([`create_pull_request`]) from a body
+    /// written to a scratch directory of its own (removed afterwards).
+    #[allow(clippy::too_many_arguments)]
     async fn make_pull_request(
         &self,
         id: IntentId,
         gh: &Gh<'_>,
         github: &GithubRepo,
         (base, head): (&str, &str),
+        commit: &str,
         title: &str,
         body: &str,
     ) -> Result<String, FeedbackFailure> {
-        if let Some(url) = find_pull_request(gh, github, head).await? {
+        if let Some(url) = find_pull_request(gh, github, head, commit).await? {
             locked(&self.parts.unconfirmed_prs).remove(&id);
             return Ok(url);
         }
@@ -461,10 +495,15 @@ impl FeedbackService {
     /// its id is saved on the idea intent, and an intent that already
     /// depends that way on the idea is taken (its id was not saved) instead
     /// of making another. Refused as [`Self::open_pull_request`] is for an
-    /// intent that is not an idea or whose agent is not done; no `gh` runs.
+    /// intent that is not an idea or whose agent is not done. Its agent's
+    /// pull request carries the idea's files, so in a repository whose
+    /// `origin` is on GitHub it needs `public_acknowledged` unless `gh`
+    /// says the repository is private (`PublicNotAcknowledged`, before
+    /// anything is made); acknowledged, no `gh` runs.
     pub async fn create_implementation_intent(
         &self,
         id: IntentId,
+        public_acknowledged: bool,
     ) -> Result<Intent, FeedbackError> {
         let _running = Running::start(&self.parts.running);
         let _own = self.parts.ideas.lock(id).await;
@@ -478,6 +517,13 @@ impl FeedbackService {
             return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
         }
         let agent = self.idle_agent(&intent).await?;
+        if let Some(github) = self.github_of(&repo).await? {
+            self.acknowledgement(&github, public_acknowledged)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(intent_id = %id, step = "acknowledge", code = e.code(), "the implementation intent was not created");
+                })?;
+        }
         let head = self.settled_head(&repo, &agent).await?;
         let req = CreateIntentRequest {
             repo_id: Some(intent.repo_id),
@@ -656,6 +702,22 @@ async fn check_scope(
     }
 }
 
+/// `IdeaBlocked(Lfs)` when a file under the issue folder at `head` is a Git
+/// LFS pointer ([`git::has_lfs_pointer`]).
+async fn require_no_lfs_pointer(
+    repo: &Repo,
+    folder: &str,
+    head: &str,
+) -> Result<(), FeedbackError> {
+    if git::has_lfs_pointer(&repo.path, head, folder)
+        .await
+        .map_err(read_failed)?
+    {
+        return Err(FeedbackError::IdeaBlocked(IdeaBlocked::Lfs));
+    }
+    Ok(())
+}
+
 /// The pull request's body ([`pull_request_body`] of `issue.md` and
 /// `explainer.md` as committed at `head`, mentioning no one: [`no_mentions`])
 /// and the explainer's "Not done" section. `IdeaBlocked(Incomplete)` when
@@ -717,6 +779,7 @@ mod tests {
             IdeaBlocked::BranchGone,
             IdeaBlocked::NotSubmits,
             IdeaBlocked::Incomplete,
+            IdeaBlocked::Lfs,
         ];
         let codes: Vec<_> = all.iter().map(|b| b.code()).collect();
         assert_eq!(
@@ -725,7 +788,8 @@ mod tests {
                 "idea_agent_missing",
                 "idea_branch_missing",
                 "idea_origin_invalid",
-                "idea_incomplete"
+                "idea_incomplete",
+                "idea_lfs"
             ]
         );
         for blocked in all {

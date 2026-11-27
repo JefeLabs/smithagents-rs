@@ -831,7 +831,7 @@ async fn an_idea_goes_from_feedback_to_a_draft_pull_request() {
 
     let implementation = within(
         "the implementation intent",
-        client.create_implementation_intent(intent.id),
+        client.create_implementation_intent(intent.id, true),
     )
     .await
     .unwrap();
@@ -850,7 +850,7 @@ async fn an_idea_goes_from_feedback_to_a_draft_pull_request() {
         implementation.content.depends_on
     );
     let again = client
-        .create_implementation_intent(intent.id)
+        .create_implementation_intent(intent.id, true)
         .await
         .unwrap();
     assert_eq!(again.id, implementation.id, "made once");

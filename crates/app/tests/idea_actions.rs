@@ -20,14 +20,15 @@ use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{AppContext as _, ElementId, Entity, Role, TestAppContext, WindowHandle};
-use smithagents_app::feedback::text::PR_DESCRIPTION;
+use smithagents_app::feedback::text::{IMPLEMENT_DESCRIPTION, PR_DESCRIPTION};
 use smithagents_app::model::Action;
 use smithagents_app::shell::{Shell, ShellOptions};
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::views::intents::{
-    intent_card_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, IMPLEMENT_ID, INTENT_ERROR_ID,
-    NOT_DONE_ID, OPEN_CHAT_ID, OPEN_PR_CANCEL_ID, OPEN_PR_CONFIRM_ID, OPEN_PR_DESCRIPTION_ID,
-    OPEN_PR_ID, OPEN_PR_TITLE_ID, PR_COPY_ID, PR_URL_ID, RESOLVE_ID,
+    intent_card_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, IMPLEMENT_CANCEL_ID,
+    IMPLEMENT_CONFIRM_ID, IMPLEMENT_DESCRIPTION_ID, IMPLEMENT_ID, IMPLEMENT_TITLE_ID,
+    INTENT_ERROR_ID, NOT_DONE_ID, OPEN_CHAT_ID, OPEN_PR_CANCEL_ID, OPEN_PR_CONFIRM_ID,
+    OPEN_PR_DESCRIPTION_ID, OPEN_PR_ID, OPEN_PR_TITLE_ID, PR_COPY_ID, PR_URL_ID, RESOLVE_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_core::agent::{Agent, AgentState};
@@ -284,7 +285,7 @@ fn a_resolved_idea_intent_offers_both_buttons(cx: &mut TestAppContext) {
     assert!(enabled_button(cx, window, OPEN_PR_ID));
     assert_eq!(
         label_of(cx, window, IMPLEMENT_ID).as_deref(),
-        Some("Create implementation intent")
+        Some("Create implementation intent…")
     );
     assert!(enabled_button(cx, window, IMPLEMENT_ID));
     assert!(!is_drawn(cx, window, PR_URL_ID));
@@ -519,13 +520,67 @@ fn the_not_done_line_is_repeated(cx: &mut TestAppContext) {
 // ---- Create implementation intent -------------------------------------------
 
 #[gpui_kit::test]
+fn create_implementation_intent_asks_first(cx: &mut TestAppContext) {
+    // A-C1: always, whatever the repository: its agent's pull request will
+    // carry the idea's files.
+    let resolved = idea_intent(IntentState::Resolved, Some(PR_URL));
+    let opened = open_detail(cx, vec![resolved.clone()], vec![]);
+    let window = opened.window;
+
+    click(cx, window, IMPLEMENT_ID);
+    assert!(dialog_open(cx, window));
+    assert_eq!(
+        label_of(cx, window, IMPLEMENT_TITLE_ID).as_deref(),
+        Some("Create an implementation intent?")
+    );
+    assert_eq!(
+        label_of(cx, window, IMPLEMENT_DESCRIPTION_ID).as_deref(),
+        Some(IMPLEMENT_DESCRIPTION)
+    );
+    assert_eq!(
+        IMPLEMENT_DESCRIPTION,
+        "Creates an intent to build this idea. Its agent's pull request will include the idea's screenshots and explainer. If the repository is public, they will be visible to anyone."
+    );
+    assert_eq!(
+        label_of(cx, window, IMPLEMENT_CANCEL_ID).as_deref(),
+        Some("Cancel")
+    );
+    assert_eq!(
+        label_of(cx, window, IMPLEMENT_CONFIRM_ID).as_deref(),
+        Some("Create implementation intent")
+    );
+    assert!(
+        is_focused(cx, window, IMPLEMENT_CANCEL_ID),
+        "Cancel is the default"
+    );
+    // Enter cancels, even with the focus on the confirm button; so does
+    // Cancel.
+    press(cx, window, "enter");
+    assert!(!dialog_open(cx, window));
+    click(cx, window, IMPLEMENT_ID);
+    press(cx, window, "tab");
+    assert!(is_focused(cx, window, IMPLEMENT_CONFIRM_ID));
+    press(cx, window, "enter");
+    assert!(!dialog_open(cx, window));
+    click(cx, window, IMPLEMENT_ID);
+    click(cx, window, IMPLEMENT_CANCEL_ID);
+    assert!(!dialog_open(cx, window));
+    assert!(calls(&opened).is_empty(), "no call yet");
+}
+
+#[gpui_kit::test]
 fn create_implementation_intent_opens_the_new_intent(cx: &mut TestAppContext) {
     let resolved = idea_intent(IntentState::Resolved, Some(PR_URL));
     let opened = open_detail(cx, vec![resolved.clone()], vec![]);
     let window = opened.window;
 
     click(cx, window, IMPLEMENT_ID);
-    assert_eq!(calls(&opened), [FeedbackCall::Implement(resolved.id)]);
+    click(cx, window, IMPLEMENT_CONFIRM_ID);
+    assert_eq!(
+        calls(&opened),
+        [FeedbackCall::Implement(resolved.id, true)],
+        "acknowledged once confirmed"
+    );
     assert_eq!(busy(cx, &opened), Some(Busy::Implementation));
     assert!(disabled_button(cx, window, IMPLEMENT_ID));
     assert_eq!(screen(cx, &opened), Screen::Detail(resolved.id));
@@ -553,10 +608,35 @@ fn a_refused_implementation_intent_stays_on_the_idea(cx: &mut TestAppContext) {
         "this intent is not an idea package",
     )));
     click(cx, window, IMPLEMENT_ID);
+    click(cx, window, IMPLEMENT_CONFIRM_ID);
     assert_eq!(screen(cx, &opened), Screen::Detail(resolved.id));
     assert_eq!(
         error_line(cx, window).as_deref(),
         Some("This intent is not an idea package")
     );
     assert!(enabled_button(cx, window, IMPLEMENT_ID));
+}
+
+#[gpui_kit::test]
+fn an_implementation_intent_made_after_the_user_left_does_not_pull_them_back(
+    cx: &mut TestAppContext,
+) {
+    // A-M1: as Create guards its own.
+    let resolved = idea_intent(IntentState::Resolved, Some(PR_URL));
+    let opened = open_detail(cx, vec![resolved.clone()], vec![]);
+    let window = opened.window;
+    click(cx, window, IMPLEMENT_ID);
+    click(cx, window, IMPLEMENT_CONFIRM_ID);
+    click(cx, window, DETAIL_BACK_ID);
+    assert_eq!(screen(cx, &opened), Screen::List);
+
+    let created = intent(
+        "implement-zoom",
+        IntentState::Draft,
+        Phase::Polishing { pass: 1 },
+    );
+    opened.feedback.answer_intent(Ok(created));
+    frame(cx, window);
+    assert_eq!(busy(cx, &opened), None);
+    assert_eq!(screen(cx, &opened), Screen::List, "left where the user is");
 }

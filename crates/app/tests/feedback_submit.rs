@@ -30,8 +30,9 @@ use smithagents_app::feedback::annotation::{Annotation, FracRect};
 use smithagents_app::feedback::draft::AttachmentId;
 use smithagents_app::feedback::state::{Feedback, SentTo, SUBMIT_TIMEOUT};
 use smithagents_app::feedback::text::{
-    EMPTY_TEXT, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, PUBLIC_WARNING, REPO_GONE_TEXT,
-    START_OVER_RISK_TEXT, START_OVER_TOOLTIP, SUBMISSION_LOCKED_TEXT,
+    EMPTY_TEXT, INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING, MAYBE_PUBLIC_WARNING,
+    NOTHING_CREATED_TEXT, PUBLIC_WARNING, REPO_GONE_TEXT, START_OVER_RISK_TEXT, START_OVER_TOOLTIP,
+    SUBMISSION_LOCKED_TEXT,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::model::Action;
@@ -680,17 +681,30 @@ fn choosing_an_issue_changes_the_button_the_summary_and_the_warning(cx: &mut Tes
     let window = opened.window;
     screenshot(cx, &opened, &setup, &[]);
 
-    for (is_public, warning) in [
-        (Some(true), Some(PUBLIC_WARNING)),
-        (None, Some(MAYBE_PUBLIC_WARNING)),
-        (Some(false), None),
+    for (is_public, warning, intent_warning) in [
+        (
+            Some(true),
+            Some(PUBLIC_WARNING),
+            Some(INTENT_PUBLIC_WARNING),
+        ),
+        (
+            None,
+            Some(MAYBE_PUBLIC_WARNING),
+            Some(INTENT_MAYBE_PUBLIC_WARNING),
+        ),
+        (Some(false), None, None),
     ] {
         open_submit(
             cx,
             &opened,
             targets(&[(alpha, true, is_public)], true, false),
         );
-        assert!(!drawn(cx, window, PUBLIC_WARNING_ID), "not for an intent");
+        // An intent's own warning: its agent's pull request (A-C1).
+        assert_eq!(
+            text_of(cx, window, PUBLIC_WARNING_ID).as_deref(),
+            intent_warning,
+            "{is_public:?}"
+        );
         click(cx, window, SEND_ISSUE_ID);
         assert_eq!(
             text_of(cx, window, SUBMIT_CONFIRM_ID).as_deref(),
@@ -2008,15 +2022,125 @@ fn the_acknowledgement_is_sent_only_after_the_dialog(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn an_intent_carries_no_acknowledgement(cx: &mut TestAppContext) {
+fn an_intent_without_a_github_remote_or_to_a_private_one_is_not_asked(cx: &mut TestAppContext) {
+    // No GitHub remote.
     let setup = FeedbackSetup::new();
     let repos = two_repos();
     let opened = ready_to_send(cx, &setup, &repos);
+    assert!(!drawn(cx, opened.window, PUBLIC_WARNING_ID));
     click(cx, opened.window, SUBMIT_CONFIRM_ID);
     assert!(!dialog(cx, opened.window), "not asked");
     let submits = opened.fake.submits();
     assert_eq!(submits.len(), 1);
     assert!(!submits[0].0.public_acknowledged);
+
+    // A GitHub remote, private.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let opened = open(cx, &setup, &repos, Some(alpha));
+    screenshot(cx, &opened, &setup, &["the toolbar"]);
+    open_submit(
+        cx,
+        &opened,
+        targets(&[(alpha, true, Some(false))], true, false),
+    );
+    type_idea(cx, opened.window, "Fix the zoom");
+    assert!(!drawn(cx, opened.window, PUBLIC_WARNING_ID));
+    click(cx, opened.window, SUBMIT_CONFIRM_ID);
+    assert!(!dialog(cx, opened.window), "not asked");
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 1);
+    assert!(!submits[0].0.public_acknowledged);
+}
+
+#[gpui_kit::test]
+fn a_plain_intent_to_a_public_repository_asks_first(cx: &mut TestAppContext) {
+    // A-C1: its agent's pull request will carry the screenshots.
+    for (is_public, warning) in [
+        (Some(true), INTENT_PUBLIC_WARNING),
+        (None, INTENT_MAYBE_PUBLIC_WARNING),
+    ] {
+        let setup = FeedbackSetup::new();
+        let repos = two_repos();
+        let alpha = repos[0].id;
+        let opened = open(cx, &setup, &repos, Some(alpha));
+        let window = opened.window;
+        screenshot(cx, &opened, &setup, &["the toolbar"]);
+        open_submit(
+            cx,
+            &opened,
+            targets(&[(alpha, true, is_public)], true, false),
+        );
+        type_idea(cx, window, "Fix the zoom");
+        assert_eq!(
+            text_of(cx, window, PUBLIC_WARNING_ID).as_deref(),
+            Some(warning)
+        );
+
+        click(cx, window, SUBMIT_CONFIRM_ID);
+        assert!(dialog(cx, window), "asked");
+        assert!(label_reads(cx, window, warning));
+        // Cancel sends nothing, and the form stays as it was.
+        click(cx, window, PUBLIC_CANCEL_ID);
+        assert!(!dialog(cx, window));
+        assert!(opened.fake.submits().is_empty(), "nothing sent");
+        assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+
+        click(cx, window, SUBMIT_CONFIRM_ID);
+        click(cx, window, PUBLIC_CONFIRM_ID);
+        let submits = opened.fake.submits();
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].0.send_as, SendAs::Intent);
+        assert!(submits[0].0.public_acknowledged, "confirmed in the dialog");
+    }
+}
+
+#[gpui_kit::test]
+fn an_idea_package_is_not_asked_at_submit(cx: &mut TestAppContext) {
+    // A-C1: nothing of it leaves before its two actions, which ask.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let opened = open(cx, &setup, &repos, Some(alpha));
+    let window = opened.window;
+    screenshot(cx, &opened, &setup, &["the toolbar"]);
+    open_submit(
+        cx,
+        &opened,
+        targets(&[(alpha, true, Some(true))], true, false),
+    );
+    type_idea(cx, window, "Fix the zoom");
+    click(cx, window, IDEA_CHECK_ID);
+    assert!(!drawn(cx, window, PUBLIC_WARNING_ID));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(!dialog(cx, window), "not asked");
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 1);
+    assert!(submits[0].0.idea.is_some());
+    assert!(!submits[0].0.public_acknowledged);
+}
+
+#[gpui_kit::test]
+fn a_daemon_that_asks_about_a_plain_intent_gets_the_question(cx: &mut TestAppContext) {
+    // The app knew nothing of the repository's remote; the daemon refuses.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    opened.fake.queue_outcome(Err(api(
+        409,
+        "public_not_acknowledged",
+        "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.",
+    )));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(dialog(cx, window), "asked");
+    assert!(label_reads(cx, window, INTENT_MAYBE_PUBLIC_WARNING));
+    click(cx, window, PUBLIC_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_eq!(submits[1].0.submission_id, submits[0].0.submission_id);
+    assert!(submits[1].0.public_acknowledged);
 }
 
 #[gpui_kit::test]
@@ -2075,4 +2199,108 @@ fn a_daemon_that_still_asks_gets_the_question_and_the_same_id(cx: &mut TestAppCo
     assert_eq!(submits[2].0.submission_id, first[0].0.submission_id);
     assert!(submits[2].0.public_acknowledged);
     assert!(!dialog(cx, window), "asked once");
+}
+
+// ---- A refused re-upload -------------------------------------------------------
+
+/// A first send the daemon never answered, then Retry: the retry route knows
+/// of no such submission, so the same request goes again (a re-upload),
+/// whose answer `reupload` is.
+fn reupload_answered(
+    cx: &mut TestAppContext,
+    opened: &Opened,
+    reupload: Result<smithagents_core::feedback::FeedbackOutcome, LinkError>,
+) {
+    let window = opened.window;
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    cx.executor()
+        .advance_clock(SUBMIT_TIMEOUT + Duration::from_secs(1));
+    frame(cx, window);
+    opened
+        .fake
+        .queue_outcome(Err(api(404, "submission_not_found", "no such submission")));
+    opened.fake.queue_outcome(reupload);
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.submits().len(), 2, "re-uploaded");
+}
+
+#[gpui_kit::test]
+fn a_refused_reupload_stays_locked(cx: &mut TestAppContext) {
+    // A-I1: the first request may still make its commit.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    reupload_answered(
+        cx,
+        &opened,
+        Err(api(
+            409,
+            "default_branch_missing",
+            "the repository's default branch main does not exist locally",
+        )),
+    );
+
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some("The repository's default branch main does not exist locally")
+    );
+    assert!(
+        cx.read(|cx| opened.feedback.read(cx).locked()),
+        "still locked"
+    );
+    assert!(drawn(cx, window, SUBMIT_RETRY_ID));
+    assert!(drawn(cx, window, SUBMIT_START_OVER_ID));
+    assert!(!drawn(cx, window, SUBMIT_CONFIRM_ID));
+    assert!(idea_disabled(cx, window));
+    assert!(setup.draft_dir().join("submission.json").exists());
+    // Nothing can be added while it is.
+    click(cx, window, SUBMIT_BACK_ID);
+    assert!(disabled(cx, window, FEEDBACK_CAPTURE_ID));
+    assert!(disabled(cx, window, FEEDBACK_ADD_FILES_ID));
+    act(cx, window, &opened.feedback, |f, window, cx| {
+        f.capture(window, cx)
+    });
+    assert_eq!(setup.hops.pending(), 0, "nothing is captured");
+    assert_eq!(
+        cx.read(|cx| opened.feedback.read(cx).notices().to_vec()),
+        [SUBMISSION_LOCKED_TEXT]
+    );
+    assert_eq!(
+        cx.read(|cx| opened.feedback.read(cx).draft().attachments.len()),
+        1
+    );
+    // Start over still asks: the first request may still run.
+    click(cx, window, FEEDBACK_SUBMIT_ID);
+    click(cx, window, SUBMIT_START_OVER_ID);
+    assert!(dialog(cx, window), "asked");
+}
+
+#[gpui_kit::test]
+fn a_reupload_the_daemon_asks_about_is_asked_while_locked(cx: &mut TestAppContext) {
+    // A-I1: the question still works on a locked draft.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    reupload_answered(
+        cx,
+        &opened,
+        Err(api(
+            409,
+            "public_not_acknowledged",
+            "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.",
+        )),
+    );
+    assert!(
+        cx.read(|cx| opened.feedback.read(cx).locked()),
+        "still locked"
+    );
+    assert!(dialog(cx, window), "asked");
+    click(cx, window, PUBLIC_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 3);
+    assert_eq!(submits[2].0.submission_id, submits[0].0.submission_id);
+    assert!(submits[2].0.public_acknowledged);
+    assert!(cx.read(|cx| opened.feedback.read(cx).locked()));
 }

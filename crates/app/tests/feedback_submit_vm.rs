@@ -11,14 +11,15 @@ use common::intents::{intent, FakeIntents};
 use smithagents_app::feedback::draft::{Attachment, AttachmentId, AttachmentKind, Draft};
 use smithagents_app::feedback::submit_vm::{
     asks_to_acknowledge, attachments_phrase, can_confirm, confirm_label, demo_help, issue_reason,
-    public_warning, result_text, send_failure, starting_repo, submit_error_text, summary,
-    upload_problem, SendFailure, KINDS,
+    maybe_public_warning, public_warning, result_text, send_failure, starting_repo,
+    submit_error_text, summary, upload_problem, SendFailure, IDEA_START, KINDS,
 };
 use smithagents_app::feedback::text::{
     DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON,
     IDEA_DEMO_LABEL, IDEA_DIAGRAMS_LABEL, IDEA_EXPLAINER_LABEL, IDEA_LABEL, IDEA_NEEDS_PART,
-    LINK_STOPPED_TEXT, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON,
-    PUBLIC_WARNING, REPO_GONE_TEXT, START_OVER_RISK_TEXT, START_OVER_TOOLTIP,
+    INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING, LINK_STOPPED_TEXT, MAYBE_PUBLIC_WARNING,
+    NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PUBLIC_WARNING, REPO_GONE_TEXT, START_OVER_RISK_TEXT,
+    START_OVER_TOOLTIP,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::view_models::{
@@ -171,30 +172,54 @@ fn any_other_readiness_shows_the_daemons_reason() {
 
 #[test]
 fn the_public_warning_depends_on_what_is_known() {
+    // `(has a GitHub remote, is public)` of the target, or no target.
+    type Known = Option<(bool, Option<bool>)>;
+    let warn = |send_as, idea, known: Known| {
+        let target = known.map(|(remote, public)| target(remote, public));
+        public_warning(send_as, idea, target.as_ref())
+    };
+    // A GitHub issue.
+    let issue = |known: Known| warn(SendAs::GithubIssue, None, known);
+    assert_eq!(issue(Some((true, Some(true)))), Some(PUBLIC_WARNING));
+    assert_eq!(issue(Some((true, None))), Some(MAYBE_PUBLIC_WARNING));
+    assert_eq!(issue(Some((true, Some(false)))), None);
+    // Nothing known about the repository: it may be public.
+    assert_eq!(issue(None), Some(MAYBE_PUBLIC_WARNING));
+
+    // A plain intent to a repository with a GitHub remote: its agent's pull
+    // request carries the screenshots (A-C1).
+    let intent = |known: Known| warn(SendAs::Intent, None, known);
     assert_eq!(
-        public_warning(SendAs::GithubIssue, Some(&target(true, Some(true)))),
-        Some(PUBLIC_WARNING)
+        intent(Some((true, Some(true)))),
+        Some(INTENT_PUBLIC_WARNING)
     );
     assert_eq!(
-        public_warning(SendAs::GithubIssue, Some(&target(true, None))),
-        Some(MAYBE_PUBLIC_WARNING)
+        intent(Some((true, None))),
+        Some(INTENT_MAYBE_PUBLIC_WARNING)
     );
-    assert_eq!(
-        public_warning(SendAs::GithubIssue, Some(&target(true, Some(false)))),
-        None
-    );
+    assert_eq!(intent(Some((true, Some(false)))), None);
+    // No GitHub remote, or nothing known (the daemon still asks): none.
+    for is_public in [Some(true), None, Some(false)] {
+        assert_eq!(intent(Some((false, is_public))), None);
+    }
+    assert_eq!(intent(None), None);
+    // An idea package: never at Submit.
     for is_public in [Some(true), None, Some(false)] {
         assert_eq!(
-            public_warning(SendAs::Intent, Some(&target(true, is_public))),
+            warn(SendAs::Intent, Some(IDEA_START), Some((true, is_public))),
             None
         );
     }
-    assert_eq!(public_warning(SendAs::Intent, None), None);
-    // Nothing known about the repository: it may be public.
+    // What the daemon's refusal makes the app ask.
     assert_eq!(
-        public_warning(SendAs::GithubIssue, None),
-        Some(MAYBE_PUBLIC_WARNING)
+        maybe_public_warning(SendAs::GithubIssue),
+        MAYBE_PUBLIC_WARNING
     );
+    assert_eq!(
+        maybe_public_warning(SendAs::Intent),
+        INTENT_MAYBE_PUBLIC_WARNING
+    );
+
     assert_eq!(
         PUBLIC_WARNING,
         "This repository is public. The screenshots will be visible to anyone."
@@ -202,6 +227,14 @@ fn the_public_warning_depends_on_what_is_known() {
     assert_eq!(
         MAYBE_PUBLIC_WARNING,
         "This repository may be public. The screenshots will be visible to anyone."
+    );
+    assert_eq!(
+        INTENT_PUBLIC_WARNING,
+        "This repository is public. The agent's pull request will include the screenshots, visible to anyone."
+    );
+    assert_eq!(
+        INTENT_MAYBE_PUBLIC_WARNING,
+        "This repository may be public. The agent's pull request will include the screenshots, visible to anyone."
     );
 }
 

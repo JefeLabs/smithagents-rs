@@ -36,7 +36,9 @@ pub enum FeedbackCall {
     /// The idea intent, and whether the user acknowledged a public
     /// repository.
     OpenPullRequest(IntentId, bool),
-    Implement(IntentId),
+    /// The idea intent, and whether the user acknowledged that the new
+    /// intent's pull request may be public.
+    Implement(IntentId, bool),
 }
 
 type Reply = Result<FeedbackSettings, LinkError>;
@@ -199,8 +201,12 @@ impl FeedbackCommands for FakeFeedback {
         self.intents.borrow_mut().reply(|| Err(LinkError::Stopped))
     }
 
-    fn create_implementation_intent(&self, id: IntentId) -> IntentAnswer {
-        self.record(FeedbackCall::Implement(id));
+    fn create_implementation_intent(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> IntentAnswer {
+        self.record(FeedbackCall::Implement(id, public_acknowledged));
         self.intents.borrow_mut().reply(|| Err(LinkError::Stopped))
     }
 }
