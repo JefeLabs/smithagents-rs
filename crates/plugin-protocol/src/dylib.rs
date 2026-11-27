@@ -61,6 +61,7 @@ pub trait DylibHandler: Send + Sync {
 
 /// Serves a [`Plugin`]: each sync call runs [`Plugin::sync`] with a
 /// [`HostApi`] that sends its requests and logs under the call's number.
+#[derive(Debug)]
 pub struct PluginHandler<P>(P);
 
 impl<P: Plugin> PluginHandler<P> {
@@ -80,6 +81,19 @@ impl<P: Plugin> DylibHandler for PluginHandler<P> {
 pub struct HostConnection {
     host: BoxedDylibHost,
 }
+
+impl std::fmt::Debug for HostConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostConnection").finish_non_exhaustive()
+    }
+}
+
+// A plugin type that holds one of these can derive `Debug`.
+const _: () = {
+    const fn debug<T: std::fmt::Debug>() {}
+    debug::<HostConnection>();
+    debug::<PluginHandler<()>>();
+};
 
 impl HostConnection {
     /// Sends `call` to the host and returns its answer. A reply the plugin

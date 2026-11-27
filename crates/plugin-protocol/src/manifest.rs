@@ -271,8 +271,12 @@ pub struct ResourceDecl {
     pub interval_secs: u32,
 }
 
+/// A plugin's `plugin.toml`, parsed and checked. Only [`Manifest::parse`]
+/// builds one, and a later build may read more from the file: fields can be
+/// added.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Manifest {
     pub id: PluginId,
     pub name: String,
@@ -298,7 +302,12 @@ fn line_suffix(line: &Option<usize>) -> String {
     line.map(|n| format!(" (line {n})")).unwrap_or_default()
 }
 
+/// Why a `plugin.toml` was refused.
+///
+/// A later build may refuse a manifest for a reason this one does not have:
+/// the set of variants can grow.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ManifestError {
     /// The text is not a manifest. Deliberately carries no message from the
     /// TOML parser: it quotes the offending source line, which may hold a
@@ -356,7 +365,10 @@ pub enum ManifestError {
     BadText { field: String, max: usize },
 }
 
+/// Why a settings value does not fit a manifest's declarations. The set of
+/// variants can grow.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SettingsError {
     #[error("settings must be an object")]
     NotAnObject,
@@ -398,7 +410,16 @@ fn normalise_host(raw: &str) -> Result<String, ManifestError> {
 }
 
 impl Manifest {
-    /// Parse and check a `plugin.toml`.
+    /// Parses and checks a `plugin.toml`.
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::Toml`] for text that is not a manifest (with the
+    /// line, never the text: a manifest can hold what should not be shown),
+    /// and one variant per rule the manifest breaks: a contract version this
+    /// build does not load, a missing or unsafe entry file name, a host,
+    /// key, kind or tool name that is not valid, a duplicate, an interval
+    /// outside 60 to 86400 seconds, a default that does not match its kind.
     pub fn parse(toml_text: &str) -> Result<Manifest, ManifestError> {
         let mut m: Manifest = toml::from_str(toml_text).map_err(|e| ManifestError::Toml {
             line: e.span().map(|span| {
@@ -538,7 +559,14 @@ impl Manifest {
         Ok(m)
     }
 
-    /// Check user-supplied settings against the declarations and fill in defaults.
+    /// Checks user-supplied settings against the declarations and returns
+    /// them with the defaults filled in.
+    ///
+    /// # Errors
+    ///
+    /// [`SettingsError`] when `value` is not an object, lacks a required
+    /// setting, holds one of the wrong kind, or holds one the manifest does
+    /// not declare.
     pub fn validate_settings(&self, value: &Value) -> Result<Value, SettingsError> {
         let given = value.as_object().ok_or(SettingsError::NotAnObject)?;
         if let Some(key) = given

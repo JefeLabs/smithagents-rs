@@ -377,6 +377,9 @@ fn fixed_sentence(e: &ManifestError) -> &'static str {
         ManifestError::BadText { .. } => {
             "a name, label or help text is empty, too long or holds control characters"
         }
+        // The protocol crate can refuse a manifest for a reason added after
+        // this was written; it still gets a sentence with no file text.
+        _ => "the manifest breaks a rule this daemon has no sentence for",
     }
 }
 
