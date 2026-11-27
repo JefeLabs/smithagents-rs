@@ -135,8 +135,12 @@ fn check_text(text: &str, max: usize, field: impl FnOnce() -> String) -> Result<
     }
 }
 
+/// A secret the plugin names in its requests. Like every part of a
+/// manifest, it can gain fields: outside this crate one is made by parsing,
+/// not written out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SecretDecl {
     pub key: String,
     pub label: String,
@@ -165,6 +169,7 @@ impl SecretDecl {
 /// prints is the secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ToolSource {
     /// The `name` of one of the manifest's `[[tools]]`.
     pub tool: String,
@@ -176,6 +181,7 @@ pub struct ToolSource {
 /// plugins; the daemon runs it, never the plugin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ToolDecl {
     /// The executable's name, never a path: `^[a-z][a-z0-9_-]{0,31}$`.
     pub name: String,
@@ -232,15 +238,28 @@ fn install_url(raw: &str) -> Option<String> {
     usable.then(|| url.as_str().to_string())
 }
 
+/// What a setting's value is. A later build may know more kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SettingKind {
+    /// A string.
     Text,
+    /// A list of strings.
     List,
     Bool,
 }
 
 impl SettingKind {
+    /// The kind as a manifest writes it: `text`, `list` or `bool`.
+    pub fn name(self) -> &'static str {
+        match self {
+            SettingKind::Text => "text",
+            SettingKind::List => "list",
+            SettingKind::Bool => "bool",
+        }
+    }
+
     fn accepts(self, v: &Value) -> bool {
         match self {
             SettingKind::Text => v.is_string(),
@@ -250,8 +269,10 @@ impl SettingKind {
     }
 }
 
+/// A setting the user can give the plugin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SettingDecl {
     pub key: String,
     pub label: String,
@@ -262,8 +283,10 @@ pub struct SettingDecl {
     pub default: Option<Value>,
 }
 
+/// A kind of record the plugin lists, and how often.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ResourceDecl {
     pub kind: String,
     pub label: String,
@@ -271,8 +294,13 @@ pub struct ResourceDecl {
     pub interval_secs: u32,
 }
 
+/// A plugin's `plugin.toml`. [`Manifest::parse`] builds a checked one, and
+/// every rule in these docs that begins "after `parse`" holds only for that;
+/// deserialising one directly checks nothing. A later build may read more
+/// from the file: this type and the declarations in it can gain fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Manifest {
     pub id: PluginId,
     pub name: String,
@@ -298,7 +326,12 @@ fn line_suffix(line: &Option<usize>) -> String {
     line.map(|n| format!(" (line {n})")).unwrap_or_default()
 }
 
+/// Why a `plugin.toml` was refused.
+///
+/// A later build may refuse a manifest for a reason this one does not have:
+/// the set of variants can grow.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ManifestError {
     /// The text is not a manifest. Deliberately carries no message from the
     /// TOML parser: it quotes the offending source line, which may hold a
@@ -356,7 +389,57 @@ pub enum ManifestError {
     BadText { field: String, max: usize },
 }
 
+impl ManifestError {
+    /// Which rule the manifest broke, in a sentence that quotes nothing from
+    /// the file. The `Display` text names the offending key, host or entry,
+    /// which is file text; this is for where that must not be shown.
+    ///
+    /// It lives here, beside the variants, so that a new variant cannot be
+    /// added without its sentence: outside this crate the enum can only be
+    /// matched with a wildcard.
+    pub fn rule(&self) -> &'static str {
+        match self {
+            ManifestError::Toml { .. } => "the text is not a plugin manifest",
+            ManifestError::UnsupportedContract(_) => {
+                "the contract version is not one this build loads"
+            }
+            ManifestError::EntryRequired(_) => "the host mode needs an entry file",
+            ManifestError::BadEntry(_) => "the entry must be a plain file name",
+            ManifestError::BadHost(_) => "a host name is not valid",
+            ManifestError::BadSecretKey(_) => "a secret key is not valid",
+            ManifestError::SecretHostsRequired(_) => {
+                "a secret must list its hosts when the plugin declares more than one"
+            }
+            ManifestError::SecretHostNotDeclared { .. } => {
+                "a secret names a host the plugin does not declare"
+            }
+            ManifestError::BadSettingKey(_) => "a setting key is not valid",
+            ManifestError::BadResourceKind(_) => "a resource kind is not valid",
+            ManifestError::DuplicateSecret(_) => "a secret key is declared twice",
+            ManifestError::DuplicateSetting(_) => "a setting key is declared twice",
+            ManifestError::DuplicateResource(_) => "a resource kind is declared twice",
+            ManifestError::BadInterval { .. } => {
+                "a resource interval is outside 60 to 86400 seconds"
+            }
+            ManifestError::BadDefault(_) => "a setting default does not match its kind",
+            ManifestError::BadToolName(_) => "a tool name is not a plain executable name",
+            ManifestError::DuplicateTool(_) => "a tool is declared twice",
+            ManifestError::BadInstall(_) => "a tool's install entry is not valid",
+            ManifestError::BadInstallUrl(_) => "a tool's install_url is not an https address",
+            ManifestError::UnknownTool { .. } => {
+                "a secret names a tool the plugin does not declare"
+            }
+            ManifestError::BadText { .. } => {
+                "a name, label or help text is empty, too long or holds control characters"
+            }
+        }
+    }
+}
+
+/// Why a settings value does not fit a manifest's declarations. The set of
+/// variants can grow.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SettingsError {
     #[error("settings must be an object")]
     NotAnObject,
@@ -398,7 +481,16 @@ fn normalise_host(raw: &str) -> Result<String, ManifestError> {
 }
 
 impl Manifest {
-    /// Parse and check a `plugin.toml`.
+    /// Parses and checks a `plugin.toml`.
+    ///
+    /// # Errors
+    ///
+    /// [`ManifestError::Toml`] for text that is not a manifest (with the
+    /// line, never the text: a manifest can hold what should not be shown),
+    /// and one variant per rule the manifest breaks: a contract version this
+    /// build does not load, a missing or unsafe entry file name, a host,
+    /// key, kind or tool name that is not valid, a duplicate, an interval
+    /// outside 60 to 86400 seconds, a default that does not match its kind.
     pub fn parse(toml_text: &str) -> Result<Manifest, ManifestError> {
         let mut m: Manifest = toml::from_str(toml_text).map_err(|e| ManifestError::Toml {
             line: e.span().map(|span| {
@@ -538,7 +630,14 @@ impl Manifest {
         Ok(m)
     }
 
-    /// Check user-supplied settings against the declarations and fill in defaults.
+    /// Checks user-supplied settings against the declarations and returns
+    /// them with the defaults filled in.
+    ///
+    /// # Errors
+    ///
+    /// [`SettingsError`] when `value` is not an object, lacks a required
+    /// setting, holds one of the wrong kind, or holds one the manifest does
+    /// not declare.
     pub fn validate_settings(&self, value: &Value) -> Result<Value, SettingsError> {
         let given = value.as_object().ok_or(SettingsError::NotAnObject)?;
         if let Some(key) = given

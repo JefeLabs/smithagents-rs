@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 # The one crate allowed `unsafe`: loading a library and fetching its entry
-# cannot be done without it. Each use carries its own allowance.
+# cannot be done without it. Each use carries its own `expect` with a reason.
 [lints.rust]
 unsafe_code = "deny"
 
@@ -15,6 +15,10 @@ smithagents-plugin-protocol = { path = "../plugin-protocol", features = ["dylib"
 libloading.workspace = true
 stabby = { workspace = true, features = ["libloading"] }
 thiserror.workspace = true
+
+# The effective user, to tell whose files may hold code this process runs.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
 smithagents-plugins-tool = { path = "../../tools/plugins" }

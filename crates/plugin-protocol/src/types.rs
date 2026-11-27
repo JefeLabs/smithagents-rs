@@ -16,34 +16,68 @@ const MAX_VERSION_BYTES: usize = 4 * 1024;
 /// One sync call: which resource to fetch, from which cursor, with which settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncRequest {
+    /// The kind of resource to list, as the manifest declares it.
     pub resource: String,
+    /// The `next_cursor` of this plugin's last page for the resource, also
+    /// when that page was `done`; `None` when there has been none. It can
+    /// have been written under older settings: a plugin must accept that,
+    /// for instance by noticing it no longer fits and starting over.
     pub cursor: Option<String>,
+    /// The user's settings with the manifest's defaults filled in: a JSON
+    /// object.
     pub settings: Value,
 }
 
 /// One record a plugin reports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
+    /// What identifies the record within its resource: not empty, at most
+    /// 4 KiB, and once per page.
     pub id: String,
+    /// At most 512 characters.
     pub title: String,
+    /// Where the record can be opened: an absolute `http` or `https` URL
+    /// with a host, written plainly (no spaces or control characters), at
+    /// most 4 KiB.
     pub url: Option<String>,
+    /// When the record last changed, if the source says.
     pub updated_at: Option<DateTime<Utc>>,
+    /// Any string that changes when the record does; at most 4 KiB.
     pub version: Option<String>,
+    /// Whatever else the plugin reports: a JSON object of at most 64 KiB.
     pub fields: Value,
 }
 
-/// One page of a sync.
+/// One page of a sync. A page that breaks a limit or a shape rule
+/// ([`SyncPage::validate`]) is refused as a whole.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncPage {
+    /// Items to insert or replace: at most 500.
     pub upserts: Vec<Item>,
+    /// Ids of items to remove: at most 500.
     pub deletes: Vec<String>,
+    /// Kept by the daemon and passed back as [`SyncRequest::cursor`] on the
+    /// next call, also after a `done` page: a plugin can keep what it needs
+    /// between listings there. `None` starts over. At most 4 KiB. A page
+    /// that is not `done` and returns the cursor it was given makes no
+    /// progress, which ends the run with an error.
     pub next_cursor: Option<String>,
+    /// The listing is finished: the run ends, and the next run, one interval
+    /// later, begins a new listing.
     pub done: bool,
+    /// With `done`: this listing was the whole truth, so the daemon deletes
+    /// every stored item of the resource that no page of it returned. Set it
+    /// only when the plugin really listed everything. A listing whose
+    /// beginning the daemon did not see deletes nothing, whatever this says.
     pub snapshot_complete: bool,
 }
 
 /// A page that breaks the contract's size or shape limits.
+///
+/// A later build may refuse a page for a reason this one does not have: the
+/// set of variants can grow.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ContractError {
     #[error("too many upserts: {0} (at most 500)")]
     TooManyUpserts(usize),
@@ -93,7 +127,14 @@ fn check_id(id: &str) -> Result<(), ContractError> {
 }
 
 impl SyncPage {
-    /// Check the page against the contract's limits.
+    /// Checks the page against the contract's limits and shape rules.
+    ///
+    /// # Errors
+    ///
+    /// The first rule the page breaks: more than 500 upserts or deletes; a
+    /// cursor, id, url or version over 4 KiB; an empty or repeated id; a
+    /// title over 512 characters; a url that is not a plain absolute `http`
+    /// or `https` address; `fields` that is not an object or exceeds 64 KiB.
     pub fn validate(&self) -> Result<(), ContractError> {
         if self.upserts.len() > MAX_ITEMS {
             return Err(ContractError::TooManyUpserts(self.upserts.len()));
@@ -152,25 +193,38 @@ impl SyncPage {
     }
 }
 
-/// Why a sync failed, as the plugin reports it.
+/// Why a sync failed, as the plugin reports it. Each variant tells the
+/// daemon what to do next, so choose the one that fits. A message is shown
+/// to the user and must not hold a secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginError {
+    /// The source refused the credentials. The daemon shows the plugin as
+    /// needing sign-in, drops the secret values it cached for it, and stops
+    /// its runs until the settings change or the user asks for a sync.
     #[error("auth: {message}")]
     Auth { message: String },
+    /// The source asked to wait. The next run waits for the longer of
+    /// `retry_after_secs` and the resource's interval.
     #[error("rate limited, retry in {retry_after_secs}s: {message}")]
     RateLimited {
         retry_after_secs: u32,
         message: String,
     },
+    /// The settings are wrong: the plugin waits for new ones.
     #[error("settings: {message}")]
     Settings { message: String },
+    /// A request failed in a way that may pass. The run fails and is tried
+    /// again with a back-off from 30 seconds, doubling, up to 30 minutes.
     #[error("http: {message}")]
     Http { message: String },
+    /// Anything else; retried like [`PluginError::Http`].
     #[error("{message}")]
     Other { message: String },
 }
 
+/// The method of an [`HttpRequest`]. During a sync the host allows only
+/// `Get` and `Head`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpMethod {
@@ -186,17 +240,15 @@ pub enum HttpMethod {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Auth {
-    Bearer {
-        secret: String,
-    },
+    /// `Authorization: Bearer <value of secret>`.
+    Bearer { secret: String },
+    /// `Authorization: Basic`, from the values of two secrets.
     Basic {
         user_secret: String,
         password_secret: String,
     },
-    Header {
-        name: String,
-        secret: String,
-    },
+    /// The header `name` with the value of `secret`.
+    Header { name: String, secret: String },
 }
 
 mod base64_opt {
@@ -228,20 +280,31 @@ mod base64_bytes {
     }
 }
 
+/// A request the host makes on the plugin's behalf ([`HostApi::http`]): the
+/// plugin has no network of its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpRequest {
     pub method: HttpMethod,
+    /// An `https` address on port 443 of a host the manifest declares.
     pub url: String,
+    /// Extra headers. Credential and connection headers (`Authorization`,
+    /// `Cookie`, `Host` and the like) are refused here: a credential comes
+    /// only from `auth`.
     pub headers: Vec<(String, String)>,
+    /// At most 1 MiB; refused during a sync.
     #[serde(with = "base64_opt")]
     pub body: Option<Vec<u8>>,
+    /// Which secret the host adds, by name. The plugin never sees its value.
     pub auth: Option<Auth>,
 }
 
+/// What came back for an [`HttpRequest`]. Redirects are not followed: a 3xx
+/// answer is returned as it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// At most 5 MiB.
     #[serde(with = "base64_bytes")]
     pub body: Vec<u8>,
 }
@@ -256,21 +319,31 @@ impl HttpResponse {
     }
 }
 
+/// Why the host made no request, or got no answer, for an [`HttpRequest`].
+/// A status such as 404 or 500 is not an error: it is an [`HttpResponse`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HttpError {
+    /// The host refused the request (an address the manifest does not
+    /// declare, a header or method it does not allow, too many requests in
+    /// one call). The reason never holds a secret.
     #[error("denied: {reason}")]
     Denied { reason: String },
+    /// The secret `auth` names has no value: the user has not signed in.
     #[error("secret missing: {key}")]
     SecretMissing { key: String },
+    /// No answer within 30 seconds.
     #[error("timeout")]
     Timeout,
+    /// The answer's body is over 5 MiB.
     #[error("response too large")]
     TooLarge,
+    /// The connection failed.
     #[error("transport: {message}")]
     Transport { message: String },
 }
 
+/// How much a line a plugin logs ([`HostApi::log`]) matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
@@ -280,13 +353,38 @@ pub enum LogLevel {
     Error,
 }
 
-/// What the host offers a plugin.
+/// What the host offers a plugin during a call. Hosts implement it; a
+/// plugin only calls it.
 pub trait HostApi {
+    /// Makes one request and returns the answer, whatever its status. At
+    /// most 50 requests per call into the plugin.
+    ///
+    /// # Errors
+    ///
+    /// [`HttpError`] when the host refuses the request or no answer comes;
+    /// see its variants.
     fn http(&self, req: HttpRequest) -> Result<HttpResponse, HttpError>;
+    /// Writes one line to the daemon's log, under the plugin's name. The
+    /// host cleans the text and caps how much one call may log; never log
+    /// a secret.
     fn log(&self, level: LogLevel, message: &str);
 }
 
 /// What a plugin implements.
 pub trait Plugin: Send + Sync {
+    /// Returns one page of `req.resource`, starting at `req.cursor`. The
+    /// daemon calls again with the page's `next_cursor` until a page is
+    /// `done`, at most 20 pages per run. The network is reached only
+    /// through `host`.
+    ///
+    /// A call must answer within 60 seconds, and a WebAssembly plugin also
+    /// within 10 seconds of its own CPU time. A call that does not, or that
+    /// panics, fails the run, which is tried again later; a native plugin
+    /// is then stopped until the daemon restarts.
+    ///
+    /// # Errors
+    ///
+    /// A [`PluginError`] whose variant says what the daemon should do next:
+    /// ask the user to sign in, wait, ask for new settings, or try again.
     fn sync(&self, host: &dyn HostApi, req: SyncRequest) -> Result<SyncPage, PluginError>;
 }

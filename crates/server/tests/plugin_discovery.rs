@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use smithagents_plugin_host::{LoadError, WasmEngine};
 use smithagents_plugin_protocol::HostMode;
-use smithagents_plugins_tool::pack_fixtures_once;
+use smithagents_plugins_tool::{pack_fixtures_once, BuiltinScratch};
 use smithagents_server::plugins::{discover, load_runtime, Origin, FEEDBACK_PLUGIN_ID};
 
 /// Sets the mode; off Unix there are no modes, so this does nothing.
@@ -85,7 +85,10 @@ fn missing_and_empty_directories_yield_nothing() {
 #[tokio::test]
 async fn builtin_dylib_and_installed_wasm_are_discovered_and_load() {
     let tmp = tempfile::tempdir().unwrap();
-    let builtin = tmp.path().join("builtin");
+    // A native plugin loads only from inside the plugins folder beside the
+    // running executable, here this test's.
+    let scratch = BuiltinScratch::new("discovery");
+    let builtin = scratch.path().to_path_buf();
     let installed = tmp.path().join("installed");
     install_fixture(&builtin, "fixture-dylib", "fixture-dylib");
     install_fixture(&installed, "fixture-wasm", "fixture-wasm");
@@ -101,6 +104,24 @@ async fn builtin_dylib_and_installed_wasm_are_discovered_and_load() {
     assert_eq!(dylib.mode(), HostMode::Dylib);
     let wasm = load_runtime(&found[1], Some(&engine)).await.unwrap();
     assert_eq!(wasm.mode(), HostMode::Wasm);
+}
+
+#[tokio::test]
+async fn a_builtin_dylib_outside_the_executables_plugins_folder_does_not_load() {
+    // `discover` takes the built-in folder as given, but the loader does
+    // not: whatever a caller says is built in, a library is opened only
+    // from the folder beside the running executable.
+    let tmp = tempfile::tempdir().unwrap();
+    let builtin = tmp.path().join("builtin");
+    install_fixture(&builtin, "fixture-dylib", "fixture-dylib");
+    let (found, rejected) = discover(Some(&builtin), Path::new("/nonexistent"));
+    assert!(rejected.is_empty(), "{rejected:?}");
+    assert_eq!(found[0].origin(), Origin::Builtin);
+
+    let err = load_runtime(&found[0], None).await.err().unwrap();
+
+    assert!(matches!(err, LoadError::Dylib { .. }), "{err:?}");
+    assert!(err.to_string().contains("plugins folder"), "{err}");
 }
 
 #[cfg(feature = "test-util")]

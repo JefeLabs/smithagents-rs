@@ -50,17 +50,18 @@ fn gh_runs(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A tool as a manifest declares it. `ToolDecl` can gain fields, so it is
+/// read here, as a manifest is, and not written out.
 fn decl(name: &str, min_version: Option<&str>, install: &[(&str, &str)]) -> ToolDecl {
-    ToolDecl {
-        name: name.into(),
-        label: "GitHub CLI".into(),
-        min_version: min_version.map(|v| v.parse().unwrap()),
-        install_url: Some("https://cli.github.com".into()),
-        install: install
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-    }
+    let install: HashMap<&str, &str> = install.iter().copied().collect();
+    serde_json::from_value(serde_json::json!({
+        "name": name,
+        "label": "GitHub CLI",
+        "min_version": min_version,
+        "install_url": "https://cli.github.com",
+        "install": install,
+    }))
+    .unwrap()
 }
 
 fn finder(dir: &TempDir) -> ToolFinder {
@@ -388,10 +389,7 @@ fn id(s: &str) -> PluginId {
 }
 
 fn gh_token() -> ToolSource {
-    ToolSource {
-        tool: "gh".into(),
-        args: vec!["auth".into(), "token".into()],
-    }
+    serde_json::from_value(serde_json::json!({ "tool": "gh", "args": ["auth", "token"] })).unwrap()
 }
 
 fn tool_secrets(dir: &TempDir, inner: Arc<dyn SecretSource>, plugin: &str) -> ToolSecrets {

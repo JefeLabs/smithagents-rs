@@ -4,7 +4,7 @@
 
 use serde_json::{Map, Value};
 use smithagents_core::plugin::SettingField;
-use smithagents_plugin_protocol::{Manifest, SettingKind};
+use smithagents_plugin_protocol::Manifest;
 
 use super::manager::clean_message;
 
@@ -34,18 +34,10 @@ pub(crate) fn fields(manifest: &Manifest) -> Vec<SettingField> {
         .map(|s| SettingField {
             key: s.key.clone(),
             label: s.label.clone(),
-            kind: kind_name(s.kind).into(),
+            kind: s.kind.name().into(),
             required: s.required,
         })
         .collect()
-}
-
-fn kind_name(kind: SettingKind) -> &'static str {
-    match kind {
-        SettingKind::Text => "text",
-        SettingKind::List => "list",
-        SettingKind::Bool => "bool",
-    }
 }
 
 #[cfg(test)]

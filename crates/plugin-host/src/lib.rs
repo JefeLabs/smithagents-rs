@@ -14,7 +14,7 @@ mod services;
 mod tools;
 mod wasm;
 
-pub use dylib::DylibRuntime;
+pub use dylib::{builtin_plugins_dir, DylibRuntime};
 pub use http::HttpPolicy;
 pub use linked::LinkedRuntime;
 pub use runtime::{CallError, LoadError, PluginRuntime};

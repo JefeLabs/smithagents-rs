@@ -277,3 +277,32 @@ fn http_error_display() {
         "secret missing: token"
     );
 }
+
+#[test]
+fn the_crates_in_the_contract_are_named_through_it() {
+    // A plugin that names these types through the protocol crate always has
+    // the versions the contract was built with, whatever it depends on itself.
+    use smithagents_plugin_protocol::{chrono, semver, serde_json};
+
+    let item = Item {
+        id: "a".into(),
+        title: "A".into(),
+        url: None,
+        updated_at: Some(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH),
+        version: None,
+        fields: serde_json::json!({}),
+    };
+    let page = SyncPage {
+        upserts: vec![item],
+        deletes: vec![],
+        next_cursor: None,
+        done: true,
+        snapshot_complete: false,
+    };
+    assert_eq!(page.validate(), Ok(()));
+    let manifest = smithagents_plugin_protocol::Manifest::parse(
+        "id = \"github\"\nname = \"GitHub\"\nversion = \"1.2.3\"\ncontract = 1\nhost = \"in-process\"\n",
+    )
+    .unwrap();
+    assert_eq!(manifest.version, semver::Version::new(1, 2, 3));
+}

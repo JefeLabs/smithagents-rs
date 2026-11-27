@@ -108,6 +108,65 @@ fn github_is_packed_with_its_own_manifest() {
     check_github(&pack_fixtures_once().dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn folders_others_can_write_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // What a umask of 002 (or an earlier, laxer run) leaves: discovery
+    // refuses a plugins folder, or a plugin's folder, that others can write.
+    let out = tempfile::tempdir().unwrap();
+    let root = out.path().join("plugins");
+    for dir in [root.clone(), root.join("fixture-dylib")] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    }
+
+    pack(&PackOptions {
+        release: true,
+        out_dir: root.clone(),
+        fixtures: true,
+    })
+    .unwrap();
+
+    assert_not_writable_by_others(&root);
+    for id in FIXTURES {
+        assert_not_writable_by_others(&root.join(id));
+    }
+    // Nothing else of the folder's mode changes.
+    let mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_output_folder_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The folder a link points to is not the packer's to change: it may be
+    // shared on purpose. (Discovery refuses a linked plugins folder anyway.)
+    let out = tempfile::tempdir().unwrap();
+    let shared = out.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let link = out.path().join("plugins");
+    std::os::unix::fs::symlink(&shared, &link).unwrap();
+
+    pack(&PackOptions {
+        release: true,
+        out_dir: link,
+        fixtures: true,
+    })
+    .unwrap();
+
+    let mode = fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o777);
+    // The plugin folders are the packer's own, and are tightened.
+    for id in FIXTURES {
+        assert_not_writable_by_others(&shared.join(id));
+    }
+}
+
 #[test]
 fn concurrent_packs_into_one_directory_both_succeed() {
     let out = tempfile::tempdir().unwrap();

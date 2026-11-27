@@ -47,13 +47,41 @@ fn daemon_bin() -> PathBuf {
 /// client's event stream, logs the raw WebSocket handshake, including the
 /// `Authorization` header with the daemon token, at `log::trace!`. If `log`
 /// is ever bridged, cap it at `debug`.
+///
+/// So the subscriber is set with `set_global_default`, never with `init()`:
+/// `init()` is itself the bridge whenever tracing-subscriber's `tracing-log`
+/// feature is on, and any dependency can turn that feature on.
 fn init_logging() {
     let level = std::env::var("SMITHAGENTS_LOG")
         .ok()
         .and_then(|level| level.parse::<tracing::Level>().ok())
         .unwrap_or(tracing::Level::INFO);
-    tracing_subscriber::fmt()
+    log_at(level);
+}
+
+/// Sets this process's one subscriber: `tracing` events at `level` and above,
+/// to stderr, and nothing from the `log` crate (see [`init_logging`]).
+fn log_at(level: tracing::Level) {
+    let subscriber = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(level)
-        .init();
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("logging is set up once, before anything else");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn logging_does_not_forward_the_log_crate() {
+        // tungstenite logs the WebSocket handshake, `Authorization` header
+        // and daemon token included, through `log` at trace. Whatever
+        // features tracing-subscriber was built with, nothing may carry
+        // those records into this process's log. (That this build has the
+        // feature that would carry them is checked in
+        // tests/log_bridge_canary.rs.)
+        super::log_at(tracing::Level::TRACE);
+        assert_eq!(log::max_level(), log::LevelFilter::Off);
+        assert!(!log::log_enabled!(log::Level::Error));
+    }
 }

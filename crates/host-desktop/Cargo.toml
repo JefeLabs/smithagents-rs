@@ -17,3 +17,10 @@ smithagents-app = { path = "../app" }
 smithagents-core = { path = "../core" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# The feature that makes `init()` forward the `log` crate's records, on in
+# test builds so the test of `init_logging` means something: logging must not
+# forward them even when a dependency turns it on.
+tracing-subscriber = { workspace = true, features = ["tracing-log"] }
+log = "0.4"

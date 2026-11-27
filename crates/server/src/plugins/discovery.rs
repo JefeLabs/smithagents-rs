@@ -1,6 +1,7 @@
 //! Plugin discovery: which directories hold a plugin that may load, and how
-//! it is loaded. This is the only place that keeps native (dylib) plugins to
-//! the built-in directory: the loader crate accepts any path.
+//! it is loaded. Native (dylib) plugins are kept to the built-in directory
+//! twice: here, by their origin and by the checks below, and by the loader
+//! crate, which opens no library outside the folder beside the executable.
 //!
 //! Trust model (Unix; other platforms have no permission bits to check and
 //! skip these checks). The anchor is the directory holding the daemon
@@ -110,10 +111,10 @@ pub struct Rejected {
 }
 
 /// `<directory of the running executable>/plugins`, with the executable's
-/// symlinks resolved so the directory is the real one.
+/// symlinks resolved so the directory is the real one: the folder the
+/// loader opens native plugins from, and no other.
 pub fn builtin_plugins_dir() -> Option<PathBuf> {
-    let exe = fs::canonicalize(std::env::current_exe().ok()?).ok()?;
-    Some(exe.parent()?.join("plugins"))
+    smithagents_plugin_host::builtin_plugins_dir()
 }
 
 #[derive(Default)]
@@ -342,41 +343,10 @@ fn read_manifest(path: &Path) -> Result<Manifest, String> {
         ManifestError::UnsupportedContract(_) | ManifestError::EntryRequired(_) => {
             format!("plugin.toml is not valid: {e}")
         }
-        // The rest would quote text from the file, so each has a fixed sentence.
-        other => format!("plugin.toml is not valid: {}", fixed_sentence(&other)),
+        // The rest would quote text from the file, so each has a fixed
+        // sentence, kept beside the variants in the protocol crate.
+        other => format!("plugin.toml is not valid: {}", other.rule()),
     })
-}
-
-fn fixed_sentence(e: &ManifestError) -> &'static str {
-    match e {
-        ManifestError::Toml { .. }
-        | ManifestError::UnsupportedContract(_)
-        | ManifestError::EntryRequired(_) => "the manifest is not usable",
-        ManifestError::BadEntry(_) => "the entry must be a plain file name",
-        ManifestError::BadHost(_) => "a host name is not valid",
-        ManifestError::BadSecretKey(_) => "a secret key is not valid",
-        ManifestError::SecretHostsRequired(_) => {
-            "a secret must list its hosts when the plugin declares more than one"
-        }
-        ManifestError::SecretHostNotDeclared { .. } => {
-            "a secret names a host the plugin does not declare"
-        }
-        ManifestError::BadSettingKey(_) => "a setting key is not valid",
-        ManifestError::BadResourceKind(_) => "a resource kind is not valid",
-        ManifestError::DuplicateSecret(_) => "a secret key is declared twice",
-        ManifestError::DuplicateSetting(_) => "a setting key is declared twice",
-        ManifestError::DuplicateResource(_) => "a resource kind is declared twice",
-        ManifestError::BadInterval { .. } => "a resource interval is outside 60 to 86400 seconds",
-        ManifestError::BadDefault(_) => "a setting default does not match its kind",
-        ManifestError::BadToolName(_) => "a tool name is not a plain executable name",
-        ManifestError::DuplicateTool(_) => "a tool is declared twice",
-        ManifestError::BadInstall(_) => "a tool's install entry is not valid",
-        ManifestError::BadInstallUrl(_) => "a tool's install_url is not an https address",
-        ManifestError::UnknownTool { .. } => "a secret names a tool the plugin does not declare",
-        ManifestError::BadText { .. } => {
-            "a name, label or help text is empty, too long or holds control characters"
-        }
-    }
 }
 
 /// Resolves the entry file and checks it. Returns its canonical path.
