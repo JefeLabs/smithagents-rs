@@ -311,23 +311,23 @@ pub async fn find_issue(
     }
 }
 
-/// The pull request of the branch `head` on `repo` that the signed-in user
-/// opened for the commit `commit`: `gh pr list --repo=… --head=<head>
-/// --author=@me --state=all --json=url,headRefOid --jq=map(select(.headRefOid
-/// == "<commit>")) | .[0].url // ""`, within `gh.timeout`. A pull request of
-/// that branch whose head is another commit is never taken. A first line
-/// that is a pull request of `repo` is that pull request; an empty one is
-/// none; anything else is `gh_bad_answer` (and nothing may be opened then).
-/// `head` must be a branch name the caller checked; `commit` that is not a
-/// full commit id finds none.
+/// The pull requests of the branch `head` on `repo` that the signed-in user
+/// opened: `gh pr list --repo=… --head=<head> --author=@me --state=all
+/// --json=url,headRefOid,state`, within `gh.timeout`, its answer read here
+/// ([`read_pull_requests`]; no `--jq` program). The one whose head is the
+/// commit `commit` is `Found`; a pull request of that branch whose head is
+/// another commit is never taken, but an open one is `HeadMoved`. An answer
+/// that is not the list `gh` prints is `gh_bad_answer` (and nothing may be
+/// opened then). `head` must be a branch name the caller checked; `commit`
+/// that is not a full commit id finds none (and `gh` does not run).
 pub async fn find_pull_request(
     gh: &Gh<'_>,
     repo: &GithubRepo,
     head: &str,
     commit: &str,
-) -> Result<Option<String>, FeedbackFailure> {
+) -> Result<PullRequestSearch, FeedbackFailure> {
     if !crate::git::is_commit_id(commit) {
-        return Ok(None);
+        return Ok(PullRequestSearch::NotFound);
     }
     let mut list = args(["pr", "list"]);
     list.push(repo.repo_arg());
@@ -335,17 +335,68 @@ pub async fn find_pull_request(
     list.extend(args([
         "--author=@me",
         "--state=all",
-        "--json=url,headRefOid",
+        "--json=url,headRefOid,state",
     ]));
-    list.push(format!(
-        r#"--jq=map(select(.headRefOid == "{commit}")) | .[0].url // """#
-    ));
     match gh.run(&list, gh.timeout).await {
-        Ok(None) => Ok(None),
-        Ok(Some(url)) if repo.is_pull_request_url(&url) => Ok(Some(url)),
-        Ok(Some(_)) => Err(bad_answer(PULL_REQUEST)),
+        Ok(answer) => read_pull_requests(answer.as_deref(), repo, commit)
+            .ok_or_else(|| bad_answer(PULL_REQUEST)),
         Err(e) => Err(run_failure(PULL_REQUEST, e).failure),
     }
+}
+
+/// What [`find_pull_request`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullRequestSearch {
+    /// The pull request whose head is the commit pushed (whatever its
+    /// state): its address.
+    Found(String),
+    /// None has that head, but one of the branch is open with another head:
+    /// the branch changed on GitHub since it was pushed.
+    HeadMoved,
+    /// Neither (closed or merged ones for other commits do not count).
+    NotFound,
+}
+
+/// One pull request as `gh pr list --json=url,headRefOid,state` prints it.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedPullRequest {
+    url: String,
+    head_ref_oid: String,
+    state: String,
+}
+
+/// `answer` (the first line `gh` printed: its JSON on one line, as `gh`
+/// writes it to a pipe) as [`find_pull_request`] reads it: `None` unless it
+/// is a JSON array of objects, each with a `url` that is a pull request of
+/// `repo`, a `headRefOid` that is a full commit id and a `state` of `OPEN`,
+/// `CLOSED` or `MERGED`. Of those, the first whose head is `commit` (in any
+/// case) is `Found`; else an `OPEN` one is `HeadMoved`; else `NotFound`.
+fn read_pull_requests(
+    answer: Option<&str>,
+    repo: &GithubRepo,
+    commit: &str,
+) -> Option<PullRequestSearch> {
+    let listed: Vec<ListedPullRequest> = serde_json::from_str(answer?).ok()?;
+    let well_formed = listed.iter().all(|pr| {
+        repo.is_pull_request_url(&pr.url)
+            && crate::git::is_commit_id(&pr.head_ref_oid)
+            && matches!(pr.state.as_str(), "OPEN" | "CLOSED" | "MERGED")
+    });
+    if !well_formed {
+        return None;
+    }
+    if let Some(pr) = listed
+        .iter()
+        .find(|pr| pr.head_ref_oid.eq_ignore_ascii_case(commit))
+    {
+        return Some(PullRequestSearch::Found(pr.url.clone()));
+    }
+    Some(if listed.iter().any(|pr| pr.state == "OPEN") {
+        PullRequestSearch::HeadMoved
+    } else {
+        PullRequestSearch::NotFound
+    })
 }
 
 /// What [`create_pull_request`] opens: a draft from `head` into `base` (both
@@ -807,6 +858,86 @@ mod tests {
             (f.code.as_str(), f.message.as_str()),
             ("io_error", "could not write the pull request's body")
         );
+    }
+
+    #[test]
+    fn a_list_of_pull_requests_is_read_in_rust() {
+        let repo = widgets();
+        let ours = "0123456789abcdef0123456789abcdef01234567";
+        let other = "fedcba9876543210fedcba9876543210fedcba98";
+        let url = |n: u32| format!("https://github.com/smithagents-test-invalid/widgets/pull/{n}");
+        let pr = |head: &str, state: &str, n: u32| {
+            format!(
+                r#"{{"headRefOid":"{head}","state":"{state}","url":"{}"}}"#,
+                url(n)
+            )
+        };
+        let list = |prs: &[String]| format!("[{}]", prs.join(","));
+        let read = |answer: &str| read_pull_requests(Some(answer), &repo, ours);
+        use PullRequestSearch::{Found, HeadMoved, NotFound};
+
+        assert_eq!(read("[]"), Some(NotFound));
+        assert_eq!(read(&list(&[pr(ours, "OPEN", 5)])), Some(Found(url(5))));
+        // The one for the commit pushed, whatever its state; in any case.
+        assert_eq!(
+            read(&list(&[pr(other, "OPEN", 4), pr(ours, "MERGED", 5)])),
+            Some(Found(url(5)))
+        );
+        assert_eq!(
+            read(&list(&[pr(&ours.to_ascii_uppercase(), "CLOSED", 6)])),
+            Some(Found(url(6)))
+        );
+        // Another head: only an open one is the branch's pull request moved
+        // on; a closed or merged one changes nothing.
+        assert_eq!(read(&list(&[pr(other, "OPEN", 4)])), Some(HeadMoved));
+        assert_eq!(
+            read(&list(&[pr(other, "CLOSED", 4), pr(other, "MERGED", 3)])),
+            Some(NotFound)
+        );
+        // Fields gh adds are no matter; their order neither.
+        assert_eq!(
+            read(&format!(
+                r#"[{{"url":"{}","number":5,"state":"OPEN","headRefOid":"{ours}"}}]"#,
+                url(5)
+            )),
+            Some(Found(url(5)))
+        );
+
+        // Anything else is not gh's answer.
+        let bad_url =
+            |u: &str| format!(r#"[{{"headRefOid":"{ours}","state":"OPEN","url":"{u}"}}]"#);
+        for answer in [
+            String::new(),
+            "[".into(),
+            "{}".into(),
+            "null".into(),
+            r#""https://github.com/smithagents-test-invalid/widgets/pull/5""#.into(),
+            "[{}]".into(),
+            "[] LEAK".into(),
+            format!(r#"[{{"state":"OPEN","url":"{}"}}]"#, url(5)),
+            format!(r#"[{{"headRefOid":"{ours}","url":"{}"}}]"#, url(5)),
+            format!(r#"[{{"headRefOid":"{ours}","state":"OPEN"}}]"#),
+            format!(
+                r#"[{{"headRefOid":"{ours}","state":"DRAFT","url":"{}"}}]"#,
+                url(5)
+            ),
+            format!(
+                r#"[{{"headRefOid":"main","state":"OPEN","url":"{}"}}]"#,
+                url(5)
+            ),
+            format!(r#"[{{"headRefOid":5,"state":"OPEN","url":"{}"}}]"#, url(5)),
+            bad_url("https://github.com/someone-else/widgets/pull/5"),
+            bad_url("https://github.com/smithagents-test-invalid/widgets/issues/5"),
+            bad_url("https://github.com/smithagents-test-invalid/widgets/pull/5/LEAK"),
+            // One bad entry spoils the answer, even beside the one wanted.
+            list(&[
+                pr(ours, "OPEN", 5),
+                format!(r#"{{"headRefOid":"{other}","state":"OPEN","url":"LEAK"}}"#),
+            ]),
+        ] {
+            assert_eq!(read(&answer), None, "{answer}");
+        }
+        assert_eq!(read_pull_requests(None, &repo, ours), None, "no answer");
     }
 
     #[test]

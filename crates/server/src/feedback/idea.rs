@@ -22,7 +22,9 @@
 //!   (by the signed-in user, for that branch) before one is opened, and none
 //!   is opened for a minute after `gh` may have opened one without saying
 //!   so, as for issues. Only a pull request whose head is the commit pushed
-//!   is taken for the idea's.
+//!   is taken for the idea's; while none is but an open one of the branch
+//!   has another head (the branch changed on GitHub), none is opened either
+//!   (`pr_head_moved`).
 //! - [`FeedbackService::create_implementation_intent`] creates, once, the
 //!   intent that implements the idea: it starts from the idea agent's
 //!   branch, has the idea's folder as its origin, and depends (fixed) on the
@@ -42,7 +44,7 @@ use smithagents_core::intent::{CreateIntentRequest, Intent, IntentFilter, Intent
 
 use super::github::{
     body_failure_at, create_pull_request, find_pull_request, gh_readiness, not_ready_sentence,
-    DraftPullRequest, Gh, GithubRepo, NotCreated,
+    DraftPullRequest, Gh, GithubRepo, NotCreated, PullRequestSearch,
 };
 use super::issue::{no_mentions, not_done_section, permalink_base, pull_request_body, title_of};
 use super::upload::StagingDir;
@@ -84,6 +86,7 @@ const TOO_MANY_COMMITS: &str =
     "the idea agent's branch has more than 1000 commits, so nothing was pushed";
 const UNCONFIRMED: &str =
     "GitHub has not confirmed whether the pull request was opened. Try again in a minute.";
+const HEAD_MOVED: &str = "A pull request for this idea's branch is already open on GitHub, but the branch there has changed since it was pushed. Open that pull request on GitHub.";
 
 const READ_STEP: &str = "read the idea agent's branch";
 
@@ -425,8 +428,11 @@ impl FeedbackService {
 
     /// The pull request of the pushed idea branch `branches.1` into
     /// `branches.0` at the commit `commit`: one the signed-in user opened
-    /// before for that very commit ([`find_pull_request`]); else, unless `gh
-    /// pr create` ran without a usable answer less than a minute ago
+    /// before for that very commit ([`find_pull_request`]); `pr_head_moved`
+    /// when there is none but an open one of the branch has another head
+    /// (the branch changed on GitHub: nothing is opened or recorded, and
+    /// the minute of `pr_unconfirmed` is left as it is); else, unless `gh pr
+    /// create` ran without a usable answer less than a minute ago
     /// (`pr_unconfirmed`), a new draft ([`create_pull_request`]) from a body
     /// written to a scratch directory of its own (removed afterwards).
     #[allow(clippy::too_many_arguments)]
@@ -440,9 +446,20 @@ impl FeedbackService {
         title: &str,
         body: &str,
     ) -> Result<String, FeedbackFailure> {
-        if let Some(url) = find_pull_request(gh, github, head, commit).await? {
-            locked(&self.parts.unconfirmed_prs).remove(&id);
-            return Ok(url);
+        match find_pull_request(gh, github, head, commit).await? {
+            PullRequestSearch::Found(url) => {
+                locked(&self.parts.unconfirmed_prs).remove(&id);
+                return Ok(url);
+            }
+            // Not taken, and none is opened beside it.
+            PullRequestSearch::HeadMoved => {
+                return Err(FeedbackFailure {
+                    step: FeedbackStep::OpenPullRequest,
+                    code: "pr_head_moved".to_owned(),
+                    message: HEAD_MOVED.to_owned(),
+                })
+            }
+            PullRequestSearch::NotFound => {}
         }
         if recent(&self.parts.unconfirmed_prs, id, (self.clock)()) {
             return Err(FeedbackFailure {

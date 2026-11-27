@@ -1431,6 +1431,7 @@ mod tests {
             FeedbackError::Unpublished(_) => "Unpublished",
             FeedbackError::IdeaBlocked(_) => "IdeaBlocked",
             FeedbackError::PublicNotAcknowledged(_) => "PublicNotAcknowledged",
+            FeedbackError::OriginUnreadable => "OriginUnreadable",
         }
     }
 
@@ -1599,10 +1600,16 @@ mod tests {
                 "idea_branch_missing",
                 "the idea agent's branch no longer exists",
             ),
+            (
+                FeedbackError::OriginUnreadable,
+                S::CONFLICT,
+                "origin_unreadable",
+                "git could not read this repository's settings. Check that its folder is still a git repository.",
+            ),
         ];
         let covered: std::collections::BTreeSet<&str> =
             cases.iter().map(|(e, ..)| feedback_variant(e)).collect();
-        assert_eq!(covered.len(), 25, "{covered:?}");
+        assert_eq!(covered.len(), 26, "{covered:?}");
 
         for (e, status, code, message) in cases {
             assert_eq!((e.status(), e.code()), (status, code), "{message}");

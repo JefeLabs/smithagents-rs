@@ -78,6 +78,12 @@ pub enum PushError {
     NoRemote,
     #[error("authentication failed")]
     Auth,
+    /// `origin`'s branch holds commits the pushed commit does not contain:
+    /// git's `[rejected]` with `(non-fast-forward)` or `(fetch first)`.
+    #[error("origin's branch has other commits")]
+    NotFastForward,
+    /// Any other refusal: declined by `origin` (`[remote rejected]`: a hook,
+    /// a protected branch) or another `[rejected]`.
     #[error("the remote rejected the branch")]
     Rejected,
     #[error("the push did not finish in time")]
@@ -694,8 +700,12 @@ pub async fn path_kind(
 /// when set, else `remote.origin.url`, with any user name and password
 /// removed (`https://user:token@host/…` is `https://host/…`). It is read
 /// with `git config`, so a `url.<base>.insteadOf` rewrite is not applied.
-/// `None` when neither is set.
+/// `None` when neither is set. A folder that is not a git repository (any
+/// more) is an error, not `None`: `git rev-parse --git-dir` must succeed
+/// first, since outside a repository `git config` reads only the user's and
+/// the system's configuration.
 pub async fn origin_url(repo_root: &Path) -> Result<Option<String>, GitError> {
+    isolated_ok(repo_root, &["rev-parse", "--git-dir"]).await?;
     for key in ["remote.origin.pushurl", "remote.origin.url"] {
         let ran = isolated(repo_root, &["config", "--get-all", key]).await?;
         match ran.status.code() {
@@ -1250,6 +1260,11 @@ fn commit_io(e: GitError) -> CommitError {
 
 /// A branch was refused: not a fast-forward, or declined by the remote.
 const PUSH_REJECTED: [&str; 2] = ["[rejected]", "[remote rejected]"];
+/// How git's own `[rejected]` line ends when `origin`'s branch holds commits
+/// the pushed commit does not contain: they are in this repository, or not.
+const PUSH_NOT_FAST_FORWARD: [&str; 2] = ["(non-fast-forward)", "(fetch first)"];
+/// The start of a line `origin` printed (a hook's, say), never git's own.
+const REMOTE_LINE: &str = "remote:";
 /// No credential, or a wrong one, over HTTPS or SSH.
 const PUSH_AUTH: [&str; 8] = [
     "Authentication failed",
@@ -1339,6 +1354,7 @@ async fn push_refspec(repo_root: &Path, refspec: &str, timeout: Duration) -> Res
         Ok(ran) if ran.status.success() => Ok(()),
         Ok(ran) => {
             let mut output = String::from_utf8_lossy(&ran.stdout).into_owned();
+            output.push('\n');
             output.push_str(&String::from_utf8_lossy(&ran.stderr));
             Err(classify_push_failure(&output, ran.status.code()))
         }
@@ -1363,9 +1379,21 @@ fn push_command(repo_root: &Path, refspec: &str) -> Command {
     )
 }
 
+/// `NotFastForward` when one of git's own lines (not one `origin` printed)
+/// is a `[rejected]` ending in [`PUSH_NOT_FAST_FORWARD`]; else `Rejected`
+/// for any refusal, then `Auth`, `NoRemote` or `Failed`.
 fn classify_push_failure(output: &str, status: Option<i32>) -> PushError {
     let has = |markers: &[&str]| markers.iter().any(|m| output.contains(m));
-    if has(&PUSH_REJECTED) {
+    let not_fast_forward = output
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(REMOTE_LINE))
+        .any(|line| {
+            let line = line.trim_end();
+            line.contains("[rejected]") && PUSH_NOT_FAST_FORWARD.iter().any(|m| line.ends_with(m))
+        });
+    if not_fast_forward {
+        PushError::NotFastForward
+    } else if has(&PUSH_REJECTED) {
         PushError::Rejected
     } else if has(&PUSH_AUTH) {
         PushError::Auth
@@ -1916,12 +1944,96 @@ mod tests {
         );
     }
 
+    /// Writes an executable `pre-receive` hook into `bare` with this body.
+    fn pre_receive(bare: &Path, script: &str) {
+        let hook = bare.join("hooks/pre-receive");
+        std::fs::write(&hook, format!("#!/bin/sh\n{script}")).unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_branch_origin_has_with_other_commits_is_not_a_fast_forward() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, bare) = repo_with_bare_origin(tmp.path());
+        let push = |commit: String, branch: &'static str| {
+            let repo = repo.clone();
+            async move { push_commit(&repo, &commit, branch, Duration::from_secs(30)).await }
+        };
+        let first = g(&repo, &["rev-parse", "main"]);
+        push(first.clone(), "idea/x").await.unwrap();
+
+        // The earlier commit is here: git says "non-fast-forward".
+        g(
+            &repo,
+            &["commit", "-q", "--amend", "--allow-empty", "-m", "amended"],
+        );
+        let amended = g(&repo, &["rev-parse", "main"]);
+        assert_eq!(
+            push(amended.clone(), "idea/x").await,
+            Err(PushError::NotFastForward)
+        );
+        assert_eq!(g(&bare, &["rev-parse", "refs/heads/idea/x"]), first);
+
+        // It is not (another clone pushed it): git says "fetch first".
+        let other = tmp.path().join("other");
+        init_repo(&other, "main");
+        g(&other, &["commit", "-q", "--allow-empty", "-m", "theirs"]);
+        let theirs = g(&other, &["rev-parse", "main"]);
+        g(
+            &other,
+            &[
+                "push",
+                "-q",
+                bare.to_str().unwrap(),
+                "main:refs/heads/idea/y",
+            ],
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["cat-file", "-e", &format!("{theirs}^{{commit}}")])
+                .current_dir(&repo)
+                .output()
+                .is_ok_and(|out| !out.status.success()),
+            "not in this repository"
+        );
+        assert_eq!(
+            push(amended.clone(), "idea/y").await,
+            Err(PushError::NotFastForward)
+        );
+        assert_eq!(g(&bare, &["rev-parse", "refs/heads/idea/y"]), theirs);
+
+        // A hook that declines a fast-forward (and prints what looks like
+        // git's own line) is a rejection like any other.
+        push(amended.clone(), "idea/z").await.unwrap();
+        pre_receive(
+            &bare,
+            "echo ' ! [rejected] main -> x (non-fast-forward)' >&2\nexit 1\n",
+        );
+        g(&repo, &["commit", "-q", "--allow-empty", "-m", "on top"]);
+        let on_top = g(&repo, &["rev-parse", "main"]);
+        assert_eq!(push(on_top, "idea/z").await, Err(PushError::Rejected));
+        assert_eq!(g(&bare, &["rev-parse", "refs/heads/idea/z"]), amended);
+    }
+
     #[test]
     fn push_failures_are_classified_from_gits_messages() {
         let cases = [
-            (" ! [rejected]        main -> x (non-fast-forward)", PushError::Rejected),
+            (
+                " ! [rejected]        main -> x (non-fast-forward)",
+                PushError::NotFastForward,
+            ),
+            (
+                "To ../bare.git\n ! [rejected]        0123abc -> x (fetch first)\nerror: failed to push some refs",
+                PushError::NotFastForward,
+            ),
+            (" ! [rejected]        v1 -> v1 (already exists)", PushError::Rejected),
             (
                 " ! [remote rejected] main -> x (pre-receive hook declined)",
+                PushError::Rejected,
+            ),
+            (
+                "remote:  ! [rejected] main -> x (non-fast-forward)        \n ! [remote rejected] main -> x (pre-receive hook declined)",
                 PushError::Rejected,
             ),
             (

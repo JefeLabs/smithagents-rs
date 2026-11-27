@@ -1251,6 +1251,62 @@ async fn a_repository_without_a_remote_takes_the_intent_path() {
 }
 
 #[tokio::test]
+async fn a_repository_git_cannot_read_is_refused_before_anything_is_made() {
+    // W2-3: its folder is gone, or is no longer a git repository. Whatever
+    // it is sent as, the answer is a 409 of its own, and nothing is made.
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    common::git(&repo.path, &["remote", "add", "origin", GITHUB_URL]);
+    let aside = fx.tmp.path().join("aside");
+    let unreadable = "git could not read this repository's settings. Check that its folder is still a git repository.";
+    for (what, moved) in [
+        ("its folder is gone", repo.path.clone()),
+        ("not a git repository", repo.path.join(".git")),
+    ] {
+        std::fs::rename(&moved, &aside).unwrap();
+        for send_as in ["intent", "idea", "github_issue"] {
+            let mut req = request_json(repo.id, send_as);
+            if send_as == "idea" {
+                req["send_as"] = json!("intent");
+                req["idea"] = json!({"explainer": true, "diagrams": false, "demo_video": false});
+            }
+            req["public_acknowledged"] = json!(true);
+
+            let (status, body) = fx.submit(&req, &[]).await;
+
+            assert_eq!(
+                (status, body["error"].as_str(), body["message"].as_str()),
+                (
+                    StatusCode::CONFLICT,
+                    Some("origin_unreadable"),
+                    Some(unreadable)
+                ),
+                "{what}, {send_as}: {body}"
+            );
+            let id: SubmissionId = serde_json::from_value(req["submission_id"].clone()).unwrap();
+            assert_eq!(
+                fx.state.store.get_submission(id).await.unwrap(),
+                None,
+                "{what}, {send_as}: nothing recorded"
+            );
+        }
+        std::fs::rename(&aside, &moved).unwrap();
+        // Nothing reached the repository.
+        assert_eq!(
+            git_out(
+                &repo.path,
+                &["for-each-ref", "refs/heads/feedback", "refs/heads/idea"]
+            ),
+            "",
+            "{what}"
+        );
+        assert!(fx.feedback_tmp_is_empty(), "{what}");
+        assert!(fx.intents().await.is_empty(), "{what}");
+        assert!(fx.fake.calls().is_empty(), "{what}: {:?}", fx.fake.calls());
+    }
+}
+
+#[tokio::test]
 async fn blocked_folders_and_branches_are_refused_with_their_sentences() {
     let fx = fixture().await;
     let a = fx.add_repo("a").await;

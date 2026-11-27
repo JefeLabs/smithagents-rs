@@ -143,7 +143,7 @@ impl FakeTools {
 
     /// Writes the control file `file` (`fail`, `hang`, `wait`, `go`,
     /// `signed-out`, `visibility`, `visibility-<name>`, `label`, `existing`,
-    /// `existing-head`, `issue-url`).
+    /// `pr-list`, `issue-url`).
     pub fn set(&self, file: &str, text: &str) {
         fs::write(self.dir.join(file), text).unwrap();
     }

@@ -30,7 +30,7 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::event::EventKind;
-use smithagents_core::feedback::{IdeaOptions, IdeaPackage, SubmissionId};
+use smithagents_core::feedback::{FeedbackStep, IdeaOptions, IdeaPackage, SubmissionId};
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentFilter, IntentState, ItemStatus, Phase};
 use smithagents_plugin_host::StaticSecrets;
@@ -41,7 +41,7 @@ use smithagents_server::feedback::idea::{
     fixed_criteria, package, CRITERION_DEMO, CRITERION_DIAGRAMS, CRITERION_EXPLAINER,
     CRITERION_SCOPE,
 };
-use smithagents_server::feedback::FeedbackService;
+use smithagents_server::feedback::{FeedbackError, FeedbackService};
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::harness::{HarnessError, HarnessEvent};
 use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
@@ -1222,11 +1222,12 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
     let calls = fx.fake.calls();
     assert_eq!(calls.len(), 3, "{calls:?}");
     assert_eq!(calls[0], "auth status --hostname=github.com");
-    // Only a pull request for the commit pushed is looked for.
+    // The branch's pull requests are listed (the user's own; no `--jq`: the
+    // daemon reads the answer), and the empty list opens one.
     assert_eq!(
         calls[1],
         format!(
-            r#"pr list {REPO_ARG} --head={BRANCH} --author=@me --state=all --json=url,headRefOid --jq=map(select(.headRefOid == "{head}")) | .[0].url // """#
+            "pr list {REPO_ARG} --head={BRANCH} --author=@me --state=all --json=url,headRefOid,state"
         )
     );
     assert!(
@@ -1283,6 +1284,26 @@ async fn a_second_request_opens_no_second_pull_request() {
     assert_eq!(reflog_size(&bare, BRANCH), 1, "pushed once");
 }
 
+/// A commit no idea here pushes.
+const OTHER_HEAD: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+/// What the fake `gh pr list` prints for these pull requests of the idea
+/// branch, each `(head, state, number)`: the JSON `gh` writes to a pipe, on
+/// one line.
+fn pr_list(prs: &[(&str, &str, u32)]) -> String {
+    let list: Vec<Value> = prs
+        .iter()
+        .map(|(head, state, n)| {
+            json!({
+                "headRefOid": head,
+                "state": state,
+                "url": format!("https://github.com/smithagents-test-invalid/widgets/pull/{n}"),
+            })
+        })
+        .collect();
+    Value::Array(list).to_string()
+}
+
 #[tokio::test]
 async fn an_existing_pull_request_is_reused() {
     let fx = fixture_with(Opts {
@@ -1293,8 +1314,10 @@ async fn an_existing_pull_request_is_reused() {
     let (repo, _bare) = fx.github_repo("r1").await;
     let (idea, _, head) = fx.sent_idea(&repo).await;
     let existing = "https://github.com/smithagents-test-invalid/widgets/pull/5";
-    fx.fake.set("existing", existing);
-    fx.fake.set("existing-head", &head);
+    fx.fake.set(
+        "pr-list",
+        &pr_list(&[(OTHER_HEAD, "CLOSED", 3), (&head, "OPEN", 5)]),
+    );
 
     let (status, body) = fx.open_pr(idea.id).await;
 
@@ -1306,31 +1329,85 @@ async fn an_existing_pull_request_is_reused() {
 #[tokio::test]
 async fn a_pull_request_for_another_commit_is_never_taken() {
     // D-M5: the branch's pull request is the idea's only when its head is
-    // the commit pushed.
+    // the commit pushed; a closed or merged one for another commit changes
+    // nothing, and a new one is opened.
+    let fx = fixture_with(Opts {
+        turns: 3,
+        ..Opts::default()
+    })
+    .await;
+    for (name, listed) in [
+        ("r1", pr_list(&[(OTHER_HEAD, "CLOSED", 5)])),
+        ("r2", pr_list(&[(OTHER_HEAD, "MERGED", 5)])),
+        ("r3", pr_list(&[])),
+    ] {
+        let (repo, _bare) = fx.github_repo(name).await;
+        let (idea, _, _) = fx.sent_idea(&repo).await;
+        fx.fake.set("pr-list", &listed);
+        let creates = fx.calls_starting("pr create").len();
+
+        let (status, body) = fx.open_pr(idea.id).await;
+
+        assert_eq!(status, StatusCode::OK, "{listed}: {body}");
+        assert_eq!(
+            body["origin"]["idea"]["pr_url"], PR_URL,
+            "{listed}: a new one"
+        );
+        assert_eq!(
+            fx.calls_starting("pr create").len(),
+            creates + 1,
+            "{listed}"
+        );
+    }
+}
+
+/// The answer while the idea branch's open pull request has another head.
+const HEAD_MOVED: &str = "A pull request for this idea's branch is already open on GitHub, but the branch there has changed since it was pushed. Open that pull request on GitHub.";
+
+#[tokio::test]
+async fn an_open_pull_request_whose_branch_moved_on_github_is_not_taken() {
+    // W2-2: its head changed on GitHub between `gh pr create` and the record
+    // of its address. It is not taken, and no second one is opened.
     let fx = fixture_with(Opts {
         turns: 1,
         ..Opts::default()
     })
     .await;
-    let (repo, _bare) = fx.github_repo("r1").await;
+    let (repo, bare) = fx.github_repo("r1").await;
     let (idea, _, head) = fx.sent_idea(&repo).await;
     fx.fake.set(
-        "existing",
-        "https://github.com/smithagents-test-invalid/widgets/pull/5",
+        "pr-list",
+        &pr_list(&[(OTHER_HEAD, "CLOSED", 3), (OTHER_HEAD, "OPEN", 5)]),
     );
+
+    for press in 1..=2 {
+        let (status, text) = fx.open_pr_text(idea.id).await;
+
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            refusal(status, &body),
+            (
+                StatusCode::BAD_GATEWAY,
+                Some("pr_head_moved"),
+                Some(HEAD_MOVED)
+            ),
+            "press {press}"
+        );
+        assert!(fx.calls_starting("pr create").is_empty(), "press {press}");
+        let package = fx.idea_of(idea.id).await;
+        assert_eq!(package.pr_url, None, "press {press}: nothing recorded");
+        assert_eq!(fx.state.feedback.unconfirmed_for_test(), 0, "press {press}");
+    }
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), head, "pushed once");
+    assert_eq!(reflog_size(&bare, BRANCH), 1);
+
+    // Once it is closed, a new one is opened at once: the minute of an
+    // unconfirmed pull request was never started.
     fx.fake
-        .set("existing-head", "fedcba9876543210fedcba9876543210fedcba98");
-
+        .set("pr-list", &pr_list(&[(OTHER_HEAD, "CLOSED", 5)]));
     let (status, body) = fx.open_pr(idea.id).await;
-
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["origin"]["idea"]["pr_url"], PR_URL, "a new one");
-    let listed = fx.calls_starting("pr list");
-    assert_eq!(listed.len(), 1, "{listed:?}");
-    assert!(
-        listed[0].contains(&format!(r#"select(.headRefOid == "{head}")"#)),
-        "{listed:?}"
-    );
+    assert_eq!(body["origin"]["idea"]["pr_url"], PR_URL);
     assert_eq!(fx.calls_starting("pr create").len(), 1);
 }
 
@@ -1342,14 +1419,26 @@ async fn a_pull_request_of_another_repository_or_a_wrong_answer_is_refused() {
     })
     .await;
     let (repo, _bare) = fx.github_repo("r1").await;
-    let (idea, _, _) = fx.sent_idea(&repo).await;
+    let (idea, _, head) = fx.sent_idea(&repo).await;
+    let with_url =
+        |url: &str| json!([{"headRefOid": head, "state": "OPEN", "url": url}]).to_string();
     for answer in [
-        "https://github.com/someone-else/widgets/pull/5",
-        "https://github.com/smithagents-test-invalid/widgets/pull/5/LEAK",
-        "https://github.com/smithagents-test-invalid/widgets/issues/5",
-        "LEAK-not-a-url",
+        with_url("https://github.com/someone-else/widgets/pull/5"),
+        with_url("https://github.com/smithagents-test-invalid/widgets/pull/5/LEAK"),
+        with_url("https://github.com/smithagents-test-invalid/widgets/issues/5"),
+        with_url("LEAK-not-a-url"),
+        // Not the JSON list gh writes.
+        "LEAK-not-json".to_owned(),
+        r#"[{"headRefOid": "LEAK""#.to_owned(),
+        format!(r#"[{{"headRefOid":"{head}","state":"LEAK","url":"{PR_URL}"}}]"#),
+        format!(r#"[{{"state":"OPEN","url":"{PR_URL}"}}]"#),
+        // Pretty-printed: its first line is `[`.
+        format!(
+            "[\n  {{\"headRefOid\": \"{head}\", \"state\": \"OPEN\", \"url\": \"{PR_URL}\"}}\n]"
+        ),
+        String::new(),
     ] {
-        fx.fake.set("existing", answer);
+        fx.fake.set("pr-list", &answer);
         let (status, text) = fx.open_pr_text(idea.id).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{answer}: {text}");
         let body: Value = serde_json::from_str(&text).unwrap();
@@ -2163,6 +2252,91 @@ async fn a_commit_taken_off_the_agents_branch_is_never_pushed() {
     assert!(!pr_body.contains(&head), "{pr_body}");
 }
 
+/// The answer to a push `origin` refuses because its branch has other
+/// commits.
+const NOT_FAST_FORWARD: &str = "git could not push to origin: origin already has that branch with other commits, perhaps from an earlier push. Delete the branch on origin if it is no longer wanted, then try again.";
+
+#[tokio::test]
+async fn an_idea_branch_origin_already_has_says_how_to_get_out() {
+    // W2-1: a first press pushes, but its record of the push is lost and no
+    // pull request is opened; then the agent's branch is amended.
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, agent, head) = fx.sent_idea(&repo).await;
+    fx.state.feedback.fail_idea_saves_for_test(1, 1);
+    fx.fake.set("fail", "pr create");
+    let (status, body) = fx.open_pr(idea.id).await;
+    assert_eq!(refusal(status, &body).1, Some("gh_failed"), "{body}");
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), head, "pushed");
+    let package = fx.idea_of(idea.id).await;
+    assert_eq!(
+        (package.pr_commit.as_deref(), package.pr_pushed),
+        (Some(head.as_str()), false),
+        "the push is not recorded"
+    );
+    fx.clear("fail");
+    common::git(
+        &agent.worktree_path,
+        &[
+            "commit",
+            "-q",
+            "--amend",
+            "-m",
+            "docs: the idea package, again",
+        ],
+    );
+    let amended = git_out(&agent.worktree_path, &["rev-parse", "HEAD"]);
+    assert_ne!(amended, head);
+    let creates = fx.calls_starting("pr create").len();
+
+    let refused = fx.state.feedback.open_pull_request(idea.id, true).await;
+
+    match refused {
+        Err(FeedbackError::Step(failure)) => assert_eq!(
+            (
+                failure.step,
+                failure.code.as_str(),
+                failure.message.as_str()
+            ),
+            (
+                FeedbackStep::Push,
+                "push_not_fast_forward",
+                NOT_FAST_FORWARD
+            )
+        ),
+        other => panic!("a failed push expected, not {other:?}"),
+    }
+    assert_eq!(
+        git_out(&bare, &["rev-parse", BRANCH]),
+        head,
+        "origin keeps the first commit: nothing is forced"
+    );
+    assert_eq!(
+        fx.calls_starting("pr create").len(),
+        creates,
+        "no gh pr create"
+    );
+    assert_eq!(fx.idea_of(idea.id).await.pr_url, None);
+
+    // Once the branch is deleted on origin, the next press pushes the
+    // amended commit and opens the pull request.
+    common::git(
+        &bare,
+        &["update-ref", "-d", &format!("refs/heads/{BRANCH}")],
+    );
+    let (status, body) = fx.open_pr(idea.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"]["idea"]["pr_url"], PR_URL);
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), amended);
+    assert_eq!(fx.calls_starting("pr create").len(), creates + 1);
+    let pr_body = fx.fake.read("pr-body.md").unwrap();
+    assert!(pr_body.contains(&format!("blob/{amended}/")), "{pr_body}");
+}
+
 #[tokio::test]
 async fn an_idea_committed_through_git_lfs_is_refused() {
     // D-I1: a pointer pushed with hooks off would never upload its object.
@@ -2375,6 +2549,45 @@ async fn lasting_conditions_have_codes_of_their_own() {
         )
     );
     assert_eq!(bare_branches(&bare), Vec::<String>::new(), "main untouched");
+}
+
+#[tokio::test]
+async fn a_repository_git_cannot_read_stops_both_actions_before_anything_is_made() {
+    // W2-3: its folder is no longer a git repository.
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, _, _) = fx.sent_idea(&repo).await;
+    let aside = fx.tmp.path().join("aside");
+    std::fs::rename(repo.path.join(".git"), &aside).unwrap();
+
+    for route in ["pull-request", "implementation"] {
+        let (status, body) = fx
+            .call(
+                Method::POST,
+                &format!("/v1/intents/{}/{route}", idea.id),
+                Some(json!({"public_acknowledged": true})),
+            )
+            .await;
+        assert_eq!(
+            refusal(status, &body),
+            (
+                StatusCode::CONFLICT,
+                Some("origin_unreadable"),
+                Some("git could not read this repository's settings. Check that its folder is still a git repository.")
+            ),
+            "{route}"
+        );
+    }
+    std::fs::rename(&aside, repo.path.join(".git")).unwrap();
+    assert!(bare_branches(&bare).is_empty(), "nothing pushed");
+    let package = fx.idea_of(idea.id).await;
+    assert_eq!((package.pr_commit, package.pr_url), (None, None));
+    assert_eq!(fx.intents().await.len(), 1, "no implementation intent");
+    assert!(fx.fake.calls().is_empty(), "{:?}", fx.fake.calls());
 }
 
 #[tokio::test]

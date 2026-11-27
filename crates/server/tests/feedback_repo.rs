@@ -1086,7 +1086,8 @@ async fn push_failures_are_named_without_gits_words() {
         ],
     );
     let failure = push(&fx.repo, &commit, branch).await.unwrap_err();
-    assert_eq!(failure.code, "push_rejected");
+    assert_eq!(failure.code, "push_not_fast_forward");
+    assert_eq!(failure.message, NOT_FAST_FORWARD);
     assert_eq!(git(&bare, &["rev-parse", branch]), theirs);
 }
 
@@ -2330,9 +2331,13 @@ async fn a_graft_hides_nothing_from_the_check() {
     assert!(!git_succeeds(&bare, &["cat-file", "-e", &mine]));
 }
 
+/// The answer to a push `origin` refuses because its branch has other
+/// commits (W2-1).
+const NOT_FAST_FORWARD: &str = "git could not push to origin: origin already has that branch with other commits, perhaps from an earlier push. Delete the branch on origin if it is no longer wanted, then try again.";
+
 #[tokio::test]
 async fn a_push_onto_a_diverged_remote_branch_is_rejected_and_never_forced() {
-    // D-I3 (82).
+    // D-I3 (82); W2-1: the answer says how to get out.
     let fx = Fixture::new();
     let bare = fx.origin();
     git(fx.root(), &["push", "-q", "origin", "main"]);
@@ -2360,10 +2365,7 @@ async fn a_push_onto_a_diverged_remote_branch_is_rejected_and_never_forced() {
     assert_eq!(failure.step, FeedbackStep::Push);
     assert_eq!(
         (failure.code.as_str(), failure.message.as_str()),
-        (
-            "push_rejected",
-            "git could not push to origin: the remote rejected the branch"
-        )
+        ("push_not_fast_forward", NOT_FAST_FORWARD)
     );
     assert_eq!(git(&bare, &["rev-parse", BRANCH]), theirs, "never forced");
 }

@@ -959,6 +959,40 @@ async fn a_failed_push_keeps_the_commit_and_retry_pushes_and_creates() {
     assert!(fx.feedback_tmp_is_empty());
 }
 
+#[tokio::test]
+async fn a_recorded_submission_whose_repository_git_cannot_read_says_so_in_its_step() {
+    // W2-3: the commit and its record exist, so this is a failed step, not
+    // a refusal that would say nothing was made.
+    let fx = fixture().await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let hook = refuse_pushes(&bare);
+    let req = issue_request(&repo);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["failed"]["code"], "push_rejected");
+    std::fs::remove_file(&hook).unwrap();
+    let aside = fx.tmp.path().join("aside");
+    std::fs::rename(repo.path.join(".git"), &aside).unwrap();
+
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        again["failed"],
+        json!({
+            "step": "push",
+            "code": "origin_unreadable",
+            "message": "git could not read this repository's settings. Check that its folder is still a git repository.",
+        })
+    );
+    assert_eq!(again["pushed"], false);
+    std::fs::rename(&aside, repo.path.join(".git")).unwrap();
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "", "nothing pushed");
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["issue_url"], ISSUE_URL);
+}
+
 /// A `pre-receive` hook in `bare` that refuses every push; its path.
 fn refuse_pushes(bare: &Path) -> PathBuf {
     let hook = bare.join("hooks/pre-receive");

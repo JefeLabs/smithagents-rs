@@ -390,7 +390,10 @@ fn issue_folder_of(paths: &[String]) -> Option<String> {
 /// repository is `commit_missing`). A push that fails is `Step` with step
 /// `Push`, a code and a fixed sentence: `commit_missing` when `commit` is
 /// not a full commit id of this repository, else `push_no_remote`,
-/// `push_auth`, `push_rejected`, `push_timeout` or `push_failed`.
+/// `push_auth`, `push_not_fast_forward` (`origin`'s branch has commits
+/// `commit` does not contain, perhaps from an earlier push: nothing is
+/// forced, so the way out is to delete that branch on `origin`),
+/// `push_rejected`, `push_timeout` or `push_failed`.
 pub async fn push_commit(
     repo: &Repo,
     commit: &str,
@@ -499,6 +502,10 @@ fn push_failure(error: PushError) -> FeedbackFailure {
         PushError::Auth => (
             "push_auth",
             "git could not push to origin: authentication failed".to_string(),
+        ),
+        PushError::NotFastForward => (
+            "push_not_fast_forward",
+            "git could not push to origin: origin already has that branch with other commits, perhaps from an earlier push. Delete the branch on origin if it is no longer wanted, then try again.".to_string(),
         ),
         PushError::Rejected => (
             "push_rejected",
@@ -1049,6 +1056,11 @@ mod tests {
                 PushError::Rejected,
                 "push_rejected",
                 "git could not push to origin: the remote rejected the branch",
+            ),
+            (
+                PushError::NotFastForward,
+                "push_not_fast_forward",
+                "git could not push to origin: origin already has that branch with other commits, perhaps from an earlier push. Delete the branch on origin if it is no longer wanted, then try again.",
             ),
             (
                 PushError::Timeout,

@@ -51,7 +51,6 @@ const ISSUE_MD_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BODY_FILE: &str = "body.md";
 /// How long an answer of [`is_public`] is used again.
 const VISIBILITY_TTL: Duration = Duration::from_secs(10 * 60);
-const ORIGIN_STEP: &str = "read the repository's origin";
 /// How long after `gh issue create` ran without a usable answer a search
 /// that finds nothing does not lead to another create: GitHub's search can
 /// take a while to find a new issue.
@@ -72,8 +71,7 @@ pub enum FeedbackError {
     DefaultBranchMissing(String),
     #[error("git has no user.name and user.email set for this repository")]
     GitIdentityMissing,
-    /// `step` is `create the worktree`, `commit the files` or `read the
-    /// repository's origin`.
+    /// `step` is `create the worktree` or `commit the files`.
     #[error("git could not {step} ({})", exit_status_text(.status))]
     Git {
         step: &'static str,
@@ -152,6 +150,12 @@ pub enum FeedbackError {
     /// [`PUBLIC_SENTENCE`] or [`MAYBE_PUBLIC_SENTENCE`].
     #[error("{0}")]
     PublicNotAcknowledged(&'static str),
+    /// git could not read the repository's `origin` (its folder moved or
+    /// deleted, not a git repository any more, or git did not finish): no
+    /// exit status, nothing git printed. A refusal before anything is made;
+    /// a recorded submission gets it as a failed step instead.
+    #[error("git could not read this repository's settings. Check that its folder is still a git repository.")]
+    OriginUnreadable,
 }
 
 /// Why a GitHub issue or pull request was refused for a public repository.
@@ -188,6 +192,7 @@ impl FeedbackError {
             Self::Unpublished(_) => repo::UNPUSHED_CODE,
             Self::IdeaBlocked(blocked) => blocked.code(),
             Self::PublicNotAcknowledged(_) => "public_not_acknowledged",
+            Self::OriginUnreadable => "origin_unreadable",
         }
     }
 
@@ -208,7 +213,8 @@ impl FeedbackError {
             | Self::OutOfScope(_)
             | Self::Unpublished(_)
             | Self::IdeaBlocked(_)
-            | Self::PublicNotAcknowledged(_) => StatusCode::CONFLICT,
+            | Self::PublicNotAcknowledged(_)
+            | Self::OriginUnreadable => StatusCode::CONFLICT,
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -630,18 +636,12 @@ impl FeedbackService {
     }
 
     /// The github.com repository `origin` names, as configured; `None` when
-    /// there is no `origin` or it is elsewhere.
+    /// there is no `origin` or it is elsewhere. `OriginUnreadable` when git
+    /// cannot read it (see [`git::origin_url`]).
     async fn github_of(&self, repo: &Repo) -> Result<Option<GithubRepo>, FeedbackError> {
-        let url = git::origin_url(&repo.path).await.map_err(|e| {
-            let status = match e {
-                git::GitError::Failed { status } => status,
-                _ => None,
-            };
-            FeedbackError::Git {
-                step: ORIGIN_STEP,
-                status,
-            }
-        })?;
+        let url = git::origin_url(&repo.path)
+            .await
+            .map_err(|_| FeedbackError::OriginUnreadable)?;
         Ok(url.as_deref().and_then(GithubRepo::from_remote))
     }
 

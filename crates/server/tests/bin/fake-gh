@@ -18,9 +18,9 @@
 #     `<owner>/<name>` its last argument names, else the file `visibility`,
 #     else PRIVATE;
 #   - `label list`: prints the file `label`, else true;
-#   - `issue list`, `pr list`: print the file `existing`, else nothing; for
-#     `pr list`, while the file `existing-head` exists, only when an
-#     argument names its commit (as the `--jq` filter on `headRefOid` would);
+#   - `issue list`: prints the file `existing`, else nothing;
+#   - `pr list`: prints the file `pr-list` (the JSON list `gh` writes to a
+#     pipe, on one line), else `[]`;
 #   - `issue create`: copies the file named by `--body-file=` to
 #     `issue-body.md` and prints the file `issue-url`, else an issue URL;
 #   - `pr create`: copies it to `pr-body.md` and prints a pull request URL;
@@ -93,13 +93,8 @@ case "$1 $2" in
     print_or existing ""
     ;;
   "pr list")
-    if [ -f "$dir/existing-head" ]; then
-      case "$*" in
-        *"\"$(cat "$dir/existing-head")\""*) print_or existing "" ;;
-      esac
-    else
-      print_or existing ""
-    fi
+    print_or pr-list "[]"
+    echo
     ;;
   "issue create")
     find_body "$@"
