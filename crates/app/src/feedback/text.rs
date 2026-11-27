@@ -256,6 +256,14 @@ pub fn partial_text(branch: &str, sha7: &str, message: &str) -> String {
 
 pub const NOTHING_CREATED_TEXT: &str = "Nothing was created. Submit again.";
 
+/// Instead of [`NOTHING_CREATED_TEXT`] when the daemon has no record of a
+/// submission whose draft names its commit: that commit is still there.
+pub fn no_record_text(branch: &str, sha7: &str) -> String {
+    format!(
+        "The daemon has no record of this submission. Its files are still committed on {branch} ({sha7}). Submit again to send it as a new one."
+    )
+}
+
 /// An idea intent's actions in its detail, and the question "Open pull
 /// request…" asks first (the public-repository warning is part of it).
 pub const OPEN_PR_LABEL: &str = "Open pull request…";

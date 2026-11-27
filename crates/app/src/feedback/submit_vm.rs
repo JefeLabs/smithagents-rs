@@ -17,11 +17,11 @@ use smithagents_core::ids::RepoId;
 
 use super::draft::{AttachmentKind, Draft};
 use super::text::{
-    attachment_refused_text, gh_not_ready_reason, partial_text, result_intent, result_issue,
-    result_issue_unnamed, summary_idea, summary_intent, summary_issue, COMMENT_TOO_LONG_REASON,
-    CREATE_INTENT_LABEL, CREATE_ISSUE_LABEL, DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT,
-    GH_MISSING_REASON, GH_SIGNED_OUT_REASON, GH_TURNED_OFF, IDEA_NEEDS_PART,
-    IMAGE_TOO_LARGE_REASON, INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING,
+    attachment_refused_text, gh_not_ready_reason, no_record_text, partial_text, result_intent,
+    result_issue, result_issue_unnamed, summary_idea, summary_intent, summary_issue,
+    COMMENT_TOO_LONG_REASON, CREATE_INTENT_LABEL, CREATE_ISSUE_LABEL, DEMO_HELP,
+    DEMO_MISSING_REASON, DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON, GH_TURNED_OFF,
+    IDEA_NEEDS_PART, IMAGE_TOO_LARGE_REASON, INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING,
     ISSUE_UNCONFIRMED_TEXT, LINK_STOPPED_TEXT, MAIN_IDEA_MAX_CHARS, MAIN_IDEA_TOO_LONG_TEXT,
     MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES,
     MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON,
@@ -41,14 +41,20 @@ pub const KINDS: [FeedbackKind; 3] = [
 ];
 
 /// The error codes of the refusals after which the daemon has recorded and
-/// committed nothing under the submission's id, so the draft stays
-/// editable and the same id can be sent again. The one place this list is
-/// kept. It mirrors `FeedbackError::code` and `FeedbackError::status` in
-/// `crates/server/src/feedback/mod.rs` and where each is raised before a
-/// record or a commit exists: `upload::check_request` and `upload::stage`
-/// (`invalid`, `unsupported_file`, `payload_too_large`; `invalid` also for
-/// an idea package with no part or sent as an issue),
+/// committed nothing under the submission's id, so the draft of a first
+/// send stays editable and the same id can be sent again. (A re-upload is
+/// sent only because an earlier request under the id went unanswered, and
+/// that request may still make its commit: a refusal of the re-upload says
+/// nothing of it, which is why the caller keeps a re-upload locked.) The
+/// one place this list is kept. It mirrors `FeedbackError::code` and
+/// `FeedbackError::status` in `crates/server/src/feedback/mod.rs` and where
+/// each is raised before a record or a commit exists: `upload::check_request`
+/// and `upload::stage` (`invalid`, `unsupported_file`, `payload_too_large`;
+/// `invalid` also for an idea package with no part or sent as an issue),
 /// `FeedbackService::require_github` (`no_github_remote`, `gh_not_ready`),
+/// `FeedbackService::github_of` (`origin_unreadable`: git cannot read the
+/// repository, its folder gone or no longer a git repository; asked by
+/// `FeedbackService::precheck`, also through `require_github`),
 /// `FeedbackService::require_tool` (`tool_missing`, also an idea package's
 /// demo video without `agent-browser`), `FeedbackService::check_publication`
 /// (which runs before a commit is made or one left by a stopped daemon is
@@ -62,14 +68,16 @@ pub const KINDS: [FeedbackKind; 3] = [
 /// acknowledgement), and `repo::place_and_commit` (`default_branch_missing`,
 /// `git_identity_missing`, `no_free_name`, `name_taken`, `folder_blocked`,
 /// `branch_blocked`). They count only as a 4xx answer: the daemon sends
-/// `git_failed` and `io_error` as 500, and any 5xx locks. (Before a push,
-/// `unpushed_commits` is a failed step of a recorded submission instead.)
-pub const NOTHING_MADE_CODES: [&str; 14] = [
+/// `git_failed` and `io_error` as 500, and any 5xx locks. (For a recorded
+/// submission, `unpushed_commits` before a push and `origin_unreadable` are
+/// failed steps instead.)
+pub const NOTHING_MADE_CODES: [&str; 15] = [
     "invalid",
     "unsupported_file",
     "payload_too_large",
     "no_github_remote",
     "gh_not_ready",
+    "origin_unreadable",
     TOOL_MISSING,
     "default_branch_missing",
     "git_identity_missing",
@@ -435,6 +443,18 @@ pub fn failure_text(outcome: &FeedbackOutcome) -> Option<String> {
         &sha7(&outcome.commit),
         &message,
     ))
+}
+
+/// What the screen says when the daemon has no record of the submission
+/// (`submission_not_found`): with the draft's recorded `outcome` (its files
+/// were committed, a later step failed), where those files still are, its
+/// branch and commit bounded as in [`failure_text`]; without one,
+/// [`NOTHING_CREATED_TEXT`].
+pub fn not_recorded_text(outcome: Option<&FeedbackOutcome>) -> String {
+    match outcome {
+        Some(outcome) => no_record_text(&bounded(&outcome.branch), &sha7(&outcome.commit)),
+        None => NOTHING_CREATED_TEXT.to_owned(),
+    }
 }
 
 /// The attachment a part (`file-<i>` or `annotated-<i>`) belongs to, and

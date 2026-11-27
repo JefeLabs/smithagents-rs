@@ -11,8 +11,8 @@ use common::intents::{intent, FakeIntents};
 use smithagents_app::feedback::draft::{Attachment, AttachmentId, AttachmentKind, Draft};
 use smithagents_app::feedback::submit_vm::{
     asks_to_acknowledge, attachments_phrase, can_confirm, confirm_label, demo_help, issue_reason,
-    maybe_public_warning, public_warning, result_text, send_failure, starting_repo,
-    submit_error_text, summary, upload_problem, SendFailure, IDEA_START, KINDS,
+    maybe_public_warning, not_recorded_text, public_warning, result_text, send_failure,
+    starting_repo, submit_error_text, summary, upload_problem, SendFailure, IDEA_START, KINDS,
 };
 use smithagents_app::feedback::text::{
     DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON,
@@ -749,6 +749,8 @@ fn what_a_failed_send_leaves_under_its_id() {
         (409, "branch_blocked"),
         (409, "unpushed_commits"),
         (409, "public_not_acknowledged"),
+        // W2-3: git cannot read the repository, before anything is made.
+        (409, "origin_unreadable"),
     ] {
         assert_eq!(
             send_failure(&api(status, code, "x")),
@@ -807,6 +809,42 @@ fn what_a_failed_send_leaves_under_its_id() {
     ));
     assert_eq!(send_failure(&ws), SendFailure::MayExist);
     assert_eq!(send_failure(&LinkError::Stopped), SendFailure::MayExist);
+}
+
+#[test]
+fn a_submission_the_daemon_has_no_record_of_names_what_is_still_committed() {
+    // W2-7: the draft's own record of a failed step names a branch and a
+    // commit, which are still in the repository.
+    let id = SubmissionId::new();
+    let mut partial = outcome_with_intent(
+        id,
+        intent(
+            "fix-the-zoom",
+            IntentState::Draft,
+            Phase::Polishing { pass: 1 },
+        ),
+    );
+    partial.intent = None;
+    partial.failed = Some(FeedbackFailure {
+        step: FeedbackStep::Push,
+        code: "push_rejected".into(),
+        message: "git could not push to origin: the remote rejected the branch".into(),
+    });
+    assert_eq!(
+        not_recorded_text(Some(&partial)),
+        "The daemon has no record of this submission. Its files are still committed on feedback/2026-11-26-fix-the-zoom (0123abc). Submit again to send it as a new one."
+    );
+    // The branch is bounded as in `failure_text`: one line, at most 300
+    // characters.
+    partial.branch = format!("feedback/{}\nLEAK", "x".repeat(400));
+    let text = not_recorded_text(Some(&partial));
+    assert!(!text.contains('\n') && !text.contains("LEAK"), "{text}");
+    assert!(
+        text.contains(&format!("feedback/{}…", "x".repeat(291))),
+        "{text}"
+    );
+    // Without a recorded outcome nothing names a commit.
+    assert_eq!(not_recorded_text(None), NOTHING_CREATED_TEXT);
 }
 
 #[test]

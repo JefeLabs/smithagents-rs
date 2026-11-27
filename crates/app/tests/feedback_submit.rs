@@ -1234,9 +1234,10 @@ fn retry_of_a_submission_the_daemon_never_saw_starts_over(cx: &mut TestAppContex
         .fake
         .queue_outcome(Err(api(404, "submission_not_found", "no such submission")));
     click(cx, window, SUBMIT_RETRY_ID);
+    // W2-7: the draft's record names the commit, which is still there.
     assert_eq!(
         text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
-        Some(NOTHING_CREATED_TEXT)
+        Some(NO_RECORD_TEXT)
     );
     assert!(!idea_disabled(cx, window));
     assert!(!disabled(cx, window, SUBMIT_CONFIRM_ID));
@@ -1246,6 +1247,35 @@ fn retry_of_a_submission_the_daemon_never_saw_starts_over(cx: &mut TestAppContex
     let submits = opened.fake.submits();
     assert_eq!(submits.len(), 2);
     assert_ne!(submits[1].0.submission_id, id);
+}
+
+/// What the screen says when the daemon has no record of a submission
+/// whose failed step the draft recorded (W2-7).
+const NO_RECORD_TEXT: &str = "The daemon has no record of this submission. Its files are still committed on feedback/2026-11-26-fix-the-zoom (0123abc). Submit again to send it as a new one.";
+
+#[gpui_kit::test]
+fn no_record_and_no_outcome_says_nothing_was_created(cx: &mut TestAppContext) {
+    // W2-7: without a recorded outcome nothing names a commit.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    opened
+        .fake
+        .answer_outcome(Err(api(404, "submission_not_found", "no such submission")));
+    frame(cx, window);
+
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(NOTHING_CREATED_TEXT)
+    );
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_ne!(submits[1].0.submission_id, id, "a new one");
 }
 
 #[gpui_kit::test]
@@ -1367,7 +1397,7 @@ fn a_forgotten_submission_keeps_its_target_after_a_restart(cx: &mut TestAppConte
     click(cx, window, SUBMIT_RETRY_ID);
     assert_eq!(
         text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
-        Some(NOTHING_CREATED_TEXT)
+        Some(NO_RECORD_TEXT)
     );
     assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
     assert_eq!(
@@ -2475,7 +2505,13 @@ fn the_question_waits_until_the_feedback_pane_shows(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn an_answer_that_does_not_complete_the_submission_deletes_nothing(cx: &mut TestAppContext) {
-    for case in ["another submission", "no intent and no issue address"] {
+    // W2-6: nor does a failed step of another submission say anything of
+    // it (its branch and commit are not this draft's).
+    for case in [
+        "another submission",
+        "no intent and no issue address",
+        "a failed step of another submission",
+    ] {
         let setup = FeedbackSetup::new();
         let repos = two_repos();
         let alpha = repos[0].id;
@@ -2483,13 +2519,20 @@ fn an_answer_that_does_not_complete_the_submission_deletes_nothing(cx: &mut Test
         let window = opened.window;
         click(cx, window, SUBMIT_CONFIRM_ID);
         let id = sent_id(&opened);
-        let answer = if case == "another submission" {
-            outcome_with_intent(
-                smithagents_core::feedback::SubmissionId::new(),
-                created_intent(alpha),
-            )
-        } else {
-            outcome_with_issue(id, alpha, "javascript:alert(1)")
+        let other = smithagents_core::feedback::SubmissionId::new();
+        let answer = match case {
+            "another submission" => outcome_with_intent(other, created_intent(alpha)),
+            "no intent and no issue address" => {
+                outcome_with_issue(id, alpha, "javascript:alert(1)")
+            }
+            _ => {
+                let mut failed = outcome_with_intent(other, created_intent(alpha));
+                failed.intent = None;
+                failed.branch = "feedback/2026-11-26-someone-elses".into();
+                failed.commit = "fedcba9876543210".into();
+                failed.failed = Some(push_failure());
+                failed
+            }
         };
         opened.fake.answer_outcome(Ok(answer));
         frame(cx, window);
@@ -2501,6 +2544,12 @@ fn an_answer_that_does_not_complete_the_submission_deletes_nothing(cx: &mut Test
             Some(MAY_HAVE_BEEN_SENT_TEXT),
             "{case}"
         );
+        // Answered, and nothing of the answer is kept.
+        let (outcome, awaiting) = cx.read(|cx| {
+            let pending = opened.feedback.read(cx).pending().cloned().unwrap();
+            (pending.outcome, pending.awaiting)
+        });
+        assert_eq!((outcome, awaiting), (None, false), "{case}");
         assert!(drawn(cx, window, SUBMIT_RETRY_ID), "{case}");
         assert_eq!(screen(cx, &opened), FeedbackScreen::Submit, "{case}");
     }

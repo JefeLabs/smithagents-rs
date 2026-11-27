@@ -68,15 +68,15 @@ use super::{confirm, Confirmation, FeedbackPane, FeedbackScreen, Paint};
 use crate::feedback::state::{Pending, SentTo, SUBMIT_TIMEOUT};
 use crate::feedback::submit_vm::{
     asks_to_acknowledge, can_confirm, confirm_label, failure_text, issue_reason,
-    maybe_public_warning, public_warning, result_text, send_failure, shows_issue_url,
-    starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
+    maybe_public_warning, not_recorded_text, public_warning, result_text, send_failure,
+    shows_issue_url, starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
 };
 use crate::feedback::text::{
     BACK_LABEL, CHOOSE_REPO_TEXT, DRAFT_BUSY_TEXT, DRAFT_NOT_READY_TEXT, KIND_LABEL,
-    MAIN_IDEA_HINT, MAIN_IDEA_LABEL, MAY_HAVE_BEEN_SENT_TEXT, NOTHING_CREATED_TEXT,
-    PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL, SEND_AS_INTENT,
-    SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL, START_OVER_LABEL, START_OVER_RISK_TEXT,
-    START_OVER_TITLE, START_OVER_TOOLTIP, SUBMIT_BUSY_TEXT,
+    MAIN_IDEA_HINT, MAIN_IDEA_LABEL, MAY_HAVE_BEEN_SENT_TEXT, PUBLIC_CONFIRM_CANCEL,
+    PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL, SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL,
+    START_OVER_CANCEL, START_OVER_LABEL, START_OVER_RISK_TEXT, START_OVER_TITLE,
+    START_OVER_TOOLTIP, SUBMIT_BUSY_TEXT,
 };
 use crate::intent_vm::kind_label;
 use crate::link::LinkError;
@@ -783,34 +783,40 @@ impl FeedbackPane {
                 // stays, awaiting.
                 Some(DAEMON_SILENT_TEXT.to_owned())
             }
-            Some(Ok(outcome)) => match result_text(&outcome) {
-                // Only an answer about this submission that names what was
-                // made deletes the draft.
-                Some(_) if !completes(&outcome, pending.as_ref()) => {
-                    tracing::warn!(
-                        submission_id = %outcome.submission_id,
-                        "a feedback answer that does not complete this submission"
-                    );
-                    self.feedback
-                        .update(cx, |feedback, cx| feedback.mark_answered(cx));
-                    Some(MAY_HAVE_BEEN_SENT_TEXT.to_owned())
+            Some(Ok(outcome)) => {
+                let ours = pending
+                    .as_ref()
+                    .is_some_and(|p| p.submission_id == outcome.submission_id);
+                match result_text(&outcome) {
+                    // Only an answer about this submission that names what
+                    // was made deletes the draft.
+                    Some(result) if ours && names_what_was_made(&outcome) => {
+                        self.succeeded(outcome, result, window, cx);
+                        None
+                    }
+                    // Only a failed step of this submission is described.
+                    None if ours => {
+                        tracing::warn!(
+                            submission_id = %outcome.submission_id,
+                            step = ?outcome.failed.as_ref().map(|f| f.step),
+                            "a feedback submission is committed, but a step failed"
+                        );
+                        let text = failure_text(&outcome);
+                        self.feedback
+                            .update(cx, |feedback, cx| feedback.record_outcome(outcome, cx));
+                        text
+                    }
+                    _ => {
+                        tracing::warn!(
+                            submission_id = %outcome.submission_id,
+                            "a feedback answer that does not complete this submission"
+                        );
+                        self.feedback
+                            .update(cx, |feedback, cx| feedback.mark_answered(cx));
+                        Some(MAY_HAVE_BEEN_SENT_TEXT.to_owned())
+                    }
                 }
-                Some(result) => {
-                    self.succeeded(outcome, result, window, cx);
-                    None
-                }
-                None => {
-                    tracing::warn!(
-                        submission_id = %outcome.submission_id,
-                        step = ?outcome.failed.as_ref().map(|f| f.step),
-                        "a feedback submission is committed, but a step failed"
-                    );
-                    let text = failure_text(&outcome);
-                    self.feedback
-                        .update(cx, |feedback, cx| feedback.record_outcome(outcome, cx));
-                    text
-                }
-            },
+            }
             Some(Err(e)) => {
                 tracing::warn!(?attempt, "a feedback submission failed: {e}");
                 match send_failure(&e) {
@@ -863,8 +869,11 @@ impl FeedbackPane {
                     }
                     SendFailure::NotRecorded => {
                         tracing::info!("the daemon has no such feedback submission; starting over");
+                        // What the draft's record names is still committed.
+                        let text =
+                            not_recorded_text(pending.as_ref().and_then(|p| p.outcome.as_ref()));
                         self.forget_keeping_target(cx);
-                        Some(NOTHING_CREATED_TEXT.to_owned())
+                        Some(text)
                     }
                     SendFailure::RepoGone => {
                         self.forget_keeping_target(cx);
@@ -1259,12 +1268,11 @@ impl FeedbackPane {
     }
 }
 
-/// Whether `outcome` completes the pending submission: it is about that
-/// submission, and names what was made (an intent, or an issue address the
-/// app shows). Any other answer is not taken for a success.
-fn completes(outcome: &FeedbackOutcome, pending: Option<&Pending>) -> bool {
-    pending.is_some_and(|p| p.submission_id == outcome.submission_id)
-        && (outcome.intent.is_some() || outcome.issue_url.as_deref().is_some_and(shows_issue_url))
+/// Whether `outcome` names what was made (an intent, or an issue address
+/// the app shows): with being about the pending submission, what completes
+/// it. Any other answer is not taken for a success.
+fn names_what_was_made(outcome: &FeedbackOutcome) -> bool {
+    outcome.intent.is_some() || outcome.issue_url.as_deref().is_some_and(shows_issue_url)
 }
 
 /// A section's name over its control.
