@@ -28,7 +28,7 @@ use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{FeedbackFailure, FeedbackStep, SubmissionId};
 
 use super::issue::{branch_name, folder_path, issue_slug, with_suffix};
-use super::FeedbackError;
+use super::{FeedbackError, PREPARE_FOLDER, USE_NAME};
 use crate::git::{self, exit_status_text, CommitError, GitError, PushError};
 use crate::paths::ensure_private_real_dir;
 
@@ -171,8 +171,8 @@ pub async fn commit_folder(
     check_names(placement, files)?;
     check_branch(root, &placement.branch).await?;
     require_default_branch(repo).await?;
-    ensure_private_real_dir(scratch)?;
-    let scratch = std::fs::canonicalize(scratch)?;
+    ensure_private_real_dir(scratch).map_err(FeedbackError::io(PREPARE_FOLDER))?;
+    let scratch = std::fs::canonicalize(scratch).map_err(FeedbackError::io(PREPARE_FOLDER))?;
 
     // Armed before anything is created: a panic or a dropped future removes
     // the worktree in `Drop`; every other way out goes through `remove`.
@@ -230,7 +230,9 @@ async fn commit_in_worktree(
                 step: COMMIT_STEP,
                 status,
             },
-            CommitError::Io(e) => FeedbackError::Io(e),
+            // A path git must not be given.
+            CommitError::Io(e) if e.kind() == io::ErrorKind::InvalidInput => unsafe_name(),
+            CommitError::Io(e) => git_not_run(COMMIT_STEP, &e),
         })?;
     create_branch(root, worktree, &placement.branch, &commit).await?;
     Ok(commit)
@@ -302,7 +304,9 @@ async fn remove_leftovers(root: &Path, own: &Path) -> Result<(), FeedbackError> 
             }
         }
     }
-    remove_path(own).await?;
+    remove_path(own)
+        .await
+        .map_err(FeedbackError::io(PREPARE_FOLDER))?;
     Ok(())
 }
 
@@ -595,18 +599,26 @@ fn parents(path: &str) -> impl Iterator<Item = &str> {
 /// Maps a git failure to `Git { step, .. }`; git's words are never kept.
 fn git_failed(step: &'static str) -> impl Fn(GitError) -> FeedbackError {
     move |e| match e {
-        GitError::Io(e) => FeedbackError::Io(e),
+        GitError::Io(e) => git_not_run(step, &e),
         GitError::UnsafeArgument => unsafe_name(),
         GitError::Failed { status } => FeedbackError::Git { step, status },
         _ => FeedbackError::Git { step, status: None },
     }
 }
 
+/// git could not be started, or its pipes failed: a git failure with no exit
+/// status, not a problem with the issue folder. The system's reason goes to
+/// the log by its kind only (its words may name paths).
+pub(super) fn git_not_run(step: &'static str, e: &io::Error) -> FeedbackError {
+    tracing::warn!(step, kind = ?e.kind(), "git could not be run");
+    FeedbackError::Git { step, status: None }
+}
+
 fn unsafe_name() -> FeedbackError {
-    FeedbackError::Io(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "a folder, branch or file name is not safe to use",
-    ))
+    FeedbackError::Io {
+        what: USE_NAME,
+        source: io::ErrorKind::InvalidInput.into(),
+    }
 }
 
 /// A plain name: a letter or digit, then letters, digits, `.`, `_` and `-`.
@@ -720,8 +732,10 @@ async fn write_folder(
         Ok(paths)
     })
     .await
-    .map_err(|_| io::Error::other("writing the issue folder stopped"))?;
-    Ok(written?)
+    .map_err(|_| io::Error::other("writing the issue folder stopped"))
+    .and_then(|written| written)
+    .map_err(FeedbackError::io(PREPARE_FOLDER))?;
+    Ok(written)
 }
 
 /// Puts the staged file `from` at `to` (a hard link, else a copy) and keeps
@@ -1117,6 +1131,33 @@ mod tests {
             err.to_string(),
             "git could not commit the files (no exit status)"
         );
+        // git that could not be started is a git failure too, not a problem
+        // with the issue folder, and the system's reason is not in it.
+        let not_started = io::Error::new(io::ErrorKind::NotFound, "No such file: /secret/path");
+        let err = git_failed(COMMIT_STEP)(GitError::Io(not_started));
+        assert_eq!(
+            err.to_string(),
+            "git could not commit the files (no exit status)"
+        );
+        assert_eq!((err.code(), err.status().as_u16()), ("git_failed", 500));
+    }
+
+    #[test]
+    fn an_io_error_names_what_failed_and_keeps_the_systems_words_for_the_log() {
+        let full = io::Error::other("No space left on device (os error 28)");
+        let err = FeedbackError::io(crate::feedback::STORE_UPLOAD)(full);
+        assert_eq!(err.to_string(), "could not store the upload");
+        assert_eq!((err.code(), err.status().as_u16()), ("io_error", 500));
+        let source = std::error::Error::source(&err).expect("the system's error is the source");
+        assert_eq!(source.to_string(), "No space left on device (os error 28)");
+
+        // A refused name keeps the sentence it always had.
+        let err = git_failed(COMMIT_STEP)(GitError::UnsafeArgument);
+        assert_eq!(
+            err.to_string(),
+            "could not prepare the issue folder: a folder, branch or file name is not safe to use"
+        );
+        assert_eq!(err.code(), "io_error");
     }
 
     #[test]

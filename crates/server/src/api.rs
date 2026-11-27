@@ -227,7 +227,12 @@ impl From<FeedbackError> for ApiError {
     fn from(e: FeedbackError) -> Self {
         let status = e.status();
         if status.is_server_error() {
-            tracing::error!("request failed: {e}");
+            // The system's own words (an `io_error`'s source) go to the log
+            // only: the answer is the fixed sentence.
+            match std::error::Error::source(&e) {
+                Some(source) => tracing::error!("request failed: {e}: {source}"),
+                None => tracing::error!("request failed: {e}"),
+            }
         }
         Self::new(status, e.code().to_owned(), e.to_string())
     }
@@ -1416,7 +1421,7 @@ mod tests {
             FeedbackError::NameTaken => "NameTaken",
             FeedbackError::FolderBlocked(_) => "FolderBlocked",
             FeedbackError::BranchBlocked(_) => "BranchBlocked",
-            FeedbackError::Io(_) => "Io",
+            FeedbackError::Io { .. } => "Io",
             FeedbackError::Invalid(_) => "Invalid",
             FeedbackError::UnsupportedFile(_) => "UnsupportedFile",
             FeedbackError::TooLarge(_) => "TooLarge",
@@ -1439,7 +1444,8 @@ mod tests {
     #[test]
     fn every_feedback_error_maps_to_a_fixed_status_code_and_sentence() {
         use StatusCode as S;
-        let io = std::io::Error::new(std::io::ErrorKind::InvalidInput, "a name is not safe");
+        // The system's words are the source: they must not show in the sentence.
+        let io = std::io::Error::other("No space left on device (os error 28)");
         let cases = [
             (FeedbackError::RepoNotFound, S::NOT_FOUND, "repo_not_found", "repo not found"),
             (
@@ -1494,10 +1500,13 @@ mod tests {
                 "a branch named feedback exists in this repository, so no branch can be created under feedback/",
             ),
             (
-                FeedbackError::Io(io),
+                FeedbackError::Io {
+                    what: crate::feedback::STORE_UPLOAD,
+                    source: io,
+                },
                 S::INTERNAL_SERVER_ERROR,
                 "io_error",
-                "could not prepare the issue folder: a name is not safe",
+                "could not store the upload",
             ),
             (
                 FeedbackError::Invalid("the main idea is empty".into()),

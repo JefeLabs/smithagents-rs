@@ -174,7 +174,7 @@ fn is_issue_folder(folder: &str) -> bool {
 /// out.
 fn read_failed(e: GitError) -> FeedbackError {
     match e {
-        GitError::Io(e) => FeedbackError::Io(e),
+        GitError::Io(e) => repo::git_not_run(READ_STEP, &e),
         GitError::Failed { status } => FeedbackError::Git {
             step: READ_STEP,
             status,

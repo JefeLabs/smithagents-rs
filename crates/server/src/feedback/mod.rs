@@ -60,7 +60,19 @@ const UNCONFIRMED_WAIT_SECS: i64 = 60;
 /// the submission.
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
-/// Every message is a fixed sentence: nothing git prints is in one.
+/// What an `io_error` says could not be done: the issue folder (or the place
+/// its commit is made in) could not be read or written.
+pub(crate) const PREPARE_FOLDER: &str = "prepare the issue folder";
+/// What an `io_error` says could not be done: an uploaded file could not be
+/// kept until the submission runs.
+pub(crate) const STORE_UPLOAD: &str = "store the upload";
+/// What an `io_error` says could not be done: a name was refused before git
+/// or the file system saw it.
+pub(crate) const USE_NAME: &str =
+    "prepare the issue folder: a folder, branch or file name is not safe to use";
+
+/// Every message is a fixed sentence: nothing git or the system prints is
+/// in one.
 #[derive(Debug, thiserror::Error)]
 pub enum FeedbackError {
     #[error("repo not found")]
@@ -96,10 +108,16 @@ pub enum FeedbackError {
         "a branch named {0} exists in this repository, so no branch can be created under {0}/"
     )]
     BranchBlocked(String),
-    /// A file of the issue folder could not be read or written, or a name in
-    /// it was not safe to use (`InvalidInput`).
-    #[error("could not prepare the issue folder: {0}")]
-    Io(#[from] std::io::Error),
+    /// A file could not be read or written, or a name was not safe to use
+    /// (`InvalidInput`). `what` is a fixed phrase for the situation (see
+    /// [`FeedbackError::io`]). The system's own words are the source, for
+    /// the log, and never part of the sentence.
+    #[error("could not {what}")]
+    Io {
+        what: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     /// The request or the upload's shape (a part missing, unexpected or
     /// twice) is not valid.
     #[error("{0}")]
@@ -168,6 +186,12 @@ pub const PUBLIC_SENTENCE: &str =
 pub const MAYBE_PUBLIC_SENTENCE: &str = "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.";
 
 impl FeedbackError {
+    /// An `io_error` for a failure to do `what` (a fixed phrase), with the
+    /// system's error as its source: `.map_err(FeedbackError::io(WHAT))`.
+    pub(crate) fn io(what: &'static str) -> impl Fn(std::io::Error) -> Self {
+        move |source| Self::Io { what, source }
+    }
+
     pub fn code(&self) -> &str {
         match self {
             Self::RepoNotFound => "repo_not_found",
@@ -179,7 +203,7 @@ impl FeedbackError {
             Self::NameTaken => "name_taken",
             Self::FolderBlocked(_) => "folder_blocked",
             Self::BranchBlocked(_) => "branch_blocked",
-            Self::Io(_) => "io_error",
+            Self::Io { .. } => "io_error",
             Self::Invalid(_) => "invalid",
             Self::UnsupportedFile(_) => "unsupported_file",
             Self::TooLarge(_) => "payload_too_large",
@@ -220,7 +244,9 @@ impl FeedbackError {
             | Self::OriginUnreadable => StatusCode::CONFLICT,
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Store(_) | Self::Git { .. } | Self::Io { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Intent(e) => e.status_and_code().0,
             Self::Step(_) => StatusCode::BAD_GATEWAY,
         }
