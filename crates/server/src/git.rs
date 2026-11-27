@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use crate::child_env::remove_plugin_secrets;
+use crate::child_env::{kill_group, remove_plugin_secrets, GroupKiller};
 
 /// A validated repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,7 +554,7 @@ async fn run(
     let mut child = cmd.spawn()?;
     // Declared after `child`, so it is dropped first: the group is killed
     // while its leader is not yet reaped and its id cannot be reused.
-    let mut group = GroupKiller(child.id());
+    let mut group = GroupKiller::of(child.id());
     let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
     let write = async move {
         if let (Some(mut pipe), Some(bytes)) = (stdin, input) {
@@ -577,7 +577,7 @@ async fn run(
     };
     match tokio::time::timeout(timeout, finish).await {
         Ok(Ok(ran)) => {
-            group.0 = None;
+            group.disarm();
             Ok(ran)
         }
         Ok(Err(e)) => Err(GitError::Io(e)),
@@ -593,27 +593,6 @@ async fn read_capped<R: AsyncRead + Unpin>(pipe: Option<R>, max: u64) -> Vec<u8>
     let _ = (&mut pipe).take(max).read_to_end(&mut kept).await;
     let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
     kept
-}
-
-/// Kills the process group led by the process it names when dropped, unless
-/// cleared first.
-struct GroupKiller(Option<u32>);
-
-impl Drop for GroupKiller {
-    fn drop(&mut self) {
-        kill_group(self.0);
-    }
-}
-
-fn kill_group(leader: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = leader
-        .and_then(|id| i32::try_from(id).ok())
-        .and_then(rustix::process::Pid::from_raw)
-    {
-        // The group may be gone already.
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
 }
 
 /// [`run`] for a `Drop`: blocking, output discarded, at most `timeout`; only

@@ -20,7 +20,7 @@ use super::structured::parse_cli_result;
 use super::{
     Harness, HarnessError, HarnessEvent, StructuredRequest, StructuredResult, TurnRequest,
 };
-use crate::child_env::remove_plugin_secrets;
+use crate::child_env::{remove_plugin_secrets, GroupKiller};
 
 const STDERR_MAX_LINES: usize = 20;
 const STDERR_MAX_BYTES: usize = 4096;
@@ -164,8 +164,10 @@ fn build_structured_args(req: &StructuredRequest) -> Vec<String> {
 }
 
 impl ClaudeCodeHarness {
-    /// claude with `args` in `cwd`, its stdio piped, killed when dropped, and
-    /// without any plugin secret in its environment.
+    /// claude with `args` in `cwd`, its stdio piped, killed when dropped,
+    /// leading a process group of its own (so it can be stopped together
+    /// with what it started, see [`GroupKiller`]), and without any plugin
+    /// secret in its environment.
     fn command(&self, args: Vec<String>, cwd: &Path) -> Command {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args)
@@ -173,6 +175,7 @@ impl ClaudeCodeHarness {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
         remove_plugin_secrets(&mut cmd);
         cmd
@@ -199,6 +202,12 @@ impl Harness for ClaudeCodeHarness {
             // process, and dropping the task handles stops the prompt writer
             // (which a process holding stdin open could otherwise block
             // forever) and the stderr reader.
+            let mut child = child;
+            // A turn that is given up on (the stream is dropped, or the
+            // daemon stops) takes down what claude started as well: a dev
+            // server, an MCP server. Once claude has ended on its own, what it
+            // left running is left alone.
+            let mut group = GroupKiller::of(child.id());
             let _stdin_task = stdin_task;
             let mut stderr_task = stderr_task;
             let mut lines = BufReader::new(stdout).lines();
@@ -217,6 +226,7 @@ impl Harness for ClaudeCodeHarness {
                     () = tokio::time::sleep_until(since_exit(READ_AFTER_EXIT_MAX)),
                         if exited_at.is_some() => break,
                     exited = child.wait(), if status.is_none() => {
+                        group.disarm();
                         status = Some(exited);
                         exited_at = Some(Instant::now());
                         continue;
@@ -256,6 +266,7 @@ impl Harness for ClaudeCodeHarness {
                     // Its output can no longer be followed: stop claude rather
                     // than wait for it.
                     tracing::warn!("error reading claude stdout: {e}; stopping claude");
+                    group.kill();
                     let _ = child.kill().await;
                     Some(format!("could not read claude's output: {e}"))
                 }
@@ -264,7 +275,10 @@ impl Harness for ClaudeCodeHarness {
                         Some(status) => status,
                         None => tokio::select! {
                             () = tx.closed() => return,
-                            s = child.wait() => s,
+                            s = child.wait() => {
+                                group.disarm();
+                                s
+                            }
                         },
                     };
                     match status {
@@ -296,14 +310,11 @@ impl Harness for ClaudeCodeHarness {
         &self,
         req: StructuredRequest,
     ) -> Result<StructuredResult, HarnessError> {
-        // Own process group, so a timeout can take down whatever claude started.
         let mut child = self
             .command(build_structured_args(&req), &req.cwd)
-            .process_group(0)
             .spawn()?;
-        let pgid = child
-            .id()
-            .and_then(|p| rustix::process::Pid::from_raw(p as i32));
+        // A timeout, or dropping this call, takes down whatever claude started.
+        let mut group = GroupKiller::of(child.id());
         let stdin = child.stdin.take().expect("stdin piped");
         let mut stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -331,13 +342,14 @@ impl Harness for ClaudeCodeHarness {
         let waited = tokio::time::timeout(req.timeout, child.wait()).await;
         let status = match waited {
             Err(_) => {
-                if let Some(pid) = pgid {
-                    let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-                }
+                group.kill();
                 let _ = child.kill().await;
                 return Err(HarnessError::Timeout);
             }
-            Ok(status) => status?,
+            Ok(status) => {
+                group.disarm();
+                status?
+            }
         };
         // Everything claude printed was in the pipe when it exited.
         let _ = tokio::time::timeout(DRAIN_AFTER_EXIT, &mut stdout_task.0).await;
