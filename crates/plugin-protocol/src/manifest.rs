@@ -135,8 +135,12 @@ fn check_text(text: &str, max: usize, field: impl FnOnce() -> String) -> Result<
     }
 }
 
+/// A secret the plugin names in its requests. Like every part of a
+/// manifest, it can gain fields: outside this crate one is made by parsing,
+/// not written out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SecretDecl {
     pub key: String,
     pub label: String,
@@ -165,6 +169,7 @@ impl SecretDecl {
 /// prints is the secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ToolSource {
     /// The `name` of one of the manifest's `[[tools]]`.
     pub tool: String,
@@ -176,6 +181,7 @@ pub struct ToolSource {
 /// plugins; the daemon runs it, never the plugin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ToolDecl {
     /// The executable's name, never a path: `^[a-z][a-z0-9_-]{0,31}$`.
     pub name: String,
@@ -232,15 +238,28 @@ fn install_url(raw: &str) -> Option<String> {
     usable.then(|| url.as_str().to_string())
 }
 
+/// What a setting's value is. A later build may know more kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SettingKind {
+    /// A string.
     Text,
+    /// A list of strings.
     List,
     Bool,
 }
 
 impl SettingKind {
+    /// The kind as a manifest writes it: `text`, `list` or `bool`.
+    pub fn name(self) -> &'static str {
+        match self {
+            SettingKind::Text => "text",
+            SettingKind::List => "list",
+            SettingKind::Bool => "bool",
+        }
+    }
+
     fn accepts(self, v: &Value) -> bool {
         match self {
             SettingKind::Text => v.is_string(),
@@ -250,8 +269,10 @@ impl SettingKind {
     }
 }
 
+/// A setting the user can give the plugin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SettingDecl {
     pub key: String,
     pub label: String,
@@ -262,8 +283,10 @@ pub struct SettingDecl {
     pub default: Option<Value>,
 }
 
+/// A kind of record the plugin lists, and how often.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ResourceDecl {
     pub kind: String,
     pub label: String,
@@ -271,9 +294,10 @@ pub struct ResourceDecl {
     pub interval_secs: u32,
 }
 
-/// A plugin's `plugin.toml`, parsed and checked. Only [`Manifest::parse`]
-/// builds one, and a later build may read more from the file: fields can be
-/// added.
+/// A plugin's `plugin.toml`. [`Manifest::parse`] builds a checked one, and
+/// every rule in these docs that begins "after `parse`" holds only for that;
+/// deserialising one directly checks nothing. A later build may read more
+/// from the file: this type and the declarations in it can gain fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -363,6 +387,53 @@ pub enum ManifestError {
     /// file text.
     #[error("{field} must be 1 to {max} characters with no control characters")]
     BadText { field: String, max: usize },
+}
+
+impl ManifestError {
+    /// Which rule the manifest broke, in a sentence that quotes nothing from
+    /// the file. The `Display` text names the offending key, host or entry,
+    /// which is file text; this is for where that must not be shown.
+    ///
+    /// It lives here, beside the variants, so that a new variant cannot be
+    /// added without its sentence: outside this crate the enum can only be
+    /// matched with a wildcard.
+    pub fn rule(&self) -> &'static str {
+        match self {
+            ManifestError::Toml { .. } => "the text is not a plugin manifest",
+            ManifestError::UnsupportedContract(_) => {
+                "the contract version is not one this build loads"
+            }
+            ManifestError::EntryRequired(_) => "the host mode needs an entry file",
+            ManifestError::BadEntry(_) => "the entry must be a plain file name",
+            ManifestError::BadHost(_) => "a host name is not valid",
+            ManifestError::BadSecretKey(_) => "a secret key is not valid",
+            ManifestError::SecretHostsRequired(_) => {
+                "a secret must list its hosts when the plugin declares more than one"
+            }
+            ManifestError::SecretHostNotDeclared { .. } => {
+                "a secret names a host the plugin does not declare"
+            }
+            ManifestError::BadSettingKey(_) => "a setting key is not valid",
+            ManifestError::BadResourceKind(_) => "a resource kind is not valid",
+            ManifestError::DuplicateSecret(_) => "a secret key is declared twice",
+            ManifestError::DuplicateSetting(_) => "a setting key is declared twice",
+            ManifestError::DuplicateResource(_) => "a resource kind is declared twice",
+            ManifestError::BadInterval { .. } => {
+                "a resource interval is outside 60 to 86400 seconds"
+            }
+            ManifestError::BadDefault(_) => "a setting default does not match its kind",
+            ManifestError::BadToolName(_) => "a tool name is not a plain executable name",
+            ManifestError::DuplicateTool(_) => "a tool is declared twice",
+            ManifestError::BadInstall(_) => "a tool's install entry is not valid",
+            ManifestError::BadInstallUrl(_) => "a tool's install_url is not an https address",
+            ManifestError::UnknownTool { .. } => {
+                "a secret names a tool the plugin does not declare"
+            }
+            ManifestError::BadText { .. } => {
+                "a name, label or help text is empty, too long or holds control characters"
+            }
+        }
+    }
 }
 
 /// Why a settings value does not fit a manifest's declarations. The set of

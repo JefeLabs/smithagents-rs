@@ -10,9 +10,13 @@
 //!   [`PluginError`], the HTTP types) have the shape the contract version
 //!   fixes ([`CONTRACT_VERSION`]). They change only with it.
 //! - What only the host side uses can grow without a new contract version:
-//!   [`Manifest`] can gain fields, and [`ManifestError`], [`SettingsError`]
-//!   and [`ContractError`] can gain variants. They are `#[non_exhaustive]`,
-//!   so code outside this crate matches them with a wildcard arm.
+//!   [`Manifest`] and the declarations in it ([`SecretDecl`], [`ToolDecl`],
+//!   [`ToolSource`], [`SettingDecl`], [`ResourceDecl`]) can gain fields, and
+//!   [`SettingKind`], [`ManifestError`], [`SettingsError`] and
+//!   [`ContractError`] can gain variants. They are `#[non_exhaustive]`: code
+//!   outside this crate gets a manifest by parsing one, and matches the
+//!   enums with a wildcard arm. Where every variant needs an answer, the
+//!   answer is a method here ([`ManifestError::rule`], [`SettingKind::name`]).
 //! - [`HostApi`] is implemented by hosts. A method added to it later gets a
 //!   default body, so a host written against an older build still compiles.
 //!

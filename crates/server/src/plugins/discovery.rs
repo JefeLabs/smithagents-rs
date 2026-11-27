@@ -343,44 +343,10 @@ fn read_manifest(path: &Path) -> Result<Manifest, String> {
         ManifestError::UnsupportedContract(_) | ManifestError::EntryRequired(_) => {
             format!("plugin.toml is not valid: {e}")
         }
-        // The rest would quote text from the file, so each has a fixed sentence.
-        other => format!("plugin.toml is not valid: {}", fixed_sentence(&other)),
+        // The rest would quote text from the file, so each has a fixed
+        // sentence, kept beside the variants in the protocol crate.
+        other => format!("plugin.toml is not valid: {}", other.rule()),
     })
-}
-
-fn fixed_sentence(e: &ManifestError) -> &'static str {
-    match e {
-        ManifestError::Toml { .. }
-        | ManifestError::UnsupportedContract(_)
-        | ManifestError::EntryRequired(_) => "the manifest is not usable",
-        ManifestError::BadEntry(_) => "the entry must be a plain file name",
-        ManifestError::BadHost(_) => "a host name is not valid",
-        ManifestError::BadSecretKey(_) => "a secret key is not valid",
-        ManifestError::SecretHostsRequired(_) => {
-            "a secret must list its hosts when the plugin declares more than one"
-        }
-        ManifestError::SecretHostNotDeclared { .. } => {
-            "a secret names a host the plugin does not declare"
-        }
-        ManifestError::BadSettingKey(_) => "a setting key is not valid",
-        ManifestError::BadResourceKind(_) => "a resource kind is not valid",
-        ManifestError::DuplicateSecret(_) => "a secret key is declared twice",
-        ManifestError::DuplicateSetting(_) => "a setting key is declared twice",
-        ManifestError::DuplicateResource(_) => "a resource kind is declared twice",
-        ManifestError::BadInterval { .. } => "a resource interval is outside 60 to 86400 seconds",
-        ManifestError::BadDefault(_) => "a setting default does not match its kind",
-        ManifestError::BadToolName(_) => "a tool name is not a plain executable name",
-        ManifestError::DuplicateTool(_) => "a tool is declared twice",
-        ManifestError::BadInstall(_) => "a tool's install entry is not valid",
-        ManifestError::BadInstallUrl(_) => "a tool's install_url is not an https address",
-        ManifestError::UnknownTool { .. } => "a secret names a tool the plugin does not declare",
-        ManifestError::BadText { .. } => {
-            "a name, label or help text is empty, too long or holds control characters"
-        }
-        // The protocol crate can refuse a manifest for a reason added after
-        // this was written; it still gets a sentence with no file text.
-        _ => "the manifest breaks a rule this daemon has no sentence for",
-    }
 }
 
 /// Resolves the entry file and checks it. Returns its canonical path.

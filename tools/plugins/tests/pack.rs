@@ -138,6 +138,35 @@ fn folders_others_can_write_are_tightened() {
     assert_eq!(mode, 0o755);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_linked_output_folder_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The folder a link points to is not the packer's to change: it may be
+    // shared on purpose. (Discovery refuses a linked plugins folder anyway.)
+    let out = tempfile::tempdir().unwrap();
+    let shared = out.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let link = out.path().join("plugins");
+    std::os::unix::fs::symlink(&shared, &link).unwrap();
+
+    pack(&PackOptions {
+        release: true,
+        out_dir: link,
+        fixtures: true,
+    })
+    .unwrap();
+
+    let mode = fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o777);
+    // The plugin folders are the packer's own, and are tightened.
+    for id in FIXTURES {
+        assert_not_writable_by_others(&shared.join(id));
+    }
+}
+
 #[test]
 fn concurrent_packs_into_one_directory_both_succeed() {
     let out = tempfile::tempdir().unwrap();

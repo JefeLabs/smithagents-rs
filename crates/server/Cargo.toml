@@ -47,6 +47,12 @@ required-features = ["test-util"]
 # The crate's own test hooks, for every test target that needs them (see
 # `required-features`): a plain `cargo test` then builds and runs them all
 # instead of silently skipping them.
+#
+# A side effect to know about: the `smithagentsd` that a test run of this
+# crate leaves in `target/<profile>/` is built with the hooks too, because
+# the binary shares this package's features. The hooks do nothing unless a
+# test sets them, and `cargo build` puts the plain daemon back. Giving the
+# binary a package of its own would end this.
 smithagents-server = { path = ".", features = ["test-util"] }
 # On in test builds so the daemon's logging test means something (see
 # `init_logging` in src/bin/smithagentsd.rs).

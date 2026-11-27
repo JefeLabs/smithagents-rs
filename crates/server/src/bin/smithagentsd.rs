@@ -440,7 +440,8 @@ mod tests {
     fn logging_does_not_forward_the_log_crate() {
         // The WebSocket library logs handshakes through `log`; whatever
         // features tracing-subscriber was built with, none of it may reach
-        // the daemon's log.
+        // the daemon's log. (That this build has the feature that would
+        // carry it is checked in tests/log_bridge_canary.rs.)
         super::init_logging();
         assert_eq!(log::max_level(), log::LevelFilter::Off);
     }

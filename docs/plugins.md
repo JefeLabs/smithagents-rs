@@ -373,9 +373,14 @@ writable by group or others. Also:
 - the directory and the entry file are checked again just before loading, so
   a file replaced between discovery and load is refused;
 - a native library is opened only when, with every link in its path
-  resolved, it lies inside `<directory of the daemon's executable>/plugins`.
-  The loader checks this itself, whatever it is asked to load: a library
-  anywhere else is refused unopened.
+  resolved, it lies inside `<directory of the daemon's executable>/plugins`,
+  that folder is a real folder and not a link, and the file, the folder and
+  every folder between them belong to the daemon's user or to root and are
+  writable by nobody else. The loader checks this itself, beside the code
+  that opens the library, whatever it is asked to load; anything else is
+  refused unopened. (The daemon's environment is trusted as the daemon is:
+  on macOS a `DYLD_LIBRARY_PATH` makes the system's loader look there first
+  for a file of the same name.)
 
 A directory that fails a check is skipped and listed with a plain-sentence
 reason; one bad plugin never stops the daemon or other plugins. A plugin that
@@ -706,7 +711,11 @@ Details:
   files `0644`, libraries `0755`. They are never group- or world-writable,
   because discovery refuses those. The output directory and each plugin's
   directory lose their group and world write permission too when they have
-  it (a umask of 002, or a directory that was already there).
+  it (a umask of 002, or a directory that was already there). The output
+  directory is checked before anything is built: if others can write it and
+  its mode cannot be changed, packing stops there and says so. An output
+  directory that is a link is left as it is, since the directory it points
+  to is not the packer's (discovery refuses a linked plugins directory).
 
 **Writing a native built-in plugin.** A crate of its own, as in
 `plugins/github-dylib`: `crate-type = ["cdylib"]`, a library name that differs

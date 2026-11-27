@@ -233,6 +233,13 @@ pub fn pack(opts: &PackOptions) -> Result<Packed, PackError> {
         .collect();
     let root = workspace_root();
 
+    // Before anything is built: `create_dir_all` leaves the mode to the
+    // umask, and a folder that was already there keeps its own, while
+    // discovery refuses a plugins folder that others can write. A folder
+    // whose mode cannot be put right is found now, not after the builds.
+    fs::create_dir_all(&opts.out_dir).map_err(io_at(&opts.out_dir))?;
+    keep_others_from_writing(&opts.out_dir).map_err(io_at(&opts.out_dir))?;
+
     let packages = |host: HostMode| -> Vec<&str> {
         specs
             .iter()
@@ -276,12 +283,9 @@ pub fn pack(opts: &PackOptions) -> Result<Packed, PackError> {
 
         let dir = opts.out_dir.join(spec.id);
         fs::create_dir_all(&dir).map_err(io_at(&dir))?;
-        // `create_dir_all` leaves the mode to the umask, and a folder that
-        // was already there keeps its own: discovery refuses both the
-        // plugins folder and a plugin's folder when others can write them.
-        for folder in [opts.out_dir.as_path(), dir.as_path()] {
-            keep_others_from_writing(folder).map_err(io_at(folder))?;
-        }
+        // As for the plugins folder above: discovery refuses a plugin's
+        // folder that others can write.
+        keep_others_from_writing(&dir).map_err(io_at(&dir))?;
         let bytes = fs::read(&artifact).map_err(io_at(&artifact))?;
         write_atomic(&dir.join(&entry), &bytes, mode)?;
         write_atomic(&dir.join("plugin.toml"), manifest.as_bytes(), FILE_MODE)?;
@@ -312,7 +316,12 @@ pub fn pack_fixtures_once() -> &'static Packed {
 /// dropped. For tests that load a native plugin: the loader opens a library
 /// only from inside that plugins folder, which for a test is the folder
 /// beside the test executable. Neither folder is writable by the group or
-/// others, as discovery requires. Panics if it cannot be made.
+/// others, as discovery and the loader require. Panics if it cannot be made,
+/// so the test executable's folder must be writable.
+///
+/// The shared `plugins` folder stays behind, empty, in the build output
+/// (another test may be using it), and a test process that is killed leaves
+/// its own folder there too.
 #[derive(Debug)]
 pub struct BuiltinScratch {
     dir: PathBuf,
@@ -508,15 +517,29 @@ fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
 }
 
 /// Takes the group's and others' write permission from `folder`, if they
-/// have it; the rest of its mode stays.
+/// have it; the rest of its mode stays. A `folder` that is a link is left
+/// alone: discovery refuses a linked folder whatever its mode, and the
+/// folder it points to is not the packer's to change.
+///
+/// Fails when others can write the folder and its mode cannot be changed
+/// (it belongs to someone else): the daemon would load nothing from it.
 #[cfg(unix)]
 fn keep_others_from_writing(folder: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(folder)?.permissions().mode();
-    if mode & 0o022 == 0 {
+    let meta = fs::symlink_metadata(folder)?;
+    let mode = meta.permissions().mode();
+    if meta.file_type().is_symlink() || mode & 0o022 == 0 {
         return Ok(());
     }
-    fs::set_permissions(folder, fs::Permissions::from_mode(mode & !0o022))
+    fs::set_permissions(folder, fs::Permissions::from_mode(mode & !0o022)).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "others can write this folder and its mode cannot be changed ({e}); \
+                 the daemon would not load plugins from it"
+            ),
+        )
+    })
 }
 
 #[cfg(not(unix))]

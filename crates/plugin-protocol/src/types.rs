@@ -377,8 +377,10 @@ pub trait Plugin: Send + Sync {
     /// `done`, at most 20 pages per run. The network is reached only
     /// through `host`.
     ///
-    /// A call must answer within 60 seconds; a plugin that does not, or
-    /// that panics, is stopped.
+    /// A call must answer within 60 seconds, and a WebAssembly plugin also
+    /// within 10 seconds of its own CPU time. A call that does not, or that
+    /// panics, fails the run, which is tried again later; a native plugin
+    /// is then stopped until the daemon restarts.
     ///
     /// # Errors
     ///

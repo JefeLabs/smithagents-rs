@@ -36,6 +36,13 @@ fn err(text: &str) -> ManifestError {
     Manifest::parse(text).unwrap_err()
 }
 
+/// A part of a manifest, made the way code outside the crate makes one: by
+/// reading it. The declaration types can gain fields, so they cannot be
+/// written out as literals here.
+fn decl<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).unwrap()
+}
+
 #[test]
 fn sample_parses() {
     let m = Manifest::parse(SAMPLE).unwrap();
@@ -49,27 +56,23 @@ fn sample_parses() {
         Some("libsmithagents_plugin_github.dylib")
     );
     assert_eq!(m.hosts, vec!["api.github.com"]);
-    assert_eq!(
-        m.secrets,
-        vec![SecretDecl {
-            key: "token".into(),
-            label: "Personal access token".into(),
-            help: None,
-            hosts: vec!["api.github.com".into()],
-            from_tool: None,
-        }]
-    );
+    let secret: SecretDecl = decl(json!({
+        "key": "token",
+        "label": "Personal access token",
+        "hosts": ["api.github.com"],
+    }));
+    assert_eq!(m.secrets, vec![secret]);
+    assert_eq!(m.secrets[0].help, None);
+    assert_eq!(m.secrets[0].from_tool, None);
     assert_eq!(m.settings.len(), 1);
     assert_eq!(m.settings[0].kind, SettingKind::List);
     assert!(m.settings[0].required);
-    assert_eq!(
-        m.resources,
-        vec![ResourceDecl {
-            kind: "issue".into(),
-            label: "Issues".into(),
-            interval_secs: 300
-        }]
-    );
+    let resource: ResourceDecl = decl(json!({
+        "kind": "issue",
+        "label": "Issues",
+        "interval_secs": 300,
+    }));
+    assert_eq!(m.resources, vec![resource]);
 }
 
 #[test]
@@ -450,27 +453,18 @@ from_tool = { tool = "gh", args = ["auth", "token"] }
 #[test]
 fn the_tools_sample_parses() {
     let m = Manifest::parse(TOOLS_SAMPLE).unwrap();
-    assert_eq!(
-        m.tools,
-        vec![ToolDecl {
-            name: "gh".into(),
-            label: "GitHub CLI".into(),
-            min_version: Some(semver::Version::new(2, 40, 0)),
-            // Stored in its normal form.
-            install_url: Some("https://cli.github.com/".into()),
-            install: [("brew", "gh"), ("mise", "gh")]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        }]
-    );
-    assert_eq!(
-        m.secrets[0].from_tool,
-        Some(ToolSource {
-            tool: "gh".into(),
-            args: vec!["auth".into(), "token".into()],
-        })
-    );
+    let tool: ToolDecl = decl(json!({
+        "name": "gh",
+        "label": "GitHub CLI",
+        "min_version": "2.40.0",
+        // Stored in its normal form.
+        "install_url": "https://cli.github.com/",
+        "install": { "brew": "gh", "mise": "gh" },
+    }));
+    assert_eq!(m.tools, vec![tool]);
+    assert_eq!(m.tools[0].min_version, Some(semver::Version::new(2, 40, 0)));
+    let source: ToolSource = decl(json!({ "tool": "gh", "args": ["auth", "token"] }));
+    assert_eq!(m.secrets[0].from_tool, Some(source));
     assert_eq!(m.secrets[0].help.as_deref(), Some("Run: gh auth login"));
 }
 
@@ -768,4 +762,37 @@ fn settings_errors() {
         m.validate_settings(&json!([])).unwrap_err(),
         SettingsError::NotAnObject
     );
+}
+
+#[test]
+fn a_rule_sentence_quotes_nothing_from_the_file() {
+    // `Display` names the offending host, key or entry, which is text from
+    // the file; `rule` is for where that must not be shown.
+    let cases = [
+        with("hosts = [\"bad_host_from_the_file\"]", ""),
+        with("entry = \"../from-the-file\"", ""),
+        with(
+            "",
+            "[[settings]]\nkey = \"From The File\"\nlabel = \"L\"\nkind = \"text\"\n",
+        ),
+    ];
+    for text in cases {
+        let e = err(&text);
+        let shown = e.to_string().to_lowercase();
+        assert!(shown.contains("from") && shown.contains("the"), "{shown}");
+        let rule = e.rule();
+        assert!(!rule.to_lowercase().contains("from"), "{rule}");
+        assert!(!rule.contains('"'), "{rule}");
+    }
+    assert_eq!(
+        err(&with("hosts = [\"bad_host_from_the_file\"]", "")).rule(),
+        "a host name is not valid"
+    );
+}
+
+#[test]
+fn a_setting_kind_is_named_as_a_manifest_writes_it() {
+    for kind in [SettingKind::Text, SettingKind::List, SettingKind::Bool] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.name()));
+    }
 }

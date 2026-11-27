@@ -56,6 +56,12 @@ fn init_logging() {
         .ok()
         .and_then(|level| level.parse::<tracing::Level>().ok())
         .unwrap_or(tracing::Level::INFO);
+    log_at(level);
+}
+
+/// Sets this process's one subscriber: `tracing` events at `level` and above,
+/// to stderr, and nothing from the `log` crate (see [`init_logging`]).
+fn log_at(level: tracing::Level) {
     let subscriber = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(level)
@@ -71,9 +77,10 @@ mod tests {
         // tungstenite logs the WebSocket handshake, `Authorization` header
         // and daemon token included, through `log` at trace. Whatever
         // features tracing-subscriber was built with, nothing may carry
-        // those records into this process's log.
-        std::env::set_var("SMITHAGENTS_LOG", "trace");
-        super::init_logging();
+        // those records into this process's log. (That this build has the
+        // feature that would carry them is checked in
+        // tests/log_bridge_canary.rs.)
+        super::log_at(tracing::Level::TRACE);
         assert_eq!(log::max_level(), log::LevelFilter::Off);
         assert!(!log::log_enabled!(log::Level::Error));
     }
