@@ -6,7 +6,7 @@
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Output, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -34,6 +34,9 @@ pub enum GitError {
     NoDefaultBranch,
     #[error("branch already exists: {0}")]
     BranchExists(String),
+    /// Something is already in the folder a new worktree would be made in.
+    #[error("the worktree folder {} is already in use", .0.display())]
+    WorktreeExists(PathBuf),
     #[error("git command failed: {stderr}")]
     Command { stderr: String },
     /// git exited unsuccessfully. What it printed is not kept.
@@ -110,16 +113,24 @@ fn git_command(cwd: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-async fn git_raw(cwd: &Path, args: &[&str]) -> Result<Output, GitError> {
-    Ok(git_command(cwd, args).output().await?)
+/// Runs git for at most [`local_timeout`]; see [`git_within`].
+async fn git_raw(cwd: &Path, args: &[&str]) -> Result<Ran, GitError> {
+    git_within(cwd, args, local_timeout()).await
 }
 
-fn stderr_of(out: &Output) -> String {
+/// Runs git for at most `timeout`, in a process group of its own: when the
+/// time is up (`TimedOut`) or the future is dropped, git is killed together
+/// with whatever it started (a hook, a filter).
+async fn git_within(cwd: &Path, args: &[&str], timeout: Duration) -> Result<Ran, GitError> {
+    run(git_command(cwd, args), timeout, None, OUTPUT_MAX).await
+}
+
+fn stderr_of(out: &Ran) -> String {
     String::from_utf8_lossy(&out.stderr).trim().to_string()
 }
 
-fn stdout_of(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+fn stdout_of(out: &Ran) -> String {
+    out.stdout_text()
 }
 
 /// Runs git and returns trimmed stdout, mapping failures to typed errors.
@@ -251,8 +262,13 @@ pub async fn create_worktree(
     }
     tokio::fs::create_dir_all(worktrees_dir).await?;
     let dir = worktrees_dir.join(branch.replace('/', "-"));
+    // git makes the branch before it looks at the folder, so a taken folder
+    // is refused here: no branch is left behind for a worktree never made.
+    if is_taken(&dir).await? {
+        return Err(GitError::WorktreeExists(dir));
+    }
     let dir_arg = dir.to_string_lossy().into_owned();
-    let out = git_raw(
+    let added = git_within(
         repo_root,
         &[
             "worktree",
@@ -264,26 +280,93 @@ pub async fn create_worktree(
             &dir_arg,
             base,
         ],
+        checkout_timeout(),
     )
-    .await?;
+    .await;
+    let out = match added {
+        Ok(out) => out,
+        Err(GitError::TimedOut) => {
+            discard_unfinished_worktree(repo_root, &dir, branch, base).await;
+            return Err(GitError::TimedOut);
+        }
+        Err(e) => return Err(e),
+    };
     if out.status.success() {
         return Ok(dir);
     }
-    let stderr = stderr_of(&out);
-    if stderr.contains("not a git repository") {
-        Err(GitError::NotAGitRepo)
-    } else if stderr.contains("already exists") && stderr.contains("branch") {
-        Err(GitError::BranchExists(branch.to_string()))
-    } else {
-        Err(GitError::Command { stderr })
+    Err(worktree_add_failure(stderr_of(&out), branch, &dir))
+}
+
+/// Whether `git worktree add` would refuse `dir`: a file, or a folder that
+/// holds anything. Nothing there, or an empty folder, is free.
+async fn is_taken(dir: &Path) -> Result<bool, GitError> {
+    match tokio::fs::read_dir(dir).await {
+        Ok(mut entries) => Ok(entries.next_entry().await?.is_some()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(true),
+        Err(e) => Err(e.into()),
     }
+}
+
+/// What a failed `git worktree add -b <branch> -- <dir>` printed, as an
+/// error. git announces the branch it is about to make (`Preparing worktree
+/// (new branch '…')`) before anything can fail, so the word "branch" alone
+/// tells nothing: only git's own sentence about a taken branch does.
+fn worktree_add_failure(stderr: String, branch: &str, dir: &Path) -> GitError {
+    if stderr.contains("not a git repository") {
+        GitError::NotAGitRepo
+    } else if stderr.contains("a branch named") && stderr.contains("already exists") {
+        GitError::BranchExists(branch.to_string())
+    } else if stderr.contains(&format!("'{}' already exists", dir.display())) {
+        GitError::WorktreeExists(dir.to_path_buf())
+    } else {
+        GitError::Command { stderr }
+    }
+}
+
+/// Removes what a `git worktree add` that was stopped left behind: the
+/// folder, its registration, and the new branch while it still points at
+/// `base` (so nothing committed on it is lost). Best effort: what cannot be
+/// removed stays, and a later start uses another branch and folder.
+async fn discard_unfinished_worktree(repo_root: &Path, dir: &Path, branch: &str, base: &str) {
+    let dir_arg = dir.to_string_lossy().into_owned();
+    // `--force` twice: a worktree stopped before its checkout ended is
+    // still locked.
+    let removed = git_ok(
+        repo_root,
+        &["worktree", "remove", "--force", "--force", "--", &dir_arg],
+    )
+    .await;
+    if !matches!(removed, Ok(true)) {
+        // git does not know the folder (yet): it was free before this
+        // checkout, so what is in it now is the checkout's.
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        let _ = git_ok(repo_root, &["worktree", "prune"]).await;
+    }
+    if let Ok(Some(commit)) = rev_parse(repo_root, base).await {
+        let _ = delete_branch_at(repo_root, branch, &commit).await;
+    }
+    tracing::warn!("a checkout for a new worktree did not finish in time and was stopped");
 }
 
 /// Removes a worktree (and its directory), discarding uncommitted changes.
 pub async fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), GitError> {
     let wt = worktree.to_string_lossy().into_owned();
-    git(repo_root, &["worktree", "remove", "--force", "--", &wt]).await?;
-    Ok(())
+    let out = git_within(
+        repo_root,
+        &["worktree", "remove", "--force", "--", &wt],
+        checkout_timeout(),
+    )
+    .await?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = stderr_of(&out);
+    if stderr.contains("not a git repository") {
+        Err(GitError::NotAGitRepo)
+    } else {
+        Err(GitError::Command { stderr })
+    }
 }
 
 // What follows is used by the feedback tool in a user's repository.
@@ -297,15 +380,22 @@ pub async fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), Gi
 // has (an unknown host key, a passphrase); a push then waits until its
 // timeout.
 
-/// The longest a local git command of the feedback tool may take.
+/// The longest a local git command may take, for the feedback tool and for
+/// an agent's quick commands (checking a branch, reading a name).
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest making or removing an agent's worktree may take. A checkout
+/// runs the repository's hooks and filters (Git LFS downloads files), so it
+/// gets far longer than [`LOCAL_TIMEOUT`]. It is still bounded: while one
+/// runs, no other agent or intent can start.
+pub const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(600);
 /// The most of stdout a command keeps; the rest is read and dropped.
 const OUTPUT_MAX: u64 = 16 * 1024 * 1024;
 /// The most of stderr a command keeps, only ever to classify a failure.
 const ERROR_OUTPUT_MAX: u64 = 64 * 1024;
 
 tokio::task_local! {
-    /// Another [`LOCAL_TIMEOUT`] for one task (see [`with_git_timeout`]).
+    /// Another [`LOCAL_TIMEOUT`] and [`CHECKOUT_TIMEOUT`] for one task (see
+    /// [`with_git_timeout`]).
     static TIMEOUT_OVERRIDE: Duration;
 }
 
@@ -316,8 +406,15 @@ pub(crate) fn local_timeout() -> Duration {
         .unwrap_or(LOCAL_TIMEOUT)
 }
 
-/// Runs `f` with every local git command of the feedback tool limited to
-/// `timeout` instead of [`LOCAL_TIMEOUT`].
+/// The time making or removing a worktree may take in this task.
+fn checkout_timeout() -> Duration {
+    TIMEOUT_OVERRIDE
+        .try_with(|timeout| *timeout)
+        .unwrap_or(CHECKOUT_TIMEOUT)
+}
+
+/// Runs `f` with every local git command, a checkout included, limited to
+/// `timeout` instead of [`LOCAL_TIMEOUT`] or [`CHECKOUT_TIMEOUT`].
 #[cfg(feature = "test-util")]
 pub async fn with_git_timeout<F: std::future::Future>(timeout: Duration, f: F) -> F::Output {
     TIMEOUT_OVERRIDE.scope(timeout, f).await
@@ -2394,5 +2491,148 @@ mod tests {
         std::fs::write(dir.join("dirty.txt"), "uncommitted").unwrap();
         remove_worktree(&repo, &dir).await.unwrap();
         assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn create_worktree_refuses_a_taken_folder_before_git_makes_a_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        let wts = tmp.path().join("wts");
+        let taken = wts.join("intent-x");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("theirs.txt"), "in the way").unwrap();
+
+        let err = create_worktree(&repo, &wts, "intent/x", "main")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, GitError::WorktreeExists(dir) if dir == &taken),
+            "{err:?}"
+        );
+        // git never ran: it would have made the branch before failing.
+        assert_eq!(g(&repo, &["branch", "--list", "intent/x"]), "");
+        assert_eq!(
+            std::fs::read_to_string(taken.join("theirs.txt")).unwrap(),
+            "in the way"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_worktree_uses_a_folder_that_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        let wts = tmp.path().join("wts");
+        std::fs::create_dir_all(wts.join("agent-x")).unwrap();
+
+        let dir = create_worktree(&repo, &wts, "agent/x", "main")
+            .await
+            .unwrap();
+
+        assert_eq!(g(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "agent/x");
+    }
+
+    #[test]
+    fn worktree_add_failures_are_classified_from_gits_messages() {
+        let dir = Path::new("/home/worktrees/app/intent-x");
+        let classify = |stderr: &str| worktree_add_failure(stderr.to_owned(), "intent/x", dir);
+        // git names the branch it is about to make before it finds the
+        // folder taken: that alone must not read as a taken branch.
+        let folder_taken = "Preparing worktree (new branch 'intent/x')\n\
+                            fatal: '/home/worktrees/app/intent-x' already exists";
+        assert!(
+            matches!(classify(folder_taken), GitError::WorktreeExists(d) if d == dir),
+            "{:?}",
+            classify(folder_taken)
+        );
+        let branch_taken = "Preparing worktree (new branch 'intent/x')\n\
+                            fatal: a branch named 'intent/x' already exists";
+        assert!(
+            matches!(classify(branch_taken), GitError::BranchExists(b) if b == "intent/x"),
+            "{:?}",
+            classify(branch_taken)
+        );
+        assert!(matches!(
+            classify("fatal: not a git repository (or any of the parent directories): .git"),
+            GitError::NotAGitRepo
+        ));
+        assert!(matches!(
+            classify("fatal: invalid reference: nope"),
+            GitError::Command { stderr } if stderr == "fatal: invalid reference: nope"
+        ));
+    }
+
+    /// Whether a process with this id exists.
+    fn alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[tokio::test]
+    async fn a_checkout_that_does_not_finish_is_stopped_with_what_it_started() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo, "main");
+        // The repository's checkout hook outlives the time a checkout gets.
+        let hooks = tmp.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let pid_file = tmp.path().join("hook.pid");
+        let hook = hooks.join("post-checkout");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        g(
+            &repo,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        let wts = tmp.path().join("wts");
+
+        let started = std::time::Instant::now();
+        let err = TIMEOUT_OVERRIDE
+            .scope(
+                Duration::from_secs(2),
+                create_worktree(&repo, &wts, "agent/x", "main"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, GitError::TimedOut), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        // The hook was stopped with git, not left running on its own.
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        for _ in 0..50 {
+            if !alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!alive(pid), "the checkout hook is still running");
+        // Nothing of the unfinished worktree is left: no folder, no
+        // registration, no branch.
+        assert!(!wts.join("agent-x").exists());
+        let listed = g(&repo, &["worktree", "list", "--porcelain"]);
+        assert_eq!(listed.matches("worktree ").count(), 1, "{listed}");
+        assert_eq!(g(&repo, &["branch", "--list", "agent/x"]), "");
+        // The same branch can be made once the hook is out of the way.
+        g(&repo, &["config", "--unset", "core.hooksPath"]);
+        let dir = create_worktree(&repo, &wts, "agent/x", "main")
+            .await
+            .unwrap();
+        assert!(dir.is_dir());
     }
 }

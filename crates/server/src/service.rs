@@ -253,7 +253,7 @@ impl AgentService {
         let color = next_color(&colors);
         let id = AgentId::new();
         let branch = opts.branch.unwrap_or_else(|| agent_branch(&name, id));
-        let worktrees = self.inner.paths.worktrees_dir().join(repo_dir_name(&repo));
+        let worktrees = self.inner.paths.repo_worktrees_dir(&repo);
         // Fully qualified, so a tag or remote-tracking ref of the same name
         // is never taken instead.
         let base = match &opts.base {
@@ -601,13 +601,6 @@ fn agent_branch(name: &str, id: AgentId) -> String {
     format!("agent/{slug}-{}", &hex[..8])
 }
 
-fn repo_dir_name(repo: &Repo) -> String {
-    repo.path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".into())
-}
-
 fn panic_message(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         format!("panic: {s}")
@@ -861,7 +854,7 @@ mod tests {
         assert!(agent.worktree_path.is_dir());
         assert!(agent
             .worktree_path
-            .starts_with(fx.paths.worktrees_dir().join("my-repo")));
+            .starts_with(fx.paths.repo_worktrees_dir(&fx.repo)));
         assert_eq!(
             git(&agent.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
             agent.branch
@@ -965,10 +958,48 @@ mod tests {
         assert!(fx.store.list_agents(true).await.unwrap().is_empty());
         assert!(!fx
             .paths
-            .worktrees_dir()
-            .join("my-repo")
+            .repo_worktrees_dir(&fx.repo)
             .join("intent-taken")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn two_repositories_with_the_same_folder_name_keep_their_worktrees_apart() {
+        let fx = fixture(vec![]).await;
+        // A second repository whose folder is also called `my-repo`.
+        let other_dir = fx.tmp.path().join("elsewhere").join("my-repo");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        git(&other_dir, &["init", "-b", "main"]);
+        git(&other_dir, &["commit", "--allow-empty", "-m", "init"]);
+        let other = fx.svc.add_repo(&other_dir).await.unwrap();
+        let on = |branch: &str| CreateAgentOptions {
+            branch: Some(branch.into()),
+            ..CreateAgentOptions::default()
+        };
+
+        let first = fx
+            .svc
+            .create_agent_with(fx.repo.id, on("intent/same"))
+            .await
+            .unwrap();
+        let second = fx
+            .svc
+            .create_agent_with(other.id, on("intent/same"))
+            .await
+            .unwrap();
+
+        assert_eq!(first.branch, "intent/same");
+        assert_eq!(second.branch, "intent/same");
+        assert_ne!(first.worktree_path, second.worktree_path);
+        for (agent, repo_dir) in [(&first, &fx.repo_dir), (&second, &other_dir)] {
+            assert_eq!(
+                git(&agent.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+                "intent/same"
+            );
+            // The worktree belongs to its own repository.
+            let listed = git(repo_dir, &["worktree", "list", "--porcelain"]);
+            assert_eq!(listed.matches("worktree ").count(), 2, "{listed}");
+        }
     }
 
     #[tokio::test]

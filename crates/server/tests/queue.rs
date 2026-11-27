@@ -388,11 +388,15 @@ impl Fx {
             .collect()
     }
 
+    /// Every agent worktree, whichever repository it belongs to.
     fn worktree_dirs(&self) -> Vec<PathBuf> {
-        match std::fs::read_dir(self.paths.worktrees_dir().join("repo")) {
-            Ok(entries) => entries.map(|e| e.unwrap().path()).collect(),
-            Err(_) => vec![],
-        }
+        let Ok(repos) = std::fs::read_dir(self.paths.worktrees_dir()) else {
+            return vec![];
+        };
+        repos
+            .flat_map(|repo| std::fs::read_dir(repo.unwrap().path()).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .collect()
     }
 }
 
