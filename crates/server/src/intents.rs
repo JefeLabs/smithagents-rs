@@ -86,8 +86,9 @@ const CLOSE_RETRY: Duration = Duration::from_secs(30);
 
 const TITLE_MAX: usize = 120;
 const ITEM_MAX: usize = 2000;
-/// Characters allowed in a current behavior set through `update`.
-const BEHAVIOR_MAX: usize = 20_000;
+/// Characters allowed in a current behavior set through `update`: what
+/// polish holds the model to as well.
+const BEHAVIOR_MAX: usize = crate::polish::MAX_BEHAVIOR_CHARS;
 const DEFAULT_TITLE: &str = "Untitled intent";
 /// The length limit `slugify` applies; numbered slugs keep to it too.
 const SLUG_MAX: usize = 48;
