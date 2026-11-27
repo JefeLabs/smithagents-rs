@@ -194,15 +194,25 @@ impl ClaudeCodeHarness {
     async fn spawn(&self, args: Vec<String>, cwd: &Path) -> Result<Child, HarnessError> {
         match self.command(args, cwd).spawn() {
             Ok(child) => Ok(child),
-            Err(e) => {
-                let folder = tokio::fs::metadata(cwd).await;
-                if folder.is_ok_and(|meta| meta.is_dir()) {
-                    Err(HarnessError::Spawn(e))
-                } else {
-                    Err(HarnessError::MissingCwd(cwd.to_owned()))
-                }
+            Err(e) if folder_is_missing(&tokio::fs::metadata(cwd).await) => {
+                tracing::debug!("claude was not started, its working folder being gone: {e}");
+                Err(HarnessError::MissingCwd(cwd.to_owned()))
             }
+            Err(e) => Err(HarnessError::Spawn(e)),
         }
+    }
+}
+
+/// Whether a look at the working folder (`fs::metadata` of it) shows that it
+/// is not there: nothing at the path, something on the way to it that is not
+/// a folder, or something there that is not one. A folder that could not be
+/// looked at for another reason is not known to be missing.
+fn folder_is_missing(looked: &std::io::Result<std::fs::Metadata>) -> bool {
+    use std::io::ErrorKind;
+
+    match looked {
+        Ok(meta) => !meta.is_dir(),
+        Err(e) => matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory),
     }
 }
 
@@ -417,6 +427,30 @@ impl Harness for ClaudeCodeHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_folder_known_to_be_missing_is_called_missing() {
+        // After a failed spawn the folder is looked at. Not there, or not a
+        // folder: that is why. Anything else about it (no permission on a
+        // parent, a disk error) is not known to be the reason, and the
+        // spawn's own error is what gets reported.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"").unwrap();
+        let kind = |kind: std::io::ErrorKind| Err(std::io::Error::from(kind));
+
+        assert!(!folder_is_missing(&std::fs::metadata(dir.path())));
+        assert!(folder_is_missing(&std::fs::metadata(&file)));
+        assert!(folder_is_missing(&std::fs::metadata(
+            dir.path().join("gone")
+        )));
+        assert!(folder_is_missing(&kind(std::io::ErrorKind::NotFound)));
+        assert!(folder_is_missing(&kind(std::io::ErrorKind::NotADirectory)));
+        assert!(!folder_is_missing(&kind(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!folder_is_missing(&kind(std::io::ErrorKind::Other)));
+    }
 
     #[test]
     fn claude_does_not_inherit_plugin_secrets() {

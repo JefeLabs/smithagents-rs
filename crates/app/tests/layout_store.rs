@@ -268,22 +268,36 @@ fn a_saved_window_larger_than_its_display_is_fitted_to_it() {
     // A display keeps its UUID when its resolution changes, so a window
     // saved on it can be larger than it is now.
     let display = Some(bounds(0., 0., 1512., 982.));
-    let large = windowed(0., 30., 2500., 1400.);
+    // Too large both ways: it covers the display, so every edge and the
+    // resize corner can be reached.
+    let large = windowed(300., 30., 2500., 1400.);
     assert_eq!(
         restored_window_bounds(&large, display),
-        Some(WindowBounds::Windowed(bounds(0., 30., 1512., 982.)))
+        Some(WindowBounds::Windowed(bounds(0., 0., 1512., 982.)))
     );
     let wide = windowed(40., 60., 2500., 700.);
     assert_eq!(
         restored_window_bounds(&wide, display),
-        Some(WindowBounds::Windowed(bounds(40., 60., 1512., 700.))),
-        "only what is too large changes, and the place is kept"
+        Some(WindowBounds::Windowed(bounds(0., 60., 1512., 700.))),
+        "only the direction that is too large changes"
+    );
+    let tall = windowed(40., 60., 1200., 1400.);
+    assert_eq!(
+        restored_window_bounds(&tall, display),
+        Some(WindowBounds::Windowed(bounds(40., 0., 1200., 982.)))
     );
     let mut maximized = large.clone();
     maximized.maximized = true;
     assert_eq!(
         restored_window_bounds(&maximized, display),
-        Some(WindowBounds::Maximized(bounds(0., 30., 1512., 982.)))
+        Some(WindowBounds::Maximized(bounds(0., 0., 1512., 982.)))
+    );
+    // A window too wide whose saved place was off the display: fitted, it is
+    // on it, where the saved one would have been given up.
+    let beyond = windowed(3000., 80., 2500., 760.);
+    assert_eq!(
+        restored_window_bounds(&beyond, display),
+        Some(WindowBounds::Windowed(bounds(0., 80., 1512., 760.)))
     );
     // A size nobody saved: finite, and no window or drawable could be it.
     let absurd = windowed(0., 0., 1e30, 1e30);
@@ -294,7 +308,7 @@ fn a_saved_window_larger_than_its_display_is_fitted_to_it() {
     // On a display smaller than the smallest window, the minimum stands.
     let small = Some(bounds(0., 0., 600., 380.));
     assert_eq!(
-        restored_window_bounds(&windowed(0., 0., 1200., 760.), small),
+        restored_window_bounds(&windowed(20., 10., 1200., 760.), small),
         Some(WindowBounds::Windowed(bounds(0., 0., 640., 400.)))
     );
     // A window that fits is given back as it was saved.

@@ -50,8 +50,10 @@ pub enum EnsureError {
         running: u32,
         expected: u32,
     },
-    #[error("smithagentsd did not become ready in time; see run/daemon.log in the home directory")]
-    StartTimeout,
+    /// No daemon answered before the deadline. `log` is where the output of
+    /// a daemon started for this home goes.
+    #[error("smithagentsd did not become ready in time; see {}", log.display())]
+    StartTimeout { log: PathBuf },
     /// A file, a folder or the daemon binary could not be used. `what` is
     /// what was tried, as the message starts ("could not read"), and `path`
     /// is what it was tried on: the lockfile, the home or its `run/` folder,
@@ -146,7 +148,7 @@ pub async fn ensure_daemon_with(
         match wait_until_ready(home, expected_version, child, daemon_bin, &log, deadline).await? {
             Started::Ready(client) => return Ok(client),
             Started::Retry if Instant::now() < deadline => {}
-            Started::Retry => return Err(EnsureError::StartTimeout),
+            Started::Retry => return Err(EnsureError::StartTimeout { log }),
         }
     }
 }
@@ -381,7 +383,9 @@ async fn wait_until_ready(
         } else {
             absent_since = None;
             if now >= deadline {
-                return Err(EnsureError::StartTimeout);
+                return Err(EnsureError::StartTimeout {
+                    log: log.to_owned(),
+                });
             }
         }
         tokio::time::sleep(POLL).await;

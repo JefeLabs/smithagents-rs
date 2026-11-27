@@ -78,9 +78,9 @@ impl ServiceError {
 
 /// Takes back what creating `agent` made in the user's repository, for an
 /// agent whose row could not be saved: its worktree, then its branch, while
-/// that still points where it was made from `base`. Left alone, the branch
-/// would take the name the next start wants. Best effort: what cannot be
-/// removed stays, and is logged.
+/// that holds no commit `base` does not. Left alone, the branch would take
+/// the name the next start wants. Best effort: what cannot be removed stays,
+/// and is logged.
 async fn discard_unsaved(repo_root: &Path, agent: &Agent, base: &str) {
     let id = agent.id;
     if let Err(e) = git::remove_worktree(repo_root, &agent.worktree_path).await {
@@ -91,7 +91,7 @@ async fn discard_unsaved(repo_root: &Path, agent: &Agent, base: &str) {
     match git::delete_branch_made_from(repo_root, &agent.branch, base).await {
         Ok(true) => {}
         Ok(false) => {
-            tracing::warn!(agent_id = %id, "the branch of an unsaved agent is not where it was made, and was kept");
+            tracing::warn!(agent_id = %id, "the branch of an unsaved agent holds a commit of its own, and was kept");
         }
         Err(e) => {
             tracing::warn!(agent_id = %id, "could not delete the branch of an unsaved agent: {e}");
@@ -1038,8 +1038,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_unsaved_agents_branch_is_kept_once_it_holds_work() {
-        // Only a branch that still points where it was made is deleted: one
-        // that moved on has commits nothing else may hold.
+        // Only a branch with nothing of its own is deleted: one that moved
+        // on has commits nothing else may hold.
         let fx = fixture(vec![]).await;
         git(&fx.repo_dir, &["branch", "moved-on"]);
         git(&fx.repo_dir, &["checkout", "-q", "moved-on"]);
@@ -1062,6 +1062,13 @@ mod tests {
 
         git(&fx.repo_dir, &["branch", "untouched"]);
         assert!(made_from("untouched", "refs/heads/main").await);
+        assert_eq!(branches(&fx), ["main", "moved-on"]);
+
+        // The base gaining a commit since does not make the branch's own:
+        // everything on it is still on the base.
+        git(&fx.repo_dir, &["branch", "left-behind"]);
+        git(&fx.repo_dir, &["commit", "--allow-empty", "-m", "later"]);
+        assert!(made_from("left-behind", "main").await);
         assert_eq!(branches(&fx), ["main", "moved-on"]);
     }
 

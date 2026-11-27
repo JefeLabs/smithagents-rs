@@ -15,7 +15,7 @@ Contents: [capturing](#capturing-the-window), [adding files](#adding-files), [th
 
 ## Adding files
 
-**Add files…** accepts png, jpg, gif and webp images of at most 10 MB each and mp4 videos of at most 50 MB. A file's contents must match its extension. A draft holds at most 10 attachments and 100 MB in all. The 100 MB are counted as they are sent: an added file once, and a screenshot twice, because it is uploaded as the picture and as its annotated copy. A screenshot or a file that would take the draft over the limit is refused when it is added, not at Submit. Each refused file is named in the pane with the reason; the other files are still added. Once the draft is full, the rest of the pick is not looked at and one sentence counts those files.
+**Add files…** accepts png, jpg, gif and webp images of at most 10 MB each and mp4 videos of at most 50 MB. A file's contents must match its extension. A draft holds at most 10 attachments and 100 MB in all. The 100 MB are counted as they are sent: an added file once, and a screenshot twice, because it is uploaded as the picture and as its annotated copy. A screenshot or a file that would take the draft over the limit is refused when it is added, with "the draft would be larger than 100 MB to send (a screenshot counts twice)". The annotated copy is counted at the picture's size, which is close but not exact, so Submit still checks the files themselves. Each refused file is named in the pane with the reason; the other files are still added. Once the draft is full, the rest of the pick is not looked at and one sentence counts those files.
 
 ## The draft
 

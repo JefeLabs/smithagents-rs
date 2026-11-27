@@ -378,7 +378,7 @@ fn each_refusal_names_the_file() {
         ),
         (
             Refusal::TotalTooLarge,
-            "big.jpg was not added: the draft would be larger than 100 MB.",
+            "big.jpg was not added: the draft would be larger than 100 MB to send (a screenshot counts twice).",
         ),
         (
             Refusal::TooMany,

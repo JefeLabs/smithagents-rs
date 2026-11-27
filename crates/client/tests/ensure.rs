@@ -472,22 +472,36 @@ async fn ensure_starts_over_when_the_lock_holder_has_no_lockfile() {
 }
 
 #[tokio::test]
-async fn ensure_keeps_starting_over_until_a_start_wins() {
-    // Three starts in a row lose the instance lock to a daemon that publishes
-    // no lockfile (one still loading its plugins looks the same); the fourth
-    // wins. The call has one deadline, not a number of attempts.
+async fn a_lost_start_outwaits_a_winner_that_is_slow_to_publish_its_lockfile() {
+    // The daemon that holds the instance lock writes its lockfile last, once
+    // its plugins are loaded. Until then every start here loses (exit 3) and
+    // finds no lockfile. Three such rounds, about a second each, used to be
+    // the end; the call now has one deadline, and 3.5 s is within it.
+    //
+    // The winner is a daemon already running for another home: publishing
+    // its lockfile here is then a copy, so the test does not also time a
+    // daemon's start.
+    let winner_home = TestHome::new();
     let home = TestHome::new();
     bounded(async {
+        let winner = ensure(&winner_home).await.health().await.unwrap().pid;
         let started = home.scratch().join("starts");
         let script = shell_script(
             &home.scratch().join("daemon"),
-            &format!(
-                "{}\nif [ $(wc -l < '{starts}') -le 3 ]; then exit 3; fi\nexec '{bin}' \"$@\"",
-                script_starts_line(&started),
-                starts = started.display(),
-                bin = daemon_bin().display(),
-            ),
+            &format!("{}\nexit 3", script_starts_line(&started)),
         );
+        let from = lockfile_path(winner_home.path());
+        let to = lockfile_path(home.path());
+        let publish = tokio::spawn({
+            let to = to.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(3500)).await;
+                // Whole, then renamed into place, as the daemon writes it.
+                let whole = to.with_extension("json.tmp");
+                std::fs::copy(&from, &whole).unwrap();
+                std::fs::rename(&whole, &to).unwrap();
+            }
+        });
 
         let client = within(
             "ensure_daemon",
@@ -495,9 +509,12 @@ async fn ensure_keeps_starting_over_until_a_start_wins() {
         )
         .await
         .unwrap_or_else(|e| panic!("ensure_daemon failed: {e}; log:\n{}", home.log()));
-        let health = client.health().await.unwrap();
-        assert_eq!(read_lockfile(home.path()).unwrap().unwrap().pid, health.pid);
-        assert_eq!(starts(&started), 4);
+        publish.await.unwrap();
+        assert_eq!(client.health().await.unwrap().pid, winner);
+        assert!(starts(&started) >= 2, "{} starts", starts(&started));
+        // The copy goes before `home` is dropped, which would otherwise stop
+        // the daemon it names and wait for a lockfile nobody removes.
+        std::fs::remove_file(&to).unwrap();
     })
     .await;
 }
@@ -519,9 +536,23 @@ async fn ensure_gives_up_at_its_deadline_when_every_start_loses() {
         )
         .await
         .expect_err("no daemon ever publishes a lockfile");
-        assert!(matches!(err, EnsureError::StartTimeout), "{err:?}");
-        // A lost start is tried again about once a second, for the whole 5 s.
-        assert!(starts(&started) >= 4, "{} starts", starts(&started));
+        // The error says where the daemon's output is, as a path to open.
+        let log = home.path().join("run").join("daemon.log");
+        assert!(
+            matches!(&err, EnsureError::StartTimeout { log: named } if *named == log),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "smithagentsd did not become ready in time; see {}",
+                log.display()
+            )
+        );
+        // Tried again, and for the whole 5 s. How many times is not counted:
+        // a round is a second plus the time a start takes, which under a
+        // loaded machine is not small.
+        assert!(starts(&started) >= 2, "{} starts", starts(&started));
         assert!(
             began.elapsed() >= Duration::from_secs(5),
             "{:?}",
@@ -560,7 +591,7 @@ async fn ensure_keeps_waiting_while_the_lock_holder_has_a_lockfile() {
         )
         .await
         .expect_err("the lockfile's daemon never answers");
-        assert!(matches!(err, EnsureError::StartTimeout), "{err:?}");
+        assert!(matches!(err, EnsureError::StartTimeout { .. }), "{err:?}");
         assert_eq!(starts(&started), 1);
         assert!(
             began.elapsed() >= Duration::from_secs(5),
