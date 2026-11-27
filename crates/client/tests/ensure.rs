@@ -18,7 +18,7 @@ use smithagents_core::agent::{AgentState, ChatMessage, Role};
 use smithagents_core::daemon::{lockfile_path, read_lockfile, DaemonInfo};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, MessageId};
-use smithagents_core::VERSION;
+use smithagents_core::{PROTOCOL, VERSION};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -514,6 +514,64 @@ async fn ensure_rejects_a_daemon_reporting_another_pid() {
         assert!(!heads.lock().unwrap().is_empty());
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_daemon_of_the_same_version_speaking_another_protocol_is_a_mismatch() {
+    // Every build reports the same version, so the version cannot tell a
+    // daemon built from other code. One that answers without `protocol` is
+    // from before the field: protocol 0.
+    for (answered, running) in [(None, 0), (Some(PROTOCOL + 1), PROTOCOL + 1)] {
+        let home = TestHome::new();
+        bounded(async {
+            let mut health = json!({
+                "version": VERSION, "pid": std::process::id(), "running_agents": 0, "ws_clients": 0,
+            });
+            if let Some(protocol) = answered {
+                health["protocol"] = json!(protocol);
+            }
+            let (port, _heads) = impostor(health).await;
+            write_lockfile(
+                &home,
+                &DaemonInfo {
+                    pid: std::process::id(),
+                    port,
+                    token: "token".into(),
+                    version: VERSION.into(),
+                },
+            );
+
+            let err = within(
+                "ensure_daemon",
+                ensure_daemon(home.path(), daemon_bin(), VERSION),
+            )
+            .await
+            .expect_err("a daemon speaking another protocol must not be accepted");
+
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "smithagentsd {VERSION} is running with protocol {running}, \
+                     but protocol {PROTOCOL} is expected"
+                )
+            );
+            match err {
+                EnsureError::ProtocolMismatch {
+                    version,
+                    running: found,
+                    expected,
+                } => {
+                    assert_eq!(version, VERSION);
+                    assert_eq!(found, running);
+                    assert_eq!(expected, PROTOCOL);
+                }
+                other => panic!("expected ProtocolMismatch, got {other:?}"),
+            }
+            // Nothing was started in its place: the caller decides.
+            assert_eq!(read_lockfile(home.path()).unwrap().unwrap().port, port);
+        })
+        .await;
+    }
 }
 
 #[tokio::test]

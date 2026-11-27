@@ -47,6 +47,10 @@ const MESSAGE_PAGE: usize = 1000;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Health {
     pub version: String,
+    /// The wire protocol the daemon speaks (`smithagents_core::PROTOCOL` of
+    /// its build); 0 from a daemon built before it reported one.
+    #[serde(default)]
+    pub protocol: u32,
     pub pid: u32,
     /// Identifies this daemon process. It changes when the daemon restarts,
     /// and with it the event sequence: seqs seen before are then void.

@@ -40,6 +40,17 @@ pub enum EnsureError {
     /// asks the user before restarting it.
     #[error("smithagentsd {running} is running, but {expected} is expected")]
     VersionMismatch { running: String, expected: String },
+    /// A daemon of the expected version is running, built from code that
+    /// speaks another wire protocol (`smithagents_core::PROTOCOL`). It is
+    /// left alone, like one of another version.
+    #[error(
+        "smithagentsd {version} is running with protocol {running}, but protocol {expected} is expected"
+    )]
+    ProtocolMismatch {
+        version: String,
+        running: u32,
+        expected: u32,
+    },
     #[error("smithagentsd did not become ready in time; see run/daemon.log in the home directory")]
     StartTimeout,
     #[error(transparent)]
@@ -69,7 +80,9 @@ pub async fn ensure_daemon(
 /// Returns a client for the daemon of `home`, starting one if none is running.
 ///
 /// - A lockfile whose daemon answers with the lockfile's pid: its client, or
-///   [`EnsureError::VersionMismatch`] when it runs another version.
+///   [`EnsureError::VersionMismatch`] when it runs another version, or
+///   [`EnsureError::ProtocolMismatch`] when it is of this version but speaks
+///   another wire protocol.
 /// - A lockfile whose pid is dead is stale: it is deleted and its port is
 ///   never sent the token. One whose pid is alive but whose port does not
 ///   answer, or answers with another pid, is kept but not trusted (the pid may
@@ -131,7 +144,7 @@ fn lockfile(home: &Path) -> io::Result<Option<DaemonInfo>> {
 }
 
 /// A client for `info` if its daemon answers in time; an error if it answers
-/// with another version.
+/// with another version or another wire protocol.
 ///
 /// The health request carries the token, so it is only sent while the
 /// lockfile's pid is alive: once that daemon is gone, any local process may
@@ -156,11 +169,18 @@ async fn connect(info: &DaemonInfo, expected: &str) -> Result<Option<Client>, En
             );
             Ok(None)
         }
-        Ok(health) if health.version == expected => Ok(Some(client)),
-        Ok(health) => Err(EnsureError::VersionMismatch {
+        Ok(health) if health.version != expected => Err(EnsureError::VersionMismatch {
             running: health.version,
             expected: expected.to_owned(),
         }),
+        Ok(health) if health.protocol != smithagents_core::PROTOCOL => {
+            Err(EnsureError::ProtocolMismatch {
+                version: health.version,
+                running: health.protocol,
+                expected: smithagents_core::PROTOCOL,
+            })
+        }
+        Ok(_) => Ok(Some(client)),
         Err(e) => {
             tracing::debug!(
                 pid = info.pid,

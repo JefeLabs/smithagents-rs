@@ -603,6 +603,7 @@ fn agent_id(raw: &str) -> Result<AgentId, ApiError> {
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "version": smithagents_core::VERSION,
+        "protocol": smithagents_core::PROTOCOL,
         "pid": std::process::id(),
         "instance_id": &*s.instance_id,
         "latest_seq": s.bus.latest_seq(),

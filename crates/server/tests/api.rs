@@ -270,6 +270,7 @@ async fn health_returns_version_and_counts() {
     let (status, body) = fx.call(Method::GET, "/v1/health", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["version"], smithagents_core::VERSION);
+    assert_eq!(body["protocol"], smithagents_core::PROTOCOL);
     assert_eq!(body["pid"], std::process::id());
     assert_eq!(body["running_agents"], 0);
     assert_eq!(body["ws_clients"], 0);

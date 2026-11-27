@@ -96,7 +96,9 @@ pub enum LinkErrorKind {
 pub enum LinkFailure {
     /// A daemon of another version runs; it was left alone (the app has no
     /// way to stop it yet). `running` is its version, `expected` the one this
-    /// app needs.
+    /// app needs. For a daemon of the same version that speaks another wire
+    /// protocol, both also name the protocol (see
+    /// [`LinkFailure::protocol_mismatch`]).
     VersionMismatch { running: String, expected: String },
     /// Any other failure: its text and kind.
     Other {
@@ -106,6 +108,16 @@ pub enum LinkFailure {
 }
 
 impl LinkFailure {
+    /// A daemon of this app's `version` runs, but speaks wire protocol
+    /// `running` where this app needs `expected`. To the user it is a daemon
+    /// of another version: both are named with their protocol.
+    pub fn protocol_mismatch(version: &str, running: u32, expected: u32) -> Self {
+        LinkFailure::VersionMismatch {
+            running: format!("{version}, protocol {running}"),
+            expected: format!("{version}, protocol {expected}"),
+        }
+    }
+
     /// The failure as one line of text (also what [`DaemonLink::last_error`]
     /// returns).
     pub fn message(&self) -> String {
@@ -775,6 +787,11 @@ async fn connect_and_forward(
         EnsureError::VersionMismatch { running, expected } => {
             Exit::Failed(LinkFailure::VersionMismatch { running, expected })
         }
+        EnsureError::ProtocolMismatch {
+            version,
+            running,
+            expected,
+        } => Exit::Failed(LinkFailure::protocol_mismatch(&version, running, expected)),
         e => Exit::Failed(LinkFailure::Other {
             message: format!("could not start {}: {e}", config.daemon_bin.display()),
             kind: LinkErrorKind::StartFailed,
