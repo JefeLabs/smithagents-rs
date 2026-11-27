@@ -510,6 +510,85 @@ async fn messages_after_seq_pages() {
 }
 
 #[tokio::test]
+async fn messages_after_a_seq_no_message_can_have_is_an_empty_page() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    let agent = fx.create_agent(&repo).await;
+    fx.state
+        .store
+        .append_message(agent.id, Role::Assistant, "m1")
+        .await
+        .unwrap();
+    let uri = format!("/v1/agents/{}/messages", agent.id);
+    // The largest seq the store can hold, one more, and the largest a client
+    // can write: a client's number, never a fault of the store.
+    for after in [
+        "9223372036854775807",
+        "9223372036854775808",
+        "18446744073709551615",
+    ] {
+        let (status, body) = fx
+            .call(Method::GET, &format!("{uri}?after={after}"), None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "after={after}: {body}");
+        assert_eq!(body, json!([]), "after={after}");
+    }
+}
+
+#[tokio::test]
+async fn a_message_without_text_is_refused_on_both_routes() {
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    let agent = fx.create_agent(&repo).await;
+    for route in ["messages", "chat"] {
+        let uri = format!("/v1/agents/{}/{route}", agent.id);
+        for text in ["", "   ", "\n\t "] {
+            let (status, body) = fx
+                .call(Method::POST, &uri, Some(json!({ "text": text })))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {text:?}: {body}");
+            assert_error(&body, "bad_request");
+            assert_eq!(body["message"], "text must not be empty", "{route}");
+        }
+    }
+    // Nothing was kept, and no turn was started.
+    let (status, body) = fx
+        .call(
+            Method::GET,
+            &format!("/v1/agents/{}/messages", agent.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([]));
+    assert!(!fx.state.service.turn_in_flight(agent.id));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_event_that_cannot_be_written_as_json_is_left_out() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fx = default_fx().await;
+    let repo = fx.add_repo().await;
+    let mut agent = fx.create_agent(&repo).await;
+    // serde refuses a path that is not UTF-8.
+    agent.worktree_path = std::ffi::OsString::from_vec(b"/gone/\xff".to_vec()).into();
+    let before = closed_event(&fx.state.bus);
+    fx.state.bus.publish(EventKind::AgentUpdated(agent.clone()));
+    let replayed = closed_event(&fx.state.bus);
+
+    // In the backlog of a client that resumes, and live after that: each
+    // time the socket goes on with the next event.
+    let addr = fx.serve().await;
+    let mut ws = ws_connect(addr, &format!("?since={}", before.seq)).await;
+    assert_eq!(next_event(&mut ws).await, replayed);
+    fx.state.bus.publish(EventKind::AgentUpdated(agent));
+    let live = closed_event(&fx.state.bus);
+    assert_eq!(next_event(&mut ws).await, live);
+}
+
+#[tokio::test]
 async fn events_ws_replays_since_then_streams_live() {
     let fx = default_fx().await;
     let e1 = closed_event(&fx.state.bus);
