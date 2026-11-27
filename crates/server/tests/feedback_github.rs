@@ -66,7 +66,8 @@ const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Once per binary, before any git or fake runs: `HOME` and
 /// `XDG_CONFIG_HOME` name an empty directory, so no configuration of the
-/// machine's user changes what git does, and the process holds [`SECRET`].
+/// machine's user changes what git does, and the process holds [`SECRET`]
+/// and [`SHELL_COLOUR`], as a daemon started from a shell may.
 fn setup() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -75,8 +76,15 @@ fn setup() {
         std::env::set_var("HOME", &home);
         std::env::set_var("XDG_CONFIG_HOME", &home);
         std::env::set_var(SECRET.0, SECRET.1);
+        for (name, value) in SHELL_COLOUR {
+            std::env::set_var(name, value);
+        }
     });
 }
+
+/// What a user's shell may hand the daemon that would make `gh` write
+/// coloured or indented JSON: `gh` must get them overridden.
+const SHELL_COLOUR: [(&str, &str); 2] = [("CLICOLOR_FORCE", "1"), ("GH_FORCE_TTY", "1")];
 
 /// The service clock starts at 2026-11-26T14:15:00Z.
 fn start() -> DateTime<Utc> {
@@ -630,12 +638,20 @@ async fn gh_runs_from_the_daemon_home_with_its_own_environment() {
         "GH_PROMPT_DISABLED=1",
         "GH_NO_UPDATE_NOTIFIER=1",
         "NO_COLOR=1",
+        // What the shell handed the daemon is overridden: colour off,
+        // no terminal-style output (`gh` reads an empty value as unset).
+        "CLICOLOR_FORCE=0",
+        "GH_FORCE_TTY=",
     ] {
         assert_eq!(
             env.lines().filter(|l| *l == var).count(),
             4,
             "{var} in every run"
         );
+    }
+    for (name, value) in SHELL_COLOUR {
+        let inherited = format!("{name}={value}");
+        assert!(!env.lines().any(|l| l == inherited), "{inherited}: {env}");
     }
     assert_eq!(std::env::var(SECRET.0).as_deref(), Ok(SECRET.1));
     assert!(!env.lines().any(|l| l.starts_with("SMITHAGENTS_")), "{env}");

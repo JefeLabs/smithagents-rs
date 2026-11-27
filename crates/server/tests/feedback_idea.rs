@@ -1343,8 +1343,9 @@ async fn a_pull_request_for_another_commit_is_never_taken() {
     // D-M5: the branch's pull request is the idea's only when its head is
     // the commit pushed; a closed or merged one for another commit changes
     // nothing, and a new one is opened.
+    // An empty list, and a `gh` that prints nothing for one, are none.
     let fx = fixture_with(Opts {
-        turns: 3,
+        turns: 4,
         ..Opts::default()
     })
     .await;
@@ -1352,6 +1353,7 @@ async fn a_pull_request_for_another_commit_is_never_taken() {
         ("r1", pr_list(&[(OTHER_HEAD, "CLOSED", 5)])),
         ("r2", pr_list(&[(OTHER_HEAD, "MERGED", 5)])),
         ("r3", pr_list(&[])),
+        ("r4", String::new()),
     ] {
         let (repo, _bare) = fx.github_repo(name).await;
         let (idea, _, _) = fx.sent_idea(&repo).await;
@@ -1448,7 +1450,6 @@ async fn a_pull_request_of_another_repository_or_a_wrong_answer_is_refused() {
         format!(
             "[\n  {{\"headRefOid\": \"{head}\", \"state\": \"OPEN\", \"url\": \"{PR_URL}\"}}\n]"
         ),
-        String::new(),
     ] {
         fx.fake.set("pr-list", &answer);
         let (status, text) = fx.open_pr_text(idea.id).await;

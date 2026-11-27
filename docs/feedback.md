@@ -211,3 +211,4 @@ With a throwaway private GitHub repository of your own:
 12. With the network off, the push fails with a plain sentence, and Retry works once it is back.
 13. An idea package: the agent writes `explainer.md` and, when `agent-browser` really records, `demo.mp4`; **Open pull request** opens a draft. Record what `agent-browser` actually produced: the recording has never been run.
 14. The public-repository warning shows for a public repository, for an issue and for a plain intent, and **Create implementation intent…** asks first.
+15. With the real `gh`, press **Open pull request…** once when no pull request exists (one is opened), and once more after it was opened (it must find the same one and open no second): the daemon's reading of `gh pr list --json` has only ever met the fake.

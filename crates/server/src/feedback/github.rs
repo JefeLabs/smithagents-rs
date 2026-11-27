@@ -47,11 +47,18 @@ const TURNED_OFF: &str = "turned off or not running";
 pub const GH_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest a quick check may take: `gh auth status` and `gh repo view`.
 pub const VISIBILITY_TIMEOUT: Duration = Duration::from_secs(5);
-/// Added to `gh`'s environment: no prompt, no update check, no colour.
-pub const GH_ENV: [(&str, &str); 3] = [
+/// Added to `gh`'s environment, over what the daemon inherited: no prompt,
+/// no update check, no colour, and output as to a pipe. `gh` writes `--json`
+/// on one compact line only while colour is off and it does not act as on a
+/// terminal: `NO_COLOR` does not win over a `CLICOLOR_FORCE` from the user's
+/// shell, so that is set to `0`, and `GH_FORCE_TTY` is set to empty, which
+/// `gh` reads as unset.
+pub const GH_ENV: [(&str, &str); 5] = [
     ("GH_PROMPT_DISABLED", "1"),
     ("GH_NO_UPDATE_NOTIFIER", "1"),
     ("NO_COLOR", "1"),
+    ("CLICOLOR_FORCE", "0"),
+    ("GH_FORCE_TTY", ""),
 ];
 
 /// Whether the feedback plugin's `tool` is ready; otherwise the reason:
@@ -316,9 +323,12 @@ pub async fn find_issue(
 /// --json=url,headRefOid,state`, within `gh.timeout`, its answer read here
 /// ([`read_pull_requests`]; no `--jq` program). The one whose head is the
 /// commit `commit` is `Found`; a pull request of that branch whose head is
-/// another commit is never taken, but an open one is `HeadMoved`. An answer
-/// that is not the list `gh` prints is `gh_bad_answer` (and nothing may be
-/// opened then). `head` must be a branch name the caller checked; `commit`
+/// another commit is never taken, but an open one is `HeadMoved`. An empty
+/// answer is `NotFound`, as `[]` is: taking "none" wrongly cannot open a
+/// duplicate (GitHub refuses a second open pull request for the same
+/// branches, and that failure is answered as any `gh` failure). Any other
+/// answer that is not the list `gh` prints is `gh_bad_answer` (and nothing
+/// may be opened then). `head` must be a branch name the caller checked; `commit`
 /// that is not a full commit id finds none (and `gh` does not run).
 pub async fn find_pull_request(
     gh: &Gh<'_>,
@@ -367,17 +377,22 @@ struct ListedPullRequest {
 }
 
 /// `answer` (the first line `gh` printed: its JSON on one line, as `gh`
-/// writes it to a pipe) as [`find_pull_request`] reads it: `None` unless it
-/// is a JSON array of objects, each with a `url` that is a pull request of
-/// `repo`, a `headRefOid` that is a full commit id and a `state` of `OPEN`,
-/// `CLOSED` or `MERGED`. Of those, the first whose head is `commit` (in any
-/// case) is `Found`; else an `OPEN` one is `HeadMoved`; else `NotFound`.
+/// writes it to a pipe; `None` when it printed nothing) as
+/// [`find_pull_request`] reads it: nothing is `NotFound`; anything else is
+/// `None` unless it is a JSON array of objects, each with a `url` that is a
+/// pull request of `repo`, a `headRefOid` that is a full commit id and a
+/// `state` of `OPEN`, `CLOSED` or `MERGED`. Of those, the first whose head
+/// is `commit` (in any case) is `Found`; else an `OPEN` one is `HeadMoved`;
+/// else `NotFound`.
 fn read_pull_requests(
     answer: Option<&str>,
     repo: &GithubRepo,
     commit: &str,
 ) -> Option<PullRequestSearch> {
-    let listed: Vec<ListedPullRequest> = serde_json::from_str(answer?).ok()?;
+    let Some(answer) = answer else {
+        return Some(PullRequestSearch::NotFound);
+    };
+    let listed: Vec<ListedPullRequest> = serde_json::from_str(answer).ok()?;
     let well_formed = listed.iter().all(|pr| {
         repo.is_pull_request_url(&pr.url)
             && crate::git::is_commit_id(&pr.head_ref_oid)
@@ -877,6 +892,8 @@ mod tests {
         use PullRequestSearch::{Found, HeadMoved, NotFound};
 
         assert_eq!(read("[]"), Some(NotFound));
+        // gh succeeded and printed nothing: no pull request either.
+        assert_eq!(read_pull_requests(None, &repo, ours), Some(NotFound));
         assert_eq!(read(&list(&[pr(ours, "OPEN", 5)])), Some(Found(url(5))));
         // The one for the commit pushed, whatever its state; in any case.
         assert_eq!(
@@ -907,7 +924,6 @@ mod tests {
         let bad_url =
             |u: &str| format!(r#"[{{"headRefOid":"{ours}","state":"OPEN","url":"{u}"}}]"#);
         for answer in [
-            String::new(),
             "[".into(),
             "{}".into(),
             "null".into(),
@@ -937,7 +953,6 @@ mod tests {
         ] {
             assert_eq!(read(&answer), None, "{answer}");
         }
-        assert_eq!(read_pull_requests(None, &repo, ours), None, "no answer");
     }
 
     #[test]
