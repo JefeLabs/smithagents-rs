@@ -139,6 +139,14 @@ pub enum FeedbackError {
     /// failure's own code and fixed sentence.
     #[error("{}", .0.message)]
     Step(FeedbackFailure),
+    /// A push would publish more than the feedback (the default branch has
+    /// commits `origin` has not got, or nothing is known of `origin`): one
+    /// of [`repo::UNPUSHED_SENTENCE`] and [`repo::NEVER_FETCHED_SENTENCE`].
+    #[error("{0}")]
+    Unpublished(&'static str),
+    /// An idea action cannot go ahead until something changes.
+    #[error("{}", .0.sentence())]
+    IdeaBlocked(idea::IdeaBlocked),
 }
 
 impl FeedbackError {
@@ -166,6 +174,8 @@ impl FeedbackError {
             Self::NotReady(_) => "invalid_state",
             Self::OutOfScope(_) => "idea_out_of_scope",
             Self::Step(failure) => &failure.code,
+            Self::Unpublished(_) => repo::UNPUSHED_CODE,
+            Self::IdeaBlocked(blocked) => blocked.code(),
         }
     }
 
@@ -183,7 +193,9 @@ impl FeedbackError {
             | Self::GhNotReady(_)
             | Self::NotAnIdea
             | Self::NotReady(_)
-            | Self::OutOfScope(_) => StatusCode::CONFLICT,
+            | Self::OutOfScope(_)
+            | Self::Unpublished(_)
+            | Self::IdeaBlocked(_) => StatusCode::CONFLICT,
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Store(_) | Self::Git { .. } | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -315,7 +327,13 @@ struct Faults {
     /// `idea_saves_failed` fail.
     idea_saves_kept: u32,
     idea_saves_failed: u32,
+    /// Runs after an idea action read its agent's branch.
+    after_head: Option<HeadHook>,
 }
+
+/// A test hook an idea action awaits right after reading its agent's branch.
+#[cfg(feature = "test-util")]
+pub type HeadHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Counts a submission in [`Parts::running`] while it lives.
 struct Running<'a>(&'a AtomicUsize);
@@ -428,6 +446,21 @@ impl FeedbackService {
         let mut faults = self.faults();
         faults.idea_saves_kept = kept;
         faults.idea_saves_failed = failed;
+    }
+
+    /// Test hook: every idea action awaits `hook` right after it read its
+    /// agent's branch, before it checks the agent's turn again.
+    #[cfg(feature = "test-util")]
+    pub fn after_reading_the_head_for_test(&self, hook: HeadHook) {
+        self.faults().after_head = Some(hook);
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn after_reading_the_head(&self) {
+        let hook = self.faults().after_head.clone();
+        if let Some(hook) = hook {
+            hook().await;
+        }
     }
 
     #[cfg(feature = "test-util")]
@@ -705,6 +738,15 @@ impl FeedbackService {
         if request.idea.is_some_and(|idea| idea.demo_video) {
             self.require_tool(AGENT_BROWSER).await?;
         }
+        // An issue's branch is pushed: nothing it is built on may publish
+        // the user's unpushed work (checked again before the push).
+        if request.send_as == SendAs::GithubIssue {
+            repo::require_published_default_branch(&repo)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(submission_id = %id, step = "commit", code = e.code(), "feedback was not committed");
+                })?;
+        }
 
         let created = (self.clock)();
         let files = folder_files(&staged, created)?;
@@ -967,6 +1009,12 @@ impl FeedbackService {
         };
 
         if !s.pushed {
+            // Nothing the commit is built on may publish the user's unpushed
+            // work.
+            if let Err(e) = repo::require_published_parents(&repo, &s.commit).await {
+                tracing::warn!(submission_id = %id, step = "push", code = e.code(), "the feedback branch was not pushed");
+                return Ok(Some(step_failure(FeedbackStep::Push, &e)));
+            }
             // The recorded commit itself, whatever the branch is now.
             if let Err(failure) = repo::push_commit(&repo, &s.commit, &s.branch).await {
                 tracing::warn!(submission_id = %id, step = "push", code = %failure.code, "the feedback branch was not pushed");

@@ -857,3 +857,41 @@ fn only_a_github_pull_request_address_is_shown() {
         "Not done: The demo video: the project did not start."
     );
 }
+
+#[test]
+fn an_idea_actions_lasting_refusals_say_the_daemons_sentence() {
+    for (code, message, shown) in [
+        (
+            "idea_branch_missing",
+            "the idea agent's branch no longer exists",
+            "The idea agent's branch no longer exists",
+        ),
+        (
+            "idea_agent_missing",
+            "the idea intent's agent no longer exists",
+            "The idea intent's agent no longer exists",
+        ),
+        (
+            "idea_origin_invalid",
+            "the idea intent's folder or branch is not one Submit made",
+            "The idea intent's folder or branch is not one Submit made",
+        ),
+        (
+            "idea_incomplete",
+            "The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.",
+            "The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.",
+        ),
+        (
+            "unpushed_commits",
+            "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.",
+            "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.",
+        ),
+    ] {
+        assert_eq!(intent_error_text(&api_error(code, message)), shown, "{code}");
+    }
+    // The two races keep the intent's sentence.
+    assert_eq!(
+        intent_error_text(&api_error("invalid_state", "the agent is still working")),
+        "The intent changed, so this is no longer possible."
+    );
+}

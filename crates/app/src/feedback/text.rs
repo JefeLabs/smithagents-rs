@@ -258,6 +258,8 @@ pub const PR_TITLE: &str = "Open a pull request?";
 pub const PR_DESCRIPTION: &str = "Pushes the idea branch to origin and opens a draft pull request. If the repository is public, the screenshots will be visible to anyone.";
 pub const OPEN_PR_CONFIRM_LABEL: &str = "Open pull request";
 pub const IMPLEMENT_LABEL: &str = "Create implementation intent";
+/// The tooltip of the button that copies the pull request's address.
+pub const COPY_LINK_LABEL: &str = "Copy link";
 pub const REPO_GONE_TEXT: &str = "That repository no longer exists.";
 pub const LINK_STOPPED_TEXT: &str = "The daemon link has stopped";
 /// "Start over"'s tooltip.

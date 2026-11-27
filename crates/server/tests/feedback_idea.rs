@@ -61,6 +61,9 @@ const REPO_ARG: &str = "--repo=github.com/smithagents-test-invalid/widgets";
 const PR_URL: &str = "https://github.com/smithagents-test-invalid/widgets/pull/8";
 /// What the agent of every idea intent here writes under "Not done".
 const NOT_DONE: &str = "The demo video: the project did not start.";
+/// The refusals while the default branch is not known to be on origin.
+const UNPUSHED: &str = "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.";
+const NEVER_FETCHED: &str = "This repository has never been fetched from origin, so it is not known what is already published. Run git fetch first.";
 /// Waits in these tests end long before this unless something is wrong.
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -333,10 +336,16 @@ impl Fx {
     }
 
     /// [`Fx::add_repo`] whose `origin` is `url`, which git sends to the
-    /// returned bare repository (it logs every update of its refs).
+    /// returned bare repository (it logs every update of its refs), with
+    /// `main` known to be on it: `refs/remotes/origin/main` at `main`, as a
+    /// fetch would leave it (nothing is fetched or pushed).
     async fn repo_with_origin(&self, name: &str, url: &str) -> (Repo, PathBuf) {
         let repo = self.add_repo(name).await;
         common::git(&repo.path, &["remote", "add", "origin", url]);
+        common::git(
+            &repo.path,
+            &["update-ref", "refs/remotes/origin/main", "main"],
+        );
         let bare = self.tmp.path().join(format!("{name}-origin.git"));
         common::git(
             self.tmp.path(),
@@ -1895,4 +1904,215 @@ async fn a_pull_request_whose_record_cannot_be_saved_is_not_opened_again() {
     assert_eq!(fx.idea_of(idea.id).await.pr_url.as_deref(), Some(PR_URL));
     assert_eq!(fx.calls_starting("pr create").len(), 1);
     assert_eq!(fx.calls_starting("pr list").len(), 1, "not even looked for");
+}
+
+/// Whether `bare` holds the object `id`.
+fn has_object(bare: &Path, id: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e", &format!("{id}^{{commit}}")])
+        .current_dir(bare)
+        .env("LC_ALL", "C")
+        .env_remove("GIT_DIR")
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// `(status, code, message)` of an answer.
+fn refusal(status: StatusCode, body: &Value) -> (StatusCode, Option<&str>, Option<&str>) {
+    (status, body["error"].as_str(), body["message"].as_str())
+}
+
+#[tokio::test]
+async fn unpushed_default_branch_commits_never_go_out_with_an_idea() {
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    // origin has M0; the local main has M1 on top when the idea is made.
+    common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    common::git(&repo.path, &["fetch", "-q", "origin"]);
+    common::git(
+        &repo.path,
+        &["commit", "-q", "--allow-empty", "-m", "M1, not for anyone"],
+    );
+    let m1 = git_out(&repo.path, &["rev-parse", "main"]);
+    // The intent path pushes nothing, so the idea is made.
+    let (idea, _, head) = fx.sent_idea(&repo).await;
+
+    let (status, body) = fx.open_pr(idea.id).await;
+
+    assert_eq!(
+        refusal(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Some("unpushed_commits"),
+            Some(UNPUSHED)
+        )
+    );
+    assert_eq!(bare_branches(&bare), ["main"]);
+    assert!(!has_object(&bare, &m1), "M1 stayed at home");
+    assert!(fx.calls_starting("pr").is_empty(), "{:?}", fx.fake.calls());
+    assert_eq!(fx.idea_of(idea.id).await.pr_url, None);
+
+    // Once M1 is on origin, the retry goes through.
+    common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    common::git(&repo.path, &["fetch", "-q", "origin"]);
+    let (status, body) = fx.open_pr(idea.id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["origin"]["idea"]["pr_url"], PR_URL);
+    assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), head);
+
+    // Never fetched: refused as well.
+    let (repo, bare) = fx.github_repo("r2").await;
+    let (idea, _, _) = fx.sent_idea(&repo).await;
+    common::git(
+        &repo.path,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    let (status, body) = fx.open_pr(idea.id).await;
+    assert_eq!(
+        refusal(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Some("unpushed_commits"),
+            Some(NEVER_FETCHED)
+        )
+    );
+    assert!(bare_branches(&bare).is_empty());
+}
+
+#[tokio::test]
+async fn an_idea_without_its_issue_md_opens_nothing() {
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, agent, _) = fx.sent_idea(&repo).await;
+    common::git(
+        &agent.worktree_path,
+        &["rm", "-q", &format!("{FOLDER}/issue.md")],
+    );
+    common::git(&agent.worktree_path, &["commit", "-q", "-m", "tidy"]);
+
+    let (status, body) = fx.open_pr(idea.id).await;
+
+    assert_eq!(
+        refusal(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Some("idea_incomplete"),
+            Some("The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.")
+        )
+    );
+    assert!(bare_branches(&bare).is_empty(), "nothing pushed");
+    assert_eq!(fx.idea_of(idea.id).await.pr_commit, None, "nothing chosen");
+    assert!(fx.calls_starting("pr").is_empty(), "{:?}", fx.fake.calls());
+}
+
+#[tokio::test]
+async fn a_turn_that_starts_while_the_head_is_read_stops_both_actions() {
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, agent, _) = fx.sent_idea(&repo).await;
+    // A message reaches the agent just after its branch was read.
+    let service = fx.state.service.clone();
+    let agent_id = agent.id;
+    fx.state
+        .feedback
+        .after_reading_the_head_for_test(Arc::new(move || {
+            let service = service.clone();
+            Box::pin(async move {
+                let _ = service
+                    .send_message(agent_id, "one more thing".into())
+                    .await;
+            })
+        }));
+
+    for route in ["pull-request", "implementation"] {
+        let (status, body) = fx
+            .call(
+                Method::POST,
+                &format!("/v1/intents/{}/{route}", idea.id),
+                None,
+            )
+            .await;
+        assert_eq!(
+            refusal(status, &body),
+            (
+                StatusCode::CONFLICT,
+                Some("invalid_state"),
+                Some("the agent is still working")
+            ),
+            "{route}"
+        );
+        fx.wait_idle(&agent).await;
+    }
+    assert!(bare_branches(&bare).is_empty());
+    assert_eq!(fx.idea_of(idea.id).await.pr_commit, None);
+    assert_eq!(fx.intents().await.len(), 1, "no implementation intent");
+}
+
+#[tokio::test]
+async fn lasting_conditions_have_codes_of_their_own() {
+    let fx = fixture_with(Opts {
+        turns: 2,
+        ..Opts::default()
+    })
+    .await;
+
+    // The agent's branch is gone.
+    let (repo, _bare) = fx.github_repo("r1").await;
+    let (idea, agent, _) = fx.sent_idea(&repo).await;
+    common::git(
+        &repo.path,
+        &["update-ref", "-d", &format!("refs/heads/{}", agent.branch)],
+    );
+    for route in ["pull-request", "implementation"] {
+        let (status, body) = fx
+            .call(
+                Method::POST,
+                &format!("/v1/intents/{}/{route}", idea.id),
+                None,
+            )
+            .await;
+        assert_eq!(
+            refusal(status, &body),
+            (
+                StatusCode::CONFLICT,
+                Some("idea_branch_missing"),
+                Some("the idea agent's branch no longer exists")
+            ),
+            "{route}"
+        );
+    }
+
+    // (An agent that is gone cannot be made here: the store keeps every
+    // agent an intent names. Its code and sentence are checked in `idea.rs`.)
+
+    // A record Submit did not make.
+    let (repo, bare) = fx.github_repo("r2").await;
+    let (idea, _, _) = fx.sent_idea(&repo).await;
+    let mut stored = fx.state.intents.get(idea.id).await.unwrap();
+    stored.origin.as_mut().unwrap().branch = "main".into();
+    fx.state.store.save_intent(&stored).await.unwrap();
+    let (status, body) = fx.open_pr(idea.id).await;
+    assert_eq!(
+        refusal(status, &body),
+        (
+            StatusCode::CONFLICT,
+            Some("idea_origin_invalid"),
+            Some("the idea intent's folder or branch is not one Submit made")
+        )
+    );
+    assert_eq!(bare_branches(&bare), Vec::<String>::new(), "main untouched");
 }

@@ -1390,6 +1390,8 @@ mod tests {
             FeedbackError::NotReady(_) => "NotReady",
             FeedbackError::OutOfScope(_) => "OutOfScope",
             FeedbackError::Step(_) => "Step",
+            FeedbackError::Unpublished(_) => "Unpublished",
+            FeedbackError::IdeaBlocked(_) => "IdeaBlocked",
         }
     }
 
@@ -1540,10 +1542,22 @@ mod tests {
                 "gh_failed",
                 "gh could not open the pull request (exit status 1)",
             ),
+            (
+                FeedbackError::Unpublished(crate::feedback::repo::UNPUSHED_SENTENCE),
+                S::CONFLICT,
+                "unpushed_commits",
+                "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.",
+            ),
+            (
+                FeedbackError::IdeaBlocked(crate::feedback::idea::IdeaBlocked::BranchGone),
+                S::CONFLICT,
+                "idea_branch_missing",
+                "the idea agent's branch no longer exists",
+            ),
         ];
         let covered: std::collections::BTreeSet<&str> =
             cases.iter().map(|(e, ..)| feedback_variant(e)).collect();
-        assert_eq!(covered.len(), 22, "{covered:?}");
+        assert_eq!(covered.len(), 24, "{covered:?}");
 
         for (e, status, code, message) in cases {
             assert_eq!((e.status(), e.code()), (status, code), "{message}");

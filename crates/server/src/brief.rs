@@ -208,8 +208,10 @@ pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
         })
         .collect();
     if let Some(depends) = section("Depends on", depends) {
-        // The worktree branches off the local default branch, which may
-        // predate the dependencies' merges.
+        // The worktree branches off the intent's base branch: the local
+        // default branch, which may predate the dependencies' merges, or the
+        // branch the intent names (an implementation intent's is its idea
+        // agent's branch).
         parts.push(format!("{depends}\n\n{REBASE_ON_DEPENDENCIES}"));
     }
 

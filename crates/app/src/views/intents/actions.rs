@@ -37,6 +37,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::label::Label;
@@ -45,16 +46,18 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    div, AnyElement, App, Context, InteractiveElement as _, IntoElement, ParentElement as _, Role,
-    SharedString, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _, WeakEntity,
-    Window,
+    div, AnyElement, App, ClipboardItem, Context, InteractiveElement as _, IntoElement,
+    ParentElement as _, Role, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TestSupportExt as _, WeakEntity, Window,
 };
 use smithagents_core::ids::{AgentId, IntentId};
 use smithagents_core::intent::{Intent, IntentState};
 
+use super::detail::opens_a_link;
 use super::{Busy, IntentsPane, Paint, Screen};
 use crate::feedback::text::{
-    IMPLEMENT_LABEL, OPEN_PR_CONFIRM_LABEL, OPEN_PR_LABEL, PR_DESCRIPTION, PR_TITLE,
+    COPY_LINK_LABEL, IMPLEMENT_LABEL, OPEN_PR_CONFIRM_LABEL, OPEN_PR_LABEL, PR_DESCRIPTION,
+    PR_TITLE,
 };
 use crate::intent_vm::{
     idea_actions_shown, not_done_text, queued_reason, shows_pull_request_url, start_error_text,
@@ -94,6 +97,8 @@ pub const PR_URL_ID: &str = "intent-pr-url";
 pub const NOT_DONE_ID: &str = "intent-not-done";
 /// Element id of the "Create implementation intent" button.
 pub const IMPLEMENT_ID: &str = "intent-implement";
+/// Element id of the button that copies the pull request's address.
+pub const PR_COPY_ID: &str = "intent-pr-copy";
 /// Element id of the pull request address's clickable area.
 const PR_LINK_ID: &str = "intent-pr-link";
 
@@ -178,7 +183,10 @@ impl IntentsPane {
                     }))
                     .into_any_element(),
             ),
-            Some(url) if shows_pull_request_url(url) => parts.push(pull_request_link(url, cx)),
+            Some(url) if shows_pull_request_url(url) => {
+                parts.push(pull_request_link(url, cx));
+                parts.push(copy_link_button(url));
+            }
             // Not an address the app shows; there is a pull request all the
             // same, so no second one is offered.
             Some(_) => {}
@@ -455,8 +463,27 @@ fn not_done_line(text: &str, paint: &Paint) -> impl IntoElement {
         .child(text)
 }
 
+/// "Copy link": puts the pull request's address on the clipboard, only when
+/// [`shows_pull_request_url`] allows it (the caller checked; the click
+/// checks again).
+fn copy_link_button(url: &str) -> AnyElement {
+    let url = url.to_owned();
+    Button::new(PR_COPY_ID)
+        .icon(IconName::Copy)
+        .ghost()
+        .xsmall()
+        .tooltip(COPY_LINK_LABEL)
+        .on_click(move |_, _, cx| {
+            if shows_pull_request_url(&url) {
+                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+            }
+        })
+        .into_any_element()
+}
+
 /// The pull request's address, a label in the link color that opens it in
-/// the browser, only when [`shows_pull_request_url`] allows it (the caller
+/// the browser on the presses a link opens on ([`opens_a_link`]: not a right
+/// click), only when [`shows_pull_request_url`] allows it (the caller
 /// checked; the click checks again).
 fn pull_request_link(url: &str, cx: &Context<IntentsPane>) -> AnyElement {
     let url = SharedString::from(url.to_owned());
@@ -471,8 +498,8 @@ fn pull_request_link(url: &str, cx: &Context<IntentsPane>) -> AnyElement {
                 .underline()
                 .text_color(cx.theme().link),
         )
-        .on_click(move |_, _, cx| {
-            if shows_pull_request_url(&url) {
+        .on_click(move |event, _, cx| {
+            if opens_a_link(event) && shows_pull_request_url(&url) {
                 cx.open_url(&url);
             }
         })

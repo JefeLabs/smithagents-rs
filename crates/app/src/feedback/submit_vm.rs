@@ -49,12 +49,16 @@ pub const KINDS: [FeedbackKind; 3] = [
 /// an idea package with no part or sent as an issue),
 /// `FeedbackService::require_github` (`no_github_remote`, `gh_not_ready`),
 /// `FeedbackService::require_tool` (`tool_missing`, also an idea package's
-/// demo video without `agent-browser`) and
+/// demo video without `agent-browser`),
+/// `repo::require_published_default_branch` (`unpushed_commits`, for an
+/// issue: the default branch has commits `origin` has not got, or nothing
+/// was ever fetched) and
 /// `repo::place_and_commit` (`default_branch_missing`,
 /// `git_identity_missing`, `no_free_name`, `name_taken`, `folder_blocked`,
 /// `branch_blocked`). They count only as a 4xx answer: the daemon sends
-/// `git_failed` and `io_error` as 500, and any 5xx locks.
-pub const NOTHING_MADE_CODES: [&str; 12] = [
+/// `git_failed` and `io_error` as 500, and any 5xx locks. (Before a push,
+/// `unpushed_commits` is a failed step of a recorded submission instead.)
+pub const NOTHING_MADE_CODES: [&str; 13] = [
     "invalid",
     "unsupported_file",
     "payload_too_large",
@@ -67,6 +71,7 @@ pub const NOTHING_MADE_CODES: [&str; 12] = [
     "name_taken",
     "folder_blocked",
     "branch_blocked",
+    "unpushed_commits",
 ];
 
 /// The daemon's code when a tool the submission needs is not ready: only

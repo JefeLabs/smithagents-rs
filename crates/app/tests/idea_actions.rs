@@ -27,7 +27,7 @@ use smithagents_app::shell_state::ShellState;
 use smithagents_app::views::intents::{
     intent_card_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, IMPLEMENT_ID, INTENT_ERROR_ID,
     NOT_DONE_ID, OPEN_CHAT_ID, OPEN_PR_CANCEL_ID, OPEN_PR_CONFIRM_ID, OPEN_PR_DESCRIPTION_ID,
-    OPEN_PR_ID, OPEN_PR_TITLE_ID, PR_URL_ID, RESOLVE_ID,
+    OPEN_PR_ID, OPEN_PR_TITLE_ID, PR_COPY_ID, PR_URL_ID, RESOLVE_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_core::agent::{Agent, AgentState};
@@ -460,14 +460,28 @@ fn only_a_github_pull_request_address_is_shown_and_opened(cx: &mut TestAppContex
     with_window(cx, window, |window, _| {
         assert_eq!(window.find(PR_URL_ID).role(), Some(Role::Label));
     });
+    // A right click opens nothing; a click does.
+    with_window(cx, window, |window, cx| window.right_click(PR_URL_ID, cx));
+    frame(cx, window);
+    assert_eq!(cx.opened_url(), None);
     click(cx, window, PR_URL_ID);
     assert_eq!(cx.opened_url().as_deref(), Some(PR_URL));
+    // "Copy link" puts the address on the clipboard.
+    assert!(enabled_button(cx, window, PR_COPY_ID));
+    click(cx, window, PR_COPY_ID);
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some(PR_URL)
+    );
     assert!(calls(&opened).is_empty());
 
     // A stored address that is not one is neither shown nor opened, and
     // offers no second pull request either.
     show(cx, &opened, odd.id);
     assert!(!is_drawn(cx, window, PR_URL_ID));
+    assert!(!is_drawn(cx, window, PR_COPY_ID));
     assert!(!is_drawn(cx, window, OPEN_PR_ID));
     assert!(enabled_button(cx, window, IMPLEMENT_ID));
 }

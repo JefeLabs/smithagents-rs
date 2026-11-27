@@ -48,6 +48,9 @@ const REPO_ARG: &str = "--repo=github.com/smithagents-test-invalid/widgets";
 /// The sign-in check, for github.com only.
 const AUTH: &str = "auth status --hostname=github.com";
 const BRANCH: &str = "feedback/2026-11-26-fix-the-zoom";
+/// The refusals while the default branch is not known to be on origin.
+const UNPUSHED: &str = "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.";
+const NEVER_FETCHED: &str = "This repository has never been fetched from origin, so it is not known what is already published. Run git fetch first.";
 const FOLDER: &str = "docs/issues/2026-11-26-fix-the-zoom";
 /// A plugin secret in the test process's environment, which `gh` must never
 /// see.
@@ -284,10 +287,16 @@ impl Fx {
         serde_json::from_value(body).unwrap()
     }
 
-    /// [`Fx::add_repo`] whose `origin` is `url`.
+    /// [`Fx::add_repo`] whose `origin` is `url`, with `main` known to be
+    /// on it: `refs/remotes/origin/main` at `main`, as a fetch would leave
+    /// it (nothing is fetched or pushed).
     async fn add_repo_with_origin(&self, name: &str, url: &str) -> Repo {
         let repo = self.add_repo(name).await;
         common::git(&repo.path, &["remote", "add", "origin", url]);
+        common::git(
+            &repo.path,
+            &["update-ref", "refs/remotes/origin/main", "main"],
+        );
         repo
     }
 
@@ -1591,4 +1600,111 @@ async fn targets_report_visibility_and_sign_in() {
     );
     assert_eq!(body["repos"][0]["is_public"], Value::Null);
     assert_eq!(fx.fake.calls(), [AUTH]);
+}
+
+// ------------------------------------- what origin has not got stays at home
+
+#[tokio::test]
+async fn unpushed_default_branch_commits_are_never_published() {
+    let fx = fixture().await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    // origin has M0; the local main has M1 on top, never pushed.
+    common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    common::git(&repo.path, &["fetch", "-q", "origin"]);
+    let m0 = git_out(&repo.path, &["rev-parse", "main"]);
+    common::git(
+        &repo.path,
+        &["commit", "-q", "--allow-empty", "-m", "M1, not for anyone"],
+    );
+    let m1 = git_out(&repo.path, &["rev-parse", "main"]);
+    let req = issue_request(&repo);
+
+    let (status, body) = fx.submit_shot(&req).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        (body["error"].as_str(), body["message"].as_str()),
+        (Some("unpushed_commits"), Some(UNPUSHED))
+    );
+    // Nothing was made, and origin never saw M1.
+    assert_eq!(git_out(&repo.path, &["branch", "--list", "feedback/*"]), "");
+    assert_eq!(fx.row(&req["submission_id"]).await, None);
+    assert!(fx.feedback_tmp_is_empty());
+    assert_eq!(git_out(&bare, &["rev-parse", "main"]), m0);
+    assert!(!has_object(&bare, &m1));
+    assert!(
+        fx.calls_starting("issue").is_empty(),
+        "{:?}",
+        fx.fake.calls()
+    );
+
+    // Once M1 is on origin, the same submission goes through.
+    common::git(&repo.path, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    common::git(&repo.path, &["fetch", "-q", "origin"]);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["issue_url"], ISSUE_URL, "{out}");
+    assert_eq!(out["failed"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_repository_never_fetched_is_refused_before_anything_is_written() {
+    let fx = fixture().await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    common::git(
+        &repo.path,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+
+    fx.refused(
+        &repo,
+        Some(&bare),
+        (StatusCode::CONFLICT, "unpushed_commits", NEVER_FETCHED),
+    )
+    .await;
+
+    // An intent is not pushed, so it is made all the same.
+    let mut req = issue_request(&repo);
+    req["send_as"] = json!("intent");
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["failed"], Value::Null);
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "");
+}
+
+#[tokio::test]
+async fn every_push_checks_what_origin_has_first() {
+    // The check before the push, after the commit: a failed step, retried.
+    let fx = fixture().await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let hook = refuse_pushes(&bare);
+    let req = issue_request(&repo);
+    let (status, out) = fx.submit_shot(&req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["failed"]["code"], "push_rejected", "{out}");
+    std::fs::remove_file(&hook).unwrap();
+    common::git(
+        &repo.path,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["pushed"], false);
+    assert_eq!(
+        again["failed"],
+        json!({"step": "push", "code": "unpushed_commits", "message": NEVER_FETCHED})
+    );
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "", "nothing pushed");
+    assert!(fx.calls_starting("issue create").is_empty());
+
+    common::git(
+        &repo.path,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["pushed"], true);
+    assert_eq!(again["issue_url"], ISSUE_URL);
 }

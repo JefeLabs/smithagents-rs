@@ -787,6 +787,61 @@ pub async fn commit_changed_paths(repo_root: &Path, commit: &str) -> Result<Vec<
         .collect())
 }
 
+/// What this repository knows `origin` has of some commits: see
+/// [`publication`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publication {
+    /// All of them and their history are on remote-tracking branches of
+    /// `origin`.
+    Published,
+    /// At least one commit is on none of them.
+    Unpushed,
+    /// There is no `refs/remotes/origin/*` at all, so nothing is known.
+    NeverFetched,
+}
+
+/// Whether every commit `revs` stands for, with its history, is on a
+/// remote-tracking branch of `origin`: `git rev-list --max-count=1 <revs>
+/// --not --remotes=origin` prints nothing. Only local refs are read; nothing
+/// is fetched. Each rev is a full commit id, a full commit id's parents
+/// (`<id>^@`) or a local branch (`refs/heads/<name>`).
+pub async fn publication(repo_root: &Path, revs: &[&str]) -> Result<Publication, GitError> {
+    let valid = |rev: &str| {
+        let id = rev.strip_suffix("^@").unwrap_or(rev);
+        is_commit_id(id)
+            || rev
+                .strip_prefix("refs/heads/")
+                .is_some_and(|name| !name.is_empty() && !name.starts_with('-'))
+    };
+    if revs.is_empty() || !revs.iter().all(|rev| valid(rev)) {
+        return Err(GitError::UnsafeArgument);
+    }
+    let tracking = isolated(
+        repo_root,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "refs/remotes/origin",
+        ],
+    )
+    .await?;
+    tracking.ok()?;
+    if tracking.stdout_text().is_empty() {
+        return Ok(Publication::NeverFetched);
+    }
+    let mut args = vec!["rev-list", "--max-count=1"];
+    args.extend_from_slice(revs);
+    args.extend(["--not", "--remotes=origin", "--"]);
+    let listed = isolated(repo_root, &args).await?;
+    listed.ok()?;
+    Ok(if listed.stdout_text().is_empty() {
+        Publication::Published
+    } else {
+        Publication::Unpushed
+    })
+}
+
 /// What the commits on top of a base change: see [`changes_since`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Changes {
@@ -1346,6 +1401,42 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         g(dir, &["init", "-b", branch]);
         g(dir, &["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    #[tokio::test]
+    async fn changes_since_lists_what_a_merge_commit_adds_of_its_own() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("r");
+        init_repo(&dir, "main");
+        let write = |path: &str| {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, path).unwrap();
+            g(&dir, &["add", "-A"]);
+        };
+        write("f/a");
+        g(&dir, &["commit", "-q", "-m", "base"]);
+        let base = g(&dir, &["rev-parse", "HEAD"]);
+        g(&dir, &["checkout", "-q", "-b", "side"]);
+        write("f/s");
+        g(&dir, &["commit", "-q", "-m", "side"]);
+        g(&dir, &["checkout", "-q", "main"]);
+        write("f/m");
+        g(&dir, &["commit", "-q", "-m", "main"]);
+        // The merge commit itself brings a file no parent has.
+        g(&dir, &["merge", "-q", "--no-ff", "--no-commit", "side"]);
+        write("evil");
+        g(&dir, &["commit", "-q", "-m", "merge"]);
+        let head = g(&dir, &["rev-parse", "HEAD"]);
+
+        let Changes::Paths(paths) = changes_since(&dir, &base, &head, 10).await.unwrap() else {
+            panic!("paths expected");
+        };
+        assert!(paths.iter().any(|p| p == "evil"), "{paths:?}");
+        assert!(
+            paths.iter().all(|p| p == "evil" || p.starts_with("f/")),
+            "{paths:?}"
+        );
     }
 
     #[tokio::test]

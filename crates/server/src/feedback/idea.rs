@@ -71,9 +71,6 @@ const UNTITLED: &str = "Idea";
 
 const NOT_SENT: &str = "the idea intent has not been sent yet";
 const STILL_WORKING: &str = "the agent is still working";
-const AGENT_GONE: &str = "the idea intent's agent no longer exists";
-const BRANCH_GONE: &str = "the idea agent's branch no longer exists";
-const NOT_SUBMITS: &str = "the idea intent's folder or branch is not one Submit made";
 const OUTSIDE_FOLDER: &str =
     "the idea agent changed files outside the issue folder, so nothing was pushed";
 const NOT_ON_IDEA: &str =
@@ -177,7 +174,41 @@ fn read_failed(e: GitError) -> FeedbackError {
     }
 }
 
-/// The texts of the idea's pull request, read at the pushed commit.
+/// Why an idea action cannot go ahead until something changes: each has a
+/// code of its own (409), unlike the races of `NotReady`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdeaBlocked {
+    /// The idea intent names an agent the daemon does not have.
+    AgentGone,
+    /// The idea agent's branch was deleted.
+    BranchGone,
+    /// The idea intent's folder or branch is not as Submit makes them.
+    NotSubmits,
+    /// `issue.md` is not in the agent's work (deleted, or unreadable).
+    Incomplete,
+}
+
+impl IdeaBlocked {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::AgentGone => "idea_agent_missing",
+            Self::BranchGone => "idea_branch_missing",
+            Self::NotSubmits => "idea_origin_invalid",
+            Self::Incomplete => "idea_incomplete",
+        }
+    }
+
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Self::AgentGone => "the idea intent's agent no longer exists",
+            Self::BranchGone => "the idea agent's branch no longer exists",
+            Self::NotSubmits => "the idea intent's folder or branch is not one Submit made",
+            Self::Incomplete => "The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.",
+        }
+    }
+}
+
+/// The texts of the idea's pull request, read at the commit to push.
 struct PullRequestText {
     body: String,
     /// The explainer's "Not done" section.
@@ -192,11 +223,14 @@ impl FeedbackService {
     ///
     /// An intent with a pull request answers as it is. Refused, with
     /// nothing pushed: an intent that is not an idea (`NotAnIdea`), not sent
-    /// or resolved, or whose agent still works (`NotReady`); a repository
-    /// whose `origin` is not on github.com (`NoGithubRemote`); `gh` not
-    /// ready (`GhNotReady`); an agent's branch that changes more than the
-    /// issue folder (`OutOfScope`). A failed push or `gh` call is `Step`,
-    /// and what succeeded before it stays done.
+    /// or resolved, or whose agent still works (`NotReady`); one whose agent,
+    /// branch, folder or `issue.md` is not there (`IdeaBlocked`); a
+    /// repository whose `origin` is not on github.com (`NoGithubRemote`);
+    /// `gh` not ready (`GhNotReady`); an agent's branch that changes more
+    /// than the issue folder (`OutOfScope`); a default branch with commits
+    /// `origin` has not got, or a repository never fetched (`Unpublished`).
+    /// A failed push or `gh` call is `Step`, and what succeeded before it
+    /// stays done.
     pub async fn open_pull_request(&self, id: IntentId) -> Result<Intent, FeedbackError> {
         let _running = Running::start(&self.parts.running);
         let _own = self.parts.ideas.lock(id).await;
@@ -209,11 +243,31 @@ impl FeedbackService {
         if let Some((url, not_done)) = remembered {
             return Ok(self.record_pull_request(&intent, url, not_done).await);
         }
-        let agent = self.idle_agent(&intent).await?;
         let repo = self.repo_of(&intent).await?;
         if !is_issue_folder(&origin.folder) || !origin.branch.starts_with(IDEA_BRANCHES) {
-            return Err(FeedbackError::NotReady(NOT_SUBMITS.to_owned()));
+            return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
         }
+        let agent = self.idle_agent(&intent).await?;
+        // The commit to push: the one chosen at an earlier press, else the
+        // agent's branch as it is now (read right after the turn check).
+        // One chosen before that was never pushed and is gone from the
+        // repository (the branch was reset and the commit pruned) cannot be
+        // pushed, so one is chosen again.
+        let chosen = match &idea.pr_commit {
+            Some(commit) if !idea.pr_pushed => {
+                let present = git::is_commit_id(commit)
+                    && git::rev_parse(&repo.path, commit)
+                        .await
+                        .map_err(read_failed)?
+                        .is_some_and(|found| found == *commit);
+                present.then(|| commit.clone())
+            }
+            chosen => chosen.clone(),
+        };
+        let (head, pushed, new) = match chosen {
+            Some(commit) => (commit, idea.pr_pushed, false),
+            None => (self.settled_head(&repo, &agent).await?, false, true),
+        };
         let github = self
             .github_of(&repo)
             .await?
@@ -228,39 +282,35 @@ impl FeedbackService {
                     .await
                     .map_err(read_failed)?;
             if !valid {
-                return Err(FeedbackError::NotReady(NOT_SUBMITS.to_owned()));
+                return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
             }
         }
-
-        // The commit to push: the one chosen at an earlier press, else the
-        // agent's branch as it is now, once checked, recorded first. One
-        // chosen before that was never pushed and is gone from the repository
-        // (the branch was reset and the commit pruned) cannot be pushed, so
-        // one is chosen again.
-        let chosen = match &idea.pr_commit {
-            Some(commit) if !idea.pr_pushed => {
-                let present = git::is_commit_id(commit)
-                    && git::rev_parse(&repo.path, commit)
-                        .await
-                        .map_err(read_failed)?
-                        .is_some_and(|found| found == *commit);
-                present.then(|| commit.clone())
-            }
-            chosen => chosen.clone(),
-        };
-        let (head, pushed) = match chosen {
-            Some(commit) => (commit, idea.pr_pushed),
-            None => {
-                let head = self.agent_head(&repo, &agent).await?;
-                check_scope(&repo, origin, &head).await.inspect_err(|e| {
-                    tracing::warn!(intent_id = %id, step = "check_scope", code = e.code(), "the idea branch was not pushed");
-                })?;
-                self.save_idea(id, |p| p.pr_commit = Some(head.clone()))
-                    .await?;
-                (head, false)
-            }
-        };
+        if new {
+            check_scope(&repo, origin, &head).await.inspect_err(|e| {
+                tracing::warn!(intent_id = %id, step = "check_scope", code = e.code(), "the idea branch was not pushed");
+            })?;
+        }
+        // Before anything is recorded or pushed: an idea without its
+        // issue.md opens no pull request.
+        let text = pull_request_text(&repo, &github, &origin.folder, &head)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(intent_id = %id, step = "read_idea", code = e.code(), "the idea branch was not pushed");
+            })?;
+        let title =
+            no_mentions(&title_of(&intent.content.title).unwrap_or_else(|| UNTITLED.to_owned()));
+        if new {
+            self.save_idea(id, |p| p.pr_commit = Some(head.clone()))
+                .await?;
+        }
         if !pushed {
+            // Nothing the idea's commit is built on may publish the user's
+            // unpushed work.
+            repo::require_published_parents(&repo, &origin.commit)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(intent_id = %id, step = "push", code = e.code(), "the idea branch was not pushed");
+                })?;
             repo::push_commit(&repo, &head, &origin.branch)
                 .await
                 .map_err(|failure| {
@@ -273,11 +323,6 @@ impl FeedbackService {
             let _ = self.save_idea(id, |p| p.pr_pushed = true).await;
         }
 
-        let text = pull_request_text(&repo, &github, &origin.folder, &head)
-            .await
-            .map_err(FeedbackError::Step)?;
-        let title =
-            no_mentions(&title_of(&intent.content.title).unwrap_or_else(|| UNTITLED.to_owned()));
         let opened = self
             .make_pull_request(
                 id,
@@ -415,12 +460,12 @@ impl FeedbackService {
         if let Some(existing) = self.implementation_of(&intent, idea).await? {
             return Ok(existing);
         }
-        let agent = self.idle_agent(&intent).await?;
         let repo = self.repo_of(&intent).await?;
         if !is_issue_folder(&origin.folder) {
-            return Err(FeedbackError::NotReady(NOT_SUBMITS.to_owned()));
+            return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
         }
-        let head = self.agent_head(&repo, &agent).await?;
+        let agent = self.idle_agent(&intent).await?;
+        let head = self.settled_head(&repo, &agent).await?;
         let req = CreateIntentRequest {
             repo_id: Some(intent.repo_id),
             kind: Some(intent.content.kind),
@@ -526,16 +571,24 @@ impl FeedbackService {
         self.store
             .get_agent(agent)
             .await?
-            .ok_or_else(|| FeedbackError::NotReady(AGENT_GONE.to_owned()))
+            .ok_or(FeedbackError::IdeaBlocked(IdeaBlocked::AgentGone))
     }
 
     /// The commit the agent's branch (`refs/heads/<branch>`: never a tag of
-    /// that name) is at now.
-    async fn agent_head(&self, repo: &Repo, agent: &Agent) -> Result<String, FeedbackError> {
-        git::rev_parse(&repo.path, &format!("refs/heads/{}", agent.branch))
+    /// that name) is at, read once its turn was found over ([`Self::idle_agent`]);
+    /// `NotReady` when a turn started meanwhile, since the branch may then
+    /// hold a commit made in the middle of it.
+    async fn settled_head(&self, repo: &Repo, agent: &Agent) -> Result<String, FeedbackError> {
+        let head = git::rev_parse(&repo.path, &format!("refs/heads/{}", agent.branch))
             .await
             .map_err(read_failed)?
-            .ok_or_else(|| FeedbackError::NotReady(BRANCH_GONE.to_owned()))
+            .ok_or(FeedbackError::IdeaBlocked(IdeaBlocked::BranchGone))?;
+        #[cfg(feature = "test-util")]
+        self.after_reading_the_head().await;
+        if self.parts.agents.turn_in_flight(agent.id) {
+            return Err(FeedbackError::NotReady(STILL_WORKING.to_owned()));
+        }
+        Ok(head)
     }
 
     /// [`crate::intents::IntentService::update_idea`] as a feedback error.
@@ -589,40 +642,31 @@ async fn check_scope(
 
 /// The pull request's body ([`pull_request_body`] of `issue.md` and
 /// `explainer.md` as committed at `head`, mentioning no one: [`no_mentions`])
-/// and the explainer's "Not done" section.
+/// and the explainer's "Not done" section. `IdeaBlocked(Incomplete)` when
+/// `issue.md` is not there or cannot be read.
 async fn pull_request_text(
     repo: &Repo,
     github: &GithubRepo,
     folder: &str,
     head: &str,
-) -> Result<PullRequestText, FeedbackFailure> {
+) -> Result<PullRequestText, FeedbackError> {
     let read = |name: &str| {
         let path = format!("{folder}/{name}");
         async move { git::show_file(&repo.path, head, &path, ISSUE_MD_MAX_BYTES).await }
     };
-    let issue_md = read(ISSUE_MD).await;
-    let explainer = read(EXPLAINER_MD).await;
-    let files = git::list_folder(&repo.path, head, folder).await;
-    match (issue_md, explainer, files) {
-        (Ok(Some(issue_md)), Ok(explainer), Ok(files)) => {
-            let base = permalink_base(&github.owner, &github.name, head, folder);
-            let explained = explainer.as_deref().map(no_mentions);
-            Ok(PullRequestText {
-                body: pull_request_body(
-                    &no_mentions(&issue_md),
-                    explained.as_deref(),
-                    &files,
-                    &base,
-                ),
-                not_done: explainer.as_deref().and_then(not_done_section),
-            })
-        }
-        _ => Err(FeedbackFailure {
-            step: FeedbackStep::OpenPullRequest,
-            code: "git_failed".to_owned(),
-            message: "git could not read the idea's issue folder".to_owned(),
-        }),
-    }
+    let Ok(Some(issue_md)) = read(ISSUE_MD).await else {
+        return Err(FeedbackError::IdeaBlocked(IdeaBlocked::Incomplete));
+    };
+    let explainer = read(EXPLAINER_MD).await.map_err(read_failed)?;
+    let files = git::list_folder(&repo.path, head, folder)
+        .await
+        .map_err(read_failed)?;
+    let base = permalink_base(&github.owner, &github.name, head, folder);
+    let explained = explainer.as_deref().map(no_mentions);
+    Ok(PullRequestText {
+        body: pull_request_body(&no_mentions(&issue_md), explained.as_deref(), &files, &base),
+        not_done: explainer.as_deref().and_then(not_done_section),
+    })
 }
 
 #[cfg(test)]
@@ -648,6 +692,36 @@ mod tests {
         ] {
             assert!(!is_issue_folder(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn lasting_refusals_have_codes_and_sentences_of_their_own() {
+        let all = [
+            IdeaBlocked::AgentGone,
+            IdeaBlocked::BranchGone,
+            IdeaBlocked::NotSubmits,
+            IdeaBlocked::Incomplete,
+        ];
+        let codes: Vec<_> = all.iter().map(|b| b.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "idea_agent_missing",
+                "idea_branch_missing",
+                "idea_origin_invalid",
+                "idea_incomplete"
+            ]
+        );
+        for blocked in all {
+            let e = FeedbackError::IdeaBlocked(blocked);
+            assert_eq!(e.code(), blocked.code());
+            assert_eq!(e.to_string(), blocked.sentence());
+            assert_eq!(e.status(), axum::http::StatusCode::CONFLICT);
+        }
+        assert_eq!(
+            IdeaBlocked::AgentGone.sentence(),
+            "the idea intent's agent no longer exists"
+        );
     }
 
     #[test]

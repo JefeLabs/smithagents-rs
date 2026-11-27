@@ -417,6 +417,54 @@ pub async fn push_commit(
         .map_err(push_failure)
 }
 
+/// The code of a push refused because it would publish more than the
+/// feedback ([`require_published_default_branch`],
+/// [`require_published_parents`]).
+pub const UNPUSHED_CODE: &str = "unpushed_commits";
+/// Why: the default branch has commits `origin` has not got.
+pub const UNPUSHED_SENTENCE: &str = "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.";
+/// Why: nothing is known of what `origin` has.
+pub const NEVER_FETCHED_SENTENCE: &str = "This repository has never been fetched from origin, so it is not known what is already published. Run git fetch first.";
+const PUBLISHED_STEP: &str = "check what origin already has";
+
+/// `Unpublished` unless the local default branch, with its history, is on
+/// `origin` as far as this repository knows (its remote-tracking branches;
+/// nothing is fetched): a feedback commit built on it would otherwise
+/// publish the user's unpushed work with it. `DefaultBranchMissing` first,
+/// as for a commit.
+pub async fn require_published_default_branch(repo: &Repo) -> Result<(), FeedbackError> {
+    require_default_branch(repo).await?;
+    require_published(repo, &format!("refs/heads/{}", repo.default_branch)).await
+}
+
+/// `Unpublished` unless the parents of the daemon-made folder commit
+/// `commit` (a full commit id), with their history, are on `origin` as far
+/// as this repository knows: checked right before every push of a feedback
+/// or idea branch. A commit that is not in the repository has nothing to
+/// publish (pushing it fails with `commit_missing`).
+pub async fn require_published_parents(repo: &Repo, commit: &str) -> Result<(), FeedbackError> {
+    let present = git::is_commit_id(commit)
+        && git::rev_parse(&repo.path, commit)
+            .await
+            .map_err(git_failed(PUBLISHED_STEP))?
+            .is_some_and(|found| found == commit);
+    if !present {
+        return Ok(());
+    }
+    require_published(repo, &format!("{commit}^@")).await
+}
+
+async fn require_published(repo: &Repo, rev: &str) -> Result<(), FeedbackError> {
+    match git::publication(&repo.path, &[rev])
+        .await
+        .map_err(git_failed(PUBLISHED_STEP))?
+    {
+        git::Publication::Published => Ok(()),
+        git::Publication::Unpushed => Err(FeedbackError::Unpublished(UNPUSHED_SENTENCE)),
+        git::Publication::NeverFetched => Err(FeedbackError::Unpublished(NEVER_FETCHED_SENTENCE)),
+    }
+}
+
 fn commit_missing() -> FeedbackFailure {
     FeedbackFailure {
         step: FeedbackStep::Push,

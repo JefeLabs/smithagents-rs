@@ -490,6 +490,14 @@ fn the_daemons_codes_show_its_own_sentence() {
         ),
         ("gh_bad_answer", "GitHub CLI (gh) gave an answer that is not an issue address"),
         ("no_github_remote", "the repository's origin is not a GitHub repository"),
+        (
+            "unpushed_commits",
+            "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.",
+        ),
+        (
+            "unpushed_commits",
+            "This repository has never been fetched from origin, so it is not known what is already published. Run git fetch first.",
+        ),
         ("a_code_from_a_newer_daemon", "something new went wrong"),
     ] {
         let text = submit_error_text(&api(409, code, message));
@@ -706,6 +714,7 @@ fn what_a_failed_send_leaves_under_its_id() {
         (409, "name_taken"),
         (409, "folder_blocked"),
         (409, "branch_blocked"),
+        (409, "unpushed_commits"),
     ] {
         assert_eq!(
             send_failure(&api(status, code, "x")),

@@ -19,8 +19,9 @@ use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{FeedbackStep, SubmissionId};
 use smithagents_core::ids::RepoId;
 use smithagents_server::feedback::repo::{
-    commit_folder, find_committed, place, place_and_commit, push, push_commit, Committed,
-    FileSource, FolderFile, Placement,
+    commit_folder, find_committed, place, place_and_commit, push, push_commit,
+    require_published_default_branch, require_published_parents, Committed, FileSource, FolderFile,
+    Placement, NEVER_FETCHED_SENTENCE, UNPUSHED_SENTENCE,
 };
 use smithagents_server::feedback::FeedbackError;
 use smithagents_server::git::{self, CommitError, GitError, PushError};
@@ -2209,4 +2210,62 @@ async fn a_branch_is_deleted_only_at_the_commit_it_was_made_at() {
             "{branch} {at}: {refused:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn only_what_origin_already_has_may_be_built_on() {
+    let fx = Fixture::new();
+    let unpublished = |r: Result<(), FeedbackError>| match r {
+        Err(FeedbackError::Unpublished(sentence)) => Some(sentence),
+        Err(e) => panic!("{e}"),
+        Ok(()) => None,
+    };
+    // Never fetched: nothing is known of origin.
+    let bare = fx.origin();
+    assert_eq!(
+        unpublished(require_published_default_branch(&fx.repo).await),
+        Some(NEVER_FETCHED_SENTENCE)
+    );
+    // Fetched, with main on origin.
+    git(fx.root(), &["push", "-q", "origin", "main"]);
+    git(fx.root(), &["fetch", "-q", "origin"]);
+    assert_eq!(
+        unpublished(require_published_default_branch(&fx.repo).await),
+        None
+    );
+    let (_, commit) = fx.submit("s1").await;
+    assert_eq!(
+        unpublished(require_published_parents(&fx.repo, &commit).await),
+        None,
+        "the folder commit itself is not checked, only what it is built on"
+    );
+    // A commit on main that origin has not got.
+    fx.commit_on_main("notes.md", "mine\n");
+    assert_eq!(
+        unpublished(require_published_default_branch(&fx.repo).await),
+        Some(UNPUSHED_SENTENCE)
+    );
+    let (_, later) = fx.submit("s2").await;
+    assert_eq!(
+        unpublished(require_published_parents(&fx.repo, &later).await),
+        Some(UNPUSHED_SENTENCE)
+    );
+    // A commit that is not here has nothing to publish.
+    assert_eq!(
+        unpublished(
+            require_published_parents(&fx.repo, "0123456789abcdef0123456789abcdef01234567").await
+        ),
+        None
+    );
+    // A tracking branch of another remote does not count.
+    git(fx.root(), &["update-ref", "-d", "refs/remotes/origin/main"]);
+    git(
+        fx.root(),
+        &["update-ref", "refs/remotes/upstream/main", "main"],
+    );
+    assert_eq!(
+        unpublished(require_published_default_branch(&fx.repo).await),
+        Some(NEVER_FETCHED_SENTENCE)
+    );
+    drop(bare);
 }
