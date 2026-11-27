@@ -526,9 +526,10 @@ install = { mise = "npm:agent-browser" }
   commit itself, to `origin`, never forced, with the user's own git
   credentials (the daemon supplies none). A push is refused (`unpushed_commits`)
   unless everything under the folder commit is already on
-  `refs/remotes/origin/*`, so the user's unpushed commits are never published
-  with it. On a repository that is public, or whose visibility `gh` cannot
-  tell, both are refused (`public_not_acknowledged`) unless the request says
+  `refs/remotes/origin/*`, so the user's unpushed commits are not published
+  with it (what this check cannot see is listed under
+  [known gaps](feedback.md#not-built--known-gaps)). On a repository that is
+  public, or whose visibility `gh` cannot tell, both are refused (`public_not_acknowledged`) unless the request says
   `public_acknowledged: true`.
 
 All routes are behind the daemon's bearer token. The ones that commit or
@@ -603,19 +604,26 @@ message is a fixed sentence, never something git or `gh` printed):
   confirmed whether the issue was created. Try again in a minute."),
   `no_github_remote`, `git_failed` or `io_error`.
 - `POST /v1/intents/{id}/pull-request`, with nothing pushed: `bad_request`
-  (400, a malformed body or id); `intent_not_found`, `repo_not_found` (404); 409 `not_an_idea`, `invalid_state` (not sent yet, or
-  the agent is still working), `idea_out_of_scope` (the agent's branch changes
+  (400, a malformed body or id); `intent_not_found`, `repo_not_found` (404);
+  409 `not_an_idea`, `invalid_state` (not sent yet, or the agent is still
+  working), `idea_agent_missing` ("the idea intent's agent no longer
+  exists"), `idea_branch_missing` ("the idea agent's branch no longer
+  exists"), `idea_origin_invalid` ("the idea intent's folder or branch is not
+  one Submit made"), `idea_out_of_scope` (the agent's branch changes
   files outside the issue folder, lacks the idea's commit, or has more than
   1000 commits on top of it), `idea_incomplete` ("The idea's issue.md is
   missing from the agent's branch, so a pull request cannot be opened."),
   `unpushed_commits`, `public_not_acknowledged`, `no_github_remote`,
-  `gh_not_ready`. A failed push or `gh` call is 502 with the step's own code
-  (the push codes above, `gh_failed`, `gh_timeout`, `gh_bad_answer`,
-  `pr_unconfirmed`, `git_failed`, `io_error`); what succeeded before it stays
+  `gh_not_ready`; 500 `git_failed` (git could not read the repository),
+  `io_error`, `store_error`. A failed push or `gh` call is 502 with the
+  step's own code (the push codes above, `gh_failed`, `gh_timeout`,
+  `gh_bad_answer`, `gh_not_ready`, `pr_unconfirmed`, or `io_error` when the
+  pull request's body could not be written); what succeeded before it stays
   done.
 - `POST /v1/intents/{id}/implementation`: `intent_not_found`,
-  `repo_not_found` (404); 409 `not_an_idea`, `invalid_state`; the intent
-  service's codes when the intent cannot be made.
+  `repo_not_found` (404); 409 `not_an_idea`, `invalid_state`,
+  `idea_agent_missing`, `idea_branch_missing`, `idea_origin_invalid`; the
+  intent service's codes when the intent cannot be made.
 - `PUT /v1/settings/feedback`: `repo_not_found` (404), `bad_request` (400).
 
 The two `unpushed_commits` sentences: "The default branch has commits that

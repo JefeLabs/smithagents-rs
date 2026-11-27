@@ -349,9 +349,9 @@ result is `docs/feedback.md`.
   The screenshots will be visible to anyone. Confirm that before sending." or
   "This repository may be public. The screenshots will be visible to anyone.
   Confirm that before sending." The app sets it only after its confirmation
-  dialog, which it shows before every such send. A recorded submission that
-  is retried is not asked again; the intent path never pushes and is never
-  asked.
+  dialog, which it shows before every such send, Retry included. A recorded
+  submission that is retried is not asked again, so the retry route carries
+  no acknowledgement; the intent path never pushes and is never asked.
 - **Locking per submission.** In the daemon, one submission id runs once at
   a time and a repeat answers with what was recorded; commits are made one at
   a time, and the steps after a commit hold up no other submission. In the
@@ -380,7 +380,7 @@ result is `docs/feedback.md`.
   (`idea_incomplete`). The agent's commits are published as it wrote them.
   "Not done" is read from `explainer.md` when the pull request is opened and
   shown in the idea intent's detail, with the pull request's address and a
-  "Copy link" button.
+  copy button (tooltip "Copy link").
 - **Demo video** is offered whenever `agent-browser` is ready, also for
   feedback about SmithAgents itself, with the line "Only works for projects a
   browser can show."
