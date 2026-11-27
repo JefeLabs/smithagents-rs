@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -187,6 +187,23 @@ impl ClaudeCodeHarness {
         remove_plugin_secrets(&mut cmd);
         cmd
     }
+
+    /// Starts [`Self::command`]. A spawn fails with the same "not found"
+    /// whether claude is missing or the folder to run it in is, so a failed
+    /// one is told apart by looking at the folder.
+    async fn spawn(&self, args: Vec<String>, cwd: &Path) -> Result<Child, HarnessError> {
+        match self.command(args, cwd).spawn() {
+            Ok(child) => Ok(child),
+            Err(e) => {
+                let folder = tokio::fs::metadata(cwd).await;
+                if folder.is_ok_and(|meta| meta.is_dir()) {
+                    Err(HarnessError::Spawn(e))
+                } else {
+                    Err(HarnessError::MissingCwd(cwd.to_owned()))
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -195,7 +212,7 @@ impl Harness for ClaudeCodeHarness {
         &self,
         req: TurnRequest,
     ) -> Result<BoxStream<'static, HarnessEvent>, HarnessError> {
-        let mut child = self.command(build_args(&req), &req.cwd).spawn()?;
+        let mut child = self.spawn(build_args(&req), &req.cwd).await?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -329,9 +346,7 @@ impl Harness for ClaudeCodeHarness {
         &self,
         req: StructuredRequest,
     ) -> Result<StructuredResult, HarnessError> {
-        let mut child = self
-            .command(build_structured_args(&req), &req.cwd)
-            .spawn()?;
+        let mut child = self.spawn(build_structured_args(&req), &req.cwd).await?;
         // A timeout, or dropping this call, takes down whatever claude started.
         let mut group = GroupKiller::of(child.id());
         let stdin = child.stdin.take().expect("stdin piped");
@@ -369,7 +384,9 @@ impl Harness for ClaudeCodeHarness {
                 if status.is_ok() {
                     group.disarm();
                 }
-                status?
+                // claude did start: this is not a failure to start it.
+                status
+                    .map_err(|e| HarnessError::Failed(format!("failed to wait for claude: {e}")))?
             }
         };
         // Everything claude printed was in the pipe when it exited.

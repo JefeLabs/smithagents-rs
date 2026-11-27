@@ -50,8 +50,14 @@ pub enum HarnessEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
+    /// The harness program could not be started, in a folder that is there:
+    /// it is not installed, or cannot be run.
     #[error("failed to spawn harness process: {0}")]
-    Spawn(#[from] std::io::Error),
+    Spawn(#[source] std::io::Error),
+    /// Nothing is at the path the run was to work in, or it is not a folder:
+    /// a repository that was moved or deleted, a worktree that was removed.
+    #[error("no working folder at {}", .0.display())]
+    MissingCwd(PathBuf),
     #[error("harness run timed out")]
     Timeout,
     #[error("harness run failed: {0}")]

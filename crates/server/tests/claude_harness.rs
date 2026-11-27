@@ -556,6 +556,58 @@ fn sreq(cwd: &Path, prompt: &str, timeout: Duration) -> StructuredRequest {
     }
 }
 
+/// Why a turn and a structured run in `cwd` both fail to start.
+async fn start_errors(harness: &ClaudeCodeHarness, cwd: &Path) -> [HarnessError; 2] {
+    let turn = harness
+        .run_turn(req(cwd, None))
+        .await
+        .err()
+        .expect("the turn started");
+    let structured = harness
+        .run_structured(sreq(cwd, "p", Duration::from_secs(10)))
+        .await
+        .expect_err("the structured run started");
+    [turn, structured]
+}
+
+#[tokio::test]
+async fn a_missing_working_folder_is_not_reported_as_a_missing_claude() {
+    // Both make the operating system answer "not found" to the spawn; only
+    // one of them is about claude.
+    let env = setup(&[("FAKE_CLAUDE_FIXTURE", FIXTURE)]);
+    let gone = env.dir.path().join("moved-away");
+    let a_file = env.dir.path().join("a-file");
+    std::fs::write(&a_file, b"").unwrap();
+
+    for cwd in [&gone, &a_file] {
+        for err in start_errors(&env.harness, cwd).await {
+            assert!(
+                matches!(&err, HarnessError::MissingCwd(path) if path == cwd),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("no working folder at {}", cwd.display())
+            );
+        }
+    }
+    assert!(!env.args_file().exists(), "claude never ran");
+}
+
+#[tokio::test]
+async fn a_missing_claude_is_a_spawn_failure_in_a_folder_that_is_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = ClaudeCodeHarness {
+        bin: dir.path().join("no-such-claude"),
+    };
+    for err in start_errors(&harness, dir.path()).await {
+        assert!(
+            matches!(&err, HarnessError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+    }
+}
+
 fn structured_env(extra: &[(&str, &str)]) -> (Env, PathBuf, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out.json");
