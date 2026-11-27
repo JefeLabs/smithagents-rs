@@ -1211,6 +1211,22 @@ impl Store {
 }
 
 #[cfg(test)]
+impl Store {
+    /// For a test of what a failed insert leaves behind: while `refused`,
+    /// the database turns every new agent row down, as it would with a full
+    /// disk.
+    pub(crate) async fn refuse_new_agents(&self, refused: bool) {
+        let sql = if refused {
+            "CREATE TRIGGER refuse_new_agents BEFORE INSERT ON agents \
+             BEGIN SELECT RAISE(ABORT, 'refused for a test'); END"
+        } else {
+            "DROP TRIGGER refuse_new_agents"
+        };
+        sqlx::query(sql).execute(&self.pool).await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use smithagents_core::palette::palette;

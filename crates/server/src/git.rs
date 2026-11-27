@@ -359,9 +359,7 @@ async fn discard_unfinished_worktree(repo_root: &Path, dir: &Path, branch: &str,
         )
         .await;
     }
-    if let Ok(Some(commit)) = rev_parse(repo_root, base).await {
-        let _ = delete_branch_at(repo_root, branch, &commit).await;
-    }
+    let _ = delete_branch_made_from(repo_root, branch, base).await;
     tracing::warn!("a checkout for a new worktree did not finish in time and was stopped");
 }
 
@@ -860,6 +858,27 @@ pub async fn delete_branch_at(
     }
     let reference = format!("refs/heads/{branch}");
     isolated_ok(repo_root, &["update-ref", "-d", &reference, commit]).await
+}
+
+/// Deletes the local branch `branch`, made from `base` (a local branch or a
+/// full commit id) and not used since: only while it still points where
+/// `base` does. `false` when it was kept: it has commits of its own, or
+/// `base` has moved or is gone, or the branch is.
+pub async fn delete_branch_made_from(
+    repo_root: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<bool, GitError> {
+    let Some(made_at) = rev_parse(repo_root, base).await? else {
+        return Ok(false);
+    };
+    let tip = rev_parse(repo_root, &format!("refs/heads/{branch}")).await?;
+    if tip.as_deref() != Some(made_at.as_str()) {
+        return Ok(false);
+    }
+    // Still only if it points there: a commit made since is not lost.
+    delete_branch_at(repo_root, branch, &made_at).await?;
+    Ok(true)
 }
 
 /// A local branch's tip and the values of one trailer of its message.
