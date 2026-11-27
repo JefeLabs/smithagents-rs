@@ -145,6 +145,7 @@ fn open_main_window(
                     connection_info: None,
                     link_failure: None,
                     intent_commands: None,
+                    feedback_commands: None,
                     clock: None,
                     // The only place the real capturer and the system's file
                     // dialog are made: tests bring fakes.

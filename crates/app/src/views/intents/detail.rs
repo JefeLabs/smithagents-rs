@@ -556,14 +556,7 @@ fn body(intent: &Intent, paint: &Paint) -> impl IntoElement {
 /// opens on: a left or middle click, a keyboard click, a tap that is not a
 /// long press. Any other link does nothing; the log names its scheme only.
 fn open_body_link(url: &SharedString, event: &ClickEvent, _: &mut Window, cx: &mut App) {
-    let pressed = match event {
-        ClickEvent::Mouse(click) => {
-            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
-        }
-        ClickEvent::Keyboard(_) => true,
-        ClickEvent::Touch(click) => !click.long_press,
-    };
-    if !pressed {
+    if !opens_a_link(event) {
         return;
     }
     if body_link_opens(url) {
@@ -574,6 +567,18 @@ fn open_body_link(url: &SharedString, event: &ClickEvent, _: &mut Window, cx: &m
             scheme = scheme.as_deref().unwrap_or("none"),
             "a body link that is not http or https was not opened"
         );
+    }
+}
+
+/// Whether `event` is a press a link opens on: a left or middle click, a
+/// keyboard click, a tap that is not a long press.
+pub(super) fn opens_a_link(event: &ClickEvent) -> bool {
+    match event {
+        ClickEvent::Mouse(click) => {
+            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+        }
+        ClickEvent::Keyboard(_) => true,
+        ClickEvent::Touch(click) => !click.long_press,
     }
 }
 

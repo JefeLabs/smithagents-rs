@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo, Role};
+use smithagents_core::feedback::{FeedbackRequest, SubmissionId};
 use smithagents_core::ids::{AgentId, IntentId, MessageId, RepoId};
 use smithagents_core::intent::{Intent, IntentFilter, IntentVersion};
 use smithagents_core::plugin::{ItemsPage, ResourceItem};
@@ -152,6 +153,13 @@ fn intent_from_row(r: &SqliteRow) -> Result<Intent, StoreError> {
         sent_at: opt_ts(r, "sent_at")?,
         resolved_at: opt_ts(r, "resolved_at")?,
         last_start_error: r.try_get("last_start_error")?,
+        base_branch: r.try_get("base_branch")?,
+        origin: r
+            .try_get::<Option<String>, _>("origin_json")?
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(corrupt)?,
     })
 }
 
@@ -162,6 +170,52 @@ fn version_from_row(r: &SqliteRow) -> Result<IntentVersion, StoreError> {
         author: enum_from_str(r.try_get("author")?)?,
         content: serde_json::from_str(r.try_get("content_json")?).map_err(corrupt)?,
         at: parse_ts(r.try_get("at")?)?,
+    })
+}
+
+fn origin_json(intent: &Intent) -> Result<Option<String>, StoreError> {
+    intent
+        .origin
+        .as_ref()
+        .map(|o| serde_json::to_string(o).map_err(corrupt))
+        .transpose()
+}
+
+/// One feedback submission: the request as sent and how far it got.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Submission {
+    pub id: SubmissionId,
+    pub repo_id: RepoId,
+    pub request: FeedbackRequest,
+    pub title: String,
+    pub branch: String,
+    pub commit: String,
+    pub folder: String,
+    pub pushed: bool,
+    pub intent_id: Option<IntentId>,
+    pub issue_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+fn submission_from_row(r: &SqliteRow) -> Result<Submission, StoreError> {
+    Ok(Submission {
+        id: parse_id(r.try_get("id")?)?,
+        repo_id: parse_id(r.try_get("repo_id")?)?,
+        request: serde_json::from_str(r.try_get("request_json")?).map_err(corrupt)?,
+        title: r.try_get("title")?,
+        branch: r.try_get("branch")?,
+        commit: r.try_get("commit_sha")?,
+        folder: r.try_get("folder")?,
+        pushed: r.try_get("pushed")?,
+        intent_id: r
+            .try_get::<Option<String>, _>("intent_id")?
+            .as_deref()
+            .map(parse_id)
+            .transpose()?,
+        issue_url: r.try_get("issue_url")?,
+        created_at: parse_ts(r.try_get("created_at")?)?,
+        updated_at: parse_ts(r.try_get("updated_at")?)?,
     })
 }
 
@@ -227,7 +281,8 @@ async fn update_intent(
     sqlx::query(
         "UPDATE intents SET repo_id = ?, slug = ?, state = ?, phase_json = ?, \
          seed_json = ?, content_json = ?, agent_id = ?, created_at = ?, updated_at = ?, \
-         queued_at = ?, sent_at = ?, resolved_at = ?, last_start_error = ? WHERE id = ?",
+         queued_at = ?, sent_at = ?, resolved_at = ?, last_start_error = ?, \
+         base_branch = ?, origin_json = ? WHERE id = ?",
     )
     .bind(intent.repo_id.to_string())
     .bind(&intent.slug)
@@ -242,6 +297,8 @@ async fn update_intent(
     .bind(intent.sent_at.map(ts))
     .bind(intent.resolved_at.map(ts))
     .bind(intent.last_start_error.as_deref())
+    .bind(intent.base_branch.as_deref())
+    .bind(origin_json(intent)?)
     .bind(intent.id.to_string())
     .execute(conn)
     .await
@@ -509,8 +566,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO intents (id, repo_id, slug, state, phase_json, seed_json, \
              content_json, agent_id, created_at, updated_at, queued_at, sent_at, \
-             resolved_at, last_start_error) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             resolved_at, last_start_error, base_branch, origin_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(intent.id.to_string())
         .bind(intent.repo_id.to_string())
@@ -526,6 +583,8 @@ impl Store {
         .bind(intent.sent_at.map(ts))
         .bind(intent.resolved_at.map(ts))
         .bind(intent.last_start_error.as_deref())
+        .bind(intent.base_branch.as_deref())
+        .bind(origin_json(intent)?)
         .execute(&mut *tx)
         .await
         .map_err(map_intent_conflict)?;
@@ -595,6 +654,62 @@ impl Store {
                 .fetch_all(&self.pool)
                 .await?;
         rows.iter().map(version_from_row).collect()
+    }
+
+    /// Stores a new submission. A second insert of an id is a
+    /// `StoreError::Conflict`.
+    pub async fn insert_submission(&self, s: &Submission) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO feedback_submissions (id, repo_id, request_json, title, branch, \
+             commit_sha, folder, pushed, intent_id, issue_url, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(s.id.to_string())
+        .bind(s.repo_id.to_string())
+        .bind(serde_json::to_string(&s.request).map_err(corrupt)?)
+        .bind(&s.title)
+        .bind(&s.branch)
+        .bind(&s.commit)
+        .bind(&s.folder)
+        .bind(s.pushed)
+        .bind(s.intent_id.map(|i| i.to_string()))
+        .bind(s.issue_url.as_deref())
+        .bind(ts(s.created_at))
+        .bind(ts(s.updated_at))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(d) if d.is_unique_violation() => {
+                StoreError::Conflict("this submission already exists".into())
+            }
+            e => e.into(),
+        })?;
+        Ok(())
+    }
+
+    pub async fn get_submission(&self, id: SubmissionId) -> Result<Option<Submission>, StoreError> {
+        let row = sqlx::query("SELECT * FROM feedback_submissions WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(submission_from_row).transpose()
+    }
+
+    /// Updates `pushed`, `intent_id`, `issue_url` and `updated_at`; the rest
+    /// of a submission is fixed when it is inserted.
+    pub async fn save_submission(&self, s: &Submission) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE feedback_submissions SET pushed = ?, intent_id = ?, issue_url = ?, \
+             updated_at = ? WHERE id = ?",
+        )
+        .bind(s.pushed)
+        .bind(s.intent_id.map(|i| i.to_string()))
+        .bind(s.issue_url.as_deref())
+        .bind(ts(s.updated_at))
+        .bind(s.id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn slug_exists(&self, repo_id: RepoId, slug: &str) -> Result<bool, StoreError> {
@@ -1371,6 +1486,7 @@ mod tests {
                 status: ItemStatus::Accepted,
                 edited: true,
                 intent_ref: None,
+                fixed: false,
             }],
             stories: vec![],
             depends_on: vec![],
@@ -1398,6 +1514,8 @@ mod tests {
             sent_at: None,
             resolved_at: None,
             last_start_error: Some("boom".into()),
+            base_branch: None,
+            origin: None,
         }
     }
 

@@ -321,6 +321,154 @@ async fn daemon_exits_and_removes_lockfile_on_sigterm() {
 }
 
 #[tokio::test]
+async fn feedback_leftovers_are_removed_when_the_daemon_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let paths = Paths { home: home.clone() };
+    let upload = paths.feedback_tmp_dir().join("x").join("upload");
+    std::fs::create_dir_all(&upload).unwrap();
+    std::fs::write(upload.join("file-1"), b"left by a crashed run").unwrap();
+
+    let mut daemon = Daemon::spawn(tmp.path(), "daemon", &home, &[], None);
+    daemon.wait_for_lockfile(&home).await;
+
+    let left: Vec<_> = std::fs::read_dir(paths.feedback_tmp_dir())
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}; log:\n{}", daemon.log_text());
+}
+
+/// A `git` for the daemon's `PATH` that, on `git commit`, touches `marker`
+/// and waits `pause` before running the real git.
+fn slow_commit_git(bin: &Path, marker: &Path, pause: Duration) {
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    assert!(real.starts_with('/'), "no git found: {real:?}");
+    std::fs::create_dir_all(bin).unwrap();
+    let script = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = commit ]; then : > '{}'; sleep {}; break; fi\ndone\nexec '{real}' \"$@\"\n",
+        marker.display(),
+        pause.as_secs()
+    );
+    let path = bin.join("git");
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// The daemon exits for idleness only once a submission whose client went
+/// away has finished: its branch, its record and its intent all exist.
+#[tokio::test]
+async fn a_running_submission_keeps_an_idle_daemon_up() {
+    use smithagents_core::feedback::{FeedbackKind, FeedbackRequest, SendAs, SubmissionId};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["config", "user.name", "Test User"],
+        &["config", "user.email", "test@example.invalid"],
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    ] {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "git {args:?}");
+    }
+    let bin = tmp.path().join("bin");
+    let marker = tmp.path().join("committing");
+    slow_commit_git(&bin, &marker, Duration::from_secs(3));
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let log = tmp.path().join("daemon.log");
+    let out = File::create(&log).unwrap();
+    let mut daemon = Daemon {
+        child: Command::new(DAEMON)
+            .arg("--home")
+            .arg(&home)
+            .args(["--claude-bin", FAKE_CLAUDE, "--idle-timeout-secs", "1"])
+            .env("PATH", path)
+            .env_remove("SMITHAGENTS_HOME")
+            .stdin(Stdio::null())
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .spawn()
+            .unwrap(),
+        log,
+    };
+    let info = daemon.wait_for_lockfile(&home).await;
+    let client = smithagents_client::Client::new(&info);
+    // A connected client keeps the daemon up while the test sets up.
+    let events = client.events(None).await.unwrap();
+    let repo = client.add_repo(&repo_dir).await.unwrap();
+    let request = FeedbackRequest {
+        submission_id: SubmissionId::new(),
+        main_idea: "Fix the zoom".into(),
+        kind: FeedbackKind::Bug,
+        repo_id: repo.id,
+        send_as: SendAs::Intent,
+        idea: None,
+        app_version: "0.1.0".into(),
+        platform: "macos".into(),
+        attachments: vec![],
+        public_acknowledged: false,
+    };
+    let submit = {
+        let (client, request) = (client.clone(), request.clone());
+        tokio::spawn(async move { client.submit_feedback(&request, &[]).await })
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the commit never began; log:\n{}",
+            daemon.log_text()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+    // Every client goes away while the commit waits.
+    submit.abort();
+    let _ = submit.await;
+    drop(events);
+
+    let status = daemon
+        .wait_exit(PATIENCE)
+        .await
+        .unwrap_or_else(|| panic!("the daemon never went idle; log:\n{}", daemon.log_text()));
+    assert_eq!(status.code(), Some(0), "log:\n{}", daemon.log_text());
+    let store = Store::open(&Paths { home }.db_path()).await.unwrap();
+    let row = store
+        .get_submission(request.submission_id)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no record; log:\n{}", daemon.log_text()));
+    assert!(
+        row.intent_id.is_some(),
+        "no intent; log:\n{}",
+        daemon.log_text()
+    );
+    let tip = Command::new("git")
+        .args(["rev-parse", &format!("refs/heads/{}", row.branch)])
+        .current_dir(&repo_dir)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), row.commit);
+}
+
+#[tokio::test]
 async fn unknown_flag_is_a_usage_error() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");

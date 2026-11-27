@@ -139,6 +139,13 @@ async fn full_loop_through_the_client() {
     let agent = client.create_agent(repo.id).await.unwrap();
     let mut events = client.events(None).await.unwrap();
 
+    // The meta repository setting.
+    let chosen = smithagents_core::feedback::FeedbackSettings {
+        meta_repo_id: Some(repo.id),
+    };
+    assert_eq!(client.set_feedback_settings(&chosen).await.unwrap(), chosen);
+    assert_eq!(client.feedback_settings().await.unwrap(), chosen);
+
     // A chat turn, then an intent seeded from it.
     client
         .send_message(agent.id, "please add dark mode")

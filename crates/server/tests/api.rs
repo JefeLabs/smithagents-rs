@@ -16,6 +16,7 @@ use smithagents_core::palette::palette;
 use smithagents_plugin_host::StaticSecrets;
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
+use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::harness::HarnessEvent;
 use smithagents_server::intents::IntentService;
@@ -60,7 +61,7 @@ async fn fixture(harness: FakeHarness, bus_capacity: usize) -> Fx {
         bus.clone(),
         Arc::new(harness.clone()),
         service.clone(),
-        paths,
+        paths.clone(),
     );
     let sched = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
     let plugins = PluginManager::start(
@@ -72,9 +73,17 @@ async fn fixture(harness: FakeHarness, bus_capacity: usize) -> Fx {
     )
     .await
     .unwrap();
+    let feedback = FeedbackService::new(
+        store.clone(),
+        intents.clone(),
+        service.clone(),
+        plugins.clone(),
+        paths,
+    );
     let state = AppState {
         service,
         intents,
+        feedback,
         bus,
         store,
         plugins,

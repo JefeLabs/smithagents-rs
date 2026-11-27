@@ -1,6 +1,9 @@
 # Feedback Tool Design
 
-Status: draft for the owner's approval. Marks: [owner] is a decision the owner
+Status: built (`docs/superpowers/plans/2026-11-26-feedback-capture.md`,
+`docs/superpowers/plans/2026-11-26-feedback-submit.md`); where the build
+differs, see [Deviations from this design](#deviations-from-this-design).
+User guide: `docs/feedback.md`. Marks: [owner] is a decision the owner
 made on 2026-11-26; [my call] is mine and open to change.
 
 Parent spec: `docs/superpowers/specs/2026-11-23-smithagents-architecture-design.md`.
@@ -70,7 +73,8 @@ reads the same thing the owner saw.
    n · k comments", the comments listed with their badges, a remove button.
    Buttons: "Add files…" (png, jpg, gif, webp, mp4), "Capture", Discard,
    "Submit…". The draft survives closing the pane and restarting the app.
-4. **Submit dialog.** Thumbnails and comments (read-only); **Main idea**
+4. **Submit screen.** A screen of the Feedback pane, not a modal dialog
+   ("Back" returns to the draft). Thumbnails and comments (read-only); **Main idea**
    (multi-line; the first line is the title; required); **Kind**: New
    feature, Enhancement, Bug; **Repository**: a picker over the Space's
    source repositories, starting on the last one used, or the Space's meta
@@ -80,8 +84,8 @@ reads the same thing the owner saw.
    issue".
 5. **After submit.** A status line in the pane: the files' branch and
    commit, and either the intent's title or the issue's URL. The draft is
-   cleared. On failure the dialog shows the daemon's message and the draft
-   stays.
+   cleared. On failure the Submit screen shows the daemon's message and the
+   draft stays.
 
 ## Idea package ("Prepare an idea PR for teammates")
 
@@ -114,7 +118,8 @@ and a demo video on idea/<slug>, and you open the pull request."
   runs `gh pr create` (draft, body from `issue.md` and `explainer.md`).
   Implementation is a second intent that depends on the idea intent and
   starts from its branch. [my call; the owner was asked and has not
-  answered]
+  answered] The agent works on `intent/<slug>` branched from `idea/<slug>`,
+  and "Open pull request" pushes that work to `origin` as `idea/<slug>`.
 - **Demo video** is offered only when `agent-browser` is ready and is
   disabled, with the reason, when it is not. It is for projects a browser
   can show. For feedback about SmithAgents itself the box is disabled.
@@ -213,7 +218,7 @@ the approval for that one write.
      ("docs(issues): <title>"), and removes the worktree;
   3. for an intent: creates it through the existing intent service with a
      text seed made of the main idea, the kind and the comments, plus the
-     path of the folder and the branch; the kind maps to the intent's kind;
+     path of the folder and the branch; the kind is passed through;
   4. for a GitHub issue: pushes the branch, then runs
      `gh issue create --title … --body-file …` in the repository. The body is
      `issue.md` with image links rewritten to the pushed branch. Labels:
@@ -236,9 +241,9 @@ the approval for that one write.
   directory under the daemon's home, never held whole in memory, and removed
   when the call ends. The daemon may be on another machine later, so the app
   never hands it a local path.
-- **Kind.** "New feature" and "Enhancement" both map to the intent kind
-  `Enhancement`; "Bug" maps to `Bug`. `issue.md` keeps the kind the owner
-  chose. No new intent kind.
+- **Kind.** New feature, Enhancement and Bug map to the intent kinds of the
+  same names (the intent tool added `new_feature`). `issue.md` keeps the kind
+  the owner chose.
 - **Meta repository setting.** A daemon setting (`meta_repo_id`), read and
   written through a settings route like agent defaults, not a flag on each
   repository. Settings → Source repositories shows which one it is and lets
@@ -306,3 +311,129 @@ the approval for that one write.
   Open pull request), the dialog shows one line: "This repository is public.
   The screenshots will be visible to anyone."
 - **Idea pull request is for the idea only** (see Idea package).
+
+## Deviations from this design
+
+Recorded 2026-11-26, when the build was done. The text above is the design
+as approved; where the build differs, this list wins. The user's view of the
+result is `docs/feedback.md`.
+
+- **The Submit dialog is a screen of the Feedback pane.** "The dialog"
+  elsewhere in this design means that screen.
+- **"Explainer doc" does something when unticked.** The design says the
+  agent always writes `explainer.md`. Unticked, the agent writes no prose
+  explainer: with Diagrams, only a minimal `explainer.md` holding the
+  diagrams and the "Not done" list; without, no `explainer.md` unless a part
+  is not done. Its fixed criterion is set only when the box is ticked; a
+  fixed criterion that nothing is implemented is always set.
+- **Fixed criteria are enforced.** The review routes refuse to edit or drop
+  a fixed item, polish keeps them first and unchanged, and the polish prompts
+  are told the intent prepares an idea package. The Intents detail tags a
+  fixed item "fixed" and offers no Edit or Skip on it. An intent made from
+  feedback, and one with a fixed dependency, cannot change repository
+  (`evidence_in_repo`, `fixed_dependency`). An idea intent's agent is never
+  told to rebase onto its dependencies (that rewrites the idea's commit).
+- **A push guard.** The folder commit is built on the local default branch,
+  so a push would publish the owner's unpushed commits too. Before an issue
+  submission commits (or takes up a commit a stopped daemon left), before an
+  idea package commits to a GitHub repository that has been fetched, and
+  inside the one function that pushes (Submit, Retry, Open pull request), the
+  daemon refuses (`unpushed_commits`) unless everything under the folder
+  commit is on `refs/remotes/origin/*`: "The default branch has commits that
+  are not on origin. Push them first, so they are not published with this
+  feedback.", or, never fetched, "This repository has never been fetched
+  from origin, so it is not known what is already published. Run git fetch
+  first." A folder commit that is not in the repository is refused
+  (`commit_missing`), and `git replace` objects are ignored, so what is
+  checked is what is pushed. A plain intent is not checked by the guard.
+  Added by the fix round that keeps unpushed default-branch work from being
+  published, after the build described here.
+- **The public-repository warning covers every route that publishes, and
+  the daemon enforces it.** The design had it in the app only, and for
+  issues only. A plain intent publishes too: its agent opens a pull request
+  that carries the folder. "A GitHub issue", a plain intent to a repository
+  whose `origin` is on GitHub, "Open pull request" and "Create
+  implementation intent" (`POST /v1/intents/{id}/implementation` takes the
+  same optional body as the pull-request route) are refused (409
+  `public_not_acknowledged`) when the repository is public or its visibility
+  cannot be determined (also without `gh`), unless the request carries
+  `public_acknowledged: true`: "This repository is public. The screenshots
+  will be visible to anyone. Confirm that before sending." or "This
+  repository may be public. The screenshots will be visible to anyone.
+  Confirm that before sending." An acknowledged request runs no `gh`. An
+  idea package submission is not asked: nothing of it is published before
+  its two actions. The app asks before every such send, Retry included: for
+  an intent with "This repository is public. The agent's pull request will
+  include the screenshots, visible to anyone." (or "…may be public…"), and
+  always before "Create implementation intent…" ("Creates an intent to
+  build this idea. Its agent's pull request will include the idea's
+  screenshots and explainer. If the repository is public, they will be
+  visible to anyone."). A recorded submission that is retried is not asked
+  again, so the retry route carries no acknowledgement.
+- **Locking per submission.** In the daemon, one submission id runs once at
+  a time and a repeat answers with what was recorded; commits are made one at
+  a time, and the steps after a commit hold up no other submission. In the
+  app, the draft is locked (Retry, Start over) only while something may exist
+  under its id; a refusal after which the daemon made nothing keeps it
+  editable under the same id, except a refused re-upload (sent only after an
+  earlier request went unanswered), which stays locked. An answer that does
+  not name this submission and what it made locks too. A locked draft with
+  no answer says "This feedback may already have been sent. Press Retry to
+  find out, or Start over to send it as a new submission."
+- **A crash between the commit and its record** is recovered from the
+  commit's `Feedback-Id: <submission id>` trailer: sending the same id again
+  takes up that commit instead of making a second one, after the same checks
+  as a new submission. An intent made but not recorded is found by its
+  origin and taken up.
+- **Commits are unsigned and run no hooks; files are ordinary blobs.** No
+  repository attribute or filter (Git LFS, git-crypt, encodings) applies to
+  the issue folder. git 2.36 or newer is required.
+- **Pushes** happen for "A GitHub issue" (at Submit or Retry) and for "Open
+  pull request". What is pushed is the recorded commit, never whatever the
+  branch points at by then, and never forced. A branch name `origin` has is
+  never chosen for a new submission.
+- **Mentions are neutralised only in what is sent to GitHub** (titles and
+  bodies of issues and pull requests), and no `@` that could mention someone
+  is left there as typed: one followed by an ASCII letter or digit, unless an
+  ASCII letter, digit or `_` comes before it. Inside a web address in a body
+  it is written `%40`, so the link still works and nobody is mentioned
+  whether or not GitHub makes it a link (the address: at the start, after
+  white space or after `*`, `_`, `~` or `(`; `http://` or `https://` with a
+  host holding a `.`, then `/`, `?` or `#`; ending at the first character
+  outside ASCII letters, digits and `-._~/%?#=&+:@`). Everywhere else, and
+  anywhere in a title, it gets a zero-width space after it. The committed
+  files keep the owner's text. A comment is capped at 500 characters and
+  never cut by bytes.
+- **Duplicates.** The search for an issue or a pull request made before
+  looks only at the signed-in user's own (`--author=@me`): the submission id
+  is public once pushed. After `gh` ran without a usable answer, nothing is
+  created for a minute (`issue_unconfirmed`, `pr_unconfirmed`).
+- **"Open pull request"** pushes only when every commit of the agent on top
+  of the idea's changes only the issue folder (`idea_out_of_scope`), and
+  refuses with nothing pushed when the agent's branch has no `issue.md`
+  (`idea_incomplete`) or any commit it would publish on top of the idea's
+  holds a Git LFS pointer under the folder, at the tip or earlier
+  (`idea_lfs`: "The idea's files were committed through Git LFS, now or in
+  an earlier commit of the agent's branch, which this push does not upload.
+  Turn Git LFS off for docs/issues and have the branch's commits made again
+  without it."). The commit to push is recorded only after every refusal,
+  and pushed again at a later press only while the agent's branch still
+  holds it; a push `origin` refuses because its branch has other commits is
+  `push_not_fast_forward`, never forced. A pull request is taken for the
+  idea's only when its head is the commit pushed; while one of the branch
+  is open with another head, none is opened (`pr_head_moved`). The agent's commits are published as it wrote them.
+  "Not done" is read from `explainer.md` when the pull request is opened and
+  shown in the idea intent's detail, with the pull request's address and a
+  copy button (tooltip "Copy link").
+- **Demo video** is offered whenever `agent-browser` is ready, also for
+  feedback about SmithAgents itself, with the line "Only works for projects a
+  browser can show."
+- **The upload** limit is the 100 MB of files plus 1 MiB for the request
+  part and the boundaries.
+- **The two idea actions** wait for the daemon as long as a submission (10
+  minutes), and show the daemon's sentence when it refuses for the intent's
+  state.
+- **An intent's agent branch tracks nothing** (`--no-track`), and a worktree
+  that cannot be made from the intent's base branch is the fixed start error
+  "The intent's base branch could not be checked out."
+  (`base_branch_failed`).

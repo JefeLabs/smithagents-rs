@@ -29,9 +29,9 @@ use smithagents_app::feedback::files::Refusal;
 use smithagents_app::feedback::state::Feedback;
 use smithagents_app::feedback::text::{
     discard_description, BROKEN_DRAFT_TEXT, EMPTY_TEXT, HELP_LINES, HELP_TITLE, PERMISSION_TEXT,
-    SUBMIT_TOOLTIP,
 };
 use smithagents_app::shell::{Shell, FEEDBACK_PANEL};
+use smithagents_app::view_models::NOT_CONNECTED_TEXT;
 use smithagents_app::views::feedback::{
     card_id, card_remove_id, comment_badge_id, DISCARD_CANCEL_ID, DISCARD_CONFIRM_ID,
     DISCARD_DIALOG_TITLE_ID, FEEDBACK_ADD_FILES_ID, FEEDBACK_CAPTURE_ID, FEEDBACK_DISCARD_ID,
@@ -275,7 +275,9 @@ fn the_help_row_starts_collapsed_and_shows_three_sentences(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
-fn submit_is_disabled_and_says_why(cx: &mut TestAppContext) {
+fn submit_needs_the_daemon(cx: &mut TestAppContext) {
+    // The pane runs offline here: Submit is disabled and says why, and a
+    // click changes nothing. (`feedback_submit.rs` covers it connected.)
     let setup = FeedbackSetup::new();
     let (window, shell, feedback) = open(cx, &setup);
     add_files(
@@ -289,11 +291,7 @@ fn submit_is_disabled_and_says_why(cx: &mut TestAppContext) {
     with_window(cx, window, |window, _| {
         let submit = window.find(FEEDBACK_SUBMIT_ID);
         assert_eq!(submit.disabled(), Some(true));
-        assert_eq!(submit.description(), Some(SUBMIT_TOOLTIP));
-        assert_eq!(
-            submit.description(),
-            Some("Submitting arrives with the next update")
-        );
+        assert_eq!(submit.description(), Some(NOT_CONNECTED_TEXT));
     });
 
     click(cx, window, FEEDBACK_SUBMIT_ID);

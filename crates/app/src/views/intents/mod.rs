@@ -33,8 +33,11 @@ mod list;
 mod sections;
 
 pub use actions::{
-    OPEN_CHAT_ID, QUEUED_REASON_ID, RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID, RESOLVE_DESCRIPTION,
-    RESOLVE_DESCRIPTION_ID, RESOLVE_ID, RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
+    IMPLEMENT_CANCEL_ID, IMPLEMENT_CONFIRM_ID, IMPLEMENT_DESCRIPTION_ID, IMPLEMENT_ID,
+    IMPLEMENT_TITLE_ID, NOT_DONE_ID, OPEN_CHAT_ID, OPEN_PR_CANCEL_ID, OPEN_PR_CONFIRM_ID,
+    OPEN_PR_DESCRIPTION_ID, OPEN_PR_ID, OPEN_PR_TITLE_ID, PR_COPY_ID, PR_URL_ID, QUEUED_REASON_ID,
+    RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID, RESOLVE_DESCRIPTION, RESOLVE_DESCRIPTION_ID, RESOLVE_ID,
+    RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
 };
 pub use create::{
     create_repo_item_id, kind_row_id, ChooseBug, ChooseEnhancement, ChooseMaintenance,
@@ -50,7 +53,7 @@ pub use detail::{
 pub use sections::{
     item_card_id, item_confirm_id, item_edit_id, item_input_id, item_skip_id, question_card_id,
     question_option_id, question_skip_id, section_counter_id, section_header_id, section_status_id,
-    skipped_line_id, ITEM_TEXT_ID, QUESTION_ANSWER_ID,
+    skipped_line_id, ITEM_FIXED_ID, ITEM_TEXT_ID, QUESTION_ANSWER_ID,
 };
 
 use std::collections::HashMap;
@@ -71,7 +74,10 @@ use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{AnswerInput, Intent, IntentKind, ReviewAction};
 use smithagents_theme::native::NativeTheme;
 
-use crate::intent_vm::{header_editable, intent_error_text, IntentFilterChoice, SectionKind};
+use crate::feedback::state::SUBMIT_TIMEOUT;
+use crate::intent_vm::{
+    header_editable, idea_action_error_text, intent_error_text, IntentFilterChoice, SectionKind,
+};
 use crate::link::{IntentAnswer, IntentCommands, LinkError};
 use crate::model::Connection;
 use crate::shell::INTENTS_PANEL;
@@ -150,6 +156,10 @@ pub enum Busy {
     Item(ItemId),
     Send,
     Resolve,
+    /// An idea intent's "Open pull request".
+    PullRequest,
+    /// An idea intent's "Create implementation intent".
+    Implementation,
 }
 
 pub struct IntentsPane {
@@ -341,8 +351,11 @@ impl IntentsPane {
     /// Sends one command. Does nothing while another is in flight: `command`
     /// is dropped unpolled, so it is never sent. Clears the error line, marks
     /// `key` busy and waits for the answer at most the shell's command
-    /// timeout; then clears busy and either calls `done` with the answer or
-    /// sets the error line (`intent_error_text`, or "The daemon did not
+    /// timeout (an idea action, which may push and run `gh` for minutes, as
+    /// long as a submission: [`SUBMIT_TIMEOUT`]); then clears busy and
+    /// either calls `done` with the answer or sets the error line
+    /// (`intent_error_text`, the daemon's own sentence for an idea action's
+    /// `invalid_state`, or "The daemon did not
     /// answer" on a timeout) if the pane still shows the screen the command
     /// was sent from. Opening another screen meanwhile does not give the
     /// command up. The model learns of the answer from the link, not from
@@ -364,9 +377,11 @@ impl IntentsPane {
         self.send_refusal = None;
         self.busy = Some(key);
         self.command_screen = Some(self.screen);
-        let timer = cx
-            .background_executor()
-            .timer(self.state.read(cx).command_timeout());
+        let timeout = match key {
+            Busy::PullRequest | Busy::Implementation => SUBMIT_TIMEOUT,
+            _ => self.state.read(cx).command_timeout(),
+        };
+        let timer = cx.background_executor().timer(timeout);
         self.command = Some(cx.spawn_in(window, async move |this, cx| {
             let answer = answered(command, timer).await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -399,7 +414,10 @@ impl IntentsPane {
             }
             Some(Err(e)) => {
                 tracing::warn!(?key, "intent command failed: {e}");
-                let text = intent_error_text(&e);
+                let text = match key {
+                    Busy::PullRequest | Busy::Implementation => idea_action_error_text(&e),
+                    _ => intent_error_text(&e),
+                };
                 if let (Busy::Send, LinkError::Client(ClientError::Api { message, .. })) = (key, &e)
                 {
                     self.send_refusal = Some((text.clone(), message.clone()));

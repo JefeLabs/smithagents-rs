@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod feedback;
+pub mod feedback_submit;
 pub mod intents;
 pub mod ui;
 

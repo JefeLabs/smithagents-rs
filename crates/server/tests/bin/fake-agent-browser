@@ -1,0 +1,3 @@
+#!/bin/sh
+# Test double for `agent-browser`: found on the tool path, does nothing.
+exit 0

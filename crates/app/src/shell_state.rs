@@ -24,7 +24,7 @@ use chrono::{DateTime, FixedOffset};
 use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use raw_window_handle::HasWindowHandle;
 use smithagents_center_host::{validated_origin, CenterTabHost, PixelRect};
-use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, RepoId};
 use smithagents_theme::native::NativeTheme;
 use smithagents_theme::state::{AppearanceSettings, ThemeState};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use crate::app_state::{AppState, AppStateStore};
 use crate::appearance::AppearanceRuntime;
 use crate::layout_store::{LeftPaneLayout, MAX_LEFT_PANE_WIDTH, MIN_LEFT_PANE_WIDTH};
-use crate::link::{AgentCommands, DaemonLink, IntentCommands, LinkFailure};
+use crate::link::{AgentCommands, DaemonLink, FeedbackCommands, IntentCommands, LinkFailure};
 use crate::model::{Action, Connection, Effect, ShellModel};
 use crate::tabs::{PlaceholderHost, TabError, TabManager, DEFAULT_PAGE_ORIGIN};
 use crate::theme_adapter::apply_framework_theme;
@@ -118,6 +118,9 @@ pub enum ShellEvent {
     /// closed again: show a notification with this sentence. The status bar
     /// already has the error.
     TabOpenFailed(String),
+    /// Show the Intents view on this intent's detail. See
+    /// [`ShellState::open_intent`].
+    OpenIntent(IntentId),
 }
 
 pub struct ShellState {
@@ -137,6 +140,8 @@ pub struct ShellState {
     commands: Option<Rc<dyn AgentCommands>>,
     /// Replaces the link for intent commands (headless tests).
     intent_commands: Option<Rc<dyn IntentCommands>>,
+    /// Replaces the link for feedback commands (headless tests).
+    feedback_commands: Option<Rc<dyn FeedbackCommands>>,
     /// Replaces the local clock (headless tests).
     clock: Option<Clock>,
     command_timeout: Duration,
@@ -212,6 +217,7 @@ impl ShellState {
             connection_info: None,
             commands,
             intent_commands: None,
+            feedback_commands: None,
             clock: None,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             app_state_store,
@@ -305,6 +311,20 @@ impl ShellState {
             Some(commands) => Some(commands.as_ref()),
             None => self.link.as_ref().map(|link| link as &dyn IntentCommands),
         }
+    }
+
+    /// Where feedback commands go: the injected commands if any, else the
+    /// link; `None` when the shell runs offline.
+    pub fn feedback_commands(&self) -> Option<&dyn FeedbackCommands> {
+        match &self.feedback_commands {
+            Some(commands) => Some(commands.as_ref()),
+            None => self.link.as_ref().map(|link| link as &dyn FeedbackCommands),
+        }
+    }
+
+    /// Replaces the link for feedback commands.
+    pub(crate) fn set_feedback_commands(&mut self, commands: Rc<dyn FeedbackCommands>) {
+        self.feedback_commands = Some(commands);
     }
 
     /// Replaces the link for intent commands.
@@ -421,6 +441,14 @@ impl ShellState {
     pub fn reveal(&mut self, entry: RailEntry, cx: &mut Context<Self>) {
         tracing::debug!(?entry, "reveal requested");
         cx.emit(ShellEvent::Reveal(entry));
+    }
+
+    /// Asks the shell to show the Intents view on `id`'s detail
+    /// ([`ShellEvent::OpenIntent`]): what Submit does with the intent it
+    /// created.
+    pub fn open_intent(&mut self, id: IntentId, cx: &mut Context<Self>) {
+        tracing::debug!(intent = %id, "open intent requested");
+        cx.emit(ShellEvent::OpenIntent(id));
     }
 
     /// Applies one action (from the user or the link), queues its effects and

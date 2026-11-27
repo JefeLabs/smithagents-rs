@@ -17,7 +17,8 @@ use smithagents_capture::{checked, CaptureError, Capturer, WindowTarget, WRONG_S
 
 use super::annotation::Annotation;
 use super::draft::{
-    annotated_name, thumb_name, Attachment, AttachmentId, AttachmentKind, Draft, DraftStore, Loaded,
+    annotated_name, thumb_name, Attachment, AttachmentId, AttachmentKind, Draft, DraftStore,
+    Loaded, SUBMISSION_FILE,
 };
 use super::files::{admit, Refusal, Usage};
 use super::render::{annotate, decode, encode_png, image_from_screenshot, thumbnail};
@@ -142,6 +143,36 @@ impl Files {
             Files::Disk(store) => store.clear(),
             Files::Memory(map) => {
                 Self::memory(map).clear();
+                Ok(())
+            }
+        }
+    }
+
+    /// The pending submission's bytes, if there are any.
+    pub(super) fn read_submission(&self) -> Option<Vec<u8>> {
+        match self {
+            Files::Disk(store) => store.read_submission(),
+            Files::Memory(map) => Self::memory(map)
+                .get(SUBMISSION_FILE)
+                .map(|bytes| bytes.to_vec()),
+        }
+    }
+
+    pub(super) fn write_submission(&self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Files::Disk(store) => store.write_submission(bytes),
+            Files::Memory(map) => {
+                Self::memory(map).insert(SUBMISSION_FILE.to_string(), bytes.into());
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn remove_submission(&self) -> io::Result<()> {
+        match self {
+            Files::Disk(store) => store.remove_submission(),
+            Files::Memory(map) => {
+                Self::memory(map).remove(SUBMISSION_FILE);
                 Ok(())
             }
         }

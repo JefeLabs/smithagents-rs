@@ -707,6 +707,52 @@ fn error_sentences() {
     );
 }
 
+#[test]
+fn an_intent_error_shows_no_body_that_is_not_the_daemons_and_one_bounded_line() {
+    // A-M3: as `submit_error_text`.
+    let proxy = FakeIntents::api_error(502, "http_502", "<html>LEAK a proxy's page</html>");
+    assert_eq!(intent_error_text(&proxy), "The daemon could not do that.");
+    let long = format!("line one\nline two {}", "é".repeat(500));
+    let text = intent_error_text(&api_error("weird", &long));
+    assert!(!text.contains('\n'), "{text:?}");
+    assert_eq!(text.chars().count(), 301, "{text:?}");
+    assert!(text.starts_with("Line one line two é"), "{text:?}");
+    assert!(text.ends_with('…'), "{text:?}");
+}
+
+#[test]
+fn an_idea_action_shows_the_daemons_sentence_for_its_state() {
+    // A-M2: "the agent is still working" reaches the user.
+    for message in [
+        "the agent is still working",
+        "the idea intent has not been sent yet",
+    ] {
+        let e = api_error("invalid_state", message);
+        assert_eq!(idea_action_error_text(&e), capitalized_for_test(message));
+        assert_eq!(
+            intent_error_text(&e),
+            "The intent changed, so this is no longer possible."
+        );
+    }
+    // Every other answer as an intent command's.
+    let e = api_error("intent_not_found", "LEAK");
+    assert_eq!(idea_action_error_text(&e), "That intent no longer exists.");
+    let proxy = FakeIntents::api_error(502, "http_502", "LEAK");
+    assert_eq!(
+        idea_action_error_text(&proxy),
+        "The daemon could not do that."
+    );
+}
+
+/// `text` with its first letter upper-case.
+fn capitalized_for_test(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 const START_PREFIX: &str = "The agent could not start: ";
 
 #[test]
@@ -789,9 +835,109 @@ fn transport_errors_are_unreachable() {
 }
 
 #[test]
+fn a_file_that_could_not_be_opened_is_not_a_daemon_error() {
+    let file = LinkError::Client(smithagents_client::ClientError::File(
+        std::io::ErrorKind::NotFound.into(),
+    ));
+    assert_eq!(
+        intent_error_text(&file),
+        "A file to upload could not be opened"
+    );
+}
+
+#[test]
 fn queue_limit_labels() {
     assert_eq!(queue_limit_label(None), "No limit");
     assert_eq!(queue_limit_label(Some(0)), "No limit");
     assert_eq!(queue_limit_label(Some(3)), "3");
     assert_eq!(QUEUE_LIMIT_CHOICES, 1..=16);
+}
+
+#[test]
+fn idea_actions_are_shown_once_the_agent_is_done() {
+    use common::feedback_submit::idea_intent;
+    for (state, agent, shown) in [
+        (IntentState::Resolved, None, true),
+        (IntentState::Resolved, Some(AgentState::Working), true),
+        (IntentState::Sent, Some(AgentState::Done), true),
+        (IntentState::Sent, Some(AgentState::Working), false),
+        (IntentState::Sent, Some(AgentState::Idle), false),
+        (IntentState::Sent, None, false),
+        (IntentState::Complete, None, false),
+        (IntentState::Queued, None, false),
+        (IntentState::Draft, None, false),
+    ] {
+        let idea = idea_intent(state, None);
+        assert_eq!(
+            idea_actions_shown(&idea, agent),
+            shown,
+            "{state:?} {agent:?}"
+        );
+        // Never for an intent that is no idea package.
+        let plain = intent("plain", state, Phase::Review);
+        assert!(!idea_actions_shown(&plain, agent), "{state:?} {agent:?}");
+    }
+}
+
+#[test]
+fn only_a_github_pull_request_address_is_shown() {
+    assert!(shows_pull_request_url(
+        "https://github.com/smithagents-test-invalid/widgets/pull/8"
+    ));
+    for bad in [
+        "",
+        "javascript:alert(1)",
+        "http://github.com/o/r/pull/8",
+        "https://github.com.evil.example/o/r/pull/8",
+        "https://github.com/o/r/issues/8",
+        "https://github.com/o/r/pull/8/files",
+        "https://github.com/o/r/pull/8?x=1",
+        "https://github.com/o/r/pull/x",
+        "https://github.com/../r/pull/8",
+        "file:///etc/passwd",
+    ] {
+        assert!(!shows_pull_request_url(bad), "{bad}");
+    }
+    assert_eq!(
+        not_done_text("The demo video:\nthe project did not start."),
+        "Not done: The demo video: the project did not start."
+    );
+}
+
+#[test]
+fn an_idea_actions_lasting_refusals_say_the_daemons_sentence() {
+    for (code, message, shown) in [
+        (
+            "idea_branch_missing",
+            "the idea agent's branch no longer exists",
+            "The idea agent's branch no longer exists",
+        ),
+        (
+            "idea_agent_missing",
+            "the idea intent's agent no longer exists",
+            "The idea intent's agent no longer exists",
+        ),
+        (
+            "idea_origin_invalid",
+            "the idea intent's folder or branch is not one Submit made",
+            "The idea intent's folder or branch is not one Submit made",
+        ),
+        (
+            "idea_incomplete",
+            "The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.",
+            "The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.",
+        ),
+        (
+            "unpushed_commits",
+            "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.",
+            "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback.",
+        ),
+    ] {
+        assert_eq!(intent_error_text(&api_error(code, message)), shown, "{code}");
+    }
+    // The two races keep the intent's sentence.
+    assert_eq!(
+        intent_error_text(&api_error("invalid_state", "the agent is still working")),
+        "The intent changed, so this is no longer possible."
+    );
 }

@@ -62,6 +62,11 @@ pub const QUESTION_ANSWER_ID: &str = "answer";
 /// Depends on card, the other intent's title (or the item's own text while
 /// that intent is not in the model).
 pub const ITEM_TEXT_ID: &str = "text";
+/// Element id of the "fixed" tag of an item the daemon set (an idea
+/// package's criteria, an implementation intent's dependency), inside its
+/// card: it cannot be edited or skipped.
+pub const ITEM_FIXED_ID: &str = "fixed";
+const FIXED_LABEL: &str = "fixed";
 
 const SKIP_LABEL: &str = "Skip";
 const CONFIRM_LABEL: &str = "Confirm";
@@ -473,9 +478,11 @@ impl IntentsPane {
             .into_any_element()
     }
 
-    /// An item's card: its text (or the input, while it is edited), then,
-    /// with `reviewable`, Confirm, Edit and Skip while it is pending. An
-    /// accepted card is outlined in `status-ok`.
+    /// An item's card: its text (or the input, while it is edited), a small
+    /// "fixed" tag on an item the daemon set, then, with `reviewable`,
+    /// Confirm, Edit and Skip while it is pending (Confirm only, for a fixed
+    /// one: the daemon refuses to change it). An accepted card is outlined
+    /// in `status-ok`.
     fn item_card(
         &self,
         intent: IntentId,
@@ -515,9 +522,21 @@ impl IntentsPane {
                     this.child(text)
                 }
             })
+            .when(item.fixed, |this| {
+                this.child(
+                    h_flex().child(
+                        Tag::secondary().small().child(
+                            Label::new(FIXED_LABEL)
+                                .id(ITEM_FIXED_ID)
+                                .text_xs()
+                                .text_color(paint.token("secondary-foreground")),
+                        ),
+                    ),
+                )
+            })
             .when(
                 reviewable && item.status == ItemStatus::Pending && !editing,
-                |this| this.child(self.item_buttons(intent, kind, item.id, cx)),
+                |this| this.child(self.item_buttons(intent, kind, item, cx)),
             )
     }
 
@@ -580,15 +599,18 @@ impl IntentsPane {
             )
     }
 
-    /// Confirm, Edit (not for a dependency) and Skip. All are disabled while
-    /// any command is in flight; the pressed one shows the spinner.
+    /// Confirm, Edit (not for a dependency) and Skip; only Confirm for a
+    /// fixed item. All are disabled while any command is in flight; the
+    /// pressed one shows the spinner.
     fn item_buttons(
         &self,
         intent: IntentId,
         kind: SectionKind,
-        item: ItemId,
+        item: &Item,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let fixed = item.fixed;
+        let item = item.id;
         let busy = self.busy.is_some();
         let pressed = self
             .pressed_review
@@ -610,7 +632,7 @@ impl IntentsPane {
             .flex_wrap()
             .gap_1()
             .child(button(item_confirm_id(item), CONFIRM_LABEL, ReviewAction::Accept).outline())
-            .when(kind != SectionKind::DependsOn, |this| {
+            .when(kind != SectionKind::DependsOn && !fixed, |this| {
                 this.child(
                     Button::new(item_edit_id(item))
                         .label(EDIT_LABEL)
@@ -626,7 +648,9 @@ impl IntentsPane {
                         })),
                 )
             })
-            .child(button(item_skip_id(item), SKIP_LABEL, ReviewAction::Drop).ghost())
+            .when(!fixed, |this| {
+                this.child(button(item_skip_id(item), SKIP_LABEL, ReviewAction::Drop).ghost())
+            })
     }
 
     /// Sends `action` for `item`, of section `kind`; nothing while another

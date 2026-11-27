@@ -43,15 +43,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use chrono::{TimeDelta, Utc};
 use futures::FutureExt;
 use smithagents_core::agent::AgentState;
 use smithagents_core::event::{Event, EventKind};
+use smithagents_core::feedback::{FeedbackOrigin, IdeaPackage};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     slugify, AgentDefaults, Answer, AnswerInput, Content, CreateIntentRequest, Intent,
-    IntentFilter, IntentKind, IntentState, IntentVersion, ItemStatus, Patch, Phase, ReviewAction,
-    Seed, SeedInput, SeedSource, VersionAuthor,
+    IntentFilter, IntentKind, IntentState, IntentVersion, Item, ItemStatus, Patch, Phase,
+    ReviewAction, Seed, SeedInput, SeedSource, VersionAuthor,
 };
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard};
@@ -75,6 +77,9 @@ const AGENT_DEFAULTS_KEY: &str = "agent_defaults";
 const QUEUE_LIMIT_MAX: u32 = 64;
 /// Hex digits of the intent id appended to an intent branch name that is taken.
 const BRANCH_SUFFIX_HEX: usize = 6;
+/// Why a start fails when the stored base branch is not a usable branch name
+/// (the name is not repeated).
+const BASE_BRANCH_INVALID: &str = "the branch this intent starts from no longer exists";
 /// How long to wait for a turn to end before trying again to close the agent
 /// of a failed start (in case the end of the turn was never published).
 const CLOSE_RETRY: Duration = Duration::from_secs(30);
@@ -91,6 +96,8 @@ const SLUG_SAVE_ATTEMPTS: usize = 8;
 /// Attempts at recording a polish failure before leaving it to `recover`.
 const FAIL_ATTEMPTS: u32 = 3;
 const RESTART_MESSAGE: &str = "polish was interrupted by a daemon restart; retry";
+/// Why a fixed item cannot be reviewed away.
+const FIXED_ITEM: &str = "this item is fixed: it cannot be edited or dropped";
 
 /// Starts a polish pass for an intent in the background. Without one set,
 /// the service runs passes itself (see [`IntentService::set_polish_runner`]).
@@ -124,6 +131,20 @@ pub enum IntentError {
     DependencyCycle,
     #[error("dependency is in a different repository")]
     DependencyCrossRepo,
+    /// The intent has an origin: the files it was made from are on a branch
+    /// of its repository, so it cannot move to another one (HTTP 409).
+    #[error("This intent's evidence is in its repository, so the repository cannot be changed.")]
+    EvidenceInRepo,
+    /// The intent has a fixed dependency, which must stay in its repository
+    /// (HTTP 409).
+    #[error(
+        "This intent depends on another intent in its repository, so the repository cannot be changed."
+    )]
+    FixedDependency,
+    /// The agent's worktree could not be made from the intent's base branch
+    /// (HTTP 409); what git said is not kept.
+    #[error("The intent's base branch could not be checked out.")]
+    BaseBranchFailed,
     #[error(transparent)]
     Service(ServiceError),
     #[error(transparent)]
@@ -154,10 +175,55 @@ impl IntentError {
             IntentError::Invalid(_) => "invalid",
             IntentError::DependencyCycle => "dependency_cycle",
             IntentError::DependencyCrossRepo => "dependency_cross_repo",
+            IntentError::EvidenceInRepo => "evidence_in_repo",
+            IntentError::FixedDependency => "fixed_dependency",
+            IntentError::BaseBranchFailed => "base_branch_failed",
             IntentError::Service(_) => "service_error",
             IntentError::Store(_) => "store_error",
         }
     }
+
+    /// The HTTP status and the code this error is answered with, wherever it
+    /// is answered: a wrapped agent-service error keeps that error's own.
+    pub fn status_and_code(&self) -> (StatusCode, &'static str) {
+        use StatusCode as S;
+        let status = match self {
+            IntentError::Service(inner) => return inner.status_and_code(),
+            IntentError::NotFound | IntentError::RepoNotFound | IntentError::AgentNotFound => {
+                S::NOT_FOUND
+            }
+            IntentError::InvalidState { .. }
+            | IntentError::Polishing
+            | IntentError::AlreadyAnswered
+            | IntentError::DependencyCycle
+            | IntentError::DependencyCrossRepo
+            | IntentError::EvidenceInRepo
+            | IntentError::FixedDependency
+            | IntentError::BaseBranchFailed => S::CONFLICT,
+            IntentError::Invalid(_) => S::BAD_REQUEST,
+            IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
+        };
+        (status, self.code())
+    }
+}
+
+/// What [`IntentService::create_with`] adds to a new intent beyond the
+/// request.
+///
+/// The fixed items are accepted from the start and stay as they are: polish
+/// pass 2 keeps them first ([`crate::polish::apply_pass2`]) and a review
+/// cannot edit or drop them.
+#[derive(Debug, Clone, Default)]
+pub struct CreateExtras {
+    /// The branch the intent's agent starts from.
+    pub base_branch: Option<String>,
+    /// Where a Submit-made intent's files are.
+    pub origin: Option<FeedbackOrigin>,
+    /// Acceptance criteria, in order (an idea package's).
+    pub fixed_criteria: Vec<String>,
+    /// An intent of the same repository this one depends on (an
+    /// implementation intent's idea intent); the item's text is its title.
+    pub fixed_dependency: Option<IntentId>,
 }
 
 /// Exclusive right to mutate one intent; released on drop.
@@ -378,12 +444,29 @@ impl IntentService {
 
     /// Creates a draft from a chat or text seed and starts polish pass 1.
     pub async fn create(&self, req: CreateIntentRequest) -> Result<Intent, IntentError> {
-        let svc = self.clone();
-        detached(async move { svc.create_now(req).await }).await
+        self.create_with(req, CreateExtras::default()).await
     }
 
-    /// Body of [`Self::create`], run detached from the caller.
-    async fn create_now(&self, req: CreateIntentRequest) -> Result<Intent, IntentError> {
+    /// [`Self::create`], with what the daemon's own callers (Submit) add to
+    /// the new intent: its base branch and origin are stored with it, and
+    /// its fixed items are in its content from the first version on. A
+    /// fixed dependency on an intent that does not exist is `Invalid`; on
+    /// one in another repository, `DependencyCrossRepo`.
+    pub async fn create_with(
+        &self,
+        req: CreateIntentRequest,
+        extras: CreateExtras,
+    ) -> Result<Intent, IntentError> {
+        let svc = self.clone();
+        detached(async move { svc.create_now(req, extras).await }).await
+    }
+
+    /// Body of [`Self::create_with`], run detached from the caller.
+    async fn create_now(
+        &self,
+        req: CreateIntentRequest,
+        extras: CreateExtras,
+    ) -> Result<Intent, IntentError> {
         let store = &self.inner.store;
         let (repo_id, seed) = match req.seed {
             SeedInput::Chat {
@@ -447,6 +530,24 @@ impl IntentService {
             .get_repo(repo_id)
             .await?
             .ok_or(IntentError::RepoNotFound)?;
+        let CreateExtras {
+            base_branch,
+            origin,
+            fixed_criteria,
+            fixed_dependency,
+        } = extras;
+        let depends_on = match fixed_dependency {
+            None => vec![],
+            Some(target) => {
+                let other = store.get_intent(target).await?.ok_or_else(|| {
+                    IntentError::Invalid("the intent this one depends on does not exist".into())
+                })?;
+                if other.repo_id != repo_id {
+                    return Err(IntentError::DependencyCrossRepo);
+                }
+                vec![fixed_item(other.content.title, Some(target))]
+            }
+        };
 
         let id = IntentId::new();
         let now = Utc::now();
@@ -456,9 +557,12 @@ impl IntentService {
             current_behavior: String::new(),
             questions: vec![],
             preconditions: vec![],
-            criteria: vec![],
+            criteria: fixed_criteria
+                .into_iter()
+                .map(|text| fixed_item(text, None))
+                .collect(),
             stories: vec![],
-            depends_on: vec![],
+            depends_on,
         };
         let intent = Intent {
             id,
@@ -475,6 +579,8 @@ impl IntentService {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
+            base_branch,
+            origin,
         };
         let first = IntentVersion {
             intent_id: id,
@@ -533,6 +639,17 @@ impl IntentService {
             )));
         }
         let new_repo = patch.repo_id.filter(|r| *r != intent.repo_id);
+        // A fixed dependency (which a move would clear) is on an intent of
+        // this repository; checked first, origin or not.
+        if new_repo.is_some() && intent.content.depends_on.iter().any(|d| d.fixed) {
+            return Err(IntentError::FixedDependency);
+        }
+        // Its agent starts from a branch of this repository that holds its
+        // files: in another repository that branch is not there, or is not
+        // the same.
+        if new_repo.is_some() && intent.origin.is_some() {
+            return Err(IntentError::EvidenceInRepo);
+        }
         if title.is_none()
             && new_repo.is_none()
             && patch.kind.is_none()
@@ -573,7 +690,9 @@ impl IntentService {
     }
 
     /// Accepts, edits or drops one item. Valid in a draft's review phase and
-    /// in a complete intent (a changed decision reopens or keeps it).
+    /// in a complete intent (a changed decision reopens or keeps it). A
+    /// fixed item cannot be edited or dropped (`Invalid`); accepting it
+    /// again changes nothing.
     pub async fn review(
         &self,
         id: IntentId,
@@ -600,6 +719,22 @@ impl IntentService {
         };
         if !open {
             return Err(wrong_state_or_phase(&intent, "the review phase"));
+        }
+        let c = &intent.content;
+        let fixed = c
+            .preconditions
+            .iter()
+            .chain(&c.criteria)
+            .chain(&c.stories)
+            .chain(&c.depends_on)
+            .any(|i| i.id == item_id && i.fixed);
+        if fixed {
+            return match action {
+                ReviewAction::Accept => Ok(intent),
+                ReviewAction::Edit(_) | ReviewAction::Drop => {
+                    Err(IntentError::Invalid(FIXED_ITEM.into()))
+                }
+            };
         }
         let text = match &action {
             ReviewAction::Edit(t) => {
@@ -930,18 +1065,21 @@ impl IntentService {
     }
 
     /// Creates the intent's agent on `intent/<slug>` (or, if that branch
-    /// exists, `intent/<slug>-<6 hex of the id>`) and sends it the brief.
+    /// exists, `intent/<slug>-<6 hex of the id>`) from the intent's base
+    /// branch (else the repository's default branch) and sends it the brief.
     /// An agent whose first message is refused is closed again.
     async fn launch_agent(&self, intent: &Intent) -> Result<AgentId, IntentError> {
+        let base = self.checked_base_branch(intent).await?;
         let brief = brief::compose(intent, &self.dep_summaries(intent).await?);
         let agents = &self.inner.agents;
         let options = |branch: String| CreateAgentOptions {
             branch: Some(branch),
             intent_id: Some(intent.id),
             system_prompt_append: Some(brief.system_append.clone()),
+            base: base.clone(),
         };
         let branch = git::branch_name_for_intent(&intent.slug);
-        let agent = match agents
+        let created = match agents
             .create_agent_with(intent.repo_id, options(branch.clone()))
             .await
         {
@@ -950,15 +1088,59 @@ impl IntentService {
                 let suffixed = format!("{branch}-{}", &hex[..BRANCH_SUFFIX_HEX]);
                 agents
                     .create_agent_with(intent.repo_id, options(suffixed))
-                    .await?
+                    .await
             }
-            other => other?,
+            other => other,
+        };
+        let agent = match created {
+            Ok(agent) => agent,
+            // What git said of a branch the user's repository holds is never
+            // kept: the start error is a fixed sentence, the log a code.
+            Err(ServiceError::Git(_)) if base.is_some() => {
+                let e = IntentError::BaseBranchFailed;
+                tracing::warn!(intent_id = %intent.id, code = e.code(), "the agent's worktree could not be made");
+                return Err(e);
+            }
+            Err(e) => return Err(e.into()),
         };
         if let Err(e) = agents.send_message(agent.id, brief.first_message).await {
             self.discard_agent(agent.id).await;
             return Err(e.into());
         }
         Ok(agent.id)
+    }
+
+    /// The intent's base branch, once it is known to be a valid branch name
+    /// that exists locally; `None` when the intent has none. Checked before
+    /// anything is made, and never replaced by the default branch: a name
+    /// that is not valid, or a branch that is gone, is `Invalid` with a fixed
+    /// sentence. Nothing is fetched, and nothing git prints is kept.
+    async fn checked_base_branch(&self, intent: &Intent) -> Result<Option<String>, IntentError> {
+        let Some(name) = &intent.base_branch else {
+            return Ok(None);
+        };
+        let repo = self
+            .inner
+            .store
+            .get_repo(intent.repo_id)
+            .await?
+            .ok_or(IntentError::RepoNotFound)?;
+        let git_error = |e: GitError| IntentError::from(ServiceError::Git(e));
+        if !git::is_valid_branch_name(&repo.path, name)
+            .await
+            .map_err(git_error)?
+        {
+            return Err(IntentError::Invalid(BASE_BRANCH_INVALID.into()));
+        }
+        if !git::branch_exists(&repo.path, name)
+            .await
+            .map_err(git_error)?
+        {
+            return Err(IntentError::Invalid(format!(
+                "the base branch {name} no longer exists, so the intent cannot start from it"
+            )));
+        }
+        Ok(Some(name.clone()))
     }
 
     /// Title, slug and current behavior of each accepted dependency's target.
@@ -1020,6 +1202,30 @@ impl IntentService {
                 tracing::error!(intent_id = %intent.id, "could not record a start failure: {e}");
             }
         }
+    }
+
+    /// Changes what an idea intent's origin records about its package
+    /// (what "Open pull request" and "Create implementation intent" made)
+    /// under the intent's reservation, then saves and publishes the intent;
+    /// nothing else of it changes. `Invalid` for an intent that is not an
+    /// idea package.
+    pub async fn update_idea(
+        &self,
+        id: IntentId,
+        change: impl FnOnce(&mut IdeaPackage),
+    ) -> Result<Intent, IntentError> {
+        let _reservation = self.reserve(id).await;
+        let mut intent = self.get(id).await?;
+        let idea = intent
+            .origin
+            .as_mut()
+            .and_then(|origin| origin.idea.as_mut())
+            .ok_or_else(|| IntentError::Invalid("this intent is not an idea package".into()))?;
+        change(idea);
+        touch(&mut intent);
+        self.inner.store.save_intent(&intent).await?;
+        self.publish_updated(&intent);
+        Ok(intent)
     }
 
     /// Marks a `Sent` intent `Resolved` (whatever its agent is doing), which
@@ -1194,8 +1400,8 @@ impl IntentService {
         c.stories = polished.stories;
         c.depends_on = polished.depends_on;
         intent.phase = Phase::Review;
-        // Every new item is pending, so this is Complete only when all four
-        // sections came back empty.
+        // Every item the model adds is pending (fixed items are accepted), so
+        // this is Complete only when the model added none.
         intent.state = if intent.is_complete_content() {
             IntentState::Complete
         } else {
@@ -1369,6 +1575,19 @@ async fn load_messages(
     agent_id: AgentId,
 ) -> Result<Vec<smithagents_core::agent::ChatMessage>, StoreError> {
     store.list_messages(agent_id, 0, u32::MAX).await
+}
+
+/// An item the daemon sets (see [`CreateExtras`]): accepted, and kept as it
+/// is by polish and review.
+fn fixed_item(text: String, intent_ref: Option<IntentId>) -> Item {
+    Item {
+        id: ItemId::new(),
+        text,
+        status: ItemStatus::Accepted,
+        edited: false,
+        intent_ref,
+        fixed: true,
+    }
 }
 
 /// The intent's current content as a version by `author`; the store numbers it.

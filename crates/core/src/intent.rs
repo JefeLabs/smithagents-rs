@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::feedback::FeedbackOrigin;
 use crate::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +124,9 @@ pub struct Item {
     pub edited: bool,
     /// Set only on depends-on items.
     pub intent_ref: Option<IntentId>,
+    /// A fixed item is kept first and unchanged by polish pass 2.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -212,6 +216,12 @@ pub struct Intent {
     pub resolved_at: Option<DateTime<Utc>>,
     /// Set by the queue when a start attempt fails, cleared on success.
     pub last_start_error: Option<String>,
+    /// The branch the agent starts from; the repository's default when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Set on an intent created by a feedback submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<FeedbackOrigin>,
 }
 
 impl Intent {
@@ -377,6 +387,7 @@ mod tests {
             status,
             edited: false,
             intent_ref: None,
+            fixed: false,
         }
     }
 
@@ -426,6 +437,8 @@ mod tests {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
+            base_branch: None,
+            origin: None,
         }
     }
 
@@ -628,5 +641,35 @@ mod tests {
             .unwrap(),
             r#"{"queue_limit":3}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_compat_tests {
+    use super::*;
+
+    #[test]
+    fn old_intent_and_item_json_still_load() {
+        let id = IntentId::new();
+        let repo = RepoId::new();
+        let item = ItemId::new();
+        let old = serde_json::json!({
+            "id": id, "repo_id": repo, "slug": "s", "state": "draft",
+            "phase": serde_json::to_value(Phase::Review).unwrap(),
+            "seed": {"source": "text", "text": "t"},
+            "content": {"title": "T", "kind": "bug", "current_behavior": "", "questions": [],
+                "preconditions": [], "stories": [], "depends_on": [],
+                "criteria": [{"id": item, "text": "c", "status": "pending", "edited": false, "intent_ref": null}]},
+            "agent_id": null, "created_at": "2026-11-26T10:00:00Z", "updated_at": "2026-11-26T10:00:00Z",
+            "queued_at": null, "sent_at": null, "resolved_at": null, "last_start_error": null
+        });
+        let got: Intent = serde_json::from_value(old).unwrap();
+        assert_eq!(got.base_branch, None);
+        assert_eq!(got.origin, None);
+        assert!(!got.content.criteria[0].fixed);
+        let back = serde_json::to_value(&got).unwrap();
+        assert!(back.get("base_branch").is_none());
+        assert!(back.get("origin").is_none());
+        assert!(back["content"]["criteria"][0].get("fixed").is_none());
     }
 }

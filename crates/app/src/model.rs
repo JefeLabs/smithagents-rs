@@ -7,6 +7,7 @@ use std::cmp::Reverse;
 
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::event::{Event, EventKind};
+use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::{AgentId, IntentId};
 use smithagents_core::intent::{AgentDefaults, Intent};
 
@@ -51,6 +52,8 @@ pub enum Action {
     IntentUpserted(Intent),
     /// The agent defaults, as loaded at connect or as a change answers them.
     AgentDefaultsLoaded(AgentDefaults),
+    /// The feedback settings, as loaded at connect or as a change answers them.
+    FeedbackSettingsLoaded(FeedbackSettings),
 }
 
 /// Work for the view layer after an action.
@@ -76,6 +79,7 @@ pub struct ShellModel {
     /// An `IntentsLoaded` was applied.
     intents_loaded: bool,
     agent_defaults: Option<AgentDefaults>,
+    feedback_settings: Option<FeedbackSettings>,
     /// Counts the changes to what the shell draws from the model.
     revision: u64,
 }
@@ -144,6 +148,11 @@ impl ShellModel {
     /// The agent defaults, once loaded.
     pub fn agent_defaults(&self) -> Option<&AgentDefaults> {
         self.agent_defaults.as_ref()
+    }
+
+    /// The feedback settings, once loaded.
+    pub fn feedback_settings(&self) -> Option<&FeedbackSettings> {
+        self.feedback_settings.as_ref()
     }
 
     /// Counts the changes to what the shell draws from the model: the agents,
@@ -223,6 +232,11 @@ impl ShellModel {
             Action::AgentDefaultsLoaded(defaults) => {
                 let changed = self.agent_defaults.as_ref() != Some(&defaults);
                 self.agent_defaults = Some(defaults);
+                changed
+            }
+            Action::FeedbackSettingsLoaded(settings) => {
+                let changed = self.feedback_settings.as_ref() != Some(&settings);
+                self.feedback_settings = Some(settings);
                 changed
             }
         };

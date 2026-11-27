@@ -23,7 +23,7 @@ pub use secrets::{
 };
 pub use services::{CallHandle, CallPurpose, HostServices, ServicesError};
 pub use tools::{
-    check_tool, find_tool, install_tool, InstallError, MissingReason, ToolFinder, ToolState,
-    MISE_INSTALL_URL,
+    check_tool, find_tool, install_tool, InstallError, MissingReason, ToolFinder, ToolRun,
+    ToolRunError, ToolState, MISE_INSTALL_URL,
 };
 pub use wasm::{WasmEngine, WasmLimits, WasmRuntime};

@@ -33,6 +33,21 @@ pub(crate) fn clean_message(text: &str) -> String {
     out
 }
 
+/// [`clean_message`]'s cleaning without its byte cap, for user text the
+/// caller bounds by characters itself: every control character, line or
+/// paragraph separator and bidirectional override or isolate as a space.
+pub(crate) fn clean_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || is_separator_or_bidi(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// U+2028 and U+2029, U+202A to U+202E and U+2066 to U+2069.
 fn is_separator_or_bidi(c: char) -> bool {
     matches!(
@@ -41,14 +56,10 @@ fn is_separator_or_bidi(c: char) -> bool {
     )
 }
 
-/// The plugin's state: unreadable stored state, a load failure, unapproved
-/// tools or a stop first
-/// (enabling does not clear them), then disabled, then invalid settings, then
-/// a problem a run met.
-/// Every message goes through [`clean_message`] here as well as where it is
-/// made, so none can reach a response or an event uncapped.
-fn state(plugin: &Managed, live: &Live) -> PluginState {
-    match raw_state(plugin, live) {
+/// `state` with every message through [`clean_message`], here as well as
+/// where it is made, so none can reach a response or an event uncapped.
+fn clean_state(state: PluginState) -> PluginState {
+    match state {
         PluginState::Disabled => PluginState::Disabled,
         PluginState::Ready => PluginState::Ready,
         PluginState::NeedsAuth { missing, message } => PluginState::NeedsAuth {
@@ -78,6 +89,11 @@ fn state(plugin: &Managed, live: &Live) -> PluginState {
     }
 }
 
+/// The plugin's state: unreadable stored state, a load failure, unapproved
+/// tools or a stop first
+/// (enabling does not clear them), then disabled, then invalid settings, then
+/// a problem a run met. A plugin without resources never runs: see
+/// [`status`] for its tools.
 fn raw_state(plugin: &Managed, live: &Live) -> PluginState {
     if plugin.is_unreadable() {
         return PluginState::LoadFailed {
@@ -127,8 +143,13 @@ fn raw_state(plugin: &Managed, live: &Live) -> PluginState {
     }
 }
 
+/// The plugin's status. A plugin with resources checks its tools before a
+/// run, and its state says what the last run found. One without resources
+/// never runs, so when it would otherwise be ready, its tools are checked
+/// here (a check is trusted for 60 s): a missing one makes it `NeedsSetup`,
+/// which is advice and holds nothing back.
 pub(super) async fn status(inner: &Inner, plugin: &Managed) -> PluginStatus {
-    let (enabled, state, resources) = {
+    let (enabled, mut state, resources) = {
         let live = plugin.live();
         let running = live.running.as_ref().map(|r| r.kind.as_str());
         let resources: Vec<_> = live
@@ -142,9 +163,19 @@ pub(super) async fn status(inner: &Inner, plugin: &Managed) -> PluginStatus {
                 )
             })
             .collect();
-        (live.enabled, state(plugin, &live), resources)
+        (live.enabled, raw_state(plugin, &live), resources)
     };
     let manifest = &plugin.manifest;
+    if manifest.resources.is_empty() && state == PluginState::Ready {
+        let missing = tools::missing_tools(inner, plugin).await;
+        if !missing.is_empty() {
+            state = PluginState::NeedsSetup {
+                message: tools::setup_message(&missing),
+                tools: missing,
+            };
+        }
+    }
+    let state = clean_state(state);
     let mut statuses = Vec::with_capacity(resources.len());
     for (decl, (kind, sync, syncing)) in manifest.resources.iter().zip(resources) {
         let item_count = match inner.store.count_items(&plugin.id, &kind).await {

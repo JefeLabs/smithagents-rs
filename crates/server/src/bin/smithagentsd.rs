@@ -21,6 +21,7 @@ use smithagents_core::daemon::DaemonInfo;
 use smithagents_plugin_host::{ConfiguredSecrets, SecretError, SecretSource, WasmEngine};
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
+use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::claude::ClaudeCodeHarness;
 use smithagents_server::intents::IntentService;
 use smithagents_server::lifecycle::{
@@ -29,7 +30,8 @@ use smithagents_server::lifecycle::{
 };
 use smithagents_server::paths::{ensure_private_real_dir, Paths};
 use smithagents_server::plugins::{
-    builtin_plugins_dir, discover, load_runtime, LoadedPlugin, ManagerConfig, PluginManager,
+    builtin_plugins_dir, discover, embedded_first, load_runtime, LoadedPlugin, ManagerConfig,
+    PluginManager,
 };
 use smithagents_server::queue::Scheduler;
 use smithagents_server::service::AgentService;
@@ -222,9 +224,20 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     let scheduler = Scheduler::start(intents.clone(), service.clone(), store.clone(), bus.clone());
     let plugins = start_plugins(paths, &store, &bus).await?;
     let ws_clients = Arc::new(AtomicUsize::new(0));
+    let feedback = FeedbackService::new(
+        store.clone(),
+        intents.clone(),
+        service.clone(),
+        plugins.clone(),
+        paths.clone(),
+    );
+    // Uploads and worktrees of submissions a previous daemon did not finish.
+    // Only one daemon runs per home, and none is served yet.
+    feedback.remove_leftovers().await;
     let state = AppState {
         service: service.clone(),
         intents,
+        feedback,
         bus,
         store,
         plugins: plugins.clone(),
@@ -248,8 +261,11 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
         "listening on 127.0.0.1"
     );
 
+    // A submission whose client went away still runs: the daemon stopping
+    // under it would leave a commit without its record.
+    let running_submissions = state.feedback.clone();
     let idle = IdleMonitor::new(opts.idle_timeout, ws_clients, move || {
-        service.running_agent_count()
+        service.running_agent_count() + running_submissions.running_submissions()
     });
     let stop = async move {
         tokio::select! {
@@ -265,10 +281,13 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     Ok(served?)
 }
 
-/// Finds the plugins, builds a runtime for each and starts the manager. A
-/// plugin that cannot load stays listed with its failure; one that is
-/// rejected is only logged. Logs name directories and fixed reasons, never a
-/// manifest's text, a setting or anything from `secrets.toml`.
+/// Finds the plugins, builds a runtime for each and starts the manager. The
+/// plugins compiled into the daemon come first ([`embedded_first`]):
+/// discovery already refuses a directory with one of their ids, and the
+/// manager would keep the first of two equal ids anyway. A plugin that
+/// cannot load stays listed with its failure; one that is rejected is only
+/// logged. Logs name directories and fixed reasons, never a manifest's text,
+/// a setting or anything from `secrets.toml`.
 async fn start_plugins(
     paths: &Paths,
     store: &Store,
@@ -279,7 +298,7 @@ async fn start_plugins(
         tracing::warn!(dir = %r.dir.display(), reason = %r.reason, "plugin rejected");
     }
     let engine = start_wasm_engine(paths);
-    let mut plugins = Vec::with_capacity(found.len());
+    let mut discovered = Vec::with_capacity(found.len());
     for d in &found {
         // Without an engine only wasm plugins fail (inside `load_runtime`).
         let runtime = load_runtime(d, engine.as_deref())
@@ -288,12 +307,13 @@ async fn start_plugins(
         if let Err(message) = &runtime {
             tracing::warn!(plugin = %d.manifest().id, %message, "plugin failed to load");
         }
-        plugins.push(LoadedPlugin {
+        discovered.push(LoadedPlugin {
             manifest: d.manifest().clone(),
             origin: d.origin(),
             runtime,
         });
     }
+    let plugins = embedded_first(discovered);
     let secrets: Arc<dyn SecretSource> = match ConfiguredSecrets::load(&paths.home) {
         Ok(secrets) => Arc::new(secrets),
         Err(e) => {

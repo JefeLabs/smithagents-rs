@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+pub mod feedback;
+
 use std::path::Path;
 use std::process::Command;
 

@@ -66,6 +66,10 @@ id_type!(
     /// Identifies a precondition, criterion, story or dependency item.
     ItemId
 );
+id_type!(
+    /// Identifies one feedback submission; made by the app.
+    SubmissionId
+);
 
 #[cfg(test)]
 mod tests {

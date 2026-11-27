@@ -6,5 +6,5 @@
 mod api;
 mod ensure;
 
-pub use api::{Client, ClientError, Health};
+pub use api::{Client, ClientError, FeedbackFile, Health};
 pub use ensure::{ensure_daemon, ensure_daemon_with, EnsureError, SpawnOptions};

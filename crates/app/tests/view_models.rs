@@ -911,7 +911,7 @@ mod settings_pane {
             repo("/work/My Project/", "develop"),
             repo("/other/alpha", "main"),
         ];
-        let rows = repo_rows(&repos);
+        let rows = repo_rows(&repos, None);
         let shown: Vec<(&str, &str, &str)> = rows
             .iter()
             .map(|r| (r.name.as_str(), r.path.as_str(), r.default_branch.as_str()))
@@ -929,13 +929,49 @@ mod settings_pane {
         assert_eq!(rows[4].id, repos[1].id);
         let root = repo("/", "main");
         assert_eq!(
-            repo_rows(std::slice::from_ref(&root)),
+            repo_rows(std::slice::from_ref(&root), None),
             [RepoRowVm {
                 id: root.id,
                 name: "/".into(),
                 path: "/".into(),
                 default_branch: "main".into(),
+                is_meta: true,
+                can_set_meta: false,
             }]
+        );
+    }
+
+    #[test]
+    fn repo_rows_mark_the_meta_repository_and_what_can_be_chosen() {
+        let repos = vec![repo("/src/a", "main"), repo("/src/b", "main")];
+        let flags = |settings: Option<&smithagents_core::feedback::FeedbackSettings>| {
+            repo_rows(&repos, settings)
+                .iter()
+                .map(|r| (r.is_meta, r.can_set_meta))
+                .collect::<Vec<_>>()
+        };
+        let stored = |id| smithagents_core::feedback::FeedbackSettings {
+            meta_repo_id: Some(id),
+        };
+        assert_eq!(flags(None), [(false, false), (false, false)]);
+        assert_eq!(
+            flags(Some(&Default::default())),
+            [(false, true), (false, true)]
+        );
+        assert_eq!(
+            flags(Some(&stored(repos[1].id))),
+            [(false, true), (true, false)]
+        );
+        // A stored id whose repository is gone is nothing stored.
+        let gone = stored(smithagents_core::ids::RepoId::new());
+        assert_eq!(flags(Some(&gone)), [(false, true), (false, true)]);
+        let one = &repos[..1];
+        assert_eq!(
+            repo_rows(one, Some(&Default::default()))
+                .iter()
+                .map(|r| (r.is_meta, r.can_set_meta))
+                .collect::<Vec<_>>(),
+            [(true, false)]
         );
     }
 

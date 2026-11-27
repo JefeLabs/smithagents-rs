@@ -14,9 +14,14 @@ use std::time::Duration;
 
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, StreamExt};
-use smithagents_client::{ensure_daemon_with, Client, ClientError, EnsureError, SpawnOptions};
+use smithagents_client::{
+    ensure_daemon_with, Client, ClientError, EnsureError, FeedbackFile, SpawnOptions,
+};
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::daemon::read_lockfile;
+use smithagents_core::feedback::{
+    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets, SubmissionId,
+};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, Patch, ReviewAction,
@@ -169,7 +174,7 @@ pub struct DaemonLink {
 
 impl DaemonLink {
     /// Starts the link thread. The receiver yields what the UI must apply:
-    /// `Snapshot`, `IntentsLoaded`, `AgentDefaultsLoaded`,
+    /// `Snapshot`, `IntentsLoaded`, `AgentDefaultsLoaded`, `FeedbackSettingsLoaded`,
     /// `ConnectionChanged(Connected)`, then daemon events; after a loss
     /// `ConnectionChanged(Reconnecting)` and the same loads again.
     pub fn start(config: LinkConfig) -> (DaemonLink, mpsc::Receiver<Action>) {
@@ -366,6 +371,97 @@ impl DaemonLink {
         })
     }
 
+    /// Stores the feedback settings and tells the UI with
+    /// `Action::FeedbackSettingsLoaded`, like [`DaemonLink::set_agent_defaults`].
+    pub fn set_feedback_settings(
+        &self,
+        settings: FeedbackSettings,
+    ) -> impl Future<Output = Result<FeedbackSettings, LinkError>> + Send + 'static {
+        self.cmd.clone().run(move |c, tx| async move {
+            let stored = c.set_feedback_settings(&settings).await?;
+            let _ = tx
+                .send(Action::FeedbackSettingsLoaded(stored.clone()))
+                .await;
+            Ok(stored)
+        })
+    }
+
+    /// The repositories Submit can choose from and the tools' readiness.
+    pub fn feedback_targets(
+        &self,
+    ) -> impl Future<Output = Result<FeedbackTargets, LinkError>> + Send + 'static {
+        self.cmd
+            .clone()
+            .run(move |c, _| async move { Ok(c.feedback_targets().await?) })
+    }
+
+    /// Sends a submission; an intent it created reaches the UI as
+    /// `Action::IntentUpserted` before the answer does, from the link's
+    /// runtime like [`DaemonLink::add_repo`]'s.
+    pub fn submit_feedback(
+        &self,
+        request: FeedbackRequest,
+        files: Vec<FeedbackFile>,
+    ) -> impl Future<Output = Result<FeedbackOutcome, LinkError>> + Send + 'static {
+        self.feedback_command(move |c| async move { c.submit_feedback(&request, &files).await })
+    }
+
+    /// Runs the steps of a recorded submission that did not succeed; answered
+    /// as [`DaemonLink::submit_feedback`] is.
+    pub fn retry_feedback(
+        &self,
+        id: SubmissionId,
+    ) -> impl Future<Output = Result<FeedbackOutcome, LinkError>> + Send + 'static {
+        self.feedback_command(move |c| async move { c.retry_feedback(id).await })
+    }
+
+    /// An idea intent's "Open pull request" (`public_acknowledged`: the user
+    /// confirmed that a public repository shows the screenshots to anyone);
+    /// the answer reaches the UI as `Action::IntentUpserted` too, as for
+    /// every intent command.
+    pub fn open_pull_request(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(
+            move |c| async move { c.open_pull_request(id, public_acknowledged).await },
+        )
+    }
+
+    /// An idea intent's "Create implementation intent" (`public_acknowledged`
+    /// as for [`Self::open_pull_request`]); the new intent reaches the UI as
+    /// `Action::IntentUpserted` too.
+    pub fn create_implementation_intent(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> impl Future<Output = Result<Intent, LinkError>> + Send + 'static {
+        self.intent_command(move |c| async move {
+            c.create_implementation_intent(id, public_acknowledged)
+                .await
+        })
+    }
+
+    /// Runs one submission or retry; an intent in its outcome reaches the UI
+    /// as `Action::IntentUpserted` first.
+    fn feedback_command<F, Fut>(
+        &self,
+        command: F,
+    ) -> impl Future<Output = Result<FeedbackOutcome, LinkError>> + Send + 'static
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<FeedbackOutcome, ClientError>> + Send + 'static,
+    {
+        self.cmd.clone().run(move |c, tx| async move {
+            let outcome = command(c).await?;
+            if let Some(intent) = &outcome.intent {
+                let _ = tx.send(Action::IntentUpserted(intent.clone())).await;
+            }
+            Ok(outcome)
+        })
+    }
+
     /// Runs one intent command and hands its answer to the UI as
     /// `Action::IntentUpserted` too, from the link's runtime, so the model
     /// has it even when the caller drops the future (the event of the same
@@ -487,6 +583,82 @@ impl IntentCommands for DaemonLink {
         defaults: AgentDefaults,
     ) -> LocalBoxFuture<'static, Result<AgentDefaults, LinkError>> {
         DaemonLink::set_agent_defaults(self, defaults).boxed_local()
+    }
+}
+
+/// The commands the Feedback tool, Settings → Source repositories and an idea
+/// intent's detail send to the daemon. [`DaemonLink`] is the production
+/// implementation; headless tests inject a fake through
+/// `ShellOptions::feedback_commands`. As for [`IntentCommands`], the link
+/// tells the model of each answer itself: the settings, the intent an
+/// outcome carries (`Action::IntentUpserted`, before the outcome is
+/// answered), and the intent an idea action answers with.
+pub trait FeedbackCommands {
+    fn set_feedback_settings(
+        &self,
+        settings: FeedbackSettings,
+    ) -> LocalBoxFuture<'static, Result<FeedbackSettings, LinkError>>;
+    fn feedback_targets(&self) -> LocalBoxFuture<'static, Result<FeedbackTargets, LinkError>>;
+    /// Sends `request` and uploads `files` (each local file as its part).
+    fn submit_feedback(
+        &self,
+        request: FeedbackRequest,
+        files: Vec<FeedbackFile>,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>>;
+    fn retry_feedback(
+        &self,
+        id: SubmissionId,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>>;
+    /// Pushes the idea intent's work as its idea branch and opens a draft
+    /// pull request; `public_acknowledged` once the user confirmed that a
+    /// public repository shows the screenshots to anyone. The link upserts
+    /// the answer.
+    fn open_pull_request(&self, id: IntentId, public_acknowledged: bool) -> IntentAnswer;
+    /// Creates the idea intent's implementation intent (once);
+    /// `public_acknowledged` once the user confirmed that its agent's pull
+    /// request may show the idea's files to anyone. The link upserts the
+    /// answer.
+    fn create_implementation_intent(&self, id: IntentId, public_acknowledged: bool)
+        -> IntentAnswer;
+}
+
+impl FeedbackCommands for DaemonLink {
+    fn set_feedback_settings(
+        &self,
+        settings: FeedbackSettings,
+    ) -> LocalBoxFuture<'static, Result<FeedbackSettings, LinkError>> {
+        DaemonLink::set_feedback_settings(self, settings).boxed_local()
+    }
+
+    fn feedback_targets(&self) -> LocalBoxFuture<'static, Result<FeedbackTargets, LinkError>> {
+        DaemonLink::feedback_targets(self).boxed_local()
+    }
+
+    fn submit_feedback(
+        &self,
+        request: FeedbackRequest,
+        files: Vec<FeedbackFile>,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>> {
+        DaemonLink::submit_feedback(self, request, files).boxed_local()
+    }
+
+    fn retry_feedback(
+        &self,
+        id: SubmissionId,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>> {
+        DaemonLink::retry_feedback(self, id).boxed_local()
+    }
+
+    fn open_pull_request(&self, id: IntentId, public_acknowledged: bool) -> IntentAnswer {
+        DaemonLink::open_pull_request(self, id, public_acknowledged).boxed_local()
+    }
+
+    fn create_implementation_intent(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> IntentAnswer {
+        DaemonLink::create_implementation_intent(self, id, public_acknowledged).boxed_local()
     }
 }
 
@@ -621,10 +793,13 @@ async fn connect_and_forward(
         let agents = client.list_agents(false).await?;
         let intents = client.list_intents(IntentFilter::default()).await?;
         let defaults = client.agent_defaults().await?;
+        let feedback = client.feedback_settings().await?;
         let events = client.events(Some(latest_seq)).await?;
-        Ok::<_, ClientError>((latest_seq, repos, agents, intents, defaults, events))
+        Ok::<_, ClientError>((
+            latest_seq, repos, agents, intents, defaults, feedback, events,
+        ))
     };
-    let (latest_seq, repos, agents, intents, defaults, mut events) =
+    let (latest_seq, repos, agents, intents, defaults, feedback, mut events) =
         match tokio::time::timeout(config.snapshot_timeout, fetch).await {
             Ok(fetched) => fetched.map_err(unreachable)?,
             Err(_) => return Err(unreachable("the daemon did not answer in time")),
@@ -641,6 +816,7 @@ async fn connect_and_forward(
     .await?;
     send(tx, Action::IntentsLoaded(intents)).await?;
     send(tx, Action::AgentDefaultsLoaded(defaults)).await?;
+    send(tx, Action::FeedbackSettingsLoaded(feedback)).await?;
     // Commands work from here on; the UI sees `Connected` after this.
     *lock(&shared.connected) = Some((
         client,

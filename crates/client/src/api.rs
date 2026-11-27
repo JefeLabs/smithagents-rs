@@ -7,10 +7,11 @@
 use std::fmt;
 use std::future::ready;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
+use reqwest::multipart::{Form, Part};
 use reqwest::RequestBuilder;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,9 @@ use serde_json::json;
 use smithagents_core::agent::{Agent, ChatMessage, Repo};
 use smithagents_core::daemon::DaemonInfo;
 use smithagents_core::event::{Event, EventKind};
+use smithagents_core::feedback::{
+    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets, SubmissionId,
+};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentVersion, Patch,
@@ -72,6 +76,18 @@ pub enum ClientError {
     /// The events WebSocket could not be opened.
     #[error("event stream failed: {0}")]
     Ws(#[from] tungstenite::Error),
+    /// A local file to upload could not be opened. Nothing was sent.
+    #[error("could not open a file to upload: {0}")]
+    File(#[source] io::Error),
+}
+
+/// A file of a feedback upload: the local file at `path`, sent as the part
+/// `part` (`file-<i>` or `annotated-<i>`, `i` the attachment's 1-based
+/// position). The local file name is never sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackFile {
+    pub part: String,
+    pub path: PathBuf,
 }
 
 /// A client for one daemon, as described by its lockfile. Cheap to clone.
@@ -302,6 +318,92 @@ impl Client {
                 .json(&defaults),
         )
         .await
+    }
+
+    pub async fn feedback_settings(&self) -> Result<FeedbackSettings, ClientError> {
+        self.fetch(self.http.get(self.url("/v1/settings/feedback")))
+            .await
+    }
+
+    pub async fn set_feedback_settings(
+        &self,
+        settings: &FeedbackSettings,
+    ) -> Result<FeedbackSettings, ClientError> {
+        self.fetch(
+            self.http
+                .put(self.url("/v1/settings/feedback"))
+                .json(settings),
+        )
+        .await
+    }
+
+    /// The repositories Submit can choose from, the meta repository and
+    /// whether `gh` and `agent-browser` are ready.
+    pub async fn feedback_targets(&self) -> Result<FeedbackTargets, ClientError> {
+        self.fetch(self.http.get(self.url("/v1/feedback/targets")))
+            .await
+    }
+
+    /// `POST /v1/feedback`: the part `request` (JSON) first, then each file,
+    /// streamed from disk and named by its part (its own name stays here).
+    /// No timeout: an upload of up to 100 MB and a commit can take long.
+    /// Sending the same request again continues it (see the daemon).
+    pub async fn submit_feedback(
+        &self,
+        request: &FeedbackRequest,
+        files: &[FeedbackFile],
+    ) -> Result<FeedbackOutcome, ClientError> {
+        // Strings, numbers (a NaN is `null`), booleans and lists: nothing to fail.
+        let json = serde_json::to_string(request).expect("a feedback request serializes");
+        let mut form = Form::new().part("request", Part::text(json).mime_str("application/json")?);
+        for file in files {
+            let part = Part::file(&file.path)
+                .await
+                .map_err(ClientError::File)?
+                .file_name(file.part.clone());
+            form = form.part(file.part.clone(), part);
+        }
+        self.fetch(self.http.post(self.url("/v1/feedback")).multipart(form))
+            .await
+    }
+
+    /// `POST /v1/feedback/{id}/retry`: runs the steps of a recorded
+    /// submission that did not succeed (the intent, or the push and the
+    /// issue) and answers as Submit does. No timeout: a push and `gh` can
+    /// take minutes.
+    pub async fn retry_feedback(&self, id: SubmissionId) -> Result<FeedbackOutcome, ClientError> {
+        let url = self.url(&format!("/v1/feedback/{id}/retry"));
+        self.fetch(self.http.post(url)).await
+    }
+
+    /// `POST /v1/intents/{id}/pull-request`: an idea intent's "Open pull
+    /// request" (the push and `gh`), answered with the intent.
+    /// `public_acknowledged`: the user confirmed that a public repository
+    /// shows the screenshots to anyone (the daemon refuses a public or
+    /// possibly public one without it). No timeout: a push and `gh` can take
+    /// minutes.
+    pub async fn open_pull_request(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/pull-request"));
+        let body = json!({ "public_acknowledged": public_acknowledged });
+        self.fetch(self.http.post(url).json(&body)).await
+    }
+
+    /// `POST /v1/intents/{id}/implementation`: an idea intent's "Create
+    /// implementation intent", answered with the new (or the earlier) one.
+    /// `public_acknowledged` as for [`Self::open_pull_request`]: its agent's
+    /// pull request carries the idea's screenshots and explainer.
+    pub async fn create_implementation_intent(
+        &self,
+        id: IntentId,
+        public_acknowledged: bool,
+    ) -> Result<Intent, ClientError> {
+        let url = self.url(&format!("/v1/intents/{id}/implementation"));
+        let body = json!({ "public_acknowledged": public_acknowledged });
+        self.fetch(self.http.post(url).json(&body)).await
     }
 
     /// `/v1/plugins/<segments>?<params>`, each segment percent-encoded, so an

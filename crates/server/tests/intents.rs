@@ -1,6 +1,7 @@
 mod common;
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,6 +11,7 @@ use futures::stream::BoxStream;
 use serde_json::{json, Value};
 use smithagents_core::agent::{Agent, Repo, Role};
 use smithagents_core::event::EventKind;
+use smithagents_core::feedback::FeedbackOrigin;
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     Answer, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentKind, IntentState, Item,
@@ -21,7 +23,7 @@ use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::harness::{
     Harness, HarnessError, HarnessEvent, StructuredRequest, StructuredResult, TurnRequest,
 };
-use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
+use smithagents_server::intents::{CreateExtras, IntentError, IntentService, PolishRunner};
 use smithagents_server::paths::Paths;
 use smithagents_server::polish::MAX_SEED_BYTES;
 use smithagents_server::service::AgentService;
@@ -797,6 +799,7 @@ async fn changing_repo_clears_depends_on() {
         status: ItemStatus::Accepted,
         edited: false,
         intent_ref: Some(IntentId::new()),
+        fixed: false,
     });
     f.store.save_intent(&stored).await.unwrap();
 
@@ -1613,6 +1616,7 @@ async fn pass_two_sees_same_repo_candidates_and_skip_marker() {
         status: ItemStatus::Accepted,
         edited: false,
         intent_ref: Some(t.id),
+        fixed: false,
     });
     f.store.save_intent(&a).await.unwrap();
 
@@ -1853,6 +1857,7 @@ fn item(text: &str, status: ItemStatus) -> Item {
         status,
         edited: false,
         intent_ref: None,
+        fixed: false,
     }
 }
 
@@ -2342,4 +2347,641 @@ async fn a_stored_task_intent_still_loads() {
         f.svc.get(i.id).await.unwrap().content.kind,
         IntentKind::Task
     );
+}
+
+// -------------------------------------------------------------- base branch
+
+/// Why a start fails when the stored base branch is not a usable branch name.
+const BASE_INVALID: &str = "the branch this intent starts from no longer exists";
+const FEEDBACK_X_MISSING: &str =
+    "the base branch feedback/x no longer exists, so the intent cannot start from it";
+
+/// Runs git with a neutral identity and the C locale: its trimmed stdout,
+/// or `None` when it fails.
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_out(cwd: &Path, args: &[&str]) -> String {
+    git_stdout(cwd, args).unwrap_or_else(|| panic!("git {args:?} failed"))
+}
+
+impl Fx {
+    /// A repository whose branch `feedback/x` adds `docs/issues/x/issue.md`
+    /// on top of `main`, as Submit leaves it; `main` stays checked out.
+    async fn feedback_repo(&self) -> (Repo, PathBuf) {
+        let dir = self.tmp.path().join("r1");
+        common::init_repo(&dir);
+        common::git(&dir, &["switch", "-c", "feedback/x"]);
+        std::fs::create_dir_all(dir.join("docs/issues/x")).unwrap();
+        std::fs::write(dir.join("docs/issues/x/issue.md"), "# Fix the zoom\n").unwrap();
+        common::git(&dir, &["add", "--", "docs/issues/x/issue.md"]);
+        common::git(&dir, &["commit", "-m", "docs(issues): Fix the zoom"]);
+        common::git(&dir, &["switch", "main"]);
+        (self.agents.add_repo(&dir).await.unwrap(), dir)
+    }
+
+    /// A text intent created with `base_branch` and `origin` as Submit
+    /// creates it, polished by the fake harness and reviewed to `Complete`.
+    async fn complete_intent(
+        &self,
+        repo: &Repo,
+        base_branch: Option<&str>,
+        origin: Option<FeedbackOrigin>,
+    ) -> Intent {
+        self.h.script(vec![pass1("Fix the zoom", 0), pass2(&[])]);
+        let extras = CreateExtras {
+            base_branch: base_branch.map(Into::into),
+            origin: origin.clone(),
+            ..CreateExtras::default()
+        };
+        let i = self
+            .svc
+            .create_with(
+                CreateIntentRequest {
+                    kind: None,
+                    repo_id: Some(repo.id),
+                    seed: SeedInput::Text("make it faster".into()),
+                },
+                extras,
+            )
+            .await
+            .unwrap();
+        assert_eq!(i.base_branch.as_deref(), base_branch);
+        assert_eq!(i.origin, origin);
+        let r = self.wait_phase(i.id, Phase::Review).await;
+        let c = &r.content;
+        let items: Vec<ItemId> = c
+            .preconditions
+            .iter()
+            .chain(&c.criteria)
+            .chain(&c.stories)
+            .map(|x| x.id)
+            .collect();
+        for item in items {
+            self.svc
+                .review(i.id, item, ReviewAction::Accept)
+                .await
+                .unwrap();
+        }
+        let done = self.svc.get(i.id).await.unwrap();
+        assert_eq!(done.state, IntentState::Complete);
+        // Polish and review kept them.
+        assert_eq!(done.base_branch.as_deref(), base_branch);
+        assert_eq!(done.origin, origin);
+        done
+    }
+
+    async fn first_message(&self, agent: &Agent) -> String {
+        let messages = self.store.list_messages(agent.id, 0, 10).await.unwrap();
+        assert_eq!(messages[0].role, Role::User);
+        messages[0].text.clone()
+    }
+
+    /// No agent, no `intent/*` branch and no worktree exist.
+    async fn assert_nothing_started(&self, dir: &Path) {
+        assert!(self.store.list_agents(true).await.unwrap().is_empty());
+        assert_eq!(git_out(dir, &["branch", "--list", "intent/*"]), "");
+        let worktrees = git_out(dir, &["worktree", "list", "--porcelain"]);
+        assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+        let dirs = std::fs::read_dir(self.paths.worktrees_dir().join("r1"));
+        assert!(dirs.map_or(true, |mut d| d.next().is_none()));
+    }
+}
+
+#[tokio::test]
+async fn send_starts_the_agent_from_the_base_branch() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let feedback_tip = git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]);
+    let origin = FeedbackOrigin {
+        folder: "docs/issues/x".into(),
+        branch: "feedback/x".into(),
+        commit: feedback_tip.clone(),
+        idea: None,
+    };
+    let x = f
+        .complete_intent(&repo, Some("feedback/x"), Some(origin))
+        .await;
+
+    let sent = f.svc.send(x.id).await.unwrap();
+
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.branch, format!("intent/{}", x.slug));
+    assert_eq!(agent.branch, "intent/fix-the-zoom");
+    assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
+    let ancestor = [
+        "merge-base",
+        "--is-ancestor",
+        "refs/heads/feedback/x",
+        &agent.branch,
+    ];
+    assert!(git_stdout(&dir, &ancestor).is_some());
+    // The feedback branch and the user's checkout are left as they were.
+    assert_eq!(
+        git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]),
+        feedback_tip
+    );
+    assert_eq!(git_out(&dir, &["branch", "--show-current"]), "main");
+    // The brief tells the agent where the evidence is.
+    let first = f.first_message(&agent).await;
+    assert!(
+        first.contains("## Evidence\n\nThe feedback files are in `docs/issues/x/` on this branch."),
+        "{first}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_base_branch_is_a_start_error() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+    let tip = git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]);
+    common::git(&dir, &["branch", "-D", "feedback/x"]);
+
+    let err = f.svc.send(x.id).await.unwrap_err();
+
+    assert_eq!(err.code(), "invalid");
+    assert_eq!(err.to_string(), FEEDBACK_X_MISSING);
+    let now = f.svc.get(x.id).await.unwrap();
+    assert_eq!(now.state, IntentState::Complete);
+    assert_eq!(now.agent_id, None);
+    assert_eq!(
+        now.last_start_error.as_deref(),
+        Some("could not start the agent: the base branch feedback/x no longer exists, so the intent cannot start from it")
+    );
+    assert!(!f.versions_of(x.id).await.contains(&VersionAuthor::Send));
+    // No silent start from the default branch.
+    f.assert_nothing_started(&dir).await;
+
+    // With the branch back, the same intent starts from it.
+    common::git(&dir, &["branch", "feedback/x", &tip]);
+    let sent = f.svc.send(x.id).await.unwrap();
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
+}
+
+#[tokio::test]
+async fn an_intent_without_a_base_branch_starts_from_the_default_branch() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, None, None).await;
+
+    let sent = f.svc.send(x.id).await.unwrap();
+
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.branch, "intent/fix-the-zoom");
+    assert!(!agent.worktree_path.join("docs").exists());
+    assert_eq!(
+        git_out(&dir, &["rev-parse", &agent.branch]),
+        git_out(&dir, &["rev-parse", "refs/heads/main"])
+    );
+    assert!(!f.first_message(&agent).await.contains("## Evidence"));
+}
+
+/// Writes each name straight to the store on purpose: it stands for a stored
+/// base branch that went bad after the intent was made (the creation path
+/// stores the branch Submit has just committed), so what is tested is the
+/// check at start, which must hold whatever the row says.
+#[tokio::test]
+async fn an_unusable_base_branch_name_is_refused_and_nothing_starts() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, None, None).await;
+    let refused = [
+        // Refused before git sees the name.
+        "",
+        "-b",
+        "--orphan=x",
+        "feedback x",
+        "feedback/x\n",
+        "feedback\tx",
+        "feedback/x\u{7f}",
+        "\u{1b}[31mfeedback/x",
+        "feedback/x..main",
+        "../feedback/x",
+        "feedback/x@{1}",
+        "@{-1}",
+        "@",
+        "feedback/",
+        "feedback/x.lock",
+        // Refused by `git check-ref-format --branch`. Several of these name
+        // a commit when git reads them as a revision.
+        "feedback/x~1",
+        "feedback/x^",
+        "feedback/x:docs",
+        "feedback/x?",
+        "feedback/*",
+        "feedback/[x",
+        "feedback//x",
+        "/feedback/x",
+        "feedback/.x",
+        "feedback/x.",
+        "feedback\\x",
+    ];
+    let recorded = format!("could not start the agent: {BASE_INVALID}");
+    for name in refused {
+        let mut i = f.svc.get(x.id).await.unwrap();
+        i.base_branch = Some(name.into());
+        f.store.save_intent(&i).await.unwrap();
+
+        let err = f.svc.send(x.id).await.unwrap_err();
+
+        assert_eq!(
+            (err.code(), err.to_string().as_str()),
+            ("invalid", BASE_INVALID),
+            "{name:?}"
+        );
+        let now = f.svc.get(x.id).await.unwrap();
+        assert_eq!(now.state, IntentState::Complete, "{name:?}");
+        assert_eq!(
+            now.last_start_error.as_deref(),
+            Some(recorded.as_str()),
+            "{name:?}"
+        );
+    }
+    f.assert_nothing_started(&dir).await;
+}
+
+#[tokio::test]
+async fn a_base_branch_is_resolved_locally_and_nothing_is_fetched() {
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+    let tip = git_out(&dir, &["rev-parse", "refs/heads/feedback/x"]);
+    // `origin` (a bare repository made here) has the branch; locally only a
+    // tag and a remote-tracking ref of that name are left.
+    let bare = f.tmp.path().join("origin.git");
+    let bare_arg = bare.to_str().unwrap();
+    let dir_arg = dir.to_str().unwrap();
+    common::git(f.tmp.path(), &["clone", "--bare", dir_arg, bare_arg]);
+    common::git(&dir, &["remote", "add", "origin", bare_arg]);
+    common::git(
+        &dir,
+        &["update-ref", "refs/remotes/origin/feedback/x", &tip],
+    );
+    common::git(&dir, &["tag", "feedback/x", &tip]);
+    common::git(&dir, &["branch", "-D", "feedback/x"]);
+
+    let err = f.svc.send(x.id).await.unwrap_err();
+    assert_eq!(err.to_string(), FEEDBACK_X_MISSING);
+    f.assert_nothing_started(&dir).await;
+
+    // Without the remote-tracking ref nothing is fetched to replace it.
+    common::git(
+        &dir,
+        &["update-ref", "-d", "refs/remotes/origin/feedback/x"],
+    );
+    let err = f.svc.send(x.id).await.unwrap_err();
+    assert_eq!(err.to_string(), FEEDBACK_X_MISSING);
+    assert_eq!(git_out(&dir, &["for-each-ref", "refs/remotes"]), "");
+    assert!(!dir.join(".git/FETCH_HEAD").exists());
+    assert_eq!(f.svc.get(x.id).await.unwrap().state, IntentState::Complete);
+    f.assert_nothing_started(&dir).await;
+}
+
+// ------------------------------------------------------------ fixed items
+
+/// What [`IntentService::create_with`] is given for an intent with fixed
+/// items (an idea package's criteria, an implementation intent's
+/// dependency).
+fn fixed_extras(criteria: &[&str], dependency: Option<IntentId>) -> CreateExtras {
+    CreateExtras {
+        fixed_criteria: criteria.iter().map(|c| (*c).to_owned()).collect(),
+        fixed_dependency: dependency,
+        ..CreateExtras::default()
+    }
+}
+
+fn text_request(repo: &Repo) -> CreateIntentRequest {
+    CreateIntentRequest {
+        kind: None,
+        repo_id: Some(repo.id),
+        seed: SeedInput::Text("make it faster".into()),
+    }
+}
+
+#[tokio::test]
+async fn fixed_items_are_accepted_from_the_start_and_kept_by_polish() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    let seeder = f.seeder();
+    let target = seeder.create(text_request(&repo)).await.unwrap();
+    let mut t = f.store.get_intent(target.id).await.unwrap().unwrap();
+    t.content.title = "Prepare the zoom idea".into();
+    f.store.save_intent(&t).await.unwrap();
+    let other = seeder.create(text_request(&repo)).await.unwrap();
+    f.h.script(vec![
+        pass1("Implement the zoom idea", 0),
+        pass2(&[target.id, other.id]),
+    ]);
+
+    let i = f
+        .svc
+        .create_with(
+            text_request(&repo),
+            fixed_extras(&["Fixed one.", "Fixed two."], Some(target.id)),
+        )
+        .await
+        .unwrap();
+
+    let fixed = |text: &str, intent_ref: Option<IntentId>, item: &Item| {
+        assert_eq!(item.text, text);
+        assert_eq!(item.status, ItemStatus::Accepted);
+        assert!(item.fixed && !item.edited);
+        assert_eq!(item.intent_ref, intent_ref);
+    };
+    assert_eq!(i.content.criteria.len(), 2);
+    fixed("Fixed one.", None, &i.content.criteria[0]);
+    fixed("Fixed two.", None, &i.content.criteria[1]);
+    assert_eq!(i.content.depends_on.len(), 1);
+    fixed(
+        "Prepare the zoom idea",
+        Some(target.id),
+        &i.content.depends_on[0],
+    );
+    // The first version holds them too.
+    let versions = f.svc.versions(i.id).await.unwrap();
+    assert_eq!(versions[0].content.criteria, i.content.criteria);
+
+    let r = f.wait_phase(i.id, Phase::Review).await;
+    assert_eq!(r.content.criteria[..2], i.content.criteria[..]);
+    assert_eq!(r.content.criteria.len(), 3);
+    assert_eq!(r.content.criteria[2].status, ItemStatus::Pending);
+    // The model proposed the target again: it is there once, fixed.
+    assert_eq!(r.content.depends_on.len(), 2, "{:?}", r.content.depends_on);
+    assert_eq!(r.content.depends_on[0], i.content.depends_on[0]);
+    assert_eq!(r.content.depends_on[1].intent_ref, Some(other.id));
+    assert_eq!(r.content.depends_on[1].status, ItemStatus::Pending);
+}
+
+#[tokio::test]
+async fn a_fixed_item_cannot_be_edited_or_dropped() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    let target = f.seeder().create(text_request(&repo)).await.unwrap();
+    f.h.script(vec![pass1("Implement it", 0), pass2(&[])]);
+    let i = f
+        .svc
+        .create_with(
+            text_request(&repo),
+            fixed_extras(&["Fixed one."], Some(target.id)),
+        )
+        .await
+        .unwrap();
+    let r = f.wait_phase(i.id, Phase::Review).await;
+    let fixed_items = [r.content.criteria[0].id, r.content.depends_on[0].id];
+
+    for item in fixed_items {
+        for action in [ReviewAction::Drop, ReviewAction::Edit("Other text.".into())] {
+            let err = f.svc.review(i.id, item, action.clone()).await.unwrap_err();
+            assert_eq!(
+                (err.code(), err.to_string().as_str()),
+                (
+                    "invalid",
+                    "this item is fixed: it cannot be edited or dropped"
+                ),
+                "{action:?}"
+            );
+            assert_eq!(f.svc.get(i.id).await.unwrap(), r, "{action:?}");
+        }
+        // Accepting it again changes nothing.
+        let again = f
+            .svc
+            .review(i.id, item, ReviewAction::Accept)
+            .await
+            .unwrap();
+        assert_eq!(again.content, r.content);
+    }
+
+    // The rest is reviewed as usual and completes the intent.
+    let c = &r.content;
+    let rest: Vec<ItemId> = c
+        .preconditions
+        .iter()
+        .chain(&c.criteria[1..])
+        .chain(&c.stories)
+        .map(|x| x.id)
+        .collect();
+    for item in rest {
+        f.svc
+            .review(i.id, item, ReviewAction::Accept)
+            .await
+            .unwrap();
+    }
+    let done = f.svc.get(i.id).await.unwrap();
+    assert_eq!(done.state, IntentState::Complete);
+    assert_eq!(done.content.criteria[0], r.content.criteria[0]);
+    assert_eq!(done.content.depends_on, r.content.depends_on);
+
+    // A PATCH of the other fields leaves them.
+    let patched = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                title: Some("Renamed".into()),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.content.criteria, done.content.criteria);
+    assert_eq!(patched.content.depends_on, done.content.depends_on);
+}
+
+#[tokio::test]
+async fn a_fixed_dependency_must_be_an_intent_of_the_same_repository() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let elsewhere = f.repo("r2").await;
+    let there = f.seeder().create(text_request(&elsewhere)).await.unwrap();
+
+    let err = f
+        .svc
+        .create_with(
+            text_request(&repo),
+            fixed_extras(&[], Some(IntentId::new())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err.code(), err.to_string().as_str()),
+        ("invalid", "the intent this one depends on does not exist")
+    );
+    let err = f
+        .svc
+        .create_with(text_request(&repo), fixed_extras(&[], Some(there.id)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "dependency_cross_repo");
+    let mine = f
+        .svc
+        .list(IntentFilter {
+            state: None,
+            repo_id: Some(repo.id),
+        })
+        .await
+        .unwrap();
+    assert!(mine.is_empty(), "nothing was created");
+    assert!(f.runner.0.lock().unwrap().is_empty(), "no polish started");
+}
+
+#[tokio::test]
+async fn a_fixed_dependency_keeps_the_intent_in_its_repository() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let other = f.repo("r2").await;
+    let target = f.seeder().create(text_request(&repo)).await.unwrap();
+    let i = f
+        .svc
+        .create_with(text_request(&repo), fixed_extras(&[], Some(target.id)))
+        .await
+        .unwrap();
+    f.finish_polish(i.id, IntentState::Draft).await;
+    let before = f.svc.get(i.id).await.unwrap();
+    assert!(before.origin.is_none(), "refused without an origin too");
+    let move_it = || Patch {
+        repo_id: Some(other.id),
+        ..Patch::default()
+    };
+
+    let err = f.svc.update(i.id, move_it()).await.unwrap_err();
+
+    assert_eq!(
+        (err.status_and_code(), err.to_string().as_str()),
+        (
+            (axum::http::StatusCode::CONFLICT, "fixed_dependency"),
+            "This intent depends on another intent in its repository, so the repository cannot be changed."
+        )
+    );
+    assert_eq!(f.svc.get(i.id).await.unwrap(), before, "nothing changed");
+
+    // With an origin as well, the fixed dependency is the reason given.
+    let mut with_origin = before.clone();
+    with_origin.origin = Some(FeedbackOrigin {
+        folder: "docs/issues/x".into(),
+        branch: "feedback/x".into(),
+        commit: "0".repeat(40),
+        idea: None,
+    });
+    f.store.save_intent(&with_origin).await.unwrap();
+    let err = f.svc.update(i.id, move_it()).await.unwrap_err();
+    assert_eq!(err.code(), "fixed_dependency");
+
+    // Its own repository is no change, and the other fields still change.
+    let renamed = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                repo_id: Some(repo.id),
+                title: Some("Renamed".into()),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.content.title, "Renamed");
+    assert_eq!(renamed.content.depends_on, before.content.depends_on);
+}
+
+#[tokio::test]
+async fn a_base_branch_that_cannot_be_checked_out_is_a_fixed_sentence() {
+    // A-M7: git's words (here a path) never reach the start error. Both
+    // worktree directories the start tries are in the way.
+    let f = real_fx().await;
+    let (repo, _dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+    let hex = x.id.0.simple().to_string();
+    for name in [
+        "intent-fix-the-zoom".to_owned(),
+        format!("intent-fix-the-zoom-{}", &hex[..6]),
+    ] {
+        let taken = f.paths.worktrees_dir().join("r1").join(name);
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("LEAK.txt"), "in the way").unwrap();
+    }
+
+    let err = f.svc.send(x.id).await.unwrap_err();
+
+    assert_eq!(err.code(), "base_branch_failed");
+    assert_eq!(
+        err.to_string(),
+        "The intent's base branch could not be checked out."
+    );
+    let now = f.svc.get(x.id).await.unwrap();
+    assert_eq!(now.state, IntentState::Complete);
+    assert_eq!(
+        now.last_start_error.as_deref(),
+        Some("could not start the agent: The intent's base branch could not be checked out.")
+    );
+    assert!(f.store.list_agents(true).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_branch_tracks_nothing_whatever_the_repository_says() {
+    // D-M4: with `branch.autoSetupMerge=always` the agent's bare `git push`
+    // would otherwise go to the local base branch.
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    common::git(&dir, &["config", "branch.autoSetupMerge", "always"]);
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+
+    let sent = f.svc.send(x.id).await.unwrap();
+
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    for key in ["remote", "merge"] {
+        let name = format!("branch.{}.{key}", agent.branch);
+        assert_eq!(
+            git_stdout(&dir, &["config", "--get", &name]),
+            None,
+            "{name}"
+        );
+    }
 }

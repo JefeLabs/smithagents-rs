@@ -19,7 +19,8 @@ use std::path::PathBuf;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::label::Label;
-use gpui_kit::component::{h_flex, v_flex, Disableable as _, Sizable as _};
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, Context, ElementId, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
@@ -27,6 +28,7 @@ use gpui_kit::{
     Window,
 };
 use smithagents_core::agent::Repo;
+use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::RepoId;
 
 use super::{caption, Paint, SentAdd, SettingsPane};
@@ -52,6 +54,14 @@ pub const ADD_REPO_ID: &str = "add-repo";
 /// The path field's accessible name.
 pub const REPO_PATH_LABEL: &str = "Repository path";
 
+/// Element id of the line under the list that says why choosing the meta
+/// repository failed (a status).
+pub const REPO_META_ERROR_ID: &str = "repo-meta-error";
+/// What the tag on the meta repository's row says.
+pub const META_TAG: &str = "Intents and feedback";
+/// The button that makes a repository the meta repository.
+const USE_META_LABEL: &str = "Use for intents and feedback";
+
 pub(super) const PATH_PLACEHOLDER: &str = "/path/to/a/git/repository";
 
 /// Element id of a repository's row.
@@ -59,7 +69,83 @@ pub fn repo_row_id(id: RepoId) -> ElementId {
     ElementId::Name(format!("repo-row-{id}").into())
 }
 
+/// Element id of the tag on the meta repository's row (a [`Tag`] reading
+/// [`META_TAG`]).
+pub fn repo_meta_tag_id(id: RepoId) -> ElementId {
+    ElementId::Name(format!("repo-meta-{id}").into())
+}
+
+/// Element id of a row's "Use for intents and feedback" button.
+pub fn repo_use_meta_id(id: RepoId) -> ElementId {
+    ElementId::Name(format!("repo-use-meta-{id}").into())
+}
+
 impl SettingsPane {
+    /// Sends the choice of `id` as the meta repository. Nothing is
+    /// optimistic: the tag moves when the daemon's answer reaches the model
+    /// (`Action::FeedbackSettingsLoaded`). Does nothing while a choice is in
+    /// flight.
+    fn choose_meta_repo(&mut self, id: RepoId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.meta_command.is_some() {
+            tracing::debug!("a meta repository change is already in flight");
+            return;
+        }
+        let (command, timeout) = {
+            let state = self.state.read(cx);
+            (
+                state.feedback_commands().map(|commands| {
+                    commands.set_feedback_settings(FeedbackSettings {
+                        meta_repo_id: Some(id),
+                    })
+                }),
+                state.command_timeout(),
+            )
+        };
+        let Some(command) = command else {
+            self.meta_error = Some(NOT_CONNECTED_TEXT.to_owned());
+            cx.notify();
+            return;
+        };
+        tracing::debug!(repo = %id, "choosing the meta repository");
+        self.meta_error = None;
+        let timer = cx.background_executor().timer(timeout);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let answer = answered(command, timer).await;
+            let _ = this.update(cx, |this, cx| this.finish_meta_repo(answer, cx));
+        });
+        self.meta_command = Some((id, task));
+        cx.notify();
+    }
+
+    /// `answer` is `None` when the daemon did not answer in time. On success
+    /// the model already holds the stored settings (the link sent them).
+    fn finish_meta_repo(
+        &mut self,
+        answer: Option<Result<FeedbackSettings, LinkError>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.meta_command = None;
+        match answer {
+            None => {
+                tracing::warn!("the daemon did not answer a meta repository change in time");
+                self.meta_error = Some(DAEMON_SILENT_TEXT.to_owned());
+            }
+            Some(Ok(stored)) => tracing::debug!(?stored, "feedback settings stored"),
+            Some(Err(e)) => {
+                tracing::warn!("cannot set the meta repository: {e}");
+                self.meta_error = Some(repo_error_text(&e));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stops waiting for the change in flight (the connection dropped).
+    pub(super) fn give_up_meta_repo(&mut self) {
+        tracing::warn!("the connection dropped while a meta repository change waited");
+        self.meta_command = None;
+        self.meta_error = Some(DAEMON_SILENT_TEXT.to_owned());
+    }
+
     /// Validates the typed path and, if it is acceptable, sends the add.
     pub(super) fn submit_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.adding.is_some() {
@@ -232,8 +318,12 @@ impl SettingsPane {
         paint: &Paint,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let rows = repo_rows(self.state.read(cx).model().repos());
+        let rows = {
+            let model = self.state.read(cx).model();
+            repo_rows(model.repos(), model.feedback_settings())
+        };
         let adding = self.adding.is_some();
+        let choosing = self.meta_command.as_ref().map(|(id, _)| *id);
         v_flex()
             .w_full()
             .gap_3()
@@ -252,8 +342,23 @@ impl SettingsPane {
                     .aria_label("Source repositories")
                     .w_full()
                     .gap_2()
-                    .children(rows.into_iter().map(|row| repo_row(row, paint)))
+                    .children(
+                        rows.into_iter()
+                            .map(|row| repo_row(row, choosing, paint, cx)),
+                    )
                     .into_any_element()
+            })
+            .when_some(self.meta_error.clone(), |this, text| {
+                this.child(
+                    div()
+                        .id(REPO_META_ERROR_ID)
+                        .role(Role::Status)
+                        .test_support()
+                        .aria_label(text.clone())
+                        .text_xs()
+                        .text_color(paint.destructive)
+                        .child(text),
+                )
             })
             .child(
                 v_flex()
@@ -314,8 +419,16 @@ impl SettingsPane {
     }
 }
 
-/// A repository: its name over its full path and default branch.
-fn repo_row(row: RepoRowVm, paint: &Paint) -> impl IntoElement {
+/// A repository: its name over its full path and default branch, with the
+/// meta tag or the button that makes it the meta repository. `choosing` is
+/// the repository whose choice is in flight.
+fn repo_row(
+    row: RepoRowVm,
+    choosing: Option<RepoId>,
+    paint: &Paint,
+    cx: &Context<SettingsPane>,
+) -> impl IntoElement {
+    let id = row.id;
     v_flex()
         .id(repo_row_id(row.id))
         .role(Role::ListItem)
@@ -345,4 +458,30 @@ fn repo_row(row: RepoRowVm, paint: &Paint) -> impl IntoElement {
                 .text_color(paint.muted_foreground)
                 .truncate(),
         )
+        .when(row.is_meta, |this| {
+            this.child(
+                div().child(
+                    Tag::secondary().small().child(
+                        Label::new(META_TAG)
+                            .id(repo_meta_tag_id(id))
+                            .text_color(cx.theme().secondary_foreground),
+                    ),
+                ),
+            )
+        })
+        .when(row.can_set_meta, |this| {
+            this.child(
+                div().child(
+                    Button::new(repo_use_meta_id(id))
+                        .label(USE_META_LABEL)
+                        .outline()
+                        .small()
+                        .loading(choosing == Some(id))
+                        .disabled(choosing.is_some())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_meta_repo(id, window, cx)
+                        })),
+                ),
+            )
+        })
 }

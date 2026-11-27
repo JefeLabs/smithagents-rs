@@ -32,7 +32,6 @@ pub const BROKEN_DRAFT_TEXT: &str =
     "The saved feedback draft could not be read and was set aside. This is a new, empty draft.";
 pub const TOO_MANY_BOXES_TEXT: &str = "A screenshot can have at most 20 boxes.";
 pub const COMMENT_TOO_LONG_TEXT: &str = "A comment can be at most 500 characters.";
-pub const SUBMIT_TOOLTIP: &str = "Submitting arrives with the next update";
 pub const COMMENT_HINT: &str = "Enter saves · Esc drops";
 pub const EMPTY_TEXT: &str =
     "No feedback yet. Hold the Feedback button for 3 seconds, or press Capture.";
@@ -140,7 +139,9 @@ pub fn card_title(number: usize, comments: usize) -> String {
 }
 
 pub fn discard_description(attachments: usize) -> String {
-    if attachments == 1 {
+    if attachments == 0 {
+        "The draft is deleted. This cannot be undone.".to_string()
+    } else if attachments == 1 {
         "1 attachment and its comments are deleted. This cannot be undone.".to_string()
     } else {
         format!("{attachments} attachments and their comments are deleted. This cannot be undone.")
@@ -154,3 +155,164 @@ pub fn annotator_discard_description(comments: usize) -> String {
         format!("Its {comments} comments are deleted.")
     }
 }
+
+// ---- Submit ------------------------------------------------------------------
+
+/// The most characters a main idea may have (the daemon's limit).
+pub const MAIN_IDEA_MAX_CHARS: usize = 20_000;
+
+/// Why "Submit…" is disabled on an empty draft.
+pub const SUBMIT_EMPTY_TOOLTIP: &str = "Add a screenshot or a file first";
+pub const MAIN_IDEA_LABEL: &str = "Main idea";
+pub const MAIN_IDEA_HINT: &str = "The first line is the title.";
+pub const KIND_LABEL: &str = "Kind";
+pub const REPO_LABEL: &str = "Repository";
+pub const SEND_AS_LABEL: &str = "Send it as";
+pub const SEND_AS_INTENT: &str = "An intent to work on now";
+pub const SEND_AS_ISSUE: &str = "A GitHub issue";
+/// The repository button while repositories exist but none is chosen.
+pub const CHOOSE_REPO_TEXT: &str = "Choose a repository";
+pub const BACK_LABEL: &str = "Back";
+pub const CREATE_INTENT_LABEL: &str = "Create intent";
+pub const CREATE_ISSUE_LABEL: &str = "Create issue";
+pub const RETRY_LABEL: &str = "Retry";
+pub const START_OVER_LABEL: &str = "Start over";
+
+/// Why the issue choice is unavailable.
+pub const NO_REMOTE_REASON: &str = "This repository has no GitHub remote.";
+pub const GH_MISSING_REASON: &str = "Install the GitHub CLI (gh) to create issues.";
+pub const GH_SIGNED_OUT_REASON: &str = "Sign in first: gh auth login";
+/// The daemon's reason while the feedback plugin is disabled, failed to load
+/// or was stopped.
+pub const GH_TURNED_OFF: &str = "turned off or not running";
+pub const PLUGIN_OFF_REASON: &str = "The feedback plugin is turned off or not running.";
+
+/// Any other reason the daemon gives for `gh` not being ready.
+pub fn gh_not_ready_reason(reason: &str) -> String {
+    format!("The GitHub CLI (gh) is not ready: {reason}.")
+}
+
+/// The idea package's box under "An intent to work on now", and its parts.
+pub const IDEA_LABEL: &str = "Prepare an idea PR for teammates";
+pub const IDEA_DEMO_LABEL: &str = "Demo video";
+pub const IDEA_DIAGRAMS_LABEL: &str = "Diagrams";
+pub const IDEA_EXPLAINER_LABEL: &str = "Explainer doc";
+/// Under "Demo video": what it needs, or why it cannot be chosen.
+pub const DEMO_HELP: &str = "Only works for projects a browser can show.";
+pub const DEMO_MISSING_REASON: &str = "Install agent-browser to record a demo video.";
+/// The summary while the idea package is ticked with none of its parts.
+pub const IDEA_NEEDS_PART: &str = "Choose at least one part.";
+
+pub const PUBLIC_WARNING: &str =
+    "This repository is public. The screenshots will be visible to anyone.";
+pub const MAYBE_PUBLIC_WARNING: &str =
+    "This repository may be public. The screenshots will be visible to anyone.";
+/// The same for a plain intent: its agent opens a pull request there.
+pub const INTENT_PUBLIC_WARNING: &str =
+    "This repository is public. The agent's pull request will include the screenshots, visible to anyone.";
+pub const INTENT_MAYBE_PUBLIC_WARNING: &str =
+    "This repository may be public. The agent's pull request will include the screenshots, visible to anyone.";
+/// The question asked before every send to a repository that is (or may
+/// be) public; the warning is its description.
+pub const PUBLIC_CONFIRM_TITLE: &str = "Send the screenshots to GitHub?";
+pub const PUBLIC_CONFIRM_CANCEL: &str = "Cancel";
+
+pub fn summary_intent(attachments: &str) -> String {
+    format!(
+        "Creates the issue folder with {attachments} on a new branch, and an intent to review and send."
+    )
+}
+
+pub fn summary_issue(attachments: &str) -> String {
+    format!(
+        "Creates the issue folder with {attachments}, pushes the branch to origin and opens a GitHub issue."
+    )
+}
+
+/// `parts` is already joined ("an explainer doc, diagrams and a demo video").
+pub fn summary_idea(attachments: &str, parts: &str) -> String {
+    format!(
+        "Creates the issue folder with {attachments}. An agent adds {parts} on an idea branch, and you open the pull request."
+    )
+}
+
+pub fn result_intent(title: &str, branch: &str, sha7: &str) -> String {
+    format!("Created the intent “{title}”. Files: {branch} ({sha7}).")
+}
+
+pub fn result_issue(url: &str, branch: &str, sha7: &str) -> String {
+    format!("Created {url}. Files: {branch} ({sha7}).")
+}
+
+/// The result of an issue whose address is not one the app shows (not a
+/// github.com issue address).
+pub fn result_issue_unnamed(branch: &str, sha7: &str) -> String {
+    format!("Created a GitHub issue. Files: {branch} ({sha7}).")
+}
+
+pub fn partial_text(branch: &str, sha7: &str, message: &str) -> String {
+    format!("The files are committed on {branch} ({sha7}), but: {message}")
+}
+
+pub const NOTHING_CREATED_TEXT: &str = "Nothing was created. Submit again.";
+
+/// Instead of [`NOTHING_CREATED_TEXT`] when the daemon has no record of a
+/// submission whose draft names its commit: that commit is still there.
+pub fn no_record_text(branch: &str, sha7: &str) -> String {
+    format!(
+        "The daemon has no record of this submission. Its files are still committed on {branch} ({sha7}). Submit again to send it as a new one."
+    )
+}
+
+/// An idea intent's actions in its detail, and the question "Open pull
+/// request…" asks first (the public-repository warning is part of it).
+pub const OPEN_PR_LABEL: &str = "Open pull request…";
+pub const PR_TITLE: &str = "Open a pull request?";
+pub const PR_DESCRIPTION: &str = "Pushes the idea branch to origin and opens a draft pull request. If the repository is public, the screenshots will be visible to anyone.";
+pub const OPEN_PR_CONFIRM_LABEL: &str = "Open pull request";
+/// "Create implementation intent…" and the question it asks first.
+pub const IMPLEMENT_LABEL: &str = "Create implementation intent…";
+pub const IMPLEMENT_TITLE: &str = "Create an implementation intent?";
+pub const IMPLEMENT_DESCRIPTION: &str = "Creates an intent to build this idea. Its agent's pull request will include the idea's screenshots and explainer. If the repository is public, they will be visible to anyone.";
+pub const IMPLEMENT_CONFIRM_LABEL: &str = "Create implementation intent";
+/// The tooltip of the button that copies the pull request's address.
+pub const COPY_LINK_LABEL: &str = "Copy link";
+pub const REPO_GONE_TEXT: &str = "That repository no longer exists.";
+pub const LINK_STOPPED_TEXT: &str = "The daemon link has stopped";
+/// "Start over"'s tooltip.
+pub const START_OVER_TOOLTIP: &str = "Keep the screenshots and text, and send as a new submission.";
+/// What Start over asks first while the daemon may still be making the
+/// submission (it took the request and did not answer).
+pub const START_OVER_TITLE: &str = "Start over?";
+pub const START_OVER_RISK_TEXT: &str =
+    "The daemon may still be finishing this submission. Starting over can create it twice.";
+pub const START_OVER_CANCEL: &str = "Cancel";
+pub const ISSUE_UNCONFIRMED_TEXT: &str =
+    "GitHub has not confirmed whether the issue was created. Try again in a minute.";
+/// A change to the draft while its submission is sent or under way.
+pub const SUBMISSION_LOCKED_TEXT: &str =
+    "This feedback was sent or is being sent. Retry or start over in Submit before changing it.";
+/// The Submit screen of a draft locked with no answer to show (a quit or a
+/// crash while it was sent, or an answer the app could not use).
+pub const MAY_HAVE_BEEN_SENT_TEXT: &str = "This feedback may already have been sent. Press Retry to find out, or Start over to send it as a new submission.";
+/// Added to Discard's question while something may exist under the draft's
+/// submission.
+pub const DISCARD_PENDING_TEXT: &str = "A submission of this draft may still be in progress. Discarding deletes the screenshots here; anything already sent stays.";
+/// Why a press of Create or Retry sent nothing.
+pub const DRAFT_BUSY_TEXT: &str = "The draft is still being changed. Try again when it is done.";
+pub const SUBMIT_BUSY_TEXT: &str = "A submission is already under way.";
+pub const DRAFT_NOT_READY_TEXT: &str = "The draft is not ready to send yet. Try again in a moment.";
+pub const MAIN_IDEA_TOO_LONG_TEXT: &str = "The main idea can be at most 20,000 characters.";
+pub const UPLOAD_TOO_LARGE_TEXT: &str =
+    "The attachments cannot be sent: together they are larger than 100 MB.";
+
+/// Why attachment `number` (1-based) cannot be sent; `reason` ends with a
+/// full stop.
+pub fn attachment_refused_text(number: usize, reason: &str) -> String {
+    format!("Attachment {number} cannot be sent: {reason}")
+}
+
+pub const TOO_MANY_BOXES_REASON: &str = "a screenshot can have at most 20 boxes.";
+pub const COMMENT_TOO_LONG_REASON: &str = "a comment can be at most 500 characters.";
+pub const IMAGE_TOO_LARGE_REASON: &str = "an image can be at most 10 MB.";
+pub const VIDEO_TOO_LARGE_REASON: &str = "a video can be at most 50 MB.";

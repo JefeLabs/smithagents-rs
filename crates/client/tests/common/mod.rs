@@ -164,8 +164,9 @@ pub fn pid_alive(pid: u32) -> bool {
     !matches!(test_kill_process(pid), Err(Errno::SRCH))
 }
 
-/// Runs git with a fixed identity and C locale, panicking on failure; returns
-/// its trimmed stdout.
+/// Runs git with a fixed identity and C locale, and no hook (the machine
+/// user's global hooks never run on a test's own commits), panicking on
+/// failure; returns its trimmed stdout.
 pub fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args([
@@ -175,6 +176,8 @@ pub fn git(cwd: &Path, args: &[&str]) -> String {
             "user.email=test@example.com",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
         ])
         .args(args)
         .current_dir(cwd)
@@ -197,4 +200,68 @@ pub fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "-b", "main"]);
     git(dir, &["commit", "--allow-empty", "-m", "init"]);
+}
+
+/// The `origin` of [`github_repo_with_local_origin`]: a GitHub address that
+/// names nobody's repository.
+pub const GITHUB_REMOTE: &str = "https://github.com/smithagents-test-invalid/widgets.git";
+
+/// The fake `gh` and `agent-browser` of `crates/server/tests/bin`, copied to
+/// `<scratch>/bin/{gh,agent-browser}` (mode 0755, in a directory of mode
+/// 0755), and the fake `gh`'s control directory `<scratch>/gh` (what
+/// `FAKE_GH_DIR` names: its logs and control files). Returns both.
+pub fn fake_tools(scratch: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (bin, dir) = (scratch.join("bin"), scratch.join("gh"));
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let fakes = workspace_root().join("crates/server/tests/bin");
+    for (source, name) in [("fake-gh", "gh"), ("fake-agent-browser", "agent-browser")] {
+        let to = bin.join(name);
+        std::fs::copy(fakes.join(source), &to).unwrap();
+        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (bin, dir)
+}
+
+/// `<scratch>/repo`: [`init_repo`] with a neutral identity of its own, whose
+/// `origin` is [`GITHUB_REMOTE`], which the repository's own
+/// `url.<bare>.insteadOf` sends to the bare repository `<scratch>/origin.git`.
+/// It is left as a fetch would leave it: `main` is on the bare repository
+/// and `refs/remotes/origin/main` points at it. Nothing reaches the network:
+/// the bare repository is pushed to by its path, with no hook. Returns the
+/// repository and the bare one.
+pub fn github_repo_with_local_origin(scratch: &Path) -> (PathBuf, PathBuf) {
+    let (repo, bare) = (scratch.join("repo"), scratch.join("origin.git"));
+    init_repo(&repo);
+    git(&repo, &["config", "user.name", "Test User"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    let bare_path = bare.to_str().unwrap();
+    git(scratch, &["init", "-q", "--bare", "-b", "main", bare_path]);
+    git(&repo, &["remote", "add", "origin", GITHUB_REMOTE]);
+    git(
+        &repo,
+        &[
+            "config",
+            &format!("url.{bare_path}.insteadOf"),
+            GITHUB_REMOTE,
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "push",
+            "-q",
+            "--no-verify",
+            bare_path,
+            "refs/heads/main:refs/heads/main",
+        ],
+    );
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/origin/main", "refs/heads/main"],
+    );
+    (repo, bare)
 }
