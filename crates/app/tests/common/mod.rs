@@ -3,6 +3,7 @@
 //! [`ui`] for the headless shell tests and [`intents`] for the intent tests.
 #![allow(dead_code)]
 
+pub mod feedback;
 pub mod intents;
 pub mod ui;
 

@@ -42,7 +42,7 @@ Exact sentences (constants in `crates/app/src/feedback/text.rs`; `{}` is filled 
 
 | Constant | Text |
 |---|---|
-| `PERMISSION_TEXT` | `SmithAgents needs Screen Recording permission to capture its window. Allow it in System Settings → Privacy & Security → Screen Recording, then try again.` |
+| `PERMISSION_TEXT` | `SmithAgents needs Screen Recording permission to capture its window. Allow it in System Settings → Privacy & Security → Screen Recording, then quit and reopen SmithAgents.` |
 | `WINDOW_NOT_FOUND_TEXT` | `Could not find the SmithAgents window to capture. Try again.` |
 | `UNSUPPORTED_TEXT` | `Capturing the window is not supported on this system. You can still add files.` |
 | `capture_failed_text(m)` | `Could not capture the window: {m}.` |
@@ -672,7 +672,12 @@ Not checked by anyone in this plan: Windows and Linux. The app crate is unix-onl
 - **Replacing xcap's deprecated macOS backend** with ScreenCaptureKit behind the same `Capturer` trait, and deciding then whether capturing our own window needs the permission at all (Apple says an app may record its own windows; this plan refuses without it, to be safe).
 - A monitor-crop fallback when the window is not in the list; matching on more than size when several of our windows have the same size.
 - Remembering whether the help row is expanded; a keyboard way to start a capture from anywhere (today: the pane's Capture button).
-- Windows and Linux: an `atomic_file` that is not unix-only, and a build check of xcap there.
+- Windows and Linux: an `atomic_file` that is not unix-only, and a build check of xcap there. Capture on Linux and Windows has never been built or run (xcap's own table says window capture does not work under Wayland).
+- A real `CenterTabHost` (native web views) would draw above the annotator overlay: the overlay must hide or cover the native views when one exists.
+- The window cannot be moved while annotating (the overlay covers the title bar).
+- Boxes cannot be drawn from the keyboard (badges can be reached and edited; a new box needs the pointer).
+- A screenshot whose PNG is over 10 MB is refused: measure the size on a 5K display, and retry with stronger compression before refusing.
+- The screenshot write and every draft save fsync on the UI thread; move them off it if a large write stutters.
 
 ## Self-review
 

@@ -18,12 +18,16 @@ smithagents-core = { path = "../core" }
 chrono.workspace = true
 futures.workspace = true
 smithagents-client = { path = "../client" }
+# Feedback: the annotated screenshot is drawn and encoded with `image`; `Screenshot` comes from the capture crate.
+image.workspace = true
+smithagents-capture = { path = "../capture" }
 smithagents-theme = { path = "../theme" }
 smithagents-center-host = { path = "../center-host" }
 # The window handle the center tab host attaches to (`CenterTabHost::attach`).
 raw-window-handle.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

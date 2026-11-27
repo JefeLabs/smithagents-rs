@@ -59,3 +59,21 @@ wit-bindgen = { version = "=0.63.0", default-features = false, features = ["macr
 # exactly: host and plugins must agree on stabby's type reports.
 stabby = "=72.1.16"
 libloading = "0.9"
+# Window capture for feedback (crates/capture). Pinned exactly: its platform
+# capture code changes between releases; upgrade on purpose.
+xcap = "=0.9.10"
+# Already in the lock through GPUI (and re-exported by xcap); only the formats
+# feedback reads and writes.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+# Image work (decoding, drawing the annotated PNG, thumbnails, encoding) is
+# unusably slow unoptimized: these few packages are built optimized in debug
+# builds too. Only the optimization level changes, never a version.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3

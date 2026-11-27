@@ -10,6 +10,7 @@ pub mod app_state;
 pub mod appearance;
 pub mod assets;
 mod atomic_file;
+pub mod feedback;
 pub mod intent_vm;
 pub mod layout_store;
 pub mod link;
@@ -23,15 +24,20 @@ pub mod update;
 pub mod view_models;
 pub mod views;
 
+use std::sync::Arc;
+
 use gpui_kit::component::TitleBar;
 use gpui_kit::{
     px, size, App, AppContext as _, Bounds, DisplayId, QuitMode, TitlebarOptions, WindowBounds,
     WindowOptions,
 };
+use smithagents_capture::XcapCapturer;
 use smithagents_center_host::CenterTabHost;
 
 use crate::app_state::AppStateStore;
 use crate::assets::AppAssets;
+use crate::feedback::draft::DraftStore;
+use crate::feedback::state::{native_file_picker, FeedbackOptions};
 use crate::layout_store::{restored_window_bounds, LayoutStore, MIN_WINDOW_SIZE};
 use crate::link::LinkConfig;
 use crate::model::ShellModel;
@@ -45,7 +51,8 @@ pub const WINDOW_TITLE: &str = "SmithAgents";
 /// Runs the app until it quits; never returns.
 ///
 /// `link` says where the daemon's home is (the app keeps its own files,
-/// such as `app-layout.json`, there too) and how to start the daemon.
+/// such as `app-layout.json` and the feedback draft, there too) and how to
+/// start the daemon.
 /// `tab_host` builds the web engine for the chat tabs
 /// ([`tabs::PlaceholderHost`] until a real one lands); it runs once the GPUI
 /// app exists, as the main window opens. The engine's
@@ -100,6 +107,7 @@ fn open_main_window(
     let layout = LayoutStore::new(&link.home);
     let app_state = AppStateStore::new(&link.home);
     let settings = AppSettingsStore::new(&link.home);
+    let draft_store = DraftStore::new(&link.home);
     // The saved place, on its display if that display is still attached.
     let placed = layout.load_window().and_then(|saved| {
         let display = cx
@@ -138,6 +146,15 @@ fn open_main_window(
                     link_failure: None,
                     intent_commands: None,
                     clock: None,
+                    // The only place the real capturer and the system's file
+                    // dialog are made: tests bring fakes.
+                    feedback: Some(FeedbackOptions {
+                        store: Some(draft_store),
+                        capturer: Some(Arc::new(XcapCapturer::new())),
+                        picker: Some(native_file_picker()),
+                        frame_hop: None,
+                        picture_timeout: None,
+                    }),
                 },
                 window,
                 cx,

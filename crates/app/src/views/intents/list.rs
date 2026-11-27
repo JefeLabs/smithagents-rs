@@ -28,6 +28,7 @@ use super::{
 };
 use crate::intent_vm::{intent_cards, list_empty_text, IntentCardVm, IntentFilterChoice};
 use crate::views::agents::status_dot;
+use crate::views::pane_heading;
 
 /// The filter button's tooltip and accessible name.
 const FILTER_LABEL: &str = "Filter";
@@ -114,19 +115,9 @@ impl IntentsPane {
             .pr_1()
             .py_2()
             .child(
-                div()
-                    .id(INTENTS_TITLE_ID)
-                    // A node needs an id and a role to reach assistive
-                    // technology.
-                    .role(Role::Heading)
-                    .test_support()
-                    .aria_label(TITLE)
+                pane_heading(INTENTS_TITLE_ID, TITLE, paint.foreground)
                     .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(paint.foreground)
-                    .child(TITLE),
+                    .truncate(),
             )
             .child(
                 h_flex()
