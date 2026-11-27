@@ -41,7 +41,8 @@ use smithagents_app::view_models::{DAEMON_UNREACHABLE_TEXT, NOT_CONNECTED_TEXT};
 use smithagents_app::views::feedback::{
     card_id, card_remove_id, submit_kind_id, submit_repo_item_id, FeedbackPane, FeedbackScreen,
     DISCARD_CONFIRM_ID, FEEDBACK_ADD_FILES_ID, FEEDBACK_CAPTURE_ID, FEEDBACK_DISCARD_ID,
-    FEEDBACK_RESULT_ID, FEEDBACK_SUBMIT_ID, PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID, PUBLIC_WARNING_ID,
+    FEEDBACK_RESULT_ID, FEEDBACK_SUBMIT_ID, IDEA_CHECK_ID, IDEA_DEMO_HELP_ID, IDEA_DEMO_ID,
+    IDEA_DIAGRAMS_ID, IDEA_EXPLAINER_ID, PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID, PUBLIC_WARNING_ID,
     SEND_INTENT_ID, SEND_ISSUE_ID, SEND_ISSUE_REASON_ID, START_OVER_CANCEL_ID,
     START_OVER_CONFIRM_ID, SUBMIT_BACK_ID, SUBMIT_CONFIRM_ID, SUBMIT_ERROR_ID, SUBMIT_IDEA_HINT_ID,
     SUBMIT_IDEA_ID, SUBMIT_IDEA_LABEL_ID, SUBMIT_REPO_ID, SUBMIT_RETRY_ID, SUBMIT_START_OVER_ID,
@@ -53,7 +54,7 @@ use smithagents_client::ClientError;
 use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{
     AttachmentKind, FeedbackFailure, FeedbackKind, FeedbackSettings, FeedbackStep, FeedbackTargets,
-    SendAs, ToolReadiness,
+    IdeaOptions, SendAs, ToolReadiness,
 };
 use smithagents_core::ids::RepoId;
 use smithagents_core::intent::{Intent, IntentState, Phase};
@@ -1477,6 +1478,7 @@ fn a_capture_or_a_file_landing_while_locked_is_refused(cx: &mut TestAppContext) 
             SentTo {
                 repo_id: alpha,
                 send_as: SendAs::Intent,
+                idea: None,
             },
             cx,
         );
@@ -1585,4 +1587,322 @@ fn escape_and_back_return_the_focus(cx: &mut TestAppContext) {
     click(cx, window, SUBMIT_BACK_ID);
     assert_eq!(screen(cx, &opened), FeedbackScreen::Draft);
     assert!(submit_focused(cx));
+}
+
+// ---- The idea package -------------------------------------------------------
+
+/// The three parts' boxes, in the order the screen shows them.
+const IDEA_PARTS: [&str; 3] = [IDEA_DEMO_ID, IDEA_DIAGRAMS_ID, IDEA_EXPLAINER_ID];
+
+/// Like [`ready_to_send`], with alpha on GitHub (private), `gh` ready and
+/// `agent-browser` ready or not.
+fn ready_for_an_idea(
+    cx: &mut TestAppContext,
+    setup: &FeedbackSetup,
+    repos: &[Repo],
+    agent_browser: bool,
+) -> Opened {
+    let opened = open(cx, setup, repos, Some(repos[0].id));
+    screenshot(cx, &opened, setup, &["the toolbar"]);
+    let list: Vec<_> = repos.iter().map(|r| (r.id, true, Some(false))).collect();
+    open_submit(cx, &opened, targets(&list, true, agent_browser));
+    type_idea(cx, opened.window, "Fix the zoom");
+    opened
+}
+
+fn parts(explainer: bool, diagrams: bool, demo_video: bool) -> IdeaOptions {
+    IdeaOptions {
+        explainer,
+        diagrams,
+        demo_video,
+    }
+}
+
+/// Which of the four boxes are checked: the parent, then the parts.
+fn ticks(cx: &mut TestAppContext, window: WindowHandle<Root>) -> [bool; 4] {
+    [
+        checked(cx, window, IDEA_CHECK_ID),
+        checked(cx, window, IDEA_DEMO_ID),
+        checked(cx, window, IDEA_DIAGRAMS_ID),
+        checked(cx, window, IDEA_EXPLAINER_ID),
+    ]
+}
+
+#[gpui_kit::test]
+fn the_idea_boxes_appear_under_the_intent_choice(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_for_an_idea(cx, &setup, &repos, true);
+    let window = opened.window;
+
+    with_window(cx, window, |window, _| {
+        let parent = window.find(IDEA_CHECK_ID);
+        assert_eq!(parent.role(), Some(Role::CheckBox));
+        assert_eq!(parent.label(), Some("Prepare an idea PR for teammates"));
+        assert_eq!(parent.checked(), Some(false));
+        assert_ne!(parent.disabled(), Some(true));
+    });
+    for id in IDEA_PARTS {
+        assert!(!drawn(cx, window, id), "{id}");
+    }
+
+    click(cx, window, IDEA_CHECK_ID);
+    for (id, label) in IDEA_PARTS
+        .into_iter()
+        .zip(["Demo video", "Diagrams", "Explainer doc"])
+    {
+        assert_eq!(text_of(cx, window, id).as_deref(), Some(label));
+        with_window(cx, window, |window, _| {
+            assert_eq!(window.find(id).role(), Some(Role::CheckBox));
+        });
+    }
+    // Ticking the parent ticks "Explainer doc".
+    assert_eq!(ticks(cx, window), [true, false, false, true]);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_SUMMARY_ID).as_deref(),
+        Some("Creates the issue folder with 1 screenshot. An agent adds an explainer doc on an idea branch, and you open the pull request.")
+    );
+    // The parts sit under the parent, which sits under the intent choice.
+    with_window(cx, window, |window, _| {
+        let left = |id: &'static str| window.find(id).bounds().origin.x;
+        assert!(left(IDEA_EXPLAINER_ID) > left(IDEA_CHECK_ID));
+        assert!(left(IDEA_CHECK_ID) > left(SEND_INTENT_ID));
+        let top = |id: &'static str| window.find(id).bounds().origin.y;
+        assert!(top(SEND_INTENT_ID) < top(IDEA_CHECK_ID));
+        assert!(top(IDEA_CHECK_ID) < top(IDEA_DEMO_ID));
+        assert!(top(IDEA_EXPLAINER_ID) < top(SEND_ISSUE_ID));
+    });
+
+    // Choosing "A GitHub issue" hides all four; back on the intent, the
+    // parent is there again.
+    click(cx, window, SEND_ISSUE_ID);
+    assert!(!drawn(cx, window, IDEA_CHECK_ID));
+    for id in IDEA_PARTS {
+        assert!(!drawn(cx, window, id), "{id}");
+    }
+    assert_eq!(
+        text_of(cx, window, SUBMIT_CONFIRM_ID).as_deref(),
+        Some("Create issue")
+    );
+    click(cx, window, SEND_INTENT_ID);
+    assert_eq!(ticks(cx, window), [true, false, false, true]);
+
+    // Unticking the parent hides the parts again.
+    click(cx, window, IDEA_CHECK_ID);
+    assert!(!checked(cx, window, IDEA_CHECK_ID));
+    assert!(!drawn(cx, window, IDEA_EXPLAINER_ID));
+
+    // Nothing is remembered when the screen opens again, nor in the draft.
+    click(cx, window, IDEA_CHECK_ID);
+    click(cx, window, IDEA_DIAGRAMS_ID);
+    click(cx, window, SUBMIT_BACK_ID);
+    let list: Vec<_> = repos.iter().map(|r| (r.id, true, Some(false))).collect();
+    open_submit(cx, &opened, targets(&list, true, true));
+    assert!(!checked(cx, window, IDEA_CHECK_ID));
+    assert!(!drawn(cx, window, IDEA_DIAGRAMS_ID));
+    let draft = fs::read_to_string(setup.draft_dir().join("draft.json")).unwrap();
+    assert!(!draft.contains("diagrams"), "{draft}");
+}
+
+#[gpui_kit::test]
+fn demo_video_needs_agent_browser(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_for_an_idea(cx, &setup, &repos, false);
+    let window = opened.window;
+    click(cx, window, IDEA_CHECK_ID);
+
+    assert!(disabled(cx, window, IDEA_DEMO_ID));
+    assert!(!disabled(cx, window, IDEA_DIAGRAMS_ID));
+    assert!(!disabled(cx, window, IDEA_EXPLAINER_ID));
+    assert_eq!(
+        text_of(cx, window, IDEA_DEMO_HELP_ID).as_deref(),
+        Some("Install agent-browser to record a demo video.")
+    );
+    click(cx, window, IDEA_DEMO_ID);
+    assert!(!checked(cx, window, IDEA_DEMO_ID), "a disabled box stays");
+
+    // Ready: enabled, and the help says what it needs.
+    click(cx, window, SUBMIT_BACK_ID);
+    let list: Vec<_> = repos.iter().map(|r| (r.id, true, Some(false))).collect();
+    open_submit(cx, &opened, targets(&list, true, true));
+    click(cx, window, IDEA_CHECK_ID);
+    assert!(!disabled(cx, window, IDEA_DEMO_ID));
+    assert_eq!(
+        text_of(cx, window, IDEA_DEMO_HELP_ID).as_deref(),
+        Some("Only works for projects a browser can show.")
+    );
+    click(cx, window, IDEA_DEMO_ID);
+    assert!(checked(cx, window, IDEA_DEMO_ID));
+
+    // While the targets load, it is disabled with no sentence.
+    click(cx, window, SUBMIT_BACK_ID);
+    click(cx, window, FEEDBACK_SUBMIT_ID);
+    click(cx, window, IDEA_CHECK_ID);
+    assert!(disabled(cx, window, IDEA_DEMO_ID));
+    assert!(!drawn(cx, window, IDEA_DEMO_HELP_ID));
+}
+
+#[gpui_kit::test]
+fn an_idea_request_carries_the_ticked_parts(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_for_an_idea(cx, &setup, &repos, true);
+    let window = opened.window;
+
+    click(cx, window, IDEA_CHECK_ID);
+    click(cx, window, IDEA_DIAGRAMS_ID);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_CONFIRM_ID).as_deref(),
+        Some("Create intent")
+    );
+    click(cx, window, SUBMIT_CONFIRM_ID);
+
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 1);
+    let request = &submits[0].0;
+    assert_eq!(request.send_as, SendAs::Intent);
+    assert_eq!(request.idea, Some(parts(true, true, false)));
+    assert_eq!(request.repo_id, repos[0].id);
+    // Every box waits with the rest of the screen.
+    for id in [
+        IDEA_CHECK_ID,
+        IDEA_DEMO_ID,
+        IDEA_DIAGRAMS_ID,
+        IDEA_EXPLAINER_ID,
+    ] {
+        assert!(disabled(cx, window, id), "{id}");
+    }
+
+    // Without the parent ticked, no idea goes.
+    let other = FeedbackSetup::new();
+    let opened = ready_for_an_idea(cx, &other, &repos, true);
+    click(cx, opened.window, SUBMIT_CONFIRM_ID);
+    assert_eq!(opened.fake.submits()[0].0.idea, None);
+}
+
+#[gpui_kit::test]
+fn no_part_means_no_confirm(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_for_an_idea(cx, &setup, &repos, true);
+    let window = opened.window;
+    click(cx, window, IDEA_CHECK_ID);
+
+    click(cx, window, IDEA_EXPLAINER_ID);
+
+    assert_eq!(ticks(cx, window), [true, false, false, false]);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_SUMMARY_ID).as_deref(),
+        Some("Choose at least one part.")
+    );
+    assert!(disabled(cx, window, SUBMIT_CONFIRM_ID));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(opened.fake.submits().is_empty());
+
+    click(cx, window, IDEA_DIAGRAMS_ID);
+    assert!(!disabled(cx, window, SUBMIT_CONFIRM_ID));
+}
+
+#[gpui_kit::test]
+fn the_idea_boxes_are_part_of_the_locked_draft(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_for_an_idea(cx, &setup, &repos, true);
+    let window = opened.window;
+    click(cx, window, IDEA_CHECK_ID);
+    click(cx, window, IDEA_DIAGRAMS_ID);
+    // A 5xx: something may exist under the id.
+    opened
+        .fake
+        .queue_outcome(Err(api(500, "store_error", "the store could not save")));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+
+    assert!(cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert_eq!(ticks(cx, window), [true, false, true, true]);
+    for id in [
+        IDEA_CHECK_ID,
+        IDEA_DEMO_ID,
+        IDEA_DIAGRAMS_ID,
+        IDEA_EXPLAINER_ID,
+    ] {
+        assert!(disabled(cx, window, id), "{id}");
+    }
+    click(cx, window, IDEA_DIAGRAMS_ID);
+    assert!(checked(cx, window, IDEA_DIAGRAMS_ID), "it stays as sent");
+    let json = fs::read_to_string(setup.draft_dir().join("submission.json")).unwrap();
+    assert!(json.contains("\"diagrams\": true"), "{json}");
+    close(cx, opened);
+
+    // After a restart the screen shows what was sent, and the request that
+    // goes again (the daemon has no record of it) is the same.
+    let opened = open(cx, &setup, &repos, Some(repos[0].id));
+    let window = opened.window;
+    let list: Vec<_> = repos.iter().map(|r| (r.id, true, Some(false))).collect();
+    open_submit(cx, &opened, targets(&list, true, true));
+    assert_eq!(ticks(cx, window), [true, false, true, true]);
+    assert!(disabled(cx, window, IDEA_CHECK_ID));
+    assert_eq!(
+        text_of(cx, window, SUBMIT_SUMMARY_ID).as_deref(),
+        Some("Creates the issue folder with 1 screenshot. An agent adds an explainer doc and diagrams on an idea branch, and you open the pull request.")
+    );
+    opened
+        .fake
+        .queue_outcome(Err(api(404, "submission_not_found", "no such submission")));
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.retries(), [id]);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 1);
+    assert_eq!(submits[0].0.submission_id, id);
+    assert_eq!(submits[0].0.idea, Some(parts(true, true, false)));
+
+    // Start over keeps the boxes as they were sent, and they can change.
+    opened
+        .fake
+        .answer_outcome(Err(api(500, "store_error", "the store could not save")));
+    frame(cx, window);
+    click(cx, window, SUBMIT_START_OVER_ID);
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert_eq!(ticks(cx, window), [true, false, true, true]);
+    assert!(!disabled(cx, window, IDEA_DIAGRAMS_ID));
+    click(cx, window, IDEA_DIAGRAMS_ID);
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_ne!(submits[1].0.submission_id, id);
+    assert_eq!(submits[1].0.idea, Some(parts(true, false, false)));
+}
+
+#[gpui_kit::test]
+fn a_refused_idea_keeps_its_boxes_editable(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_for_an_idea(cx, &setup, &repos, true);
+    let window = opened.window;
+    click(cx, window, IDEA_CHECK_ID);
+    click(cx, window, IDEA_DEMO_ID);
+    // The daemon's agent-browser went away meanwhile: refused before
+    // anything was made.
+    opened.fake.queue_outcome(Err(api(
+        409,
+        "tool_missing",
+        "agent-browser is not installed",
+    )));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some("Agent-browser is not installed")
+    );
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert_eq!(ticks(cx, window), [true, true, false, true]);
+    assert!(!disabled(cx, window, IDEA_DEMO_ID));
+    click(cx, window, IDEA_DEMO_ID);
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_eq!(submits[1].0.submission_id, id, "the same id");
+    assert_eq!(submits[1].0.idea, Some(parts(true, false, false)));
 }

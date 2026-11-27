@@ -1,4 +1,5 @@
 pub mod github;
+pub mod idea;
 pub mod issue;
 pub mod repo;
 pub mod upload;
@@ -550,17 +551,17 @@ impl FeedbackService {
         }
     }
 
-    /// Commits the staged submission's issue folder on a new branch, then
-    /// creates the intent, or pushes the branch and creates the GitHub
-    /// issue. A submission already recorded under this id is continued
-    /// instead (its uploads are not used): only a step that has not
-    /// succeeded runs again. So is one whose commit is on a branch without
-    /// its record (the daemon stopped in between): that commit is recorded,
-    /// not made again. A record that cannot be stored takes its new branch
-    /// back. An issue submission is refused before anything is written when
-    /// `origin` is not on github.com or `gh` is not ready. A failure of a
-    /// step after the commit is in the answer's `failed`, not an error, and
-    /// undoes nothing.
+    /// Commits the staged submission's issue folder on a new branch
+    /// (`idea/<slug>` for an idea package), then creates the intent, or
+    /// pushes the branch and creates the GitHub issue. A submission already
+    /// recorded under this id is continued instead (its uploads are not
+    /// used): only a step that has not succeeded runs again. So is one whose
+    /// commit is on a branch without its record (the daemon stopped in
+    /// between): that commit is recorded, not made again. A record that
+    /// cannot be stored takes its new branch back. An issue submission is
+    /// refused before anything is written when `origin` is not on github.com
+    /// or `gh` is not ready. A failure of a step after the commit is in the
+    /// answer's `failed`, not an error, and undoes nothing.
     pub async fn submit(&self, staged: Staged) -> Result<FeedbackOutcome, FeedbackError> {
         let _running = Running::start(&self.parts.running);
         let id = staged.request.submission_id;
@@ -638,11 +639,12 @@ impl FeedbackService {
 
         let created = (self.clock)();
         let files = folder_files(&staged, created)?;
+        // An idea package goes on `idea/<slug>`.
         let (placement, commit) = place_and_commit(
             &repo,
             &staged.title,
             created.date_naive(),
-            false,
+            request.idea.is_some(),
             &files,
             id,
             staged.dir.path(),
@@ -810,7 +812,9 @@ impl FeedbackService {
     }
 
     /// An intent of the submission's kind, seeded from its text and the
-    /// folder's whereabouts, starting from its branch.
+    /// folder's whereabouts, starting from its branch. For an idea package,
+    /// an idea intent: its origin records the parts asked for, and its
+    /// criteria are fixed ([`idea::fixed_criteria`]).
     async fn create_intent(&self, s: &Submission) -> Result<Intent, IntentError> {
         #[cfg(feature = "test-util")]
         if let Some(e) = self.faults().intent.take() {
@@ -843,9 +847,10 @@ impl FeedbackService {
                 folder: s.folder.clone(),
                 branch: s.branch.clone(),
                 commit: s.commit.clone(),
-                idea: None,
+                idea: request.idea.map(idea::package),
             }),
-            ..CreateExtras::default()
+            fixed_criteria: request.idea.map(idea::fixed_criteria).unwrap_or_default(),
+            fixed_dependency: None,
         };
         self.parts.intents.create_with(req, extras).await
     }

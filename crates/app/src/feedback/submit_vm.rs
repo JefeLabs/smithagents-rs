@@ -19,12 +19,13 @@ use super::draft::{AttachmentKind, Draft};
 use super::text::{
     attachment_refused_text, gh_not_ready_reason, partial_text, result_intent, result_issue,
     result_issue_unnamed, summary_idea, summary_intent, summary_issue, COMMENT_TOO_LONG_REASON,
-    CREATE_INTENT_LABEL, CREATE_ISSUE_LABEL, DRAFT_FULL_TEXT, GH_MISSING_REASON,
-    GH_SIGNED_OUT_REASON, GH_TURNED_OFF, IMAGE_TOO_LARGE_REASON, ISSUE_UNCONFIRMED_TEXT,
-    LINK_STOPPED_TEXT, MAIN_IDEA_MAX_CHARS, MAIN_IDEA_TOO_LONG_TEXT, MAX_ATTACHMENTS, MAX_BOXES,
-    MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES, MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING,
-    NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PLUGIN_OFF_REASON, PUBLIC_WARNING, REPO_GONE_TEXT,
-    TOO_MANY_BOXES_REASON, UPLOAD_TOO_LARGE_TEXT, VIDEO_TOO_LARGE_REASON,
+    CREATE_INTENT_LABEL, CREATE_ISSUE_LABEL, DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT,
+    GH_MISSING_REASON, GH_SIGNED_OUT_REASON, GH_TURNED_OFF, IDEA_NEEDS_PART,
+    IMAGE_TOO_LARGE_REASON, ISSUE_UNCONFIRMED_TEXT, LINK_STOPPED_TEXT, MAIN_IDEA_MAX_CHARS,
+    MAIN_IDEA_TOO_LONG_TEXT, MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES,
+    MAX_TOTAL_BYTES, MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON,
+    PLUGIN_OFF_REASON, PUBLIC_WARNING, REPO_GONE_TEXT, TOO_MANY_BOXES_REASON,
+    UPLOAD_TOO_LARGE_TEXT, VIDEO_TOO_LARGE_REASON,
 };
 use crate::link::LinkError;
 use crate::view_models::{
@@ -44,9 +45,11 @@ pub const KINDS: [FeedbackKind; 3] = [
 /// kept. It mirrors `FeedbackError::code` and `FeedbackError::status` in
 /// `crates/server/src/feedback/mod.rs` and where each is raised before a
 /// record or a commit exists: `upload::check_request` and `upload::stage`
-/// (`invalid`, `unsupported_file`, `payload_too_large`),
+/// (`invalid`, `unsupported_file`, `payload_too_large`; `invalid` also for
+/// an idea package with no part or sent as an issue),
 /// `FeedbackService::require_github` (`no_github_remote`, `gh_not_ready`),
-/// `FeedbackService::require_tool` (`tool_missing`) and
+/// `FeedbackService::require_tool` (`tool_missing`, also an idea package's
+/// demo video without `agent-browser`) and
 /// `repo::place_and_commit` (`default_branch_missing`,
 /// `git_identity_missing`, `no_free_name`, `name_taken`, `folder_blocked`,
 /// `branch_blocked`). They count only as a 4xx answer: the daemon sends
@@ -186,6 +189,29 @@ pub fn public_warning(send_as: SendAs, target: Option<&FeedbackTarget>) -> Optio
     }
 }
 
+/// The parts ticking "Prepare an idea PR for teammates" starts with: the
+/// explainer doc.
+pub const IDEA_START: IdeaOptions = IdeaOptions {
+    explainer: true,
+    diagrams: false,
+    demo_video: false,
+};
+
+/// Whether an idea package has any part.
+fn has_part(idea: IdeaOptions) -> bool {
+    idea.explainer || idea.diagrams || idea.demo_video
+}
+
+/// What "Demo video" says under it: what it needs while `agent-browser` is
+/// ready, else how to get it.
+pub fn demo_help(agent_browser_ready: bool) -> &'static str {
+    if agent_browser_ready {
+        DEMO_HELP
+    } else {
+        DEMO_MISSING_REASON
+    }
+}
+
 /// The idea package's parts as a phrase: "an explainer doc, diagrams and a
 /// demo video".
 fn idea_parts(idea: IdeaOptions) -> String {
@@ -204,10 +230,12 @@ fn idea_parts(idea: IdeaOptions) -> String {
     }
 }
 
-/// What Create will do, in one sentence.
+/// What Create will do, in one sentence; for an idea package with no part,
+/// that one is needed.
 pub fn summary(send_as: SendAs, idea: Option<IdeaOptions>, draft: &Draft) -> String {
     let attachments = attachments_phrase(draft);
     match (send_as, idea) {
+        (SendAs::Intent, Some(idea)) if !has_part(idea) => IDEA_NEEDS_PART.to_owned(),
         (SendAs::Intent, Some(idea)) => summary_idea(&attachments, &idea_parts(idea)),
         (SendAs::Intent, None) => summary_intent(&attachments),
         (SendAs::GithubIssue, _) => summary_issue(&attachments),
@@ -242,9 +270,7 @@ pub fn can_confirm(
     issue_reason: Option<&str>,
     idea: Option<IdeaOptions>,
 ) -> bool {
-    let idea_ok = idea.is_none_or(|idea| {
-        send_as == SendAs::Intent && (idea.explainer || idea.diagrams || idea.demo_video)
-    });
+    let idea_ok = idea.is_none_or(|idea| send_as == SendAs::Intent && has_part(idea));
     !main_idea.trim().is_empty()
         && repo.is_some()
         && !(send_as == SendAs::GithubIssue && issue_reason.is_some())

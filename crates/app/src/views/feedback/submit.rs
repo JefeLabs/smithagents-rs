@@ -28,6 +28,10 @@
 //!
 //! Escape and "Back" go back to the draft (not while a command is under way),
 //! and the focus returns to where it was when the screen opened.
+//!
+//! The idea package's boxes, under the intent's radio, are in [`idea`].
+
+mod idea;
 
 use std::borrow::Cow;
 use std::fs;
@@ -51,7 +55,7 @@ use gpui_kit::{
 use smithagents_client::{ClientError, FeedbackFile};
 use smithagents_core::feedback::{
     effective_meta_repo, FeedbackKind, FeedbackOutcome, FeedbackRequest, FeedbackTarget,
-    FeedbackTargets, SendAs, SubmissionId,
+    FeedbackTargets, IdeaOptions, SendAs, SubmissionId,
 };
 use smithagents_core::ids::RepoId;
 
@@ -76,6 +80,10 @@ use crate::view_models::{
 };
 use crate::views::answered;
 use crate::views::rail::RailEntry;
+
+pub use idea::{
+    IDEA_CHECK_ID, IDEA_DEMO_HELP_ID, IDEA_DEMO_ID, IDEA_DIAGRAMS_ID, IDEA_EXPLAINER_ID,
+};
 
 /// Key context of the Submit screen (on the pane while it shows the
 /// screen), for Escape.
@@ -150,6 +158,9 @@ pub(super) struct Submit {
     /// The repository picked in the menu.
     picked_repo: Option<RepoId>,
     send_as: SendAs,
+    /// The idea package's parts as ticked; `None` while "Prepare an idea PR
+    /// for teammates" is not.
+    package: Option<IdeaOptions>,
     /// The screen's error line.
     error: Option<String>,
     /// The last send's sentence and the submission it is about: shown again
@@ -171,6 +182,7 @@ impl Submit {
             targets_task: None,
             picked_repo: None,
             send_as: SendAs::Intent,
+            package: None,
             error: None,
             answer: None,
             busy: None,
@@ -287,6 +299,7 @@ impl FeedbackPane {
             });
         submit.picked_repo = None;
         submit.send_as = SendAs::Intent;
+        submit.package = None;
         submit.targets = None;
         let timer = cx
             .background_executor()
@@ -449,8 +462,9 @@ impl FeedbackPane {
         let repo = self.chosen_repo(cx);
         let send_as = self.chosen_send_as(repo, cx);
         let reason = self.issue_reason(repo);
+        let idea = self.chosen_idea(send_as, cx);
         let main_idea = self.feedback.read(cx).draft().main_idea.clone();
-        if !can_confirm(&main_idea, repo, send_as, reason.as_deref(), None) {
+        if !can_confirm(&main_idea, repo, send_as, reason.as_deref(), idea) {
             return;
         }
         let Some(repo) = repo else {
@@ -460,6 +474,7 @@ impl FeedbackPane {
             SentTo {
                 repo_id: repo,
                 send_as,
+                idea,
             },
             Attempt::Submit,
             window,
@@ -532,6 +547,7 @@ impl FeedbackPane {
         if let Some(sent) = self.sent_to(cx) {
             self.submit.picked_repo = Some(sent.repo_id);
             self.submit.send_as = sent.send_as;
+            self.submit.package = sent.idea;
         }
         self.submit.answer = None;
         self.feedback
@@ -643,7 +659,7 @@ impl FeedbackPane {
                     kind,
                     repo_id: to.repo_id,
                     send_as: to.send_as,
-                    idea: None,
+                    idea: to.idea,
                     app_version: smithagents_core::VERSION.to_owned(),
                     platform: std::env::consts::OS.to_owned(),
                     attachments,
@@ -806,6 +822,7 @@ impl FeedbackPane {
             .update(cx, |feedback, cx| feedback.finish_submission(result, cx));
         self.submit.picked_repo = None;
         self.submit.send_as = SendAs::Intent;
+        self.submit.package = None;
         self.close_submit(window, cx);
         if let Some(intent) = outcome.intent.filter(|_| showing) {
             self.state
@@ -831,6 +848,7 @@ impl FeedbackPane {
         let repo = self.chosen_repo(cx);
         let send_as = self.chosen_send_as(repo, cx);
         let reason = self.issue_reason(repo);
+        let idea = self.chosen_idea(send_as, cx);
         let issue_disabled = frozen || self.submit.targets.is_none() || reason.is_some();
         let warning = public_warning(send_as, self.target(repo));
         let cards = cards(self.feedback.read(cx));
@@ -876,7 +894,7 @@ impl FeedbackPane {
                         cx,
                     ))
                     .child(
-                        Label::new(summary(send_as, None, &draft))
+                        Label::new(summary(send_as, idea, &draft))
                             .id(SUBMIT_SUMMARY_ID)
                             .text_xs()
                             .text_color(paint.muted_foreground),
@@ -1012,7 +1030,8 @@ impl FeedbackPane {
             .child(h_flex().min_w_0().child(button))
     }
 
-    /// "Send it as": two radios, and why the issue cannot be chosen.
+    /// "Send it as": two radios, the idea package's boxes under the intent's
+    /// while it is chosen, and why the issue cannot be chosen.
     fn send_as_row(
         &self,
         send_as: SendAs,
@@ -1038,6 +1057,9 @@ impl FeedbackPane {
                         }
                     })),
             )
+            .when(send_as == SendAs::Intent, |this| {
+                this.child(self.idea_boxes(self.chosen_idea(send_as, cx), frozen, paint, cx))
+            })
             .child(
                 Radio::new(SEND_ISSUE_ID)
                     .label(SEND_AS_ISSUE)
@@ -1130,7 +1152,13 @@ impl FeedbackPane {
         let enabled = busy.is_none()
             && !working
             && ready
-            && can_confirm(&main_idea, repo, send_as, reason, None);
+            && can_confirm(
+                &main_idea,
+                repo,
+                send_as,
+                reason,
+                self.chosen_idea(send_as, cx),
+            );
         row.child(
             Button::new(SUBMIT_CONFIRM_ID)
                 .label(confirm_label(send_as))

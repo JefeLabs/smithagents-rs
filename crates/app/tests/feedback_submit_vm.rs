@@ -10,13 +10,15 @@ use common::feedback_submit::{outcome_with_intent, outcome_with_issue};
 use common::intents::{intent, FakeIntents};
 use smithagents_app::feedback::draft::{Attachment, AttachmentId, AttachmentKind, Draft};
 use smithagents_app::feedback::submit_vm::{
-    attachments_phrase, can_confirm, confirm_label, issue_reason, public_warning, result_text,
-    send_failure, starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
+    attachments_phrase, can_confirm, confirm_label, demo_help, issue_reason, public_warning,
+    result_text, send_failure, starting_repo, submit_error_text, summary, upload_problem,
+    SendFailure, KINDS,
 };
 use smithagents_app::feedback::text::{
-    DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON, LINK_STOPPED_TEXT,
-    MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PUBLIC_WARNING, REPO_GONE_TEXT,
-    START_OVER_RISK_TEXT, START_OVER_TOOLTIP,
+    DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON,
+    IDEA_DEMO_LABEL, IDEA_DIAGRAMS_LABEL, IDEA_EXPLAINER_LABEL, IDEA_LABEL, IDEA_NEEDS_PART,
+    LINK_STOPPED_TEXT, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON,
+    PUBLIC_WARNING, REPO_GONE_TEXT, START_OVER_RISK_TEXT, START_OVER_TOOLTIP,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::view_models::{
@@ -228,6 +230,74 @@ fn summaries() {
     assert_eq!(
         summary(SendAs::Intent, Some(idea), &one),
         "Creates the issue folder with 1 screenshot. An agent adds an explainer doc, diagrams and a demo video on an idea branch, and you open the pull request."
+    );
+}
+
+fn parts(explainer: bool, diagrams: bool, demo_video: bool) -> IdeaOptions {
+    IdeaOptions {
+        explainer,
+        diagrams,
+        demo_video,
+    }
+}
+
+#[test]
+fn idea_summaries() {
+    let one = draft_of(&[AttachmentKind::Screenshot]);
+    assert_eq!(
+        summary(SendAs::Intent, Some(parts(true, false, true)), &one),
+        "Creates the issue folder with 1 screenshot. An agent adds an explainer doc and a demo video on an idea branch, and you open the pull request."
+    );
+    assert!(summary(SendAs::Intent, Some(parts(true, true, true)), &one)
+        .contains("An agent adds an explainer doc, diagrams and a demo video on"),);
+    assert!(
+        summary(SendAs::Intent, Some(parts(false, true, false)), &one)
+            .contains("An agent adds diagrams on an idea branch")
+    );
+    assert_eq!(
+        summary(SendAs::Intent, Some(parts(false, false, false)), &one),
+        IDEA_NEEDS_PART
+    );
+    assert_eq!(IDEA_NEEDS_PART, "Choose at least one part.");
+
+    let repo = Some(RepoId::new());
+    assert!(!can_confirm(
+        "Fix the zoom",
+        repo,
+        SendAs::Intent,
+        None,
+        Some(parts(false, false, false))
+    ));
+    assert!(can_confirm(
+        "Fix the zoom",
+        repo,
+        SendAs::Intent,
+        None,
+        Some(parts(false, true, false))
+    ));
+    // An idea package is only ever an intent.
+    assert!(!can_confirm(
+        "Fix the zoom",
+        repo,
+        SendAs::GithubIssue,
+        None,
+        Some(parts(true, false, false))
+    ));
+}
+
+#[test]
+fn the_idea_sentences() {
+    assert_eq!(IDEA_LABEL, "Prepare an idea PR for teammates");
+    assert_eq!(
+        [IDEA_DEMO_LABEL, IDEA_DIAGRAMS_LABEL, IDEA_EXPLAINER_LABEL],
+        ["Demo video", "Diagrams", "Explainer doc"]
+    );
+    assert_eq!(demo_help(true), DEMO_HELP);
+    assert_eq!(demo_help(false), DEMO_MISSING_REASON);
+    assert_eq!(DEMO_HELP, "Only works for projects a browser can show.");
+    assert_eq!(
+        DEMO_MISSING_REASON,
+        "Install agent-browser to record a demo video."
     );
 }
 

@@ -52,8 +52,8 @@ use smithagents_core::feedback::FeedbackOrigin;
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     slugify, AgentDefaults, Answer, AnswerInput, Content, CreateIntentRequest, Intent,
-    IntentFilter, IntentKind, IntentState, IntentVersion, ItemStatus, Patch, Phase, ReviewAction,
-    Seed, SeedInput, SeedSource, VersionAuthor,
+    IntentFilter, IntentKind, IntentState, IntentVersion, Item, ItemStatus, Patch, Phase,
+    ReviewAction, Seed, SeedInput, SeedSource, VersionAuthor,
 };
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard};
@@ -96,6 +96,8 @@ const SLUG_SAVE_ATTEMPTS: usize = 8;
 /// Attempts at recording a polish failure before leaving it to `recover`.
 const FAIL_ATTEMPTS: u32 = 3;
 const RESTART_MESSAGE: &str = "polish was interrupted by a daemon restart; retry";
+/// Why a fixed item cannot be reviewed away.
+const FIXED_ITEM: &str = "this item is fixed: it cannot be edited or dropped";
 
 /// Starts a polish pass for an intent in the background. Without one set,
 /// the service runs passes itself (see [`IntentService::set_polish_runner`]).
@@ -192,15 +194,21 @@ impl IntentError {
 }
 
 /// What [`IntentService::create_with`] adds to a new intent beyond the
-/// request. `fixed_criteria` and `fixed_dependency` are for the idea package
-/// and are not read before it exists.
+/// request.
+///
+/// The fixed items are accepted from the start and stay as they are: polish
+/// pass 2 keeps them first ([`crate::polish::apply_pass2`]) and a review
+/// cannot edit or drop them.
 #[derive(Debug, Clone, Default)]
 pub struct CreateExtras {
     /// The branch the intent's agent starts from.
     pub base_branch: Option<String>,
     /// Where a Submit-made intent's files are.
     pub origin: Option<FeedbackOrigin>,
+    /// Acceptance criteria, in order (an idea package's).
     pub fixed_criteria: Vec<String>,
+    /// An intent of the same repository this one depends on (an
+    /// implementation intent's idea intent); the item's text is its title.
     pub fixed_dependency: Option<IntentId>,
 }
 
@@ -426,7 +434,10 @@ impl IntentService {
     }
 
     /// [`Self::create`], with what the daemon's own callers (Submit) add to
-    /// the new intent: its base branch and origin are stored with it.
+    /// the new intent: its base branch and origin are stored with it, and
+    /// its fixed items are in its content from the first version on. A
+    /// fixed dependency on an intent that does not exist is `Invalid`; on
+    /// one in another repository, `DependencyCrossRepo`.
     pub async fn create_with(
         &self,
         req: CreateIntentRequest,
@@ -505,6 +516,24 @@ impl IntentService {
             .get_repo(repo_id)
             .await?
             .ok_or(IntentError::RepoNotFound)?;
+        let CreateExtras {
+            base_branch,
+            origin,
+            fixed_criteria,
+            fixed_dependency,
+        } = extras;
+        let depends_on = match fixed_dependency {
+            None => vec![],
+            Some(target) => {
+                let other = store.get_intent(target).await?.ok_or_else(|| {
+                    IntentError::Invalid("the intent this one depends on does not exist".into())
+                })?;
+                if other.repo_id != repo_id {
+                    return Err(IntentError::DependencyCrossRepo);
+                }
+                vec![fixed_item(other.content.title, Some(target))]
+            }
+        };
 
         let id = IntentId::new();
         let now = Utc::now();
@@ -514,9 +543,12 @@ impl IntentService {
             current_behavior: String::new(),
             questions: vec![],
             preconditions: vec![],
-            criteria: vec![],
+            criteria: fixed_criteria
+                .into_iter()
+                .map(|text| fixed_item(text, None))
+                .collect(),
             stories: vec![],
-            depends_on: vec![],
+            depends_on,
         };
         let intent = Intent {
             id,
@@ -533,8 +565,8 @@ impl IntentService {
             sent_at: None,
             resolved_at: None,
             last_start_error: None,
-            base_branch: extras.base_branch,
-            origin: extras.origin,
+            base_branch,
+            origin,
         };
         let first = IntentVersion {
             intent_id: id,
@@ -639,7 +671,9 @@ impl IntentService {
     }
 
     /// Accepts, edits or drops one item. Valid in a draft's review phase and
-    /// in a complete intent (a changed decision reopens or keeps it).
+    /// in a complete intent (a changed decision reopens or keeps it). A
+    /// fixed item cannot be edited or dropped (`Invalid`); accepting it
+    /// again changes nothing.
     pub async fn review(
         &self,
         id: IntentId,
@@ -666,6 +700,22 @@ impl IntentService {
         };
         if !open {
             return Err(wrong_state_or_phase(&intent, "the review phase"));
+        }
+        let c = &intent.content;
+        let fixed = c
+            .preconditions
+            .iter()
+            .chain(&c.criteria)
+            .chain(&c.stories)
+            .chain(&c.depends_on)
+            .any(|i| i.id == item_id && i.fixed);
+        if fixed {
+            return match action {
+                ReviewAction::Accept => Ok(intent),
+                ReviewAction::Edit(_) | ReviewAction::Drop => {
+                    Err(IntentError::Invalid(FIXED_ITEM.into()))
+                }
+            };
         }
         let text = match &action {
             ReviewAction::Edit(t) => {
@@ -1471,6 +1521,19 @@ async fn load_messages(
     agent_id: AgentId,
 ) -> Result<Vec<smithagents_core::agent::ChatMessage>, StoreError> {
     store.list_messages(agent_id, 0, u32::MAX).await
+}
+
+/// An item the daemon sets (see [`CreateExtras`]): accepted, and kept as it
+/// is by polish and review.
+fn fixed_item(text: String, intent_ref: Option<IntentId>) -> Item {
+    Item {
+        id: ItemId::new(),
+        text,
+        status: ItemStatus::Accepted,
+        edited: false,
+        intent_ref,
+        fixed: true,
+    }
 }
 
 /// The intent's current content as a version by `author`; the store numbers it.

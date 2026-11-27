@@ -2679,3 +2679,190 @@ async fn a_base_branch_is_resolved_locally_and_nothing_is_fetched() {
     assert_eq!(f.svc.get(x.id).await.unwrap().state, IntentState::Complete);
     f.assert_nothing_started(&dir).await;
 }
+
+// ------------------------------------------------------------ fixed items
+
+/// What [`IntentService::create_with`] is given for an intent with fixed
+/// items (an idea package's criteria, an implementation intent's
+/// dependency).
+fn fixed_extras(criteria: &[&str], dependency: Option<IntentId>) -> CreateExtras {
+    CreateExtras {
+        fixed_criteria: criteria.iter().map(|c| (*c).to_owned()).collect(),
+        fixed_dependency: dependency,
+        ..CreateExtras::default()
+    }
+}
+
+fn text_request(repo: &Repo) -> CreateIntentRequest {
+    CreateIntentRequest {
+        kind: None,
+        repo_id: Some(repo.id),
+        seed: SeedInput::Text("make it faster".into()),
+    }
+}
+
+#[tokio::test]
+async fn fixed_items_are_accepted_from_the_start_and_kept_by_polish() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    let seeder = f.seeder();
+    let target = seeder.create(text_request(&repo)).await.unwrap();
+    let mut t = f.store.get_intent(target.id).await.unwrap().unwrap();
+    t.content.title = "Prepare the zoom idea".into();
+    f.store.save_intent(&t).await.unwrap();
+    let other = seeder.create(text_request(&repo)).await.unwrap();
+    f.h.script(vec![
+        pass1("Implement the zoom idea", 0),
+        pass2(&[target.id, other.id]),
+    ]);
+
+    let i = f
+        .svc
+        .create_with(
+            text_request(&repo),
+            fixed_extras(&["Fixed one.", "Fixed two."], Some(target.id)),
+        )
+        .await
+        .unwrap();
+
+    let fixed = |text: &str, intent_ref: Option<IntentId>, item: &Item| {
+        assert_eq!(item.text, text);
+        assert_eq!(item.status, ItemStatus::Accepted);
+        assert!(item.fixed && !item.edited);
+        assert_eq!(item.intent_ref, intent_ref);
+    };
+    assert_eq!(i.content.criteria.len(), 2);
+    fixed("Fixed one.", None, &i.content.criteria[0]);
+    fixed("Fixed two.", None, &i.content.criteria[1]);
+    assert_eq!(i.content.depends_on.len(), 1);
+    fixed(
+        "Prepare the zoom idea",
+        Some(target.id),
+        &i.content.depends_on[0],
+    );
+    // The first version holds them too.
+    let versions = f.svc.versions(i.id).await.unwrap();
+    assert_eq!(versions[0].content.criteria, i.content.criteria);
+
+    let r = f.wait_phase(i.id, Phase::Review).await;
+    assert_eq!(r.content.criteria[..2], i.content.criteria[..]);
+    assert_eq!(r.content.criteria.len(), 3);
+    assert_eq!(r.content.criteria[2].status, ItemStatus::Pending);
+    // The model proposed the target again: it is there once, fixed.
+    assert_eq!(r.content.depends_on.len(), 2, "{:?}", r.content.depends_on);
+    assert_eq!(r.content.depends_on[0], i.content.depends_on[0]);
+    assert_eq!(r.content.depends_on[1].intent_ref, Some(other.id));
+    assert_eq!(r.content.depends_on[1].status, ItemStatus::Pending);
+}
+
+#[tokio::test]
+async fn a_fixed_item_cannot_be_edited_or_dropped() {
+    let f = real_fx().await;
+    let repo = f.repo("r1").await;
+    let target = f.seeder().create(text_request(&repo)).await.unwrap();
+    f.h.script(vec![pass1("Implement it", 0), pass2(&[])]);
+    let i = f
+        .svc
+        .create_with(
+            text_request(&repo),
+            fixed_extras(&["Fixed one."], Some(target.id)),
+        )
+        .await
+        .unwrap();
+    let r = f.wait_phase(i.id, Phase::Review).await;
+    let fixed_items = [r.content.criteria[0].id, r.content.depends_on[0].id];
+
+    for item in fixed_items {
+        for action in [ReviewAction::Drop, ReviewAction::Edit("Other text.".into())] {
+            let err = f.svc.review(i.id, item, action.clone()).await.unwrap_err();
+            assert_eq!(
+                (err.code(), err.to_string().as_str()),
+                (
+                    "invalid",
+                    "this item is fixed: it cannot be edited or dropped"
+                ),
+                "{action:?}"
+            );
+            assert_eq!(f.svc.get(i.id).await.unwrap(), r, "{action:?}");
+        }
+        // Accepting it again changes nothing.
+        let again = f
+            .svc
+            .review(i.id, item, ReviewAction::Accept)
+            .await
+            .unwrap();
+        assert_eq!(again.content, r.content);
+    }
+
+    // The rest is reviewed as usual and completes the intent.
+    let c = &r.content;
+    let rest: Vec<ItemId> = c
+        .preconditions
+        .iter()
+        .chain(&c.criteria[1..])
+        .chain(&c.stories)
+        .map(|x| x.id)
+        .collect();
+    for item in rest {
+        f.svc
+            .review(i.id, item, ReviewAction::Accept)
+            .await
+            .unwrap();
+    }
+    let done = f.svc.get(i.id).await.unwrap();
+    assert_eq!(done.state, IntentState::Complete);
+    assert_eq!(done.content.criteria[0], r.content.criteria[0]);
+    assert_eq!(done.content.depends_on, r.content.depends_on);
+
+    // A PATCH of the other fields leaves them.
+    let patched = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                title: Some("Renamed".into()),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.content.criteria, done.content.criteria);
+    assert_eq!(patched.content.depends_on, done.content.depends_on);
+}
+
+#[tokio::test]
+async fn a_fixed_dependency_must_be_an_intent_of_the_same_repository() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let elsewhere = f.repo("r2").await;
+    let there = f.seeder().create(text_request(&elsewhere)).await.unwrap();
+
+    let err = f
+        .svc
+        .create_with(
+            text_request(&repo),
+            fixed_extras(&[], Some(IntentId::new())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err.code(), err.to_string().as_str()),
+        ("invalid", "the intent this one depends on does not exist")
+    );
+    let err = f
+        .svc
+        .create_with(text_request(&repo), fixed_extras(&[], Some(there.id)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "dependency_cross_repo");
+    let mine = f
+        .svc
+        .list(IntentFilter {
+            state: None,
+            repo_id: Some(repo.id),
+        })
+        .await
+        .unwrap();
+    assert!(mine.is_empty(), "nothing was created");
+    assert!(f.runner.0.lock().unwrap().is_empty(), "no polish started");
+}

@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 use smithagents_capture::{CaptureError, Capturer, Frame, WindowTarget};
 use smithagents_client::FeedbackFile;
 use smithagents_core::feedback::{
-    FeedbackAttachment, FeedbackBox, FeedbackKind, FeedbackOutcome, SendAs, SubmissionId,
+    FeedbackAttachment, FeedbackBox, FeedbackKind, FeedbackOutcome, IdeaOptions, SendAs,
+    SubmissionId,
 };
 use smithagents_core::ids::RepoId;
 
@@ -84,11 +85,14 @@ pub struct Pending {
     pub awaiting: bool,
 }
 
-/// The repository and the kind of result a submission was sent for.
+/// The repository and the kind of result a submission was sent for, and the
+/// idea package's parts when it was sent as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SentTo {
     pub repo_id: RepoId,
     pub send_as: SendAs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idea: Option<IdeaOptions>,
 }
 
 /// A box as the daemon takes it.

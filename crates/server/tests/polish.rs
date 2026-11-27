@@ -342,6 +342,138 @@ fn apply_pass2_dependencies() {
     assert!(dropped[&cyc.id.to_string()].contains("cycle"));
 }
 
+/// An accepted item the daemon fixed (an idea package's criterion, an
+/// implementation intent's dependency).
+fn fixed(text: &str, intent_ref: Option<IntentId>) -> Item {
+    Item {
+        id: ItemId::new(),
+        text: text.into(),
+        status: ItemStatus::Accepted,
+        edited: false,
+        intent_ref,
+        fixed: true,
+    }
+}
+
+fn texts(items: &[Item]) -> Vec<&str> {
+    items.iter().map(|i| i.text.as_str()).collect()
+}
+
+#[test]
+fn pass_two_keeps_fixed_criteria_first() {
+    let (a, b) = (fixed("Criterion A", None), fixed("Criterion B", None));
+    let mut c = content();
+    c.criteria = vec![a.clone(), b.clone()];
+    let raw = json!({
+        "preconditions": [], "stories": [], "depends_on": [],
+        "acceptance_criteria": ["x", "Criterion A", "y"],
+    });
+
+    apply_pass2(&mut c, &raw, &ctx(vec![], HashMap::new())).unwrap();
+
+    assert_eq!(texts(&c.criteria), ["Criterion A", "Criterion B", "x", "y"]);
+    assert_eq!(c.criteria[0], a, "same id, status and text");
+    assert_eq!(c.criteria[1], b);
+    for new in &c.criteria[2..] {
+        assert_eq!(new.status, ItemStatus::Pending);
+        assert!(!new.fixed && !new.edited);
+    }
+}
+
+#[test]
+fn a_model_answer_cannot_change_a_fixed_item() {
+    // Dropped, reworded, reordered and repeated by the model: the fixed items
+    // stay as they were, first and once.
+    let (a, b) = (fixed("Criterion A", None), fixed("Criterion B", None));
+    let mut c = content();
+    c.criteria = vec![a.clone(), b.clone()];
+    let raw = json!({
+        "preconditions": [], "stories": [], "depends_on": [],
+        "acceptance_criteria": ["  Criterion B  ", "Criterion B", "Criterion A, reworded", "Criterion B"],
+    });
+
+    apply_pass2(&mut c, &raw, &ctx(vec![], HashMap::new())).unwrap();
+
+    assert_eq!(
+        texts(&c.criteria),
+        ["Criterion A", "Criterion B", "Criterion A, reworded"]
+    );
+    assert_eq!(&c.criteria[..2], &[a, b]);
+    assert_eq!(c.criteria[2].status, ItemStatus::Pending);
+
+    // A model that answers no criteria at all leaves them too.
+    let before = c.criteria[..2].to_vec();
+    let empty =
+        json!({"preconditions": [], "acceptance_criteria": [], "stories": [], "depends_on": []});
+    apply_pass2(&mut c, &empty, &ctx(vec![], HashMap::new())).unwrap();
+    assert_eq!(c.criteria, before);
+}
+
+#[test]
+fn pass_two_keeps_a_fixed_dependency() {
+    let (t, u) = (cand("Target"), cand("Other"));
+    let dep = fixed("Target", Some(t.id));
+    let mut c = content();
+    c.depends_on = vec![dep.clone()];
+    let raw = json!({
+        "preconditions": [], "acceptance_criteria": [], "stories": [],
+        "depends_on": [
+            {"intent_id": t.id.to_string(), "reason": "proposed again"},
+            {"intent_id": u.id.to_string(), "reason": "needs the other"},
+        ]
+    });
+
+    let report = apply_pass2(
+        &mut c,
+        &raw,
+        &ctx(vec![t.clone(), u.clone()], HashMap::new()),
+    )
+    .unwrap();
+
+    assert_eq!(c.depends_on.len(), 2, "{:?}", c.depends_on);
+    assert_eq!(c.depends_on[0], dep, "T once, fixed and accepted");
+    assert_eq!(c.depends_on[1].intent_ref, Some(u.id));
+    assert_eq!(c.depends_on[1].text, "needs the other");
+    assert_eq!(c.depends_on[1].status, ItemStatus::Pending);
+    assert!(!c.depends_on[1].fixed);
+    assert!(report.dropped_dependencies.is_empty(), "{report:?}");
+}
+
+#[test]
+fn content_without_fixed_items_is_replaced_as_before() {
+    let mut c = content();
+    let old = Item {
+        id: ItemId::new(),
+        text: "old".into(),
+        status: ItemStatus::Accepted,
+        edited: true,
+        intent_ref: None,
+        fixed: false,
+    };
+    c.preconditions = vec![old.clone()];
+    c.criteria = vec![old.clone()];
+    c.stories = vec![old.clone()];
+    let o = cand("Old dep");
+    c.depends_on = vec![Item {
+        intent_ref: Some(o.id),
+        ..old.clone()
+    }];
+    let raw = json!({
+        "preconditions": ["p"], "acceptance_criteria": ["old", "c"], "stories": ["s"],
+        "depends_on": []
+    });
+    apply_pass2(&mut c, &raw, &ctx(vec![o], HashMap::new())).unwrap();
+    assert_eq!(texts(&c.preconditions), ["p"]);
+    assert_eq!(texts(&c.criteria), ["old", "c"]);
+    assert_ne!(c.criteria[0].id, old.id, "a new, pending item");
+    assert!(c
+        .criteria
+        .iter()
+        .all(|i| i.status == ItemStatus::Pending && !i.fixed));
+    assert_eq!(texts(&c.stories), ["s"]);
+    assert!(c.depends_on.is_empty());
+}
+
 #[test]
 fn would_create_cycle_cases() {
     let (a, b, c, d) = (

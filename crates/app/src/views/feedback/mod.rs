@@ -39,7 +39,8 @@ pub use annotator::{
 pub use card::{card_id, card_remove_id, comment_badge_id};
 pub use hold::{HoldButton, HoldEvent, HOLD_RING_ID};
 pub use submit::{
-    submit_kind_id, submit_repo_item_id, PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID,
+    submit_kind_id, submit_repo_item_id, IDEA_CHECK_ID, IDEA_DEMO_HELP_ID, IDEA_DEMO_ID,
+    IDEA_DIAGRAMS_ID, IDEA_EXPLAINER_ID, PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID,
     PUBLIC_CONFIRM_TITLE_ID, PUBLIC_WARNING_ID, SEND_INTENT_ID, SEND_ISSUE_ID,
     SEND_ISSUE_REASON_ID, START_OVER_CANCEL_ID, START_OVER_CONFIRM_ID, START_OVER_TITLE_ID,
     SUBMIT_BACK_ID, SUBMIT_CONFIRM_ID, SUBMIT_ERROR_ID, SUBMIT_IDEA_HINT_ID, SUBMIT_IDEA_ID,

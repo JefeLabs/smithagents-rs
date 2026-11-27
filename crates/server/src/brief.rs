@@ -1,11 +1,17 @@
 //! Composes the instructions an execution agent receives for an intent: a fixed
 //! system-prompt append and a Markdown first message built from the intent's
 //! accepted content and, for an intent made by Submit, where its files are.
+//! An idea intent's agent gets its own append and, in place of the
+//! evidence, what to prepare in the issue folder ([`idea_instructions`]).
 
+use smithagents_core::feedback::IdeaPackage;
 use smithagents_core::intent::{Answer, Intent, IntentKind, Item, ItemStatus};
 
 /// Title of the section that points a feedback intent's agent at its files.
 pub const EVIDENCE_TITLE: &str = "Evidence";
+
+/// The system-prompt append of an idea intent's agent.
+pub const IDEA_SYSTEM_APPEND: &str = "Work only in this worktree. Prepare the idea package the intent describes and nothing else: do not implement the idea, do not push, and do not open a pull request. Commit your work inside the issue folder and stop.";
 
 /// How much of a dependency's current behavior is quoted.
 const DEP_BEHAVIOR_CHARS: usize = 300;
@@ -75,6 +81,62 @@ fn evidence(intent: &Intent) -> Option<String> {
     ))
 }
 
+/// The "Idea package" section: the steps of the parts in `idea`, numbered
+/// from 1 (diagrams and the demo video only when asked for). `folder` must be
+/// a plain repository-relative path; [`compose`] names no other.
+pub fn idea_instructions(folder: &str, idea: &IdeaPackage) -> String {
+    let steps: Vec<String> = [
+        Some(format!("Read `{folder}/issue.md` and look at its images.")),
+        Some(format!(
+            "Write `{folder}/explainer.md` with the sections \"What\", \"Why\", \"How it could \
+             work\" and \"Open questions\"."
+        )),
+        idea.diagrams.then(|| {
+            "Add diagrams to `explainer.md` as Mermaid code blocks. If a Mermaid renderer is \
+             installed, also save one rendered image per diagram in the folder and link it."
+                .to_owned()
+        }),
+        idea.demo_video.then(|| {
+            format!(
+                "Run the project, reproduce the bug or walk through the idea in a browser with \
+                 `agent-browser`, and save the recording as `{folder}/demo.mp4` (at most 50 MB). \
+                 Write the steps you took in `{folder}/demo.md`."
+            )
+        }),
+        Some(
+            "If you cannot produce a part, say why under a \"Not done\" heading in \
+             `explainer.md` and go on with the rest."
+                .to_owned(),
+        ),
+        Some(format!(
+            "Commit only files inside `{folder}/`. Change nothing else. Do not push and do not \
+             open a pull request. Then stop."
+        )),
+    ]
+    .into_iter()
+    .flatten()
+    .enumerate()
+    .map(|(n, step)| format!("{}. {step}", n + 1))
+    .collect();
+    format!(
+        "## Idea package\n\nThis intent prepares an idea for teammates. Do not implement it.\n\n{}",
+        steps.join("\n")
+    )
+}
+
+/// The idea package an idea intent asks for (its origin's), if it is one.
+fn idea_of(intent: &Intent) -> Option<&IdeaPackage> {
+    intent.origin.as_ref()?.idea.as_ref()
+}
+
+/// An idea intent's "Idea package" section, naming the folder from the
+/// origin the daemon stored; none when that folder is not a plain path.
+fn idea_section(intent: &Intent) -> Option<String> {
+    let idea = idea_of(intent)?;
+    let folder = relative_folder(&intent.origin.as_ref()?.folder)?;
+    Some(idea_instructions(folder, idea))
+}
+
 pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
     let c = &intent.content;
     let mut parts = vec![format!("# {}\n\nKind: {}", c.title, kind_label(c.kind))];
@@ -84,6 +146,7 @@ pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
         parts.push(format!("## Current behavior\n\n{behavior}"));
     }
     parts.extend(evidence(intent));
+    parts.extend(idea_section(intent));
     parts.extend(section("Preconditions", bullets(&c.preconditions)));
     let criteria = accepted(&c.criteria)
         .enumerate()
@@ -124,8 +187,15 @@ pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
         parts.push(format!("{depends}\n\n{REBASE_ON_DEPENDENCIES}"));
     }
 
+    // An idea intent's agent never gets the append that asks for a pull
+    // request, also when its section cannot be written.
+    let system_append = if idea_of(intent).is_some() {
+        IDEA_SYSTEM_APPEND
+    } else {
+        SYSTEM_APPEND
+    };
     Brief {
-        system_append: SYSTEM_APPEND.to_string(),
+        system_append: system_append.to_string(),
         first_message: parts.join("\n\n"),
     }
 }

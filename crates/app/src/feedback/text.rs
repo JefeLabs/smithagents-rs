@@ -192,6 +192,17 @@ pub fn gh_not_ready_reason(reason: &str) -> String {
     format!("The GitHub CLI (gh) is not ready: {reason}.")
 }
 
+/// The idea package's box under "An intent to work on now", and its parts.
+pub const IDEA_LABEL: &str = "Prepare an idea PR for teammates";
+pub const IDEA_DEMO_LABEL: &str = "Demo video";
+pub const IDEA_DIAGRAMS_LABEL: &str = "Diagrams";
+pub const IDEA_EXPLAINER_LABEL: &str = "Explainer doc";
+/// Under "Demo video": what it needs, or why it cannot be chosen.
+pub const DEMO_HELP: &str = "Only works for projects a browser can show.";
+pub const DEMO_MISSING_REASON: &str = "Install agent-browser to record a demo video.";
+/// The summary while the idea package is ticked with none of its parts.
+pub const IDEA_NEEDS_PART: &str = "Choose at least one part.";
+
 pub const PUBLIC_WARNING: &str =
     "This repository is public. The screenshots will be visible to anyone.";
 pub const MAYBE_PUBLIC_WARNING: &str =

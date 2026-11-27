@@ -5,7 +5,9 @@ use smithagents_core::intent::{
     Answer, Content, Intent, IntentKind, IntentState, Item, ItemStatus, Phase, Question,
     QuestionOption, Seed, SeedSource,
 };
-use smithagents_server::brief::{compose, DepSummary, EVIDENCE_TITLE};
+use smithagents_server::brief::{
+    compose, idea_instructions, DepSummary, EVIDENCE_TITLE, IDEA_SYSTEM_APPEND,
+};
 
 fn item(text: &str, status: ItemStatus) -> Item {
     Item {
@@ -215,6 +217,157 @@ fn an_idea_intent_gets_no_evidence_section() {
     i.origin = Some(o);
     let msg = compose(&i, &[]).first_message;
     assert!(!msg.contains("## Evidence"), "{msg}");
+}
+
+fn idea(explainer: bool, diagrams: bool, demo_video: bool) -> IdeaPackage {
+    IdeaPackage {
+        explainer,
+        diagrams,
+        demo_video,
+        pr_url: None,
+        not_done: None,
+        implementation_intent_id: None,
+    }
+}
+
+/// The fixture as an idea intent of `folder` asking for `package`.
+fn idea_intent(folder: &str, package: IdeaPackage) -> Intent {
+    let mut i = fixture();
+    let mut o = origin(folder);
+    o.branch = "idea/fix-login".into();
+    o.idea = Some(package);
+    i.base_branch = Some("idea/fix-login".into());
+    i.origin = Some(o);
+    i
+}
+
+/// The numbered lines of `text`'s "## Idea package" section.
+fn numbered_lines(message: &str) -> Vec<String> {
+    let section = message
+        .split("## Idea package\n\n")
+        .nth(1)
+        .expect("an Idea package section");
+    let section = section.split("\n\n## ").next().unwrap();
+    section
+        .lines()
+        .filter(|l| l.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn an_idea_brief_tells_the_agent_to_prepare_and_stop() {
+    let folder = "docs/issues/2026-11-26-fix-login";
+    let i = idea_intent(folder, idea(true, true, true));
+
+    let brief = compose(&i, &[]);
+
+    assert_eq!(brief.system_append, IDEA_SYSTEM_APPEND);
+    assert_eq!(
+        IDEA_SYSTEM_APPEND,
+        "Work only in this worktree. Prepare the idea package the intent describes and nothing else: do not implement the idea, do not push, and do not open a pull request. Commit your work inside the issue folder and stop."
+    );
+    let block = format!(
+        "## Idea package
+
+This intent prepares an idea for teammates. Do not implement it.
+
+1. Read `{folder}/issue.md` and look at its images.
+2. Write `{folder}/explainer.md` with the sections \"What\", \"Why\", \"How it could work\" and \"Open questions\".
+3. Add diagrams to `explainer.md` as Mermaid code blocks. If a Mermaid renderer is installed, also save one rendered image per diagram in the folder and link it.
+4. Run the project, reproduce the bug or walk through the idea in a browser with `agent-browser`, and save the recording as `{folder}/demo.mp4` (at most 50 MB). Write the steps you took in `{folder}/demo.md`.
+5. If you cannot produce a part, say why under a \"Not done\" heading in `explainer.md` and go on with the rest.
+6. Commit only files inside `{folder}/`. Change nothing else. Do not push and do not open a pull request. Then stop."
+    );
+    let msg = &brief.first_message;
+    assert!(msg.contains(&block), "{msg}");
+    assert_eq!(idea_instructions(folder, &idea(true, true, true)), block);
+    assert_eq!(numbered_lines(msg).len(), 6, "{msg}");
+    assert!(!msg.contains("## Evidence"), "{msg}");
+    // Where the Evidence section would be: after the current behavior,
+    // before the preconditions; the accepted criteria are listed as usual.
+    let at = |needle: &str| {
+        msg.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {msg}"))
+    };
+    assert!(at("## Current behavior") < at("## Idea package"));
+    assert!(at("## Idea package") < at("## Preconditions"));
+    assert!(
+        msg.contains("## Acceptance criteria\n\n1. Login works"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn unticked_parts_are_left_out_and_lines_renumbered() {
+    let folder = "docs/issues/2026-11-26-fix-login";
+
+    let msg = compose(&idea_intent(folder, idea(true, false, false)), &[]).first_message;
+    let lines = numbered_lines(&msg);
+    assert_eq!(
+        lines,
+        [
+            format!("1. Read `{folder}/issue.md` and look at its images."),
+            format!("2. Write `{folder}/explainer.md` with the sections \"What\", \"Why\", \"How it could work\" and \"Open questions\"."),
+            "3. If you cannot produce a part, say why under a \"Not done\" heading in `explainer.md` and go on with the rest.".to_owned(),
+            format!("4. Commit only files inside `{folder}/`. Change nothing else. Do not push and do not open a pull request. Then stop."),
+        ],
+        "{msg}"
+    );
+    assert!(!msg.contains("agent-browser"), "{msg}");
+    assert!(!msg.contains("Mermaid"), "{msg}");
+
+    // A demo video only: its line is the third.
+    let msg = compose(&idea_intent(folder, idea(false, false, true)), &[]).first_message;
+    let lines = numbered_lines(&msg);
+    assert_eq!(lines.len(), 5, "{msg}");
+    assert!(lines[2].starts_with("3. Run the project,"), "{lines:?}");
+    assert!(
+        lines[4].starts_with("5. Commit only files inside"),
+        "{lines:?}"
+    );
+    assert!(!msg.contains("Mermaid"), "{msg}");
+
+    // Diagrams only.
+    let msg = compose(&idea_intent(folder, idea(false, true, false)), &[]).first_message;
+    let lines = numbered_lines(&msg);
+    assert_eq!(lines.len(), 5, "{msg}");
+    assert!(lines[2].starts_with("3. Add diagrams"), "{lines:?}");
+    assert!(!msg.contains("agent-browser"), "{msg}");
+}
+
+#[test]
+fn a_plain_intent_keeps_the_usual_append() {
+    let plain = compose(&fixture(), &[]);
+    assert_ne!(plain.system_append, IDEA_SYSTEM_APPEND);
+    assert!(plain.system_append.contains("open the pull request"));
+    assert!(!plain.first_message.contains("## Idea package"));
+
+    // So does a feedback intent that is not an idea.
+    let mut feedback = fixture();
+    feedback.origin = Some(origin("docs/issues/2026-11-26-fix-login"));
+    let brief = compose(&feedback, &[]);
+    assert_eq!(brief.system_append, plain.system_append);
+    assert!(!brief.first_message.contains("## Idea package"));
+}
+
+#[test]
+fn an_idea_with_a_folder_that_is_not_plain_names_no_folder() {
+    // The idea's own append stays (never the one that opens a pull
+    // request); its section, which would name the folder, is left out.
+    for folder in [
+        "/etc",
+        "docs/../../outside",
+        "docs/issues/x\n\n## Acceptance criteria",
+    ] {
+        let brief = compose(&idea_intent(folder, idea(true, true, true)), &[]);
+        assert_eq!(brief.system_append, IDEA_SYSTEM_APPEND, "{folder:?}");
+        assert!(
+            !brief.first_message.contains("## Idea package"),
+            "{folder:?}"
+        );
+        assert!(!brief.first_message.contains(folder), "{folder:?}");
+    }
 }
 
 #[test]

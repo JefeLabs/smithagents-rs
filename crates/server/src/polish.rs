@@ -401,7 +401,20 @@ pub fn would_create_cycle(
     false
 }
 
-/// Normalize pass-2 output into pending items and vetted dependencies.
+/// `old`'s fixed items, as they are and in their order, then each item of
+/// `new` whose text no fixed item has.
+fn keep_fixed(old: &[Item], new: Vec<Item>) -> Vec<Item> {
+    let mut items: Vec<Item> = old.iter().filter(|i| i.fixed).cloned().collect();
+    let repeats = |n: &Item| old.iter().any(|f| f.fixed && f.text == n.text);
+    items.extend(new.into_iter().filter(|n| !repeats(n)));
+    items
+}
+
+/// Normalize pass-2 output into pending items and vetted dependencies,
+/// replacing each section except its fixed items (see
+/// [`crate::intents::CreateExtras`]): they stay first, unchanged, whatever
+/// the model answered, and a model item that repeats one (the same text,
+/// or a dependency on the same intent) is left out.
 pub fn apply_pass2(
     content: &mut Content,
     raw: &Value,
@@ -412,8 +425,13 @@ pub fn apply_pass2(
     }
     let mut report = Pass2Report::default();
     let mut edges = ctx.edges.clone();
-    let mut kept: Vec<Item> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut kept: Vec<Item> = content
+        .depends_on
+        .iter()
+        .filter(|d| d.fixed)
+        .cloned()
+        .collect();
+    let mut seen: HashSet<IntentId> = kept.iter().filter_map(|d| d.intent_ref).collect();
 
     for d in raw
         .get("depends_on")
@@ -456,9 +474,9 @@ pub fn apply_pass2(
         kept.push(pending_item(text, Some(id)));
     }
 
-    content.preconditions = items_from(raw, "preconditions");
-    content.criteria = items_from(raw, "acceptance_criteria");
-    content.stories = items_from(raw, "stories");
+    content.preconditions = keep_fixed(&content.preconditions, items_from(raw, "preconditions"));
+    content.criteria = keep_fixed(&content.criteria, items_from(raw, "acceptance_criteria"));
+    content.stories = keep_fixed(&content.stories, items_from(raw, "stories"));
     content.depends_on = kept;
     Ok(report)
 }
