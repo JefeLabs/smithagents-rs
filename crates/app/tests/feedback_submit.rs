@@ -10,6 +10,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -33,7 +34,7 @@ use smithagents_app::feedback::text::{
     DISCARD_PENDING_TEXT, DRAFT_BUSY_TEXT, DRAFT_NOT_READY_TEXT, EMPTY_TEXT,
     INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING, MAYBE_PUBLIC_WARNING,
     MAY_HAVE_BEEN_SENT_TEXT, NOTHING_CREATED_TEXT, PUBLIC_WARNING, REPO_GONE_TEXT,
-    START_OVER_RISK_TEXT, START_OVER_TOOLTIP, SUBMISSION_LOCKED_TEXT,
+    START_OVER_RISK_TEXT, START_OVER_TOOLTIP, SUBMISSION_LOCKED_TEXT, SUBMISSION_NOT_SAVED_TEXT,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::model::Action;
@@ -1215,6 +1216,114 @@ fn a_pending_submission_survives_a_restart(cx: &mut TestAppContext) {
     assert_eq!(opened.fake.retries(), [id], "the same submission");
 }
 
+/// Sends a submission whose push failed, closes the app, and rewrites its
+/// `submission.json` with `change` applied to the JSON.
+fn restart_with_a_changed_submission_file(
+    cx: &mut TestAppContext,
+    setup: &FeedbackSetup,
+    repos: &[Repo],
+    change: impl FnOnce(&mut serde_json::Value),
+) -> (smithagents_core::feedback::SubmissionId, Opened) {
+    let alpha = repos[0].id;
+    let opened = ready_to_send(cx, setup, repos);
+    let window = opened.window;
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    let mut partial = outcome_with_intent(id, created_intent(alpha));
+    partial.intent = None;
+    partial.failed = Some(push_failure());
+    opened.fake.answer_outcome(Ok(partial));
+    frame(cx, window);
+    close(cx, opened);
+
+    let file = setup.draft_dir().join("submission.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    change(&mut json);
+    fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+    (id, open(cx, setup, repos, Some(alpha)))
+}
+
+#[gpui_kit::test]
+fn a_submission_file_read_only_in_part_keeps_its_id_and_its_lock(cx: &mut TestAppContext) {
+    // Another version of the app wrote an outcome this one cannot read. The
+    // id and where it was sent still read: the daemon is asked about that
+    // submission, and nothing is made a second time under a new id.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let (id, opened) = restart_with_a_changed_submission_file(cx, &setup, &repos, |json| {
+        json["outcome"] = serde_json::json!({ "a_shape_from_another_version": true });
+    });
+    let window = opened.window;
+
+    let pending = cx
+        .read(|cx| opened.feedback.read(cx).pending().cloned())
+        .expect("the submission is still pending");
+    assert_eq!(pending.submission_id, id);
+    assert_eq!(pending.sent.map(|sent| sent.repo_id), Some(alpha));
+    assert_eq!(pending.outcome, None);
+    // What became of it is not known: it awaits the daemon's answer.
+    assert!(pending.awaiting);
+    assert!(cx.read(|cx| opened.feedback.read(cx).locked()));
+
+    open_submit(cx, &opened, no_remotes(&repos));
+    assert!(idea_disabled(cx, window));
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.retries(), [id], "the same submission");
+}
+
+#[gpui_kit::test]
+fn a_submission_file_with_only_its_id_readable_keeps_the_id(cx: &mut TestAppContext) {
+    // Where it was sent cannot be read either, so the draft is not locked;
+    // but a new send still goes out under the old id, which the daemon knows.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let (id, opened) = restart_with_a_changed_submission_file(cx, &setup, &repos, |json| {
+        json["outcome"] = serde_json::json!(7);
+        json["sent"] = serde_json::json!({ "send_as": "a way this version does not know" });
+    });
+
+    let pending = cx
+        .read(|cx| opened.feedback.read(cx).pending().cloned())
+        .expect("the submission is still pending");
+    assert_eq!(pending.submission_id, id);
+    assert_eq!(pending.sent, None);
+    assert!(!pending.awaiting);
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+
+    open_submit(cx, &opened, no_remotes(&repos));
+    click(cx, opened.window, SUBMIT_CONFIRM_ID);
+    assert_eq!(sent_id(&opened), id, "sent again under the same id");
+}
+
+#[gpui_kit::test]
+fn a_submission_that_cannot_be_written_down_is_not_sent(cx: &mut TestAppContext) {
+    // The file is what keeps the draft locked across a quit or a lost
+    // connection: without it nothing leaves.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    fs::set_permissions(setup.draft_dir(), fs::Permissions::from_mode(0o500)).unwrap();
+
+    click(cx, window, SUBMIT_CONFIRM_ID);
+
+    fs::set_permissions(setup.draft_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(opened.fake.submits().is_empty(), "nothing was sent");
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(SUBMISSION_NOT_SAVED_TEXT)
+    );
+    assert!(!submitting(cx, &opened));
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert!(!idea_disabled(cx, window));
+    assert!(!setup.draft_dir().join("submission.json").exists());
+
+    // With the folder writable again, the same press sends it.
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert_eq!(opened.fake.submits().len(), 1);
+}
+
 #[gpui_kit::test]
 fn retry_of_a_submission_the_daemon_never_saw_starts_over(cx: &mut TestAppContext) {
     let setup = FeedbackSetup::new();
@@ -1519,14 +1628,14 @@ fn a_capture_or_a_file_landing_while_locked_is_refused(cx: &mut TestAppContext) 
     let (window, feedback) = (opened.window, opened.feedback.clone());
     let lock = |f: &mut Feedback, cx: &mut gpui_kit::Context<Feedback>| {
         f.begin_submission(cx);
-        f.mark_sent(
+        assert!(f.mark_sent(
             SentTo {
                 repo_id: alpha,
                 send_as: SendAs::Intent,
                 idea: None,
             },
             cx,
-        );
+        ));
     };
 
     // A capture that started before the lock lands after it.

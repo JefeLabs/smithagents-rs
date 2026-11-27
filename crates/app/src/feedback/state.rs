@@ -95,6 +95,31 @@ pub struct SentTo {
     pub idea: Option<IdeaOptions>,
 }
 
+/// A `submission.json` as this build reads it. One it cannot read in full
+/// (another version of the app wrote it, say) still gives its id, and where
+/// it was sent when that part reads: the id is what keeps a re-send from
+/// being made a second time, and the daemon knows what became of it. Sent
+/// somewhere with no readable answer, it awaits one.
+fn read_pending(bytes: &[u8]) -> Option<Pending> {
+    match serde_json::from_slice::<Pending>(bytes) {
+        Ok(pending) => return Some(pending),
+        Err(e) => {
+            tracing::warn!(error = %e, "the pending feedback submission could not be read in full");
+        }
+    }
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let submission_id = serde_json::from_value(json.get("submission_id")?.clone()).ok()?;
+    let sent: Option<SentTo> = json
+        .get("sent")
+        .and_then(|sent| serde_json::from_value(sent.clone()).ok());
+    Some(Pending {
+        submission_id,
+        outcome: None,
+        sent,
+        awaiting: sent.is_some(),
+    })
+}
+
 /// A box as the daemon takes it.
 fn wire_box(annotation: &Annotation) -> FeedbackBox {
     let rect = annotation.rect;
@@ -258,15 +283,9 @@ impl Feedback {
             None => Files::Memory(Arc::default()),
         };
         let Loaded { draft, notices } = files.load();
-        let pending = files.read_submission().and_then(|bytes| {
-            match serde_json::from_slice::<Pending>(&bytes) {
-                Ok(pending) => Some(pending),
-                Err(e) => {
-                    tracing::warn!(error = %e, "the pending feedback submission could not be read");
-                    None
-                }
-            }
-        });
+        let pending = files
+            .read_submission()
+            .and_then(|bytes| read_pending(&bytes));
         let mut this = Self {
             files,
             capturer,
@@ -921,8 +940,21 @@ impl Feedback {
     /// The pending submission's request is about to leave for `to`: written
     /// first, so a quit or a lost connection meanwhile leaves the draft
     /// locked. It is awaiting an answer until one comes.
-    pub fn mark_sent(&mut self, to: SentTo, cx: &mut Context<Self>) {
-        self.set_sent(Some(to), true, cx);
+    ///
+    /// Whether it is written. When it is not (a failure is said), the
+    /// request must not leave, and the draft is as it was before.
+    #[must_use = "a submission that is not written down must not be sent"]
+    pub fn mark_sent(&mut self, to: SentTo, cx: &mut Context<Self>) -> bool {
+        let before = self.pending.as_ref().map(|p| (p.sent, p.awaiting));
+        if self.set_sent(Some(to), true, cx) {
+            return true;
+        }
+        if let (Some(pending), Some((sent, awaiting))) = (self.pending.as_mut(), before) {
+            pending.sent = sent;
+            pending.awaiting = awaiting;
+        }
+        cx.notify();
+        false
     }
 
     /// The daemon answered the pending submission (and something may exist
@@ -935,18 +967,27 @@ impl Feedback {
     /// Where the pending submission was sent, and whether it awaits an
     /// answer, as they were or are again: `None` when nothing exists under
     /// its id (the draft can change again, under the same id).
-    pub fn set_sent(&mut self, sent: Option<SentTo>, awaiting: bool, cx: &mut Context<Self>) {
+    ///
+    /// Whether `submission.json` says so now: `false` when there is no
+    /// pending submission or the file could not be written (which is said).
+    pub fn set_sent(
+        &mut self,
+        sent: Option<SentTo>,
+        awaiting: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(pending) = self.pending.as_mut() else {
-            return;
+            return false;
         };
         let awaiting = awaiting && sent.is_some();
         if pending.sent == sent && pending.awaiting == awaiting {
-            return;
+            return true;
         }
         pending.sent = sent;
         pending.awaiting = awaiting;
-        self.save_pending();
+        let written = self.save_pending();
         cx.notify();
+        written
     }
 
     /// Keeps the daemon's answer of a submission whose step failed: sent to
@@ -1042,17 +1083,21 @@ impl Feedback {
         true
     }
 
-    /// Writes `submission.json` (a failure is said).
-    fn save_pending(&mut self) {
+    /// Writes `submission.json`; whether it was written (a failure is said).
+    fn save_pending(&mut self) -> bool {
         let Some(pending) = &self.pending else {
-            return;
+            return false;
         };
         let written = serde_json::to_vec_pretty(pending)
             .map_err(std::io::Error::other)
             .and_then(|json| self.files.write_submission(&json));
-        if let Err(e) = written {
-            tracing::warn!(error = %e, "could not save the pending feedback submission");
-            self.add_notice(io_text(&e));
+        match written {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not save the pending feedback submission");
+                self.add_notice(io_text(&e));
+                false
+            }
         }
     }
 

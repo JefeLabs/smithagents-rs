@@ -302,6 +302,10 @@ pub const DISCARD_PENDING_TEXT: &str = "A submission of this draft may still be 
 pub const DRAFT_BUSY_TEXT: &str = "The draft is still being changed. Try again when it is done.";
 pub const SUBMIT_BUSY_TEXT: &str = "A submission is already under way.";
 pub const DRAFT_NOT_READY_TEXT: &str = "The draft is not ready to send yet. Try again in a moment.";
+/// The submission could not be written to the draft's folder first, which
+/// is what keeps the draft locked across a quit or a lost connection.
+pub const SUBMISSION_NOT_SAVED_TEXT: &str =
+    "The submission could not be saved in the draft's folder, so nothing was sent. Try again.";
 pub const MAIN_IDEA_TOO_LONG_TEXT: &str = "The main idea can be at most 20,000 characters.";
 pub const UPLOAD_TOO_LARGE_TEXT: &str =
     "The attachments cannot be sent: together they are larger than 100 MB.";
