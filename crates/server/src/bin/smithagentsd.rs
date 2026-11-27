@@ -125,12 +125,7 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    // Logs go to stderr. Never log the token, and never add request tracing:
-    // `/v1/events` accepts the token in its query string.
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    init_logging();
 
     let paths = match resolve_paths(opts.home.clone()) {
         Ok(paths) => paths,
@@ -392,6 +387,22 @@ async fn serve(
     }
 }
 
+/// Logs go to stderr. Never log the token, and never add request tracing:
+/// `/v1/events` accepts the token in its query string.
+///
+/// The subscriber is set with `set_global_default`, never with `init()`:
+/// `init()` also forwards the `log` crate's records whenever
+/// tracing-subscriber's `tracing-log` feature is on (any dependency can turn
+/// it on), and the WebSocket library logs handshakes through `log`.
+fn init_logging() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("logging is set up once, before anything else");
+}
+
 /// Resolves with the signal's name on SIGTERM, SIGINT (ctrl-c) or SIGHUP
 /// (the terminal it was started from closed). An agent's claude leads a
 /// process group of its own and so does not get the terminal's signals
@@ -425,6 +436,15 @@ fn shutdown_signal() -> io::Result<impl Future<Output = &'static str> + Send + '
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logging_does_not_forward_the_log_crate() {
+        // The WebSocket library logs handshakes through `log`; whatever
+        // features tracing-subscriber was built with, none of it may reach
+        // the daemon's log.
+        super::init_logging();
+        assert_eq!(log::max_level(), log::LevelFilter::Off);
+    }
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Invocation, String> {

@@ -44,6 +44,10 @@ path = "tests/api.rs"
 required-features = ["test-util"]
 
 [dev-dependencies]
+# On in test builds so the daemon's logging test means something (see
+# `init_logging` in src/bin/smithagentsd.rs).
+tracing-subscriber = { workspace = true, features = ["tracing-log"] }
+log = "0.4"
 smithagents-plugin-fixture = { path = "../../plugins/fixture" }
 smithagents-plugin-github = { path = "../../plugins/github" }
 smithagents-client = { path = "../client" }
