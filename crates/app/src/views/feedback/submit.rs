@@ -13,13 +13,18 @@
 //! here first, so nothing is uploaded that it would refuse.
 //!
 //! The draft keeps one submission id ([`Pending`]) for every send of it. A
-//! success deletes the draft, says what was created on the draft screen and
-//! opens a created intent in the Intents pane. Once the daemon has seen the
-//! submission (it answered, or took the request and did not answer in
-//! time), the text, kind and target stay as sent: the screen offers Retry
-//! (the failed step, or the same request again) and Start over (a new
-//! submission; what was committed stays). Only "could not reach the daemon"
-//! leaves the form as it was.
+//! success deletes the draft, says what was created on the draft screen and,
+//! while the Feedback pane is the one showing, opens a created intent in the
+//! Intents pane. The target is written before a request leaves; while
+//! something may exist under the id (a step failed after the commit, no
+//! answer came, the connection broke after sending, a 5xx or an unknown
+//! code: see [`send_failure`]) the text, kind and target stay as sent, and
+//! the screen offers Retry (the retry route first; the same request again
+//! only when the daemon has no record of it) and Start over (a new
+//! submission; what was committed stays; asked first while no answer came).
+//! A request that never left, and a refusal after which the daemon made
+//! nothing, leave the form editable under the same id; the refusal's
+//! sentence stays until the next send.
 //!
 //! Escape and "Back" go back to the draft (not while a command is under way),
 //! and the focus returns to where it was when the screen opened.
@@ -55,12 +60,13 @@ use super::{confirm, Confirmation, FeedbackPane, FeedbackScreen, Paint};
 use crate::feedback::state::{Pending, SentTo, SUBMIT_TIMEOUT};
 use crate::feedback::submit_vm::{
     can_confirm, confirm_label, failure_text, issue_reason, public_warning, result_text,
-    starting_repo, submit_error_text, summary, upload_problem,
+    send_failure, starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
 };
 use crate::feedback::text::{
     BACK_LABEL, CHOOSE_REPO_TEXT, KIND_LABEL, MAIN_IDEA_HINT, MAIN_IDEA_LABEL,
     NOTHING_CREATED_TEXT, PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL,
-    SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_LABEL,
+    SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL, START_OVER_LABEL,
+    START_OVER_RISK_TEXT, START_OVER_TITLE, START_OVER_TOOLTIP,
 };
 use crate::intent_vm::kind_label;
 use crate::link::LinkError;
@@ -69,6 +75,7 @@ use crate::view_models::{
     NOT_CONNECTED_TEXT,
 };
 use crate::views::answered;
+use crate::views::rail::RailEntry;
 
 /// Key context of the Submit screen (on the pane while it shows the
 /// screen), for Escape.
@@ -97,13 +104,13 @@ pub const SUBMIT_START_OVER_ID: &str = "feedback-submit-start-over";
 pub const PUBLIC_CONFIRM_TITLE_ID: &str = "feedback-public-confirm-title";
 pub const PUBLIC_CANCEL_ID: &str = "feedback-public-cancel";
 pub const PUBLIC_CONFIRM_ID: &str = "feedback-public-confirm";
+/// Element ids in the dialog Start over opens while the daemon may still be
+/// making the submission.
+pub const START_OVER_TITLE_ID: &str = "feedback-start-over-title";
+pub const START_OVER_CANCEL_ID: &str = "feedback-start-over-cancel";
+pub const START_OVER_CONFIRM_ID: &str = "feedback-start-over-confirm";
 
 const SCREEN_ID: &str = "feedback-submit";
-const KINDS: [FeedbackKind; 3] = [
-    FeedbackKind::NewFeature,
-    FeedbackKind::Enhancement,
-    FeedbackKind::Bug,
-];
 /// The main idea grows from this many lines to this many, then scrolls.
 const IDEA_ROWS: (usize, usize) = (3, 10);
 /// The repository menu's label and widest, in rems.
@@ -123,10 +130,14 @@ pub fn submit_repo_item_id(repo: RepoId) -> ElementId {
 /// What a press sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempt {
-    /// The draft as a request (a first send, or the same one again).
+    /// The draft as a request (Create).
     Submit,
-    /// The steps of the recorded submission that did not succeed.
+    /// The retry route: the steps of the recorded submission that did not
+    /// succeed (Retry, always first).
     Retry,
+    /// The same request again under the same id: what Retry sends when the
+    /// daemon has no record of a submission whose answer never came.
+    Reupload,
 }
 
 /// The Submit screen's state, kept in the pane.
@@ -141,6 +152,9 @@ pub(super) struct Submit {
     send_as: SendAs,
     /// The screen's error line.
     error: Option<String>,
+    /// The last send's sentence and the submission it is about: shown again
+    /// whenever the screen opens on that submission, until the next send.
+    answer: Option<(SubmissionId, String)>,
     /// The command under way, and its task; dropping the task gives it up.
     busy: Option<Attempt>,
     command: Option<Task<()>>,
@@ -158,6 +172,7 @@ impl Submit {
             picked_repo: None,
             send_as: SendAs::Intent,
             error: None,
+            answer: None,
             busy: None,
             command: None,
             focus_before: None,
@@ -203,13 +218,9 @@ fn size_of(path: &Path) -> Option<u64> {
         .map(|meta| meta.len())
 }
 
-/// Whether the daemon answered: only then did it surely see the request.
+/// Whether the daemon answered (as opposed to no answer coming at all).
 fn answered_by_daemon(error: &LinkError) -> bool {
     matches!(error, LinkError::Client(ClientError::Api { .. }))
-}
-
-fn is_code(error: &LinkError, wanted: &str) -> bool {
-    matches!(error, LinkError::Client(ClientError::Api { code, .. }) if code == wanted)
 }
 
 /// What the repository line shows.
@@ -262,10 +273,18 @@ impl FeedbackPane {
         self.submit.focus_before = window.focused(cx);
         self.screen = FeedbackScreen::Submit;
         let submit = &mut self.submit;
-        submit.error = pending
+        let id = pending.as_ref().map(|p| p.submission_id);
+        submit.error = submit
+            .answer
             .as_ref()
-            .and_then(|p| p.outcome.as_ref())
-            .and_then(failure_text);
+            .filter(|(about, _)| Some(*about) == id)
+            .map(|(_, text)| text.clone())
+            .or_else(|| {
+                pending
+                    .as_ref()
+                    .and_then(|p| p.outcome.as_ref())
+                    .and_then(failure_text)
+            });
         submit.picked_repo = None;
         submit.send_as = SendAs::Intent;
         submit.targets = None;
@@ -336,8 +355,8 @@ impl FeedbackPane {
         cx.notify();
     }
 
-    /// The pending submission, once the daemon has seen it: what it was
-    /// sent for.
+    /// What the pending submission was sent for, while something may exist
+    /// under its id.
     fn sent_to(&self, cx: &App) -> Option<SentTo> {
         self.feedback.read(cx).pending().and_then(|p| p.sent)
     }
@@ -448,24 +467,48 @@ impl FeedbackPane {
         );
     }
 
-    /// Retry: the failed step of a recorded submission, else the same
-    /// request again.
+    /// Retry: the retry route first (it runs what did not succeed of a
+    /// recorded submission); the request goes again only when the daemon
+    /// has no record of one whose answer never came.
     fn press_retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.submit.busy.is_some() {
             return;
         }
-        let Some(pending) = self.feedback.read(cx).pending().cloned() else {
+        let Some(to) = self.sent_to(cx) else {
             return;
         };
-        let Some(to) = pending.sent else {
+        self.ask_then_send(to, Attempt::Retry, window, cx);
+    }
+
+    /// Start over; while the daemon may still be making the submission (it
+    /// took the request and no answer came), after asking.
+    fn press_start_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submit.busy.is_some() {
             return;
+        }
+        let awaiting = self.feedback.read(cx).pending().is_some_and(|p| p.awaiting);
+        if !awaiting {
+            self.start_over(window, cx);
+            return;
+        }
+        let pane: WeakEntity<Self> = cx.entity().downgrade();
+        let ask = Confirmation {
+            title_id: START_OVER_TITLE_ID,
+            title: START_OVER_TITLE,
+            description: START_OVER_RISK_TEXT.to_owned(),
+            cancel_id: START_OVER_CANCEL_ID,
+            cancel: START_OVER_CANCEL,
+            confirm_id: START_OVER_CONFIRM_ID,
+            confirm: START_OVER_LABEL,
         };
-        let attempt = if pending.outcome.as_ref().is_some_and(|o| o.failed.is_some()) {
-            Attempt::Retry
-        } else {
-            Attempt::Submit
-        };
-        self.ask_then_send(to, attempt, window, cx);
+        confirm(
+            ask,
+            move |window, cx| {
+                let _ = pane.update(cx, |pane, cx| pane.start_over(window, cx));
+            },
+            window,
+            cx,
+        );
     }
 
     /// Start over: the pending submission is dropped (what it committed
@@ -474,19 +517,25 @@ impl FeedbackPane {
         if self.submit.busy.is_some() {
             return;
         }
-        let sent = self.sent_to(cx);
         tracing::debug!("feedback submission started over");
-        self.feedback
-            .update(cx, |feedback, cx| feedback.forget_submission(cx));
-        if let Some(sent) = sent {
-            self.submit.picked_repo = Some(sent.repo_id);
-            self.submit.send_as = sent.send_as;
-        }
+        self.forget_keeping_target(cx);
         self.submit.error = None;
         self.submit
             .idea
             .update(cx, |idea, cx| idea.focus(window, cx));
         cx.notify();
+    }
+
+    /// Drops the pending submission; the form keeps the target it was sent
+    /// for (the screen would otherwise start on another after a restart).
+    fn forget_keeping_target(&mut self, cx: &mut Context<Self>) {
+        if let Some(sent) = self.sent_to(cx) {
+            self.submit.picked_repo = Some(sent.repo_id);
+            self.submit.send_as = sent.send_as;
+        }
+        self.submit.answer = None;
+        self.feedback
+            .update(cx, |feedback, cx| feedback.forget_submission(cx));
     }
 
     /// Sends now, or, for a GitHub issue in a repository that is or may be
@@ -511,8 +560,8 @@ impl FeedbackPane {
             cancel: PUBLIC_CONFIRM_CANCEL,
             confirm_id: PUBLIC_CONFIRM_ID,
             confirm: match attempt {
-                Attempt::Submit if self.sent_to(cx).is_none() => confirm_label(to.send_as),
-                _ => RETRY_LABEL,
+                Attempt::Submit => confirm_label(to.send_as),
+                Attempt::Retry | Attempt::Reupload => RETRY_LABEL,
             },
         };
         confirm(
@@ -526,13 +575,28 @@ impl FeedbackPane {
     }
 
     /// Sends the draft (or retries the pending submission) to `to`: one at
-    /// a time, with every control waiting, for at most [`SUBMIT_TIMEOUT`].
-    /// A draft the daemon would refuse is not sent: the error line says why.
+    /// a time, with every control waiting, for at most [`SUBMIT_TIMEOUT`];
+    /// never while a capture or other work on the draft runs. A draft the
+    /// daemon would refuse is not sent: the error line says why. The target
+    /// is on disk before the request leaves ([`Feedback::mark_sent`]).
     fn send(&mut self, to: SentTo, attempt: Attempt, window: &mut Window, cx: &mut Context<Self>) {
         if self.submit.busy.is_some() {
             tracing::debug!("a feedback submission is already under way");
             return;
         }
+        let (capturing, working, before) = {
+            let feedback = self.feedback.read(cx);
+            (
+                feedback.capturing(),
+                feedback.busy(),
+                feedback.pending().map(|p| (p.sent, p.awaiting)),
+            )
+        };
+        if capturing || working {
+            tracing::debug!("the draft is still being changed; nothing is sent");
+            return;
+        }
+        let before = before.unwrap_or((None, false));
         if self.state.read(cx).feedback_commands().is_none() {
             self.submit.error = Some(NOT_CONNECTED_TEXT.to_owned());
             cx.notify();
@@ -550,7 +614,7 @@ impl FeedbackPane {
                 tracing::info!(submission_id = %id, "retrying a feedback submission");
                 Sending::Retry(id)
             }
-            Attempt::Submit => {
+            Attempt::Submit | Attempt::Reupload => {
                 let (upload, main_idea, kind) = {
                     let feedback = self.feedback.read(cx);
                     (
@@ -588,6 +652,10 @@ impl FeedbackPane {
                 Sending::Submit(request, files.into_iter().map(|(file, _)| file).collect())
             }
         };
+        // On disk before the request leaves: a quit or a lost connection
+        // from here on leaves the draft locked.
+        self.feedback
+            .update(cx, |feedback, cx| feedback.mark_sent(to, cx));
         let Some(command) = self
             .state
             .read(cx)
@@ -601,23 +669,27 @@ impl FeedbackPane {
         };
         self.submit.busy = Some(attempt);
         self.submit.error = None;
+        self.submit.answer = None;
         self.feedback
             .update(cx, |feedback, cx| feedback.set_submitting(true, cx));
         let timer = cx.background_executor().timer(SUBMIT_TIMEOUT);
         self.submit.command = Some(cx.spawn_in(window, async move |this, cx| {
             let answer = answered(command, timer).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.finish(to, attempt, answer, window, cx)
+                this.finish(to, attempt, before, answer, window, cx)
             });
         }));
         cx.notify();
     }
 
-    /// `answer` is `None` when the daemon did not answer in time.
+    /// `answer` is `None` when the daemon did not answer in time; `before`
+    /// is where the submission stood before this attempt. Whatever may exist
+    /// under the id keeps the draft locked (see [`send_failure`]).
     fn finish(
         &mut self,
         to: SentTo,
         attempt: Attempt,
+        before: (Option<SentTo>, bool),
         answer: Option<Result<FeedbackOutcome, LinkError>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -626,52 +698,96 @@ impl FeedbackPane {
         self.submit.command = None;
         self.feedback
             .update(cx, |feedback, cx| feedback.set_submitting(false, cx));
-        match answer {
+        let pending = self.feedback.read(cx).pending().cloned();
+        let error = match answer {
             None => {
                 tracing::warn!(
                     ?attempt,
                     "the daemon did not answer a feedback submission in time"
                 );
-                // It took the request: it may still make it.
-                self.feedback
-                    .update(cx, |feedback, cx| feedback.mark_sent(to, cx));
-                self.submit.error = Some(DAEMON_SILENT_TEXT.to_owned());
+                // It took the request: it may still make it, so the marker
+                // stays, awaiting.
+                Some(DAEMON_SILENT_TEXT.to_owned())
             }
             Some(Ok(outcome)) => match result_text(&outcome) {
-                Some(result) => self.succeeded(outcome, result, window, cx),
+                Some(result) => {
+                    self.succeeded(outcome, result, window, cx);
+                    None
+                }
                 None => {
                     tracing::warn!(
                         submission_id = %outcome.submission_id,
                         step = ?outcome.failed.as_ref().map(|f| f.step),
                         "a feedback submission is committed, but a step failed"
                     );
-                    self.submit.error = failure_text(&outcome);
-                    self.feedback.update(cx, |feedback, cx| {
-                        feedback.mark_sent(to, cx);
-                        feedback.record_outcome(outcome, cx);
-                    });
+                    let text = failure_text(&outcome);
+                    self.feedback
+                        .update(cx, |feedback, cx| feedback.record_outcome(outcome, cx));
+                    text
                 }
             },
-            Some(Err(e)) if is_code(&e, "submission_not_found") => {
-                tracing::info!("the daemon has no such feedback submission; starting over");
-                self.feedback
-                    .update(cx, |feedback, cx| feedback.forget_submission(cx));
-                self.submit.error = Some(NOTHING_CREATED_TEXT.to_owned());
-            }
             Some(Err(e)) => {
                 tracing::warn!(?attempt, "a feedback submission failed: {e}");
-                if answered_by_daemon(&e) {
-                    self.feedback
-                        .update(cx, |feedback, cx| feedback.mark_sent(to, cx));
+                match send_failure(&e) {
+                    SendFailure::NotSent => {
+                        // Nothing left: the submission is where it was.
+                        self.feedback
+                            .update(cx, |feedback, cx| feedback.set_sent(before.0, before.1, cx));
+                        Some(submit_error_text(&e))
+                    }
+                    SendFailure::Refused => {
+                        // The daemon made nothing for this request; a
+                        // recorded submission stays as it was.
+                        let (sent, awaiting) = match attempt {
+                            Attempt::Retry => before,
+                            Attempt::Submit | Attempt::Reupload => (None, false),
+                        };
+                        self.feedback
+                            .update(cx, |feedback, cx| feedback.set_sent(sent, awaiting, cx));
+                        Some(submit_error_text(&e))
+                    }
+                    SendFailure::NotRecorded
+                        if attempt == Attempt::Retry
+                            && pending.as_ref().is_some_and(|p| p.outcome.is_none()) =>
+                    {
+                        tracing::info!(
+                            "no record of a submission whose answer never came; sending it again"
+                        );
+                        self.send(to, Attempt::Reupload, window, cx);
+                        cx.notify();
+                        return;
+                    }
+                    SendFailure::NotRecorded => {
+                        tracing::info!("the daemon has no such feedback submission; starting over");
+                        self.forget_keeping_target(cx);
+                        Some(NOTHING_CREATED_TEXT.to_owned())
+                    }
+                    SendFailure::RepoGone => {
+                        self.forget_keeping_target(cx);
+                        Some(submit_error_text(&e))
+                    }
+                    SendFailure::MayExist => {
+                        if answered_by_daemon(&e) {
+                            self.feedback
+                                .update(cx, |feedback, cx| feedback.mark_answered(cx));
+                        }
+                        Some(submit_error_text(&e))
+                    }
                 }
-                self.submit.error = Some(submit_error_text(&e));
             }
+        };
+        if let Some(text) = error {
+            if let Some(id) = self.feedback.read(cx).pending().map(|p| p.submission_id) {
+                self.submit.answer = Some((id, text.clone()));
+            }
+            self.submit.error = Some(text);
         }
         cx.notify();
     }
 
-    /// The daemon made it all: the repository becomes the last used, the
-    /// draft goes, the draft screen says what was created, and a created
+    /// The daemon made it all: the repository the daemon names becomes the
+    /// last used, the draft goes, the draft screen says what was created,
+    /// and, while the Feedback pane is still the one showing, a created
     /// intent opens in the Intents pane.
     fn succeeded(
         &mut self,
@@ -681,6 +797,9 @@ impl FeedbackPane {
         cx: &mut Context<Self>,
     ) {
         tracing::info!(submission_id = %outcome.submission_id, "feedback submitted");
+        let showing = self.state.read(cx).right_entry() == RailEntry::Feedback
+            && self.focus.is_rendered(window);
+        self.submit.answer = None;
         self.state
             .update(cx, |state, _| state.set_last_repo_id(outcome.repo_id));
         self.feedback
@@ -688,7 +807,7 @@ impl FeedbackPane {
         self.submit.picked_repo = None;
         self.submit.send_as = SendAs::Intent;
         self.close_submit(window, cx);
-        if let Some(intent) = outcome.intent {
+        if let Some(intent) = outcome.intent.filter(|_| showing) {
             self.state
                 .update(cx, |state, cx| state.open_intent(intent.id, cx));
         }
@@ -958,8 +1077,8 @@ impl FeedbackPane {
         )
     }
 
-    /// Create, or (once the daemon has seen the submission) Retry and Start
-    /// over.
+    /// Create, or (while something may exist under the submission's id)
+    /// Retry and Start over.
     fn actions(
         &self,
         locked: bool,
@@ -970,23 +1089,33 @@ impl FeedbackPane {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let busy = self.submit.busy;
+        // Nothing is sent while a capture or other work on the draft runs.
+        let working = {
+            let feedback = self.feedback.read(cx);
+            feedback.capturing() || feedback.busy()
+        };
         let row = h_flex().w_full().justify_end().gap_1();
-        if locked && pending.is_some() {
+        // A first send shows its spinner on Create, though the draft is
+        // locked from the moment its request leaves.
+        if locked && pending.is_some() && busy != Some(Attempt::Submit) {
             return row
                 .child(
                     Button::new(SUBMIT_START_OVER_ID)
                         .label(START_OVER_LABEL)
                         .ghost()
                         .small()
+                        .tooltip(START_OVER_TOOLTIP)
                         .disabled(busy.is_some())
-                        .on_click(cx.listener(|this, _, window, cx| this.start_over(window, cx))),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.press_start_over(window, cx)),
+                        ),
                 )
                 .child(
                     Button::new(SUBMIT_RETRY_ID)
                         .label(RETRY_LABEL)
                         .primary()
                         .small()
-                        .disabled(busy.is_some())
+                        .disabled(busy.is_some() || working)
                         .loading(busy.is_some())
                         .on_click(cx.listener(|this, _, window, cx| this.press_retry(window, cx))),
                 );
@@ -998,8 +1127,10 @@ impl FeedbackPane {
                 feedback.upload().is_some(),
             )
         };
-        let enabled =
-            busy.is_none() && ready && can_confirm(&main_idea, repo, send_as, reason, None);
+        let enabled = busy.is_none()
+            && !working
+            && ready
+            && can_confirm(&main_idea, repo, send_as, reason, None);
         row.child(
             Button::new(SUBMIT_CONFIRM_ID)
                 .label(confirm_label(send_as))

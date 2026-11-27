@@ -11,11 +11,12 @@ use common::intents::{intent, FakeIntents};
 use smithagents_app::feedback::draft::{Attachment, AttachmentId, AttachmentKind, Draft};
 use smithagents_app::feedback::submit_vm::{
     attachments_phrase, can_confirm, confirm_label, issue_reason, public_warning, result_text,
-    starting_repo, submit_error_text, summary, upload_problem,
+    send_failure, starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
 };
 use smithagents_app::feedback::text::{
-    DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON, MAYBE_PUBLIC_WARNING,
-    NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PUBLIC_WARNING,
+    DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON, LINK_STOPPED_TEXT,
+    MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PUBLIC_WARNING, REPO_GONE_TEXT,
+    START_OVER_RISK_TEXT, START_OVER_TOOLTIP,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::view_models::{
@@ -24,8 +25,8 @@ use smithagents_app::view_models::{
 use smithagents_client::{ClientError, FeedbackFile};
 use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{
-    AttachmentKind as WireKind, FeedbackAttachment, FeedbackBox, FeedbackFailure, FeedbackStep,
-    FeedbackTarget, IdeaOptions, SendAs, SubmissionId, ToolReadiness,
+    AttachmentKind as WireKind, FeedbackAttachment, FeedbackBox, FeedbackFailure, FeedbackKind,
+    FeedbackStep, FeedbackTarget, IdeaOptions, SendAs, SubmissionId, ToolReadiness,
 };
 use smithagents_core::ids::RepoId;
 use smithagents_core::intent::{IntentState, Phase};
@@ -588,5 +589,127 @@ fn the_daemons_limits_are_checked_before_anything_is_sent() {
         )
         .as_deref(),
         Some(FILE_UNREADABLE_TEXT)
+    );
+}
+
+/// A connect error: the port was free a moment ago, so nothing listens (on
+/// the loopback only; no proxy).
+fn connect_error() -> reqwest::Error {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("nothing listens there")
+    })
+}
+
+#[test]
+fn what_a_failed_send_leaves_under_its_id() {
+    // Refusals after which the daemon recorded and committed nothing, at
+    // the status the daemon answers them with (`FeedbackError::status`).
+    for (status, code) in [
+        (400, "invalid"),
+        (400, "unsupported_file"),
+        (413, "payload_too_large"),
+        (409, "no_github_remote"),
+        (409, "gh_not_ready"),
+        (409, "tool_missing"),
+        (409, "default_branch_missing"),
+        (409, "git_identity_missing"),
+        (409, "no_free_name"),
+        (409, "name_taken"),
+        (409, "folder_blocked"),
+        (409, "branch_blocked"),
+    ] {
+        assert_eq!(
+            send_failure(&api(status, code, "x")),
+            SendFailure::Refused,
+            "{code}"
+        );
+    }
+    // Something may exist: any 5xx (whatever its code), an unknown code,
+    // a body that is not the daemon's.
+    for (status, code) in [
+        (500, "git_failed"),
+        (500, "io_error"),
+        (500, "store_error"),
+        (503, "invalid"),
+        (409, "a_code_from_a_newer_daemon"),
+        (413, "http_413"),
+        (409, "intent_not_found"),
+    ] {
+        assert_eq!(
+            send_failure(&api(status, code, "x")),
+            SendFailure::MayExist,
+            "{status} {code}"
+        );
+    }
+    assert_eq!(
+        send_failure(&api(404, "repo_not_found", "repo not found")),
+        SendFailure::RepoGone
+    );
+    assert_eq!(
+        send_failure(&api(404, "submission_not_found", "no such submission")),
+        SendFailure::NotRecorded
+    );
+
+    // The request provably never left.
+    assert_eq!(send_failure(&LinkError::NotConnected), SendFailure::NotSent);
+    let file = LinkError::Client(ClientError::File(std::io::Error::other("gone")));
+    assert_eq!(send_failure(&file), SendFailure::NotSent);
+    let refused = connect_error();
+    assert!(refused.is_connect());
+    assert_eq!(
+        send_failure(&LinkError::Client(ClientError::Http(refused))),
+        SendFailure::NotSent
+    );
+    // It may have left: a transport failure after connecting, a stopped link.
+    let broken = reqwest::Client::new()
+        .get("not a url")
+        .build()
+        .expect_err("an invalid URL is a reqwest error");
+    assert!(!broken.is_connect());
+    assert_eq!(
+        send_failure(&LinkError::Client(ClientError::Http(broken))),
+        SendFailure::MayExist
+    );
+    let ws = LinkError::Client(ClientError::Ws(
+        tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+    ));
+    assert_eq!(send_failure(&ws), SendFailure::MayExist);
+    assert_eq!(send_failure(&LinkError::Stopped), SendFailure::MayExist);
+}
+
+#[test]
+fn the_fixed_sentences_of_this_round() {
+    assert_eq!(REPO_GONE_TEXT, "That repository no longer exists.");
+    assert_eq!(LINK_STOPPED_TEXT, "The daemon link has stopped");
+    assert_eq!(submit_error_text(&LinkError::Stopped), LINK_STOPPED_TEXT);
+    assert_eq!(
+        START_OVER_TOOLTIP,
+        "Keep the screenshots and text, and send as a new submission."
+    );
+    assert_eq!(
+        START_OVER_RISK_TEXT,
+        "The daemon may still be finishing this submission. Starting over can create it twice."
+    );
+    assert_eq!(
+        KINDS,
+        [
+            FeedbackKind::NewFeature,
+            FeedbackKind::Enhancement,
+            FeedbackKind::Bug
+        ]
     );
 }

@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use common::feedback::{act, capture_now, png, FeedbackSetup};
+use common::feedback::{act, capture_now, png, run_hop, FeedbackSetup};
 use common::feedback_submit::{
     outcome_with_intent, outcome_with_issue, targets, FakeFeedback, FeedbackCall, BRANCH,
 };
@@ -28,20 +28,22 @@ use gpui_kit::{AppContext as _, ElementId, Entity, Role, TestAppContext, WindowH
 use smithagents_app::app_state::AppStateStore;
 use smithagents_app::feedback::annotation::{Annotation, FracRect};
 use smithagents_app::feedback::draft::AttachmentId;
-use smithagents_app::feedback::state::{Feedback, SUBMIT_TIMEOUT};
+use smithagents_app::feedback::state::{Feedback, SentTo, SUBMIT_TIMEOUT};
 use smithagents_app::feedback::text::{
-    EMPTY_TEXT, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, PUBLIC_WARNING, SUBMISSION_LOCKED_TEXT,
+    EMPTY_TEXT, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, PUBLIC_WARNING, REPO_GONE_TEXT,
+    START_OVER_RISK_TEXT, START_OVER_TOOLTIP, SUBMISSION_LOCKED_TEXT,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::model::Action;
 use smithagents_app::shell::Shell;
 use smithagents_app::shell_state::ShellState;
-use smithagents_app::view_models::DAEMON_UNREACHABLE_TEXT;
+use smithagents_app::view_models::{DAEMON_UNREACHABLE_TEXT, NOT_CONNECTED_TEXT};
 use smithagents_app::views::feedback::{
     card_id, card_remove_id, submit_kind_id, submit_repo_item_id, FeedbackPane, FeedbackScreen,
-    FEEDBACK_ADD_FILES_ID, FEEDBACK_CAPTURE_ID, FEEDBACK_RESULT_ID, FEEDBACK_SUBMIT_ID,
-    PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID, PUBLIC_WARNING_ID, SEND_INTENT_ID, SEND_ISSUE_ID,
-    SEND_ISSUE_REASON_ID, SUBMIT_BACK_ID, SUBMIT_CONFIRM_ID, SUBMIT_ERROR_ID, SUBMIT_IDEA_HINT_ID,
+    DISCARD_CONFIRM_ID, FEEDBACK_ADD_FILES_ID, FEEDBACK_CAPTURE_ID, FEEDBACK_DISCARD_ID,
+    FEEDBACK_RESULT_ID, FEEDBACK_SUBMIT_ID, PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID, PUBLIC_WARNING_ID,
+    SEND_INTENT_ID, SEND_ISSUE_ID, SEND_ISSUE_REASON_ID, START_OVER_CANCEL_ID,
+    START_OVER_CONFIRM_ID, SUBMIT_BACK_ID, SUBMIT_CONFIRM_ID, SUBMIT_ERROR_ID, SUBMIT_IDEA_HINT_ID,
     SUBMIT_IDEA_ID, SUBMIT_IDEA_LABEL_ID, SUBMIT_REPO_ID, SUBMIT_RETRY_ID, SUBMIT_START_OVER_ID,
     SUBMIT_SUMMARY_ID,
 };
@@ -901,12 +903,13 @@ fn a_refusal_keeps_the_draft_and_shows_the_daemons_sentence(cx: &mut TestAppCont
 
     click(cx, window, SUBMIT_CONFIRM_ID);
     let id = sent_id(&opened);
+    let sentence = "The repository's default branch main does not exist locally";
     with_window(cx, window, |window, _| {
         assert_eq!(window.find(SUBMIT_ERROR_ID).role(), Some(Role::Status));
     });
     assert_eq!(
         text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
-        Some("The repository's default branch main does not exist locally")
+        Some(sentence)
     );
     assert!(!submitting(cx, &opened));
     assert_eq!(
@@ -916,17 +919,30 @@ fn a_refusal_keeps_the_draft_and_shows_the_daemons_sentence(cx: &mut TestAppCont
     );
     assert!(setup.draft_dir().join("submission.json").is_file());
 
-    // It reached the daemon: sent again as it was, under the same id.
-    assert!(!drawn(cx, window, SUBMIT_CONFIRM_ID));
-    click(cx, window, SUBMIT_RETRY_ID);
+    // Nothing was made under the id: the form stays as it was.
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert!(!idea_disabled(cx, window));
+    assert!(!disabled(cx, window, submit_kind_id(FeedbackKind::Bug)));
+    assert!(!disabled(cx, window, SUBMIT_CONFIRM_ID));
+    assert!(!drawn(cx, window, SUBMIT_RETRY_ID));
+
+    // The sentence stays after Back and on reopening; the draft never says
+    // it was sent.
+    click(cx, window, SUBMIT_BACK_ID);
+    assert!(!disabled(cx, window, FEEDBACK_CAPTURE_ID));
+    assert!(cx.read(|cx| opened.feedback.read(cx).notices().is_empty()));
+    open_submit(cx, &opened, no_remotes(&repos));
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(sentence)
+    );
+
+    // A second confirm sends the same id; the sentence goes with the send.
+    click(cx, window, SUBMIT_CONFIRM_ID);
     let submits = opened.fake.submits();
     assert_eq!(submits.len(), 2);
     assert_eq!(submits[1].0.submission_id, id);
-    assert_eq!(submits[1].0.main_idea, "Fix the zoom");
-    assert!(
-        opened.fake.retries().is_empty(),
-        "nothing is recorded to retry"
-    );
+    assert!(!drawn(cx, window, SUBMIT_ERROR_ID));
 }
 
 #[gpui_kit::test]
@@ -935,9 +951,10 @@ fn a_sent_submission_keeps_its_text_and_target(cx: &mut TestAppContext) {
     let repos = two_repos();
     let opened = ready_to_send(cx, &setup, &repos);
     let window = opened.window;
+    // A 5xx: the daemon may have made something under the id.
     opened
         .fake
-        .queue_outcome(Err(api(409, "name_taken", "a name was taken meanwhile")));
+        .queue_outcome(Err(api(500, "store_error", "the store could not save")));
     click(cx, window, SUBMIT_CONFIRM_ID);
 
     // Text, kind and target are what the daemon saw.
@@ -958,6 +975,12 @@ fn a_sent_submission_keeps_its_text_and_target(cx: &mut TestAppContext) {
         text_of(cx, window, SUBMIT_START_OVER_ID).as_deref(),
         Some("Start over")
     );
+    with_window(cx, window, |window, _| {
+        assert_eq!(
+            window.find(SUBMIT_START_OVER_ID).description(),
+            Some(START_OVER_TOOLTIP)
+        );
+    });
 
     // So are the attachments.
     click(cx, window, SUBMIT_BACK_ID);
@@ -1002,25 +1025,22 @@ fn a_sent_submission_keeps_its_text_and_target(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn an_unreachable_daemon_leaves_the_form_as_it_was(cx: &mut TestAppContext) {
+fn a_request_that_never_left_leaves_the_form_as_it_was(cx: &mut TestAppContext) {
     let setup = FeedbackSetup::new();
     let repos = two_repos();
     let opened = ready_to_send(cx, &setup, &repos);
     let window = opened.window;
-    let http = reqwest::Client::new()
-        .get("not a url")
-        .build()
-        .expect_err("an invalid URL is a reqwest error");
-    opened
-        .fake
-        .queue_outcome(Err(LinkError::Client(ClientError::Http(http))));
+    opened.fake.queue_outcome(Err(LinkError::NotConnected));
 
     click(cx, window, SUBMIT_CONFIRM_ID);
     let id = sent_id(&opened);
     assert_eq!(
         text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
-        Some(DAEMON_UNREACHABLE_TEXT)
+        Some(NOT_CONNECTED_TEXT)
     );
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    let json = fs::read_to_string(setup.draft_dir().join("submission.json")).unwrap();
+    assert!(!json.contains("sent"), "{json}");
     assert!(!idea_disabled(cx, window));
     assert!(!disabled(cx, window, SUBMIT_CONFIRM_ID));
     assert!(!drawn(cx, window, SUBMIT_RETRY_ID));
@@ -1031,6 +1051,59 @@ fn an_unreachable_daemon_leaves_the_form_as_it_was(cx: &mut TestAppContext) {
         submits[1].0.submission_id, id,
         "the same draft, the same id"
     );
+}
+
+#[gpui_kit::test]
+fn a_connection_lost_after_sending_locks_the_draft(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    // Not a connect error: the request may have reached the daemon.
+    let broken = reqwest::Client::new()
+        .get("not a url")
+        .build()
+        .expect_err("an invalid URL is a reqwest error");
+    opened
+        .fake
+        .queue_outcome(Err(LinkError::Client(ClientError::Http(broken))));
+
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(DAEMON_UNREACHABLE_TEXT)
+    );
+    assert!(cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert!(idea_disabled(cx, window));
+    assert!(!drawn(cx, window, SUBMIT_CONFIRM_ID));
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.retries(), [id], "the retry route first");
+    assert_eq!(opened.fake.submits().len(), 1);
+}
+
+#[gpui_kit::test]
+fn a_window_closed_while_sending_leaves_a_locked_draft(cx: &mut TestAppContext) {
+    // Review F2: the marker is on disk before the request leaves.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    click(cx, opened.window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    let json = fs::read_to_string(setup.draft_dir().join("submission.json")).unwrap();
+    assert!(json.contains("sent"), "{json}");
+    close(cx, opened);
+
+    let opened = open(cx, &setup, &repos, Some(repos[0].id));
+    let window = opened.window;
+    assert!(cx.read(|cx| opened.feedback.read(cx).locked()));
+    open_submit(cx, &opened, no_remotes(&repos));
+    assert!(drawn(cx, window, SUBMIT_RETRY_ID));
+    assert!(!drawn(cx, window, SUBMIT_CONFIRM_ID));
+    assert!(idea_disabled(cx, window));
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.retries(), [id], "the same id");
+    assert!(opened.fake.submits().is_empty(), "nothing is uploaded yet");
 }
 
 #[gpui_kit::test]
@@ -1188,11 +1261,270 @@ fn a_silent_daemon_frees_the_screen(cx: &mut TestAppContext) {
         Some(id),
         "the pending id is kept"
     );
-    // It may have reached the daemon: sent again as it was.
+    // The daemon took it: the retry route first, which knows of no such
+    // submission, so the same request goes again under the same id.
+    opened
+        .fake
+        .queue_outcome(Err(api(404, "submission_not_found", "no such submission")));
     click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.retries(), [id]);
     let submits = opened.fake.submits();
     assert_eq!(submits.len(), 2);
     assert_eq!(submits[1].0.submission_id, id);
+    assert_eq!(submits[1].0.main_idea, "Fix the zoom");
+    assert!(submitting(cx, &opened));
+}
+
+#[gpui_kit::test]
+fn starting_over_a_submission_that_may_still_run_asks_first(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    cx.executor()
+        .advance_clock(SUBMIT_TIMEOUT + Duration::from_secs(1));
+    frame(cx, window);
+
+    click(cx, window, SUBMIT_START_OVER_ID);
+    assert!(with_window(cx, window, |window, cx| window.has_active_dialog(cx)));
+    with_window(cx, window, |window, _| {
+        assert!(window
+            .find_all_by_role(Role::Label)
+            .iter()
+            .any(|label| label.value() == Some(START_OVER_RISK_TEXT)));
+        assert_eq!(window.find(START_OVER_CANCEL_ID).focused(), Some(true));
+    });
+    click(cx, window, START_OVER_CANCEL_ID);
+    assert!(!with_window(cx, window, |window, cx| window.has_active_dialog(cx)));
+    assert!(
+        cx.read(|cx| opened.feedback.read(cx).locked()),
+        "nothing changed"
+    );
+
+    click(cx, window, SUBMIT_START_OVER_ID);
+    click(cx, window, START_OVER_CONFIRM_ID);
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert!(drawn(cx, window, SUBMIT_CONFIRM_ID));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_ne!(submits[1].0.submission_id, id);
+}
+
+#[gpui_kit::test]
+fn a_forgotten_submission_keeps_its_target_after_a_restart(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let (alpha, beta) = (repos[0].id, repos[1].id);
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    click(cx, window, SUBMIT_REPO_ID);
+    with_window(cx, window, |window, cx| {
+        window
+            .within("popup-menu")
+            .click(submit_repo_item_id(beta), cx)
+    });
+    frame(cx, window);
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    let mut partial = outcome_with_intent(id, created_intent(beta));
+    partial.intent = None;
+    partial.failed = Some(FeedbackFailure {
+        step: FeedbackStep::CreateIntent,
+        code: "store_error".into(),
+        message: "the intent could not be saved".into(),
+    });
+    opened.fake.answer_outcome(Ok(partial));
+    frame(cx, window);
+    close(cx, opened);
+
+    // After a restart the screen would start on the meta repository, alpha.
+    let opened = open(cx, &setup, &repos, Some(alpha));
+    let window = opened.window;
+    open_submit(cx, &opened, no_remotes(&repos));
+    assert_eq!(text_of(cx, window, SUBMIT_REPO_ID).as_deref(), Some("beta"));
+    opened
+        .fake
+        .queue_outcome(Err(api(404, "submission_not_found", "no such submission")));
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(NOTHING_CREATED_TEXT)
+    );
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert_eq!(
+        text_of(cx, window, SUBMIT_REPO_ID).as_deref(),
+        Some("beta"),
+        "the repository it was sent to"
+    );
+}
+
+#[gpui_kit::test]
+fn a_repository_that_is_gone_forgets_the_submission(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    opened
+        .fake
+        .queue_outcome(Err(api(404, "repo_not_found", "repo not found")));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(REPO_GONE_TEXT)
+    );
+    assert_eq!(
+        cx.read(|cx| opened.feedback.read(cx).pending().cloned()),
+        None
+    );
+    assert!(!idea_disabled(cx, window));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 2);
+    assert_ne!(submits[1].0.submission_id, id);
+}
+
+#[gpui_kit::test]
+fn success_while_another_pane_shows_switches_nothing(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+
+    click(cx, window, RailEntry::Settings.element_id());
+    let created = created_intent(alpha);
+    opened.state.update(cx, |state, cx| {
+        state.dispatch(Action::IntentUpserted(created.clone()), cx)
+    });
+    opened
+        .fake
+        .answer_outcome(Ok(outcome_with_intent(id, created.clone())));
+    frame(cx, window);
+    assert_eq!(
+        opened
+            .shell
+            .read_with(cx, |shell, cx| shell.rail_active(cx)),
+        Some(RailEntry::Settings)
+    );
+    let intents = intents_pane(cx, &opened.shell);
+    assert_ne!(
+        intents.read_with(cx, |pane, _| *pane.screen()),
+        Screen::Detail(created.id)
+    );
+
+    click(cx, window, RailEntry::Feedback.element_id());
+    assert_eq!(screen(cx, &opened), FeedbackScreen::Draft);
+    assert_eq!(
+        text_of(cx, window, FEEDBACK_RESULT_ID).as_deref(),
+        Some(
+            "Created the intent “Fix the zoom”. Files: feedback/2026-11-26-fix-the-zoom (0123abc)."
+        )
+    );
+    assert!(!setup.draft_dir().exists());
+}
+
+#[gpui_kit::test]
+fn a_locked_draft_without_attachments_can_be_discarded(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let opened = ready_to_send(cx, &setup, &repos);
+    click(cx, opened.window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    let mut partial = outcome_with_intent(id, created_intent(alpha));
+    partial.intent = None;
+    partial.failed = Some(push_failure());
+    opened.fake.answer_outcome(Ok(partial));
+    frame(cx, opened.window);
+    close(cx, opened);
+    // Its files went missing meanwhile.
+    for name in ["screenshot-1.png", "screenshot-1.annotated.png"] {
+        fs::remove_file(setup.draft_dir().join(name)).unwrap();
+    }
+
+    let opened = open(cx, &setup, &repos, Some(alpha));
+    let window = opened.window;
+    assert!(cx.read(|cx| opened.feedback.read(cx).draft().is_empty()));
+    assert!(cx.read(|cx| opened.feedback.read(cx).pending().is_some()));
+    assert!(disabled(cx, window, FEEDBACK_SUBMIT_ID));
+    assert!(!disabled(cx, window, FEEDBACK_DISCARD_ID), "not a dead end");
+    click(cx, window, FEEDBACK_DISCARD_ID);
+    click(cx, window, DISCARD_CONFIRM_ID);
+    assert!(!setup.draft_dir().exists());
+    assert_eq!(
+        cx.read(|cx| opened.feedback.read(cx).pending().cloned()),
+        None
+    );
+    assert!(!disabled(cx, window, FEEDBACK_CAPTURE_ID));
+}
+
+#[gpui_kit::test]
+fn a_capture_or_a_file_landing_while_locked_is_refused(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let opened = ready_to_send(cx, &setup, &repos);
+    let (window, feedback) = (opened.window, opened.feedback.clone());
+    let lock = |f: &mut Feedback, cx: &mut gpui_kit::Context<Feedback>| {
+        f.begin_submission(cx);
+        f.mark_sent(
+            SentTo {
+                repo_id: alpha,
+                send_as: SendAs::Intent,
+            },
+            cx,
+        );
+    };
+
+    // A capture that started before the lock lands after it.
+    act(cx, window, &feedback, |f, window, cx| {
+        f.capture(window, cx);
+        lock(f, cx);
+    });
+    run_hop(cx, window, &setup);
+    run_hop(cx, window, &setup);
+    let draft = cx.read(|cx| feedback.read(cx).draft().clone());
+    assert_eq!(draft.attachments.len(), 1, "the picture is not added");
+    assert_eq!(
+        cx.read(|cx| feedback.read(cx).notices().to_vec()),
+        [SUBMISSION_LOCKED_TEXT]
+    );
+    assert!(!setup.draft_dir().join("screenshot-2.png").exists());
+
+    // A file being copied in when the lock comes.
+    act(cx, window, &feedback, |f, _, cx| f.forget_submission(cx));
+    setup.pick(vec![setup.picked_file("good.png", &png(64, 48))]);
+    act(cx, window, &feedback, |f, window, cx| {
+        f.add_files(window, cx);
+        lock(f, cx);
+    });
+    frame(cx, window);
+    assert_eq!(cx.read(|cx| feedback.read(cx).draft().attachments.len()), 1);
+    let names = common::feedback::file_names(&setup.draft_dir());
+    assert!(
+        !names.iter().any(|name| name.starts_with("image-")),
+        "{names:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn no_send_starts_while_a_capture_runs(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let (window, feedback) = (opened.window, opened.feedback.clone());
+    act(cx, window, &feedback, |f, window, cx| f.capture(window, cx));
+    assert!(cx.read(|cx| feedback.read(cx).capturing()));
+    assert!(disabled(cx, window, SUBMIT_CONFIRM_ID));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(opened.fake.submits().is_empty());
+    assert!(!setup.draft_dir().join("submission.json").exists());
 }
 
 #[gpui_kit::test]

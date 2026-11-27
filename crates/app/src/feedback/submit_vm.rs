@@ -10,8 +10,8 @@ use std::borrow::Cow;
 use smithagents_client::{ClientError, FeedbackFile};
 use smithagents_core::agent::Repo;
 use smithagents_core::feedback::{
-    AttachmentKind as WireKind, FeedbackAttachment, FeedbackOutcome, FeedbackTarget, IdeaOptions,
-    SendAs, ToolReadiness,
+    AttachmentKind as WireKind, FeedbackAttachment, FeedbackKind, FeedbackOutcome, FeedbackTarget,
+    IdeaOptions, SendAs, ToolReadiness,
 };
 use smithagents_core::ids::RepoId;
 
@@ -21,15 +21,86 @@ use super::text::{
     result_issue_unnamed, summary_idea, summary_intent, summary_issue, COMMENT_TOO_LONG_REASON,
     CREATE_INTENT_LABEL, CREATE_ISSUE_LABEL, DRAFT_FULL_TEXT, GH_MISSING_REASON,
     GH_SIGNED_OUT_REASON, GH_TURNED_OFF, IMAGE_TOO_LARGE_REASON, ISSUE_UNCONFIRMED_TEXT,
-    MAIN_IDEA_MAX_CHARS, MAIN_IDEA_TOO_LONG_TEXT, MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS,
-    MAX_IMAGE_BYTES, MAX_TOTAL_BYTES, MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT,
-    NO_REMOTE_REASON, PLUGIN_OFF_REASON, PUBLIC_WARNING, TOO_MANY_BOXES_REASON,
-    UPLOAD_TOO_LARGE_TEXT, VIDEO_TOO_LARGE_REASON,
+    LINK_STOPPED_TEXT, MAIN_IDEA_MAX_CHARS, MAIN_IDEA_TOO_LONG_TEXT, MAX_ATTACHMENTS, MAX_BOXES,
+    MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES, MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING,
+    NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PLUGIN_OFF_REASON, PUBLIC_WARNING, REPO_GONE_TEXT,
+    TOO_MANY_BOXES_REASON, UPLOAD_TOO_LARGE_TEXT, VIDEO_TOO_LARGE_REASON,
 };
 use crate::link::LinkError;
 use crate::view_models::{
     capitalized, one_line, DAEMON_UNREACHABLE_TEXT, FILE_UNREADABLE_TEXT, NOT_CONNECTED_TEXT,
 };
+
+/// The feedback kinds, in the order the Submit screen offers them.
+pub const KINDS: [FeedbackKind; 3] = [
+    FeedbackKind::NewFeature,
+    FeedbackKind::Enhancement,
+    FeedbackKind::Bug,
+];
+
+/// The error codes of the refusals after which the daemon has recorded and
+/// committed nothing under the submission's id, so the draft stays
+/// editable and the same id can be sent again. The one place this list is
+/// kept. It mirrors `FeedbackError::code` and `FeedbackError::status` in
+/// `crates/server/src/feedback/mod.rs` and where each is raised before a
+/// record or a commit exists: `upload::check_request` and `upload::stage`
+/// (`invalid`, `unsupported_file`, `payload_too_large`),
+/// `FeedbackService::require_github` (`no_github_remote`, `gh_not_ready`),
+/// `FeedbackService::require_tool` (`tool_missing`) and
+/// `repo::place_and_commit` (`default_branch_missing`,
+/// `git_identity_missing`, `no_free_name`, `name_taken`, `folder_blocked`,
+/// `branch_blocked`). They count only as a 4xx answer: the daemon sends
+/// `git_failed` and `io_error` as 500, and any 5xx locks.
+pub const NOTHING_MADE_CODES: [&str; 12] = [
+    "invalid",
+    "unsupported_file",
+    "payload_too_large",
+    "no_github_remote",
+    "gh_not_ready",
+    "tool_missing",
+    "default_branch_missing",
+    "git_identity_missing",
+    "no_free_name",
+    "name_taken",
+    "folder_blocked",
+    "branch_blocked",
+];
+
+/// What a failed send (or retry) leaves under the submission's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailure {
+    /// The request provably never left: not connected, the daemon refused
+    /// the connection, or a local file could not be opened. The draft stays
+    /// as it was.
+    NotSent,
+    /// The daemon refused it and made nothing ([`NOTHING_MADE_CODES`]): the
+    /// draft stays editable, under the same id.
+    Refused,
+    /// The daemon has no such repository: the id is dropped, the draft stays
+    /// editable.
+    RepoGone,
+    /// The daemon has no record of the id (`submission_not_found`).
+    NotRecorded,
+    /// Something may exist under the id: a 5xx, an unknown code, a transport
+    /// failure after the request was sent. The draft is locked.
+    MayExist,
+}
+
+pub fn send_failure(error: &LinkError) -> SendFailure {
+    match error {
+        LinkError::NotConnected | LinkError::Client(ClientError::File(_)) => SendFailure::NotSent,
+        LinkError::Client(ClientError::Http(e)) if e.is_connect() => SendFailure::NotSent,
+        LinkError::Stopped | LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
+            SendFailure::MayExist
+        }
+        LinkError::Client(ClientError::Api { status, code, .. }) => match code.as_str() {
+            "submission_not_found" => SendFailure::NotRecorded,
+            "repo_not_found" => SendFailure::RepoGone,
+            code if *status < 500 && NOTHING_MADE_CODES.contains(&code) => SendFailure::Refused,
+            _ => SendFailure::MayExist,
+        },
+    }
+}
 
 /// How many characters of a daemon's message a line shows.
 const MESSAGE_CHARS: usize = 300;
@@ -186,7 +257,7 @@ fn feedback_code_text(code: &str) -> Option<&'static str> {
     Some(match code {
         "submission_not_found" => NOTHING_CREATED_TEXT,
         "issue_unconfirmed" => ISSUE_UNCONFIRMED_TEXT,
-        "repo_not_found" => "That repository no longer exists.",
+        "repo_not_found" => REPO_GONE_TEXT,
         _ => return None,
     })
 }
@@ -200,7 +271,7 @@ fn feedback_code_text(code: &str) -> Option<&'static str> {
 pub fn submit_error_text(error: &LinkError) -> String {
     match error {
         LinkError::NotConnected => NOT_CONNECTED_TEXT.to_owned(),
-        LinkError::Stopped => "The daemon link has stopped".to_owned(),
+        LinkError::Stopped => LINK_STOPPED_TEXT.to_owned(),
         LinkError::Client(ClientError::Http(_) | ClientError::Ws(_)) => {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }

@@ -12,9 +12,10 @@
 //! "Capture" takes a picture of the window as it is, "Add files…" asks for
 //! files, "Discard" asks first, and "Submit…" opens the Submit screen
 //! ([`submit`]), once the draft has an attachment and the daemon is there.
-//! While the draft is locked (its submission is under way or was sent), it
-//! cannot be changed: Capture and Add files are disabled and the cards have
-//! no remove button.
+//! While the draft is locked (something may exist under its submission's
+//! id), it cannot be changed: Capture and Add files are disabled and the
+//! cards have no remove button. Discard works whenever there is a pending
+//! submission, also when its attachments are gone.
 //!
 //! The pane only shows the [`Feedback`] entity and calls it: the draft, the
 //! disk, the capturer and the picker are all there. It does release the
@@ -40,8 +41,9 @@ pub use hold::{HoldButton, HoldEvent, HOLD_RING_ID};
 pub use submit::{
     submit_kind_id, submit_repo_item_id, PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID,
     PUBLIC_CONFIRM_TITLE_ID, PUBLIC_WARNING_ID, SEND_INTENT_ID, SEND_ISSUE_ID,
-    SEND_ISSUE_REASON_ID, SUBMIT_BACK_ID, SUBMIT_CONFIRM_ID, SUBMIT_ERROR_ID, SUBMIT_IDEA_HINT_ID,
-    SUBMIT_IDEA_ID, SUBMIT_IDEA_LABEL_ID, SUBMIT_KEY_CONTEXT, SUBMIT_REPO_ID, SUBMIT_RETRY_ID,
+    SEND_ISSUE_REASON_ID, START_OVER_CANCEL_ID, START_OVER_CONFIRM_ID, START_OVER_TITLE_ID,
+    SUBMIT_BACK_ID, SUBMIT_CONFIRM_ID, SUBMIT_ERROR_ID, SUBMIT_IDEA_HINT_ID, SUBMIT_IDEA_ID,
+    SUBMIT_IDEA_LABEL_ID, SUBMIT_KEY_CONTEXT, SUBMIT_REPO_ID, SUBMIT_RETRY_ID,
     SUBMIT_START_OVER_ID, SUBMIT_SUMMARY_ID,
 };
 
@@ -257,13 +259,14 @@ impl FeedbackPane {
     /// "Submit…" needs an attachment, no work running on the draft and the
     /// daemon; disabled, it says why (an empty draft, or no daemon).
     fn buttons(&self, empty: bool, cx: &Context<Self>) -> impl IntoElement {
-        let (capturing, locked, busy, submitting) = {
+        let (capturing, locked, busy, submitting, pending) = {
             let feedback = self.feedback.read(cx);
             (
                 feedback.capturing(),
                 feedback.locked(),
                 feedback.busy(),
                 feedback.submitting(),
+                feedback.pending().is_some(),
             )
         };
         let connected = self.state.read(cx).feedback_commands().is_some();
@@ -319,7 +322,9 @@ impl FeedbackPane {
                             .label(DISCARD_LABEL)
                             .ghost()
                             .small()
-                            .disabled(empty || submitting)
+                            // A pending submission can always be discarded:
+                            // a locked draft whose files are gone is no dead end.
+                            .disabled((empty && !pending) || submitting)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.ask_to_discard(window, cx)),
                             ),
@@ -360,8 +365,14 @@ impl FeedbackPane {
     }
 
     fn ask_to_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.feedback.read(cx).draft().attachments.len();
-        if count == 0 {
+        let (count, pending) = {
+            let feedback = self.feedback.read(cx);
+            (
+                feedback.draft().attachments.len(),
+                feedback.pending().is_some(),
+            )
+        };
+        if count == 0 && !pending {
             return;
         }
         let feedback = self.feedback.downgrade();

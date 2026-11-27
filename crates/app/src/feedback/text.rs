@@ -139,7 +139,9 @@ pub fn card_title(number: usize, comments: usize) -> String {
 }
 
 pub fn discard_description(attachments: usize) -> String {
-    if attachments == 1 {
+    if attachments == 0 {
+        "The draft is deleted. This cannot be undone.".to_string()
+    } else if attachments == 1 {
         "1 attachment and its comments are deleted. This cannot be undone.".to_string()
     } else {
         format!("{attachments} attachments and their comments are deleted. This cannot be undone.")
@@ -237,6 +239,16 @@ pub fn partial_text(branch: &str, sha7: &str, message: &str) -> String {
 }
 
 pub const NOTHING_CREATED_TEXT: &str = "Nothing was created. Submit again.";
+pub const REPO_GONE_TEXT: &str = "That repository no longer exists.";
+pub const LINK_STOPPED_TEXT: &str = "The daemon link has stopped";
+/// "Start over"'s tooltip.
+pub const START_OVER_TOOLTIP: &str = "Keep the screenshots and text, and send as a new submission.";
+/// What Start over asks first while the daemon may still be making the
+/// submission (it took the request and did not answer).
+pub const START_OVER_TITLE: &str = "Start over?";
+pub const START_OVER_RISK_TEXT: &str =
+    "The daemon may still be finishing this submission. Starting over can create it twice.";
+pub const START_OVER_CANCEL: &str = "Cancel";
 pub const ISSUE_UNCONFIRMED_TEXT: &str =
     "GitHub has not confirmed whether the issue was created. Try again in a minute.";
 /// A change to the draft while its submission is sent or under way.

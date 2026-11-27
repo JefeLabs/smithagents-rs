@@ -13,11 +13,13 @@
 //!
 //! Submitting: the draft gets one submission id ([`Pending`], kept in
 //! `submission.json`), used for every send and retry of it until it
-//! succeeds, is started over or discarded. While a submission is under way,
-//! and once the daemon has seen it, the draft is [`Feedback::locked`]: it
-//! stays as it was sent (the daemon may already have committed it), so
-//! nothing is added, removed, annotated or retyped. Only a success deletes
-//! the draft and its files.
+//! succeeds, is started over or discarded. Before a request leaves, the
+//! target it is sent for is written there ([`Feedback::mark_sent`]); from
+//! then on, and until an answer shows that nothing exists under the id,
+//! the draft is [`Feedback::locked`]: it stays as it was sent (the daemon
+//! may already have committed it), so nothing is added, removed, annotated
+//! or retyped, and a capture or a file that lands meanwhile is refused.
+//! Only a success deletes the draft and its files.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -45,7 +47,7 @@ use super::draft::{
 };
 use super::files::{FileKind, Refusal};
 use super::render::decode;
-use super::submit_vm::wire_kind;
+use super::submit_vm::{wire_kind, KINDS};
 use super::text::{
     capture_failed_text, more_files_text, more_notices_text, picker_failed_text,
     CAPTURE_FRAMES_MISSED, CAPTURE_FRAMES_TIMEOUT, CAPTURE_PICTURE_TIMEOUT, CAPTURE_TOO_SLOW,
@@ -72,10 +74,14 @@ pub struct Pending {
     /// The daemon's answer when a step after the commit failed.
     #[serde(default)]
     pub outcome: Option<FeedbackOutcome>,
-    /// Where the submission went, once the daemon has seen it (it answered,
-    /// or took the request and did not answer in time).
+    /// Where the submission went: written before its request leaves, and
+    /// kept while something may exist under the id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent: Option<SentTo>,
+    /// The last request went out and no answer came (a timeout, a lost
+    /// connection, a quit while sending): the daemon may still be making it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaiting: bool,
 }
 
 /// The repository and the kind of result a submission was sent for.
@@ -84,13 +90,6 @@ pub struct SentTo {
     pub repo_id: RepoId,
     pub send_as: SendAs,
 }
-
-/// The feedback kinds by their wire names.
-const KINDS: [FeedbackKind; 3] = [
-    FeedbackKind::NewFeature,
-    FeedbackKind::Enhancement,
-    FeedbackKind::Bug,
-];
 
 /// A box as the daemon takes it.
 fn wire_box(annotation: &Annotation) -> FeedbackBox {
@@ -493,6 +492,11 @@ impl Feedback {
             tracing::warn!(error = %e, "feedback capture failed");
             capture_error_text(&e)
         })?;
+        // The draft was sent while the picture was taken: what a success
+        // deletes must be only what was sent.
+        if self.locked() {
+            return Err(SUBMISSION_LOCKED_TEXT.to_string());
+        }
         // The draft may have filled up while the picture was taken.
         let usage = self.draft.usage();
         if usage.count >= MAX_ATTACHMENTS {
@@ -571,11 +575,20 @@ impl Feedback {
             while let Some(path) = paths.next() {
                 // What the draft holds now, files added earlier in this pick
                 // included; nothing once it is full.
-                let Ok(next) = this.update(cx, |this, _| {
-                    (this.draft.attachments.len() < MAX_ATTACHMENTS)
-                        .then(|| (this.files.clone(), this.draft.usage(), this.draft.clone()))
+                let Ok(next) = this.update(cx, |this, cx| {
+                    if this.locked() {
+                        this.add_notice(SUBMISSION_LOCKED_TEXT.to_string());
+                        cx.notify();
+                        return Err(());
+                    }
+                    Ok((this.draft.attachments.len() < MAX_ATTACHMENTS)
+                        .then(|| (this.files.clone(), this.draft.usage(), this.draft.clone())))
                 }) else {
                     return;
+                };
+                // Sent meanwhile: the rest of the pick is not added.
+                let Ok(next) = next else {
+                    break;
                 };
                 let Some((files, usage, draft)) = next else {
                     let left = 1 + paths.len();
@@ -620,6 +633,13 @@ impl Feedback {
                 thumbnail,
                 thumbnail_error,
             } => {
+                if self.locked() {
+                    // Sent while the file was copied: its copy goes.
+                    self.files.remove(&attachment.stored_name);
+                    self.add_notice(SUBMISSION_LOCKED_TEXT.to_string());
+                    cx.notify();
+                    return;
+                }
                 // A capture may have landed while the file was copied.
                 let usage = self.draft.usage();
                 let late_refusal = if usage.count >= MAX_ATTACHMENTS {
@@ -859,9 +879,9 @@ impl Feedback {
         self.submitting
     }
 
-    /// The draft stays as it was sent: a submission is under way, or the
-    /// daemon has seen the pending one. Nothing can be added, removed,
-    /// annotated or retyped then.
+    /// The draft stays as it was sent: a submission is under way, or
+    /// something may exist under the pending one's id. Nothing can be
+    /// added, removed, annotated or retyped then.
     pub fn locked(&self) -> bool {
         self.submitting || self.pending.as_ref().is_some_and(|p| p.sent.is_some())
     }
@@ -887,27 +907,46 @@ impl Feedback {
             submission_id: id,
             outcome: None,
             sent: None,
+            awaiting: false,
         });
         self.save_pending();
         cx.notify();
         id
     }
 
-    /// The daemon has seen the pending submission, sent for `to`: the draft
-    /// is locked from here on.
+    /// The pending submission's request is about to leave for `to`: written
+    /// first, so a quit or a lost connection meanwhile leaves the draft
+    /// locked. It is awaiting an answer until one comes.
     pub fn mark_sent(&mut self, to: SentTo, cx: &mut Context<Self>) {
+        self.set_sent(Some(to), true, cx);
+    }
+
+    /// The daemon answered the pending submission (and something may exist
+    /// under its id): still locked, no longer awaiting.
+    pub fn mark_answered(&mut self, cx: &mut Context<Self>) {
+        let sent = self.pending.as_ref().and_then(|p| p.sent);
+        self.set_sent(sent, false, cx);
+    }
+
+    /// Where the pending submission was sent, and whether it awaits an
+    /// answer, as they were or are again: `None` when nothing exists under
+    /// its id (the draft can change again, under the same id).
+    pub fn set_sent(&mut self, sent: Option<SentTo>, awaiting: bool, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
-        if pending.sent == Some(to) {
+        let awaiting = awaiting && sent.is_some();
+        if pending.sent == sent && pending.awaiting == awaiting {
             return;
         }
-        pending.sent = Some(to);
+        pending.sent = sent;
+        pending.awaiting = awaiting;
         self.save_pending();
         cx.notify();
     }
 
-    /// Keeps the daemon's answer of a submission whose step failed.
+    /// Keeps the daemon's answer of a submission whose step failed: sent to
+    /// the repository the daemon names, answered.
     pub fn record_outcome(&mut self, outcome: FeedbackOutcome, cx: &mut Context<Self>) {
         let Some(pending) = self
             .pending
@@ -917,6 +956,10 @@ impl Feedback {
             tracing::warn!(submission_id = %outcome.submission_id, "an outcome of another submission");
             return;
         };
+        if let Some(sent) = pending.sent.as_mut() {
+            sent.repo_id = outcome.repo_id;
+        }
+        pending.awaiting = false;
         pending.outcome = Some(outcome);
         self.save_pending();
         cx.notify();
