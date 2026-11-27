@@ -272,15 +272,9 @@ impl FeedbackPane {
                 feedback.pending().cloned(),
             )
         };
-        let Some(targets) = self
-            .state
-            .read(cx)
-            .feedback_commands()
-            .filter(|_| !empty && !busy)
-            .map(|commands| commands.feedback_targets())
-        else {
+        if empty || busy || self.state.read(cx).feedback_commands().is_none() {
             return;
-        };
+        }
         tracing::debug!("feedback submit screen");
         self.submit.focus_before = window.focused(cx);
         self.screen = FeedbackScreen::Submit;
@@ -301,10 +295,39 @@ impl FeedbackPane {
         submit.send_as = SendAs::Intent;
         submit.package = None;
         submit.targets = None;
+        self.load_targets(window, cx);
+        let main_idea = self.feedback.read(cx).draft().main_idea.clone();
+        let locked = self.feedback.read(cx).locked();
+        self.submit.idea.update(cx, |idea, cx| {
+            if idea.value() != main_idea {
+                idea.set_value(main_idea, window, cx);
+            }
+            if !locked {
+                idea.focus(window, cx);
+            }
+        });
+        if locked {
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Asks the daemon for the targets; what the screen has meanwhile stays
+    /// until they come. A failure is said on the error line unless it has a
+    /// sentence already.
+    fn load_targets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(targets) = self
+            .state
+            .read(cx)
+            .feedback_commands()
+            .map(|commands| commands.feedback_targets())
+        else {
+            return;
+        };
         let timer = cx
             .background_executor()
             .timer(self.state.read(cx).command_timeout());
-        submit.targets_task = Some(cx.spawn_in(window, async move |this, cx| {
+        self.submit.targets_task = Some(cx.spawn_in(window, async move |this, cx| {
             let answer = answered(targets, timer).await;
             let _ = this.update(cx, |this, cx| {
                 this.submit.targets_task = None;
@@ -324,20 +347,6 @@ impl FeedbackPane {
                 cx.notify();
             });
         }));
-        let main_idea = self.feedback.read(cx).draft().main_idea.clone();
-        let locked = self.feedback.read(cx).locked();
-        self.submit.idea.update(cx, |idea, cx| {
-            if idea.value() != main_idea {
-                idea.set_value(main_idea, window, cx);
-            }
-            if !locked {
-                idea.focus(window, cx);
-            }
-        });
-        if locked {
-            self.focus.focus(window, cx);
-        }
-        cx.notify();
     }
 
     /// Back to the draft, unless a command is under way; the focus returns
@@ -760,6 +769,7 @@ impl FeedbackPane {
                         };
                         self.feedback
                             .update(cx, |feedback, cx| feedback.set_sent(sent, awaiting, cx));
+                        self.after_refusal(&e, window, cx);
                         Some(submit_error_text(&e))
                     }
                     SendFailure::NotRecorded

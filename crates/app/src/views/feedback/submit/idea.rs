@@ -6,6 +6,10 @@
 //! disabled, with no sentence). With no part ticked the summary asks for
 //! one and Create is disabled.
 //!
+//! A submission the daemon refuses because `agent-browser` is not ready
+//! there (`tool_missing`) unticks and disables "Demo video", and the
+//! targets are asked for again; the error line says how to get it.
+//!
 //! The boxes are part of the form, not of the draft: they start unticked
 //! whenever the screen opens. Once a submission is sent, they show what was
 //! sent and stay as they were while the draft is locked, like the rest of
@@ -15,14 +19,16 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::{v_flex, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{App, Context, IntoElement, ParentElement as _, Styled as _};
-use smithagents_core::feedback::{IdeaOptions, SendAs};
+use gpui_kit::{App, Context, IntoElement, ParentElement as _, Styled as _, Window};
+use smithagents_client::ClientError;
+use smithagents_core::feedback::{IdeaOptions, SendAs, ToolReadiness};
 
 use super::super::{FeedbackPane, Paint};
-use crate::feedback::submit_vm::{demo_help, IDEA_START};
+use crate::feedback::submit_vm::{demo_help, IDEA_START, TOOL_MISSING};
 use crate::feedback::text::{
     IDEA_DEMO_LABEL, IDEA_DIAGRAMS_LABEL, IDEA_EXPLAINER_LABEL, IDEA_LABEL,
 };
+use crate::link::LinkError;
 
 /// Element id of "Prepare an idea PR for teammates".
 pub const IDEA_CHECK_ID: &str = "feedback-idea";
@@ -92,6 +98,37 @@ impl FeedbackPane {
             Part::Explainer => parts.explainer = ticked,
         }
         cx.notify();
+    }
+
+    /// After a refusal that made nothing: when it was `tool_missing`
+    /// (`agent-browser` is not ready for the demo video), "Demo video" is
+    /// unticked and disabled until the targets, asked for again, say it is
+    /// ready.
+    pub(super) fn after_refusal(
+        &mut self,
+        error: &LinkError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let LinkError::Client(ClientError::Api { code, .. }) = error else {
+            return;
+        };
+        if code != TOOL_MISSING {
+            return;
+        }
+        tracing::info!(
+            "agent-browser is not ready for the demo video; asking for the targets again"
+        );
+        if let Some(parts) = self.submit.package.as_mut() {
+            parts.demo_video = false;
+        }
+        if let Some(targets) = self.submit.targets.as_mut() {
+            targets.agent_browser = ToolReadiness {
+                ready: false,
+                reason: None,
+            };
+        }
+        self.load_targets(window, cx);
     }
 
     /// The boxes, as `idea` has them (see [`Self::chosen_idea`]), indented

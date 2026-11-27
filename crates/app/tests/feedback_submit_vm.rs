@@ -456,6 +456,11 @@ fn error_sentences() {
         submit_error_text(&api(409, "issue_unconfirmed", "anything")),
         "GitHub has not confirmed whether the issue was created. Try again in a minute."
     );
+    // The only tool a submission needs is agent-browser, for a demo video.
+    assert_eq!(
+        submit_error_text(&api(409, "tool_missing", "agent-browser is not installed")),
+        DEMO_MISSING_REASON
+    );
 }
 
 #[test]

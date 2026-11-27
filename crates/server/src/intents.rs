@@ -135,6 +135,12 @@ pub enum IntentError {
     /// of its repository, so it cannot move to another one (HTTP 409).
     #[error("This intent's evidence is in its repository, so the repository cannot be changed.")]
     EvidenceInRepo,
+    /// The intent has a fixed dependency, which must stay in its repository
+    /// (HTTP 409).
+    #[error(
+        "This intent depends on another intent in its repository, so the repository cannot be changed."
+    )]
+    FixedDependency,
     #[error(transparent)]
     Service(ServiceError),
     #[error(transparent)]
@@ -166,6 +172,7 @@ impl IntentError {
             IntentError::DependencyCycle => "dependency_cycle",
             IntentError::DependencyCrossRepo => "dependency_cross_repo",
             IntentError::EvidenceInRepo => "evidence_in_repo",
+            IntentError::FixedDependency => "fixed_dependency",
             IntentError::Service(_) => "service_error",
             IntentError::Store(_) => "store_error",
         }
@@ -185,7 +192,8 @@ impl IntentError {
             | IntentError::AlreadyAnswered
             | IntentError::DependencyCycle
             | IntentError::DependencyCrossRepo
-            | IntentError::EvidenceInRepo => S::CONFLICT,
+            | IntentError::EvidenceInRepo
+            | IntentError::FixedDependency => S::CONFLICT,
             IntentError::Invalid(_) => S::BAD_REQUEST,
             IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
         };
@@ -625,6 +633,11 @@ impl IntentService {
             )));
         }
         let new_repo = patch.repo_id.filter(|r| *r != intent.repo_id);
+        // A fixed dependency (which a move would clear) is on an intent of
+        // this repository; checked first, origin or not.
+        if new_repo.is_some() && intent.content.depends_on.iter().any(|d| d.fixed) {
+            return Err(IntentError::FixedDependency);
+        }
         // Its agent starts from a branch of this repository that holds its
         // files: in another repository that branch is not there, or is not
         // the same.
@@ -1346,8 +1359,8 @@ impl IntentService {
         c.stories = polished.stories;
         c.depends_on = polished.depends_on;
         intent.phase = Phase::Review;
-        // Every new item is pending, so this is Complete only when all four
-        // sections came back empty.
+        // Every item the model adds is pending (fixed items are accepted), so
+        // this is Complete only when the model added none.
         intent.state = if intent.is_complete_content() {
             IntentState::Complete
         } else {

@@ -60,7 +60,7 @@ pub const NOTHING_MADE_CODES: [&str; 12] = [
     "payload_too_large",
     "no_github_remote",
     "gh_not_ready",
-    "tool_missing",
+    TOOL_MISSING,
     "default_branch_missing",
     "git_identity_missing",
     "no_free_name",
@@ -68,6 +68,10 @@ pub const NOTHING_MADE_CODES: [&str; 12] = [
     "folder_blocked",
     "branch_blocked",
 ];
+
+/// The daemon's code when a tool the submission needs is not ready: only
+/// `agent-browser`, for an idea package's demo video.
+pub const TOOL_MISSING: &str = "tool_missing";
 
 /// What a failed send (or retry) leaves under the submission's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +288,7 @@ fn feedback_code_text(code: &str) -> Option<&'static str> {
         "submission_not_found" => NOTHING_CREATED_TEXT,
         "issue_unconfirmed" => ISSUE_UNCONFIRMED_TEXT,
         "repo_not_found" => REPO_GONE_TEXT,
+        TOOL_MISSING => DEMO_MISSING_REASON,
         _ => return None,
     })
 }

@@ -1875,7 +1875,7 @@ fn the_idea_boxes_are_part_of_the_locked_draft(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn a_refused_idea_keeps_its_boxes_editable(cx: &mut TestAppContext) {
+fn a_refused_demo_video_is_unticked_and_the_targets_reload(cx: &mut TestAppContext) {
     let setup = FeedbackSetup::new();
     let repos = two_repos();
     let opened = ready_for_an_idea(cx, &setup, &repos, true);
@@ -1894,15 +1894,71 @@ fn a_refused_idea_keeps_its_boxes_editable(cx: &mut TestAppContext) {
 
     assert_eq!(
         text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
-        Some("Agent-browser is not installed")
+        Some("Install agent-browser to record a demo video.")
     );
+    // The form stays editable; "Demo video" is unticked and disabled
+    // until the targets say otherwise, and they are asked for again.
     assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
-    assert_eq!(ticks(cx, window), [true, true, false, true]);
-    assert!(!disabled(cx, window, IDEA_DEMO_ID));
-    click(cx, window, IDEA_DEMO_ID);
+    assert_eq!(ticks(cx, window), [true, false, false, true]);
+    assert!(disabled(cx, window, IDEA_DEMO_ID));
+    assert!(!disabled(cx, window, IDEA_DIAGRAMS_ID));
+    assert_eq!(
+        text_of(cx, window, IDEA_DEMO_HELP_ID).as_deref(),
+        Some("Install agent-browser to record a demo video.")
+    );
+    let targets_calls = || {
+        opened
+            .fake
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| **call == FeedbackCall::Targets)
+            .count()
+    };
+    assert_eq!(targets_calls(), 2, "the targets are asked for again");
+    let list: Vec<_> = repos.iter().map(|r| (r.id, true, Some(false))).collect();
+    opened.fake.answer_targets(Ok(targets(&list, true, false)));
+    frame(cx, window);
+    assert!(disabled(cx, window, IDEA_DEMO_ID));
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some("Install agent-browser to record a demo video."),
+        "the sentence stays"
+    );
+
+    // The same id is sent again with what is ticked now.
+    click(cx, window, IDEA_DIAGRAMS_ID);
     click(cx, window, SUBMIT_CONFIRM_ID);
     let submits = opened.fake.submits();
     assert_eq!(submits.len(), 2);
     assert_eq!(submits[1].0.submission_id, id, "the same id");
-    assert_eq!(submits[1].0.idea, Some(parts(true, false, false)));
+    assert_eq!(submits[1].0.idea, Some(parts(true, true, false)));
+}
+
+#[gpui_kit::test]
+fn a_demo_video_comes_back_when_the_reloaded_targets_have_agent_browser(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_for_an_idea(cx, &setup, &repos, true);
+    let window = opened.window;
+    click(cx, window, IDEA_CHECK_ID);
+    click(cx, window, IDEA_DEMO_ID);
+    opened.fake.queue_outcome(Err(api(
+        409,
+        "tool_missing",
+        "agent-browser is not installed",
+    )));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(disabled(cx, window, IDEA_DEMO_ID));
+
+    let list: Vec<_> = repos.iter().map(|r| (r.id, true, Some(false))).collect();
+    opened.fake.answer_targets(Ok(targets(&list, true, true)));
+    frame(cx, window);
+
+    assert!(!disabled(cx, window, IDEA_DEMO_ID));
+    assert!(!checked(cx, window, IDEA_DEMO_ID), "it stays unticked");
+    assert_eq!(
+        text_of(cx, window, IDEA_DEMO_HELP_ID).as_deref(),
+        Some("Only works for projects a browser can show.")
+    );
 }

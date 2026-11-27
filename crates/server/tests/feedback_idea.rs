@@ -28,9 +28,11 @@ use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentFilter, ItemStatus, Phase};
 use smithagents_plugin_host::StaticSecrets;
 use smithagents_server::api::{router, AppState};
+use smithagents_server::brief::idea_instructions;
 use smithagents_server::events::EventBus;
 use smithagents_server::feedback::idea::{
-    fixed_criteria, CRITERION_DEMO, CRITERION_DIAGRAMS, CRITERION_EXPLAINER, CRITERION_SCOPE,
+    fixed_criteria, package, CRITERION_DEMO, CRITERION_DIAGRAMS, CRITERION_EXPLAINER,
+    CRITERION_SCOPE,
 };
 use smithagents_server::feedback::FeedbackService;
 use smithagents_server::harness::fake::FakeHarness;
@@ -38,6 +40,7 @@ use smithagents_server::harness::HarnessError;
 use smithagents_server::intents::{IntentError, IntentService, PolishRunner};
 use smithagents_server::paths::Paths;
 use smithagents_server::plugins::{embedded_plugins, ManagerConfig, PluginManager};
+use smithagents_server::polish::{IDEA_PASS1_NOTE, IDEA_PASS2_ASK, IDEA_PASS2_NOTE};
 use smithagents_server::service::AgentService;
 use smithagents_server::store::Store;
 use tempfile::TempDir;
@@ -720,5 +723,121 @@ async fn nothing_typed_reaches_a_log() {
 impl Logs {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+#[test]
+fn the_brief_never_asks_for_less_than_the_criteria_check() {
+    let folder = FOLDER;
+    for (explainer, diagrams, demo_video) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, false),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let options = IdeaOptions {
+            explainer,
+            diagrams,
+            demo_video,
+        };
+        let criteria = fixed_criteria(options);
+        let brief = idea_instructions(folder, &package(options));
+        let what = format!("{options:?}: {brief}");
+
+        assert_eq!(
+            criteria.contains(&CRITERION_EXPLAINER.to_owned()),
+            explainer,
+            "{what}"
+        );
+        assert_eq!(
+            criteria.contains(&CRITERION_DIAGRAMS.to_owned()),
+            diagrams,
+            "{what}"
+        );
+        assert_eq!(
+            criteria.contains(&CRITERION_DEMO.to_owned()),
+            demo_video,
+            "{what}"
+        );
+        assert_eq!(criteria.last().map(String::as_str), Some(CRITERION_SCOPE));
+        // What the criteria check, the brief asks for.
+        assert_eq!(brief.contains("\"Open questions\""), explainer, "{what}");
+        assert_eq!(brief.contains("Mermaid code blocks"), diagrams, "{what}");
+        assert_eq!(
+            brief.contains(&format!("`{folder}/demo.mp4`")),
+            demo_video,
+            "{what}"
+        );
+        // No criterion needs a file the brief says not to write.
+        let no_explainer = brief.contains(&format!("do not create `{folder}/explainer.md`"));
+        assert_eq!(no_explainer, !explainer && !diagrams, "{what}");
+        if no_explainer {
+            assert!(
+                criteria.iter().all(|c| !c.contains("explainer.md")),
+                "{what}: {criteria:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_polish_prompts_know_an_idea_package() {
+    let fx = fixture(true).await;
+    let repo = fx.add_repo("r1").await;
+    let pass1 =
+        json!({"title": "Fix the zoom", "kind": "bug", "current_behavior": "", "questions": []});
+    let pass2 =
+        json!({"acceptance_criteria": [], "preconditions": [], "stories": [], "depends_on": []});
+    fx.harness.script_structured(vec![
+        Ok(pass1.clone()),
+        Ok(pass2.clone()),
+        Ok(pass1),
+        Ok(pass2),
+    ]);
+
+    // An idea first, then a plain feedback intent.
+    let (status, out) = fx.submit(&idea_request(&repo, false, true, false)).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let idea: IntentId = serde_json::from_value(out["intent"]["id"].clone()).unwrap();
+    let reviewed = fx.wait(idea, |i| i.phase == Phase::Review).await;
+    // With nothing to add, the fixed criteria alone complete it.
+    assert_eq!(
+        criteria(&reviewed),
+        fixed_accepted(&[CRITERION_DIAGRAMS, CRITERION_SCOPE])
+    );
+    let mut plain_req = request_json(repo.id, "intent");
+    plain_req["main_idea"] = json!("Fix the menu\n\nThe page is too big.");
+    plain_req["attachments"] = json!([{"kind": "image", "original_name": "a.png"}]);
+    let (status, out) = fx.submit(&plain_req).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let plain: IntentId = serde_json::from_value(out["intent"]["id"].clone()).unwrap();
+    fx.wait(plain, |i| i.phase == Phase::Review).await;
+
+    let calls = fx.harness.structured_calls();
+    assert_eq!(calls.len(), 4);
+    let split = |prompt: &str| {
+        let parts: Vec<&str> = prompt.split("=====").collect();
+        assert_eq!(parts.len(), 5, "{prompt}");
+        (format!("{}{}", parts[0], parts[4]), parts[2].to_owned())
+    };
+    let (outside, inside) = split(&calls[0].prompt);
+    assert!(outside.contains(IDEA_PASS1_NOTE), "{}", calls[0].prompt);
+    assert!(inside.contains("The page is too big.") && !outside.contains("The page is too big."));
+    let (outside, inside) = split(&calls[1].prompt);
+    let note =
+        format!("{IDEA_PASS2_NOTE}\n- {CRITERION_DIAGRAMS}\n- {CRITERION_SCOPE}\n{IDEA_PASS2_ASK}");
+    assert!(outside.contains(&note), "{}", calls[1].prompt);
+    assert!(!inside.contains(CRITERION_SCOPE));
+    assert!(inside.contains("The page is too big.") && !outside.contains("The page is too big."));
+    for call in &calls[2..] {
+        let p = &call.prompt;
+        assert!(
+            !p.contains(IDEA_PASS1_NOTE) && !p.contains(IDEA_PASS2_NOTE),
+            "{p}"
+        );
+        assert!(!p.contains(CRITERION_SCOPE), "{p}");
     }
 }

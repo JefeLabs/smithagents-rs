@@ -2866,3 +2866,62 @@ async fn a_fixed_dependency_must_be_an_intent_of_the_same_repository() {
     assert!(mine.is_empty(), "nothing was created");
     assert!(f.runner.0.lock().unwrap().is_empty(), "no polish started");
 }
+
+#[tokio::test]
+async fn a_fixed_dependency_keeps_the_intent_in_its_repository() {
+    let f = fx().await;
+    let repo = f.repo("r1").await;
+    let other = f.repo("r2").await;
+    let target = f.seeder().create(text_request(&repo)).await.unwrap();
+    let i = f
+        .svc
+        .create_with(text_request(&repo), fixed_extras(&[], Some(target.id)))
+        .await
+        .unwrap();
+    f.finish_polish(i.id, IntentState::Draft).await;
+    let before = f.svc.get(i.id).await.unwrap();
+    assert!(before.origin.is_none(), "refused without an origin too");
+    let move_it = || Patch {
+        repo_id: Some(other.id),
+        ..Patch::default()
+    };
+
+    let err = f.svc.update(i.id, move_it()).await.unwrap_err();
+
+    assert_eq!(
+        (err.status_and_code(), err.to_string().as_str()),
+        (
+            (axum::http::StatusCode::CONFLICT, "fixed_dependency"),
+            "This intent depends on another intent in its repository, so the repository cannot be changed."
+        )
+    );
+    assert_eq!(f.svc.get(i.id).await.unwrap(), before, "nothing changed");
+
+    // With an origin as well, the fixed dependency is the reason given.
+    let mut with_origin = before.clone();
+    with_origin.origin = Some(FeedbackOrigin {
+        folder: "docs/issues/x".into(),
+        branch: "feedback/x".into(),
+        commit: "0".repeat(40),
+        idea: None,
+    });
+    f.store.save_intent(&with_origin).await.unwrap();
+    let err = f.svc.update(i.id, move_it()).await.unwrap_err();
+    assert_eq!(err.code(), "fixed_dependency");
+
+    // Its own repository is no change, and the other fields still change.
+    let renamed = f
+        .svc
+        .update(
+            i.id,
+            Patch {
+                repo_id: Some(repo.id),
+                title: Some("Renamed".into()),
+                ..Patch::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.content.title, "Renamed");
+    assert_eq!(renamed.content.depends_on, before.content.depends_on);
+}
