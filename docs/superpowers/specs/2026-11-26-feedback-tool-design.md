@@ -393,10 +393,14 @@ result is `docs/feedback.md`.
   branch points at by then, and never forced. A branch name `origin` has is
   never chosen for a new submission.
 - **Mentions are neutralised only in what is sent to GitHub** (titles and
-  bodies of issues and pull requests): every `@` followed by a letter or
-  digit gets a zero-width space after it unless an ASCII letter, digit or
-  `_` comes before it. The committed files keep the owner's text. A comment
-  is capped at 500 characters and never cut by bytes.
+  bodies of issues and pull requests): every `@` followed by an ASCII letter
+  or digit gets a zero-width space after it unless an ASCII letter, digit or
+  `_` comes before it. In a body (rendered as Markdown) an `@` inside a web
+  address GitHub's extended autolink links is left alone, by a rule narrower
+  than GitHub's (`http://` or `https://`, a host with a `.`, then `/`, `?` or
+  `#`); a title is never a link and keeps the strict rule. The committed
+  files keep the owner's text. A comment is capped at 500 characters and
+  never cut by bytes.
 - **Duplicates.** The search for an issue or a pull request made before
   looks only at the signed-in user's own (`--author=@me`): the submission id
   is public once pushed. After `gh` ran without a usable answer, nothing is
@@ -404,13 +408,17 @@ result is `docs/feedback.md`.
 - **"Open pull request"** pushes only when every commit of the agent on top
   of the idea's changes only the issue folder (`idea_out_of_scope`), and
   refuses with nothing pushed when the agent's branch has no `issue.md`
-  (`idea_incomplete`) or a file of the folder is a Git LFS pointer
-  (`idea_lfs`: "The idea's files were committed through Git LFS, which this
-  push does not upload. Turn Git LFS off for docs/issues and ask the agent
-  to commit them again."). The commit to push is recorded only after every
-  refusal, and pushed again at a later press only while the agent's branch
-  still holds it. A pull request is taken for the idea's only when its head
-  is the commit pushed. The agent's commits are published as it wrote them.
+  (`idea_incomplete`) or any commit it would publish on top of the idea's
+  holds a Git LFS pointer under the folder, at the tip or earlier
+  (`idea_lfs`: "The idea's files were committed through Git LFS, now or in
+  an earlier commit of the agent's branch, which this push does not upload.
+  Turn Git LFS off for docs/issues and have the branch's commits made again
+  without it."). The commit to push is recorded only after every refusal,
+  and pushed again at a later press only while the agent's branch still
+  holds it; a push `origin` refuses because its branch has other commits is
+  `push_not_fast_forward`, never forced. A pull request is taken for the
+  idea's only when its head is the commit pushed; while one of the branch
+  is open with another head, none is opened (`pr_head_moved`). The agent's commits are published as it wrote them.
   "Not done" is read from `explainer.md` when the pull request is opened and
   shown in the idea intent's detail, with the pull request's address and a
   copy button (tooltip "Copy link").

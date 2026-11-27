@@ -589,6 +589,9 @@ message is a fixed sentence, never something git or `gh` printed):
   package with no part or sent as an issue), `unsupported_file` (400: "screenshot
   1 is not a png file"), `payload_too_large` (413: a part, the request part or
   the whole upload over its limit), `repo_not_found` (404); 409
+  `origin_unreadable` ("git could not read this repository's settings. Check
+  that its folder is still a git repository.": its folder is gone or no
+  longer a git repository; whatever the submission is sent as),
   `default_branch_missing`, `git_identity_missing`, `no_free_name`,
   `name_taken`, `folder_blocked`, `branch_blocked`, `tool_missing` (Demo video
   without `agent-browser`); for an issue `no_github_remote`, `gh_not_ready`,
@@ -603,14 +606,17 @@ message is a fixed sentence, never something git or `gh` printed):
   `submission_not_found`, `repo_not_found`, `intent_not_found` (404);
   `store_error` (500).
 - In `failed` (a 200 answer: the commit exists): step `create_intent` with the
-  intent service's code; step `push` with `push_rejected`, `push_auth`,
+  intent service's code; step `push` with `push_not_fast_forward` ("git could
+  not push to origin: origin already has that branch with other commits,
+  perhaps from an earlier push. Delete the branch on origin if it is no
+  longer wanted, then try again."), `push_rejected`, `push_auth`,
   `push_no_remote`, `push_timeout`, `push_failed`, `commit_missing` ("The
   feedback commit is no longer in this repository, so it cannot be pushed."),
-  `unpushed_commits`, `no_github_remote`, `git_failed` or `io_error`; step
-  `create_issue` with `gh_not_ready`, `gh_failed`, `gh_timeout`,
-  `gh_bad_answer`, `issue_unconfirmed` ("GitHub has not confirmed whether the
-  issue was created. Try again in a minute."), `no_github_remote`,
-  `git_failed` or `io_error`.
+  `unpushed_commits`, `no_github_remote`, `origin_unreadable`, `git_failed`
+  or `io_error`; step `create_issue` with `gh_not_ready`, `gh_failed`,
+  `gh_timeout`, `gh_bad_answer`, `issue_unconfirmed` ("GitHub has not
+  confirmed whether the issue was created. Try again in a minute."),
+  `no_github_remote`, `origin_unreadable`, `git_failed` or `io_error`.
 - `POST /v1/intents/{id}/pull-request`, with nothing pushed: `bad_request`
   (400, a malformed body or id); `intent_not_found`, `repo_not_found` (404);
   409 `not_an_idea`, `invalid_state` (not sent yet, or the agent is still
@@ -620,28 +626,33 @@ message is a fixed sentence, never something git or `gh` printed):
   one Submit made"), `idea_out_of_scope` (the agent's branch changes
   files outside the issue folder, lacks the idea's commit, or has more than
   1000 commits on top of it), `idea_lfs` ("The idea's files were committed
-  through Git LFS, which this push does not upload. Turn Git LFS off for
-  docs/issues and ask the agent to commit them again."), `idea_incomplete`
-  ("The idea's issue.md is missing from the agent's branch, so a pull
-  request cannot be opened."), `unpushed_commits`, `public_not_acknowledged`,
-  `no_github_remote`, `gh_not_ready`; 500 `git_failed` (git could not read
-  the repository), `io_error`, `store_error`. Every one of these comes before
-  the commit to push is recorded. A failed push or `gh` call is 502 with the
-  step's own code: `push_rejected`, `push_auth`, `push_no_remote`,
-  `push_timeout`, `push_failed`, `commit_missing` (the push), `gh_failed`,
-  `gh_timeout`, `gh_bad_answer`, `gh_not_ready`, `pr_unconfirmed`, or
-  `io_error` when the pull request's body could not be written (`gh`); what
-  succeeded before it stays done. (On this route `unpushed_commits` and
-  `no_github_remote` are 409, and `git_failed` is 500.)
+  through Git LFS, now or in an earlier commit of the agent's branch, which
+  this push does not upload. Turn Git LFS off for docs/issues and have the
+  branch's commits made again without it."), `idea_incomplete` ("The idea's
+  issue.md is missing from the agent's branch, so a pull request cannot be
+  opened."), `unpushed_commits`, `public_not_acknowledged`,
+  `origin_unreadable`, `no_github_remote`, `gh_not_ready`; 500 `git_failed`
+  (git could not read the repository), `io_error`, `store_error`. Every one
+  of these comes before the commit to push is recorded. A failed push or
+  `gh` call is 502 with the step's own code: `push_not_fast_forward`,
+  `push_rejected`, `push_auth`, `push_no_remote`, `push_timeout`,
+  `push_failed`, `commit_missing` (the push), `gh_failed`, `gh_timeout`,
+  `gh_bad_answer`, `gh_not_ready`, `pr_unconfirmed`, `pr_head_moved` ("A pull
+  request for this idea's branch is already open on GitHub, but the branch
+  there has changed since it was pushed. Open that pull request on GitHub.":
+  none is opened beside it), or `io_error` when the pull request's body could
+  not be written (`gh`); what succeeded before it stays done. (On this route
+  `unpushed_commits`, `origin_unreadable` and `no_github_remote` are 409, and
+  `git_failed` is 500.)
 - `POST /v1/intents/{id}/implementation`: `bad_request` (400, a malformed
   body or id); `intent_not_found`, `repo_not_found` (404); 409
   `not_an_idea`, `invalid_state`, `idea_agent_missing`,
-  `idea_branch_missing`, `idea_origin_invalid`, `public_not_acknowledged`
-  (its repository's `origin` is on GitHub, the body does not acknowledge, and
-  `gh` does not say it is private; checked before anything is made); 500
-  `git_failed`, `io_error` (git could not read the repository or the agent's
-  branch), `store_error`; the intent service's codes when the intent cannot
-  be made.
+  `idea_branch_missing`, `idea_origin_invalid`, `origin_unreadable`,
+  `public_not_acknowledged` (its repository's `origin` is on GitHub, the body
+  does not acknowledge, and `gh` does not say it is private; checked before
+  anything is made); 500 `git_failed`, `io_error` (git could not read the
+  repository or the agent's branch), `store_error`; the intent service's
+  codes when the intent cannot be made.
 - `PUT /v1/settings/feedback`: `repo_not_found` (404), `bad_request` (400).
 
 The two `unpushed_commits` sentences: "The default branch has commits that
