@@ -666,8 +666,43 @@ pub fn default_repo(repos: &[Repo], last_used: Option<RepoId>) -> Option<RepoId>
         })
 }
 
-/// What a failed intent command says, as one line.
+/// How many characters of a daemon's message a line shows.
+const MESSAGE_CHARS: usize = 300;
+/// What a failed command says when the daemon's answer has no sentence to
+/// show.
+const COULD_NOT_TEXT: &str = "The daemon could not do that.";
+
+/// What a failed intent command says, as one line: our sentence for a known
+/// code, else the daemon's message (first letter capitalized, on one line,
+/// at most 300 characters, "…" when cut). An answer that was not the
+/// daemon's JSON (`http_<status>`: a proxy's page, a plain-text rejection)
+/// shows none of its body.
 pub fn intent_error_text(error: &LinkError) -> String {
+    match error {
+        LinkError::Client(ClientError::Api { code, .. }) => match intent_code_text(code) {
+            Some(text) => text.to_owned(),
+            None => daemon_text(error),
+        },
+        _ => daemon_text(error),
+    }
+}
+
+/// What a failed idea action ("Open pull request", "Create implementation
+/// intent") says: as [`intent_error_text`], except that the daemon's own
+/// sentence for `invalid_state` is shown ("the agent is still working",
+/// "the idea intent has not been sent yet"), not that the intent changed.
+pub fn idea_action_error_text(error: &LinkError) -> String {
+    match error {
+        LinkError::Client(ClientError::Api { code, .. }) if code == "invalid_state" => {
+            daemon_text(error)
+        }
+        _ => intent_error_text(error),
+    }
+}
+
+/// The daemon's message of `error` by [`intent_error_text`]'s rules, or our
+/// sentence for a failure that has none.
+fn daemon_text(error: &LinkError) -> String {
     match error {
         LinkError::NotConnected => NOT_CONNECTED_TEXT.to_owned(),
         LinkError::Stopped => "The daemon link has stopped".to_owned(),
@@ -675,17 +710,17 @@ pub fn intent_error_text(error: &LinkError) -> String {
             DAEMON_UNREACHABLE_TEXT.to_owned()
         }
         LinkError::Client(ClientError::File(_)) => FILE_UNREADABLE_TEXT.to_owned(),
-        LinkError::Client(ClientError::Api { code, message, .. }) => match intent_code_text(code) {
-            Some(text) => text.to_owned(),
-            None => {
-                let message = one_line(message);
-                if message.is_empty() {
-                    "The daemon could not do that.".to_owned()
-                } else {
-                    capitalized(&message)
-                }
+        LinkError::Client(ClientError::Api { code, message, .. }) => {
+            let line = one_line(message);
+            if code.starts_with("http_") || line.is_empty() {
+                return COULD_NOT_TEXT.to_owned();
             }
-        },
+            let mut kept: String = line.chars().take(MESSAGE_CHARS).collect();
+            if kept.len() < line.len() {
+                kept.push('…');
+            }
+            capitalized(&kept)
+        }
     }
 }
 

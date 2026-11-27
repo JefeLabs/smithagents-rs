@@ -812,6 +812,12 @@ fn what_a_failed_send_leaves_under_its_id() {
 #[test]
 fn the_fixed_sentences_of_this_round() {
     assert_eq!(REPO_GONE_TEXT, "That repository no longer exists.");
+    // (A send while another is under way cannot be started from the
+    // screen, whose buttons wait: only its sentence is checked.)
+    assert_eq!(
+        smithagents_app::feedback::text::SUBMIT_BUSY_TEXT,
+        "A submission is already under way."
+    );
     assert_eq!(LINK_STOPPED_TEXT, "The daemon link has stopped");
     assert_eq!(submit_error_text(&LinkError::Stopped), LINK_STOPPED_TEXT);
     assert_eq!(

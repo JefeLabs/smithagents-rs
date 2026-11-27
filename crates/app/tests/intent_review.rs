@@ -32,7 +32,7 @@ use smithagents_app::views::intents::{
     intent_card_id, item_card_id, item_confirm_id, item_edit_id, item_input_id, item_skip_id,
     question_card_id, question_option_id, question_skip_id, section_counter_id, section_header_id,
     section_status_id, skipped_line_id, Busy, IntentsPane, Screen, CARD_SLUG_ID, DETAIL_BACK_ID,
-    INTENT_ERROR_ID, ITEM_TEXT_ID, POLISHING_ID, QUESTION_ANSWER_ID,
+    INTENT_ERROR_ID, ITEM_FIXED_ID, ITEM_TEXT_ID, POLISHING_ID, QUESTION_ANSWER_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_core::ids::{IntentId, ItemId};
@@ -1675,5 +1675,38 @@ fn a_dependency_on_an_unknown_intent_shows_its_own_text(cx: &mut TestAppContext)
     assert_eq!(
         enabled_item_buttons(cx, window, candidate),
         ["Confirm", "Skip"]
+    );
+}
+
+#[gpui_kit::test]
+fn a_fixed_item_is_tagged_and_offers_neither_edit_nor_skip(cx: &mut TestAppContext) {
+    // A-M6: the daemon refuses to change an item it set.
+    let mut draft = in_review();
+    draft.content.criteria[0].fixed = true;
+    draft.content.criteria[1].fixed = true;
+    let opened = open_detail(cx, vec![draft.clone()]);
+    let window = opened.window;
+    let [pending, accepted, plain] = [0, 1, 2].map(|i| draft.content.criteria[i].id);
+    draft.content.criteria[2].status = ItemStatus::Pending;
+    upsert(cx, &opened, &draft);
+
+    assert_eq!(
+        item_buttons(cx, window, pending),
+        [("Confirm".to_owned(), false)],
+        "Confirm only"
+    );
+    assert_eq!(
+        item_part(cx, window, pending, ITEM_FIXED_ID).as_deref(),
+        Some("fixed")
+    );
+    assert_eq!(
+        item_part(cx, window, accepted, ITEM_FIXED_ID).as_deref(),
+        Some("fixed")
+    );
+    // Not fixed: no tag, every button.
+    assert_eq!(item_part(cx, window, plain, ITEM_FIXED_ID), None);
+    assert_eq!(
+        enabled_item_buttons(cx, window, plain),
+        ["Confirm", "Edit", "Skip"]
     );
 }

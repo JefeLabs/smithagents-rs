@@ -73,8 +73,8 @@ use gpui_kit::{
 use crate::feedback::draft::AttachmentId;
 use crate::feedback::state::Feedback;
 use crate::feedback::text::{
-    discard_description, DISCARD_CANCEL, DISCARD_CONFIRM, DISCARD_TITLE, EMPTY_TEXT, HELP_LINES,
-    HELP_TITLE, SUBMIT_EMPTY_TOOLTIP,
+    discard_description, DISCARD_CANCEL, DISCARD_CONFIRM, DISCARD_PENDING_TEXT, DISCARD_TITLE,
+    EMPTY_TEXT, HELP_LINES, HELP_TITLE, SUBMIT_EMPTY_TOOLTIP,
 };
 use crate::shell::FEEDBACK_PANEL;
 use crate::shell_state::ShellState;
@@ -365,22 +365,30 @@ impl FeedbackPane {
         )
     }
 
+    /// Asks before Discard; while something may exist under the draft's
+    /// submission (it was sent), the question says that what was sent stays.
     fn ask_to_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (count, pending) = {
+        let (count, pending, sent) = {
             let feedback = self.feedback.read(cx);
+            let pending = feedback.pending();
             (
                 feedback.draft().attachments.len(),
-                feedback.pending().is_some(),
+                pending.is_some(),
+                pending.is_some_and(|p| p.sent.is_some()),
             )
         };
         if count == 0 && !pending {
             return;
         }
+        let mut description = discard_description(count);
+        if sent {
+            description = format!("{description} {DISCARD_PENDING_TEXT}");
+        }
         let feedback = self.feedback.downgrade();
         let ask = Confirmation {
             title_id: DISCARD_DIALOG_TITLE_ID,
             title: DISCARD_TITLE,
-            description: discard_description(count),
+            description,
             cancel_id: DISCARD_CANCEL_ID,
             cancel: DISCARD_CANCEL,
             confirm_id: DISCARD_CONFIRM_ID,

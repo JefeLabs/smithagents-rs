@@ -30,9 +30,10 @@ use smithagents_app::feedback::annotation::{Annotation, FracRect};
 use smithagents_app::feedback::draft::AttachmentId;
 use smithagents_app::feedback::state::{Feedback, SentTo, SUBMIT_TIMEOUT};
 use smithagents_app::feedback::text::{
-    EMPTY_TEXT, INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING, MAYBE_PUBLIC_WARNING,
-    NOTHING_CREATED_TEXT, PUBLIC_WARNING, REPO_GONE_TEXT, START_OVER_RISK_TEXT, START_OVER_TOOLTIP,
-    SUBMISSION_LOCKED_TEXT,
+    DISCARD_PENDING_TEXT, DRAFT_BUSY_TEXT, DRAFT_NOT_READY_TEXT, EMPTY_TEXT,
+    INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING, MAYBE_PUBLIC_WARNING,
+    MAY_HAVE_BEEN_SENT_TEXT, NOTHING_CREATED_TEXT, PUBLIC_WARNING, REPO_GONE_TEXT,
+    START_OVER_RISK_TEXT, START_OVER_TOOLTIP, SUBMISSION_LOCKED_TEXT,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::model::Action;
@@ -2303,4 +2304,204 @@ fn a_reupload_the_daemon_asks_about_is_asked_while_locked(cx: &mut TestAppContex
     assert_eq!(submits[2].0.submission_id, submits[0].0.submission_id);
     assert!(submits[2].0.public_acknowledged);
     assert!(cx.read(|cx| opened.feedback.read(cx).locked()));
+}
+
+// ---- What a locked draft and a send that cannot start say (A-I3) ------------
+
+#[gpui_kit::test]
+fn a_draft_locked_with_no_answer_says_it_may_have_been_sent(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let opened = ready_to_send(cx, &setup, &repos);
+    click(cx, opened.window, SUBMIT_CONFIRM_ID);
+    // The app quits while the request is out.
+    close(cx, opened);
+
+    let opened = open(cx, &setup, &repos, Some(alpha));
+    let window = opened.window;
+    open_submit(cx, &opened, no_remotes(&repos));
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(MAY_HAVE_BEEN_SENT_TEXT)
+    );
+    assert_eq!(
+        MAY_HAVE_BEEN_SENT_TEXT,
+        "This feedback may already have been sent. Press Retry to find out, or Start over to send it as a new submission."
+    );
+    assert!(drawn(cx, window, SUBMIT_RETRY_ID));
+    assert!(drawn(cx, window, SUBMIT_START_OVER_ID));
+
+    // The notice a change to it gets, and what Discard asks.
+    assert_eq!(
+        SUBMISSION_LOCKED_TEXT,
+        "This feedback was sent or is being sent. Retry or start over in Submit before changing it."
+    );
+    click(cx, window, SUBMIT_BACK_ID);
+    click(cx, window, FEEDBACK_DISCARD_ID);
+    assert!(dialog(cx, window));
+    assert!(label_reads(
+        cx,
+        window,
+        &format!(
+            "1 attachment and its comments are deleted. This cannot be undone. {DISCARD_PENDING_TEXT}"
+        )
+    ));
+    assert_eq!(
+        DISCARD_PENDING_TEXT,
+        "A submission of this draft may still be in progress. Discarding deletes the screenshots here; anything already sent stays."
+    );
+}
+
+#[gpui_kit::test]
+fn discard_says_nothing_of_a_submission_when_none_was_sent(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    click(cx, window, SUBMIT_BACK_ID);
+    click(cx, window, FEEDBACK_DISCARD_ID);
+    assert!(label_reads(
+        cx,
+        window,
+        "1 attachment and its comments are deleted. This cannot be undone."
+    ));
+}
+
+/// alpha (public) and a screenshot, the Submit screen open on alpha with
+/// "Fix the zoom" typed, and Create pressed: the question is open.
+fn asking(cx: &mut TestAppContext, setup: &FeedbackSetup, repos: &[Repo]) -> Opened {
+    let alpha = repos[0].id;
+    let opened = open(cx, setup, repos, Some(alpha));
+    let window = opened.window;
+    screenshot(cx, &opened, setup, &["the toolbar"]);
+    open_submit(
+        cx,
+        &opened,
+        targets(&[(alpha, true, Some(true))], true, false),
+    );
+    type_idea(cx, window, "Fix the zoom");
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(dialog(cx, window), "asked");
+    opened
+}
+
+#[gpui_kit::test]
+fn a_send_while_a_capture_runs_says_why(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = asking(cx, &setup, &repos);
+    let (window, feedback) = (opened.window, opened.feedback.clone());
+    act(cx, window, &feedback, |f, window, cx| f.capture(window, cx));
+    assert!(cx.read(|cx| feedback.read(cx).capturing()));
+
+    click(cx, window, PUBLIC_CONFIRM_ID);
+
+    assert!(opened.fake.submits().is_empty());
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(DRAFT_BUSY_TEXT)
+    );
+    assert_eq!(
+        DRAFT_BUSY_TEXT,
+        "The draft is still being changed. Try again when it is done."
+    );
+}
+
+#[gpui_kit::test]
+fn a_draft_whose_boxes_are_not_drawn_says_so(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = asking(cx, &setup, &repos);
+    let (window, feedback) = (opened.window, opened.feedback.clone());
+    // The boxes change while the question is open: the annotated picture no
+    // longer matches them.
+    let shot = cx.read(|cx| feedback.read(cx).draft().attachments[0].id.clone());
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_boxes(&shot, Vec::new(), cx)
+    });
+
+    click(cx, window, PUBLIC_CONFIRM_ID);
+
+    assert!(opened.fake.submits().is_empty());
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(DRAFT_NOT_READY_TEXT)
+    );
+    assert_eq!(
+        DRAFT_NOT_READY_TEXT,
+        "The draft is not ready to send yet. Try again in a moment."
+    );
+}
+
+// ---- The daemon's question waits for the pane (A-M4) -----------------------
+
+#[gpui_kit::test]
+fn the_question_waits_until_the_feedback_pane_shows(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    let sentence = "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending.";
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    // The user went to the Intents pane before the answer came.
+    click(cx, window, RailEntry::Intents.element_id());
+    opened
+        .fake
+        .answer_outcome(Err(api(409, "public_not_acknowledged", sentence)));
+    frame(cx, window);
+    assert!(!dialog(cx, window), "not asked elsewhere");
+
+    click(cx, window, RailEntry::Feedback.element_id());
+    assert_eq!(screen(cx, &opened), FeedbackScreen::Submit);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some(sentence),
+        "the sentence stays"
+    );
+    // Create again: the daemon asks again, and now the question opens.
+    opened
+        .fake
+        .queue_outcome(Err(api(409, "public_not_acknowledged", sentence)));
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert!(dialog(cx, window), "asked");
+    click(cx, window, PUBLIC_CONFIRM_ID);
+    let submits = opened.fake.submits();
+    assert_eq!(submits.len(), 3);
+    assert!(submits[2].0.public_acknowledged);
+}
+
+// ---- Only an answer that completes the submission deletes it (A-M5) ---------
+
+#[gpui_kit::test]
+fn an_answer_that_does_not_complete_the_submission_deletes_nothing(cx: &mut TestAppContext) {
+    for case in ["another submission", "no intent and no issue address"] {
+        let setup = FeedbackSetup::new();
+        let repos = two_repos();
+        let alpha = repos[0].id;
+        let opened = ready_to_send(cx, &setup, &repos);
+        let window = opened.window;
+        click(cx, window, SUBMIT_CONFIRM_ID);
+        let id = sent_id(&opened);
+        let answer = if case == "another submission" {
+            outcome_with_intent(
+                smithagents_core::feedback::SubmissionId::new(),
+                created_intent(alpha),
+            )
+        } else {
+            outcome_with_issue(id, alpha, "javascript:alert(1)")
+        };
+        opened.fake.answer_outcome(Ok(answer));
+        frame(cx, window);
+
+        assert!(setup.draft_dir().exists(), "{case}: the draft stays");
+        assert!(cx.read(|cx| opened.feedback.read(cx).locked()), "{case}");
+        assert_eq!(
+            text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+            Some(MAY_HAVE_BEEN_SENT_TEXT),
+            "{case}"
+        );
+        assert!(drawn(cx, window, SUBMIT_RETRY_ID), "{case}");
+        assert_eq!(screen(cx, &opened), FeedbackScreen::Submit, "{case}");
+    }
 }

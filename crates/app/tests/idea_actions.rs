@@ -20,10 +20,12 @@ use gpui_kit::component::dock::DockPlacement;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::{ElementSnapshot, TestWindowExt as _};
 use gpui_kit::{AppContext as _, ElementId, Entity, Role, TestAppContext, WindowHandle};
+use smithagents_app::feedback::state::SUBMIT_TIMEOUT;
 use smithagents_app::feedback::text::{IMPLEMENT_DESCRIPTION, PR_DESCRIPTION};
 use smithagents_app::model::Action;
 use smithagents_app::shell::{Shell, ShellOptions};
 use smithagents_app::shell_state::ShellState;
+use smithagents_app::shell_state::DEFAULT_COMMAND_TIMEOUT;
 use smithagents_app::views::intents::{
     intent_card_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, IMPLEMENT_CANCEL_ID,
     IMPLEMENT_CONFIRM_ID, IMPLEMENT_DESCRIPTION_ID, IMPLEMENT_ID, IMPLEMENT_TITLE_ID,
@@ -639,4 +641,62 @@ fn an_implementation_intent_made_after_the_user_left_does_not_pull_them_back(
     frame(cx, window);
     assert_eq!(busy(cx, &opened), None);
     assert_eq!(screen(cx, &opened), Screen::List, "left where the user is");
+}
+
+// ---- How long they wait, and what a refusal says ----------------------------
+
+#[gpui_kit::test]
+fn the_idea_actions_wait_as_long_as_a_submission(cx: &mut TestAppContext) {
+    // A-I2: a push and gh can take minutes; other commands wait 60 s.
+    for (button, confirm_id, key) in [
+        (OPEN_PR_ID, OPEN_PR_CONFIRM_ID, Busy::PullRequest),
+        (IMPLEMENT_ID, IMPLEMENT_CONFIRM_ID, Busy::Implementation),
+    ] {
+        let resolved = idea_intent(IntentState::Resolved, None);
+        let opened = open_detail(cx, vec![resolved.clone()], vec![]);
+        let window = opened.window;
+        click(cx, window, button);
+        click(cx, window, confirm_id);
+        assert_eq!(busy(cx, &opened), Some(key));
+
+        cx.executor()
+            .advance_clock(DEFAULT_COMMAND_TIMEOUT + std::time::Duration::from_secs(1));
+        frame(cx, window);
+        assert_eq!(busy(cx, &opened), Some(key), "{key:?}: still waiting");
+        assert_eq!(error_line(cx, window), None);
+
+        cx.executor().advance_clock(SUBMIT_TIMEOUT);
+        frame(cx, window);
+        assert_eq!(busy(cx, &opened), None, "{key:?}");
+        assert_eq!(
+            error_line(cx, window).as_deref(),
+            Some("The daemon did not answer"),
+            "{key:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn an_idea_action_refused_for_its_state_says_why(cx: &mut TestAppContext) {
+    // A-M2.
+    let resolved = idea_intent(IntentState::Resolved, None);
+    let opened = open_detail(cx, vec![resolved.clone()], vec![]);
+    let window = opened.window;
+    for (button, confirm_id) in [
+        (OPEN_PR_ID, OPEN_PR_CONFIRM_ID),
+        (IMPLEMENT_ID, IMPLEMENT_CONFIRM_ID),
+    ] {
+        opened.feedback.queue_intent(Err(FakeIntents::api_error(
+            409,
+            "invalid_state",
+            "the agent is still working",
+        )));
+        click(cx, window, button);
+        click(cx, window, confirm_id);
+        assert_eq!(
+            error_line(cx, window).as_deref(),
+            Some("The agent is still working"),
+            "{button}"
+        );
+    }
 }

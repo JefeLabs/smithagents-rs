@@ -283,7 +283,17 @@ pub const ISSUE_UNCONFIRMED_TEXT: &str =
     "GitHub has not confirmed whether the issue was created. Try again in a minute.";
 /// A change to the draft while its submission is sent or under way.
 pub const SUBMISSION_LOCKED_TEXT: &str =
-    "This feedback was sent. Retry or start over in Submit before changing it.";
+    "This feedback was sent or is being sent. Retry or start over in Submit before changing it.";
+/// The Submit screen of a draft locked with no answer to show (a quit or a
+/// crash while it was sent, or an answer the app could not use).
+pub const MAY_HAVE_BEEN_SENT_TEXT: &str = "This feedback may already have been sent. Press Retry to find out, or Start over to send it as a new submission.";
+/// Added to Discard's question while something may exist under the draft's
+/// submission.
+pub const DISCARD_PENDING_TEXT: &str = "A submission of this draft may still be in progress. Discarding deletes the screenshots here; anything already sent stays.";
+/// Why a press of Create or Retry sent nothing.
+pub const DRAFT_BUSY_TEXT: &str = "The draft is still being changed. Try again when it is done.";
+pub const SUBMIT_BUSY_TEXT: &str = "A submission is already under way.";
+pub const DRAFT_NOT_READY_TEXT: &str = "The draft is not ready to send yet. Try again in a moment.";
 pub const MAIN_IDEA_TOO_LONG_TEXT: &str = "The main idea can be at most 20,000 characters.";
 pub const UPLOAD_TOO_LARGE_TEXT: &str =
     "The attachments cannot be sent: together they are larger than 100 MB.";

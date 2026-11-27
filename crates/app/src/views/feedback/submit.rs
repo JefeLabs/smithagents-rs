@@ -68,14 +68,15 @@ use super::{confirm, Confirmation, FeedbackPane, FeedbackScreen, Paint};
 use crate::feedback::state::{Pending, SentTo, SUBMIT_TIMEOUT};
 use crate::feedback::submit_vm::{
     asks_to_acknowledge, can_confirm, confirm_label, failure_text, issue_reason,
-    maybe_public_warning, public_warning, result_text, send_failure, starting_repo,
-    submit_error_text, summary, upload_problem, SendFailure, KINDS,
+    maybe_public_warning, public_warning, result_text, send_failure, shows_issue_url,
+    starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
 };
 use crate::feedback::text::{
-    BACK_LABEL, CHOOSE_REPO_TEXT, KIND_LABEL, MAIN_IDEA_HINT, MAIN_IDEA_LABEL,
-    NOTHING_CREATED_TEXT, PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL,
-    SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL, START_OVER_LABEL,
-    START_OVER_RISK_TEXT, START_OVER_TITLE, START_OVER_TOOLTIP,
+    BACK_LABEL, CHOOSE_REPO_TEXT, DRAFT_BUSY_TEXT, DRAFT_NOT_READY_TEXT, KIND_LABEL,
+    MAIN_IDEA_HINT, MAIN_IDEA_LABEL, MAY_HAVE_BEEN_SENT_TEXT, NOTHING_CREATED_TEXT,
+    PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL, SEND_AS_INTENT,
+    SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_CANCEL, START_OVER_LABEL, START_OVER_RISK_TEXT,
+    START_OVER_TITLE, START_OVER_TOOLTIP, SUBMIT_BUSY_TEXT,
 };
 use crate::intent_vm::kind_label;
 use crate::link::LinkError;
@@ -266,8 +267,9 @@ impl FeedbackPane {
 
     /// Opens the Submit screen and asks the daemon for the targets. Needs an
     /// attachment, no work on the draft and the daemon ("Submit…" is
-    /// disabled otherwise). A pending submission whose step failed shows its
-    /// failure at once.
+    /// disabled otherwise). A pending submission shows at once what is known
+    /// of it: the last answer's sentence, its failed step, or, sent with no
+    /// answer kept, that it may already have been sent.
     pub(super) fn open_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (empty, busy, pending) = {
             let feedback = self.feedback.read(cx);
@@ -295,6 +297,12 @@ impl FeedbackPane {
                     .as_ref()
                     .and_then(|p| p.outcome.as_ref())
                     .and_then(failure_text)
+            })
+            .or_else(|| {
+                pending
+                    .as_ref()
+                    .filter(|p| p.sent.is_some())
+                    .map(|_| MAY_HAVE_BEEN_SENT_TEXT.to_owned())
             });
         submit.picked_repo = None;
         submit.send_as = SendAs::Intent;
@@ -639,6 +647,8 @@ impl FeedbackPane {
     ) {
         if self.submit.busy.is_some() {
             tracing::debug!("a feedback submission is already under way");
+            self.submit.error = Some(SUBMIT_BUSY_TEXT.to_owned());
+            cx.notify();
             return;
         }
         let (capturing, working, before) = {
@@ -651,6 +661,8 @@ impl FeedbackPane {
         };
         if capturing || working {
             tracing::debug!("the draft is still being changed; nothing is sent");
+            self.submit.error = Some(DRAFT_BUSY_TEXT.to_owned());
+            cx.notify();
             return;
         }
         let before = before.unwrap_or((None, false));
@@ -682,6 +694,8 @@ impl FeedbackPane {
                 };
                 let Some((attachments, files)) = upload else {
                     tracing::debug!("the draft is not ready to send");
+                    self.submit.error = Some(DRAFT_NOT_READY_TEXT.to_owned());
+                    cx.notify();
                     return;
                 };
                 let files = sizes_on_disk(files);
@@ -770,6 +784,17 @@ impl FeedbackPane {
                 Some(DAEMON_SILENT_TEXT.to_owned())
             }
             Some(Ok(outcome)) => match result_text(&outcome) {
+                // Only an answer about this submission that names what was
+                // made deletes the draft.
+                Some(_) if !completes(&outcome, pending.as_ref()) => {
+                    tracing::warn!(
+                        submission_id = %outcome.submission_id,
+                        "a feedback answer that does not complete this submission"
+                    );
+                    self.feedback
+                        .update(cx, |feedback, cx| feedback.mark_answered(cx));
+                    Some(MAY_HAVE_BEEN_SENT_TEXT.to_owned())
+                }
                 Some(result) => {
                     self.succeeded(outcome, result, window, cx);
                     None
@@ -809,8 +834,16 @@ impl FeedbackPane {
                         self.after_refusal(&e, window, cx);
                         // The app took the repository for private, the
                         // daemon does not: asked now, and sent again under
-                        // the same id once confirmed.
-                        if !acknowledged && attempt != Attempt::Retry && asks_to_acknowledge(&e) {
+                        // the same id once confirmed. Only while the pane
+                        // is on screen: otherwise the sentence stays, and
+                        // the next Create meets the same question.
+                        let showing = self.state.read(cx).right_entry() == RailEntry::Feedback
+                            && self.focus.is_rendered(window);
+                        if !acknowledged
+                            && attempt != Attempt::Retry
+                            && asks_to_acknowledge(&e)
+                            && showing
+                        {
                             tracing::info!("the daemon asks to confirm a public repository");
                             let warning = maybe_public_warning(to.send_as);
                             self.ask_public(to, attempt, warning, window, cx);
@@ -1224,6 +1257,14 @@ impl FeedbackPane {
                 .on_click(cx.listener(|this, _, window, cx| this.press_confirm(window, cx))),
         )
     }
+}
+
+/// Whether `outcome` completes the pending submission: it is about that
+/// submission, and names what was made (an intent, or an issue address the
+/// app shows). Any other answer is not taken for a success.
+fn completes(outcome: &FeedbackOutcome, pending: Option<&Pending>) -> bool {
+    pending.is_some_and(|p| p.submission_id == outcome.submission_id)
+        && (outcome.intent.is_some() || outcome.issue_url.as_deref().is_some_and(shows_issue_url))
 }
 
 /// A section's name over its control.

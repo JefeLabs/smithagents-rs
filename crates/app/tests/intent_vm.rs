@@ -707,6 +707,52 @@ fn error_sentences() {
     );
 }
 
+#[test]
+fn an_intent_error_shows_no_body_that_is_not_the_daemons_and_one_bounded_line() {
+    // A-M3: as `submit_error_text`.
+    let proxy = FakeIntents::api_error(502, "http_502", "<html>LEAK a proxy's page</html>");
+    assert_eq!(intent_error_text(&proxy), "The daemon could not do that.");
+    let long = format!("line one\nline two {}", "é".repeat(500));
+    let text = intent_error_text(&api_error("weird", &long));
+    assert!(!text.contains('\n'), "{text:?}");
+    assert_eq!(text.chars().count(), 301, "{text:?}");
+    assert!(text.starts_with("Line one line two é"), "{text:?}");
+    assert!(text.ends_with('…'), "{text:?}");
+}
+
+#[test]
+fn an_idea_action_shows_the_daemons_sentence_for_its_state() {
+    // A-M2: "the agent is still working" reaches the user.
+    for message in [
+        "the agent is still working",
+        "the idea intent has not been sent yet",
+    ] {
+        let e = api_error("invalid_state", message);
+        assert_eq!(idea_action_error_text(&e), capitalized_for_test(message));
+        assert_eq!(
+            intent_error_text(&e),
+            "The intent changed, so this is no longer possible."
+        );
+    }
+    // Every other answer as an intent command's.
+    let e = api_error("intent_not_found", "LEAK");
+    assert_eq!(idea_action_error_text(&e), "That intent no longer exists.");
+    let proxy = FakeIntents::api_error(502, "http_502", "LEAK");
+    assert_eq!(
+        idea_action_error_text(&proxy),
+        "The daemon could not do that."
+    );
+}
+
+/// `text` with its first letter upper-case.
+fn capitalized_for_test(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 const START_PREFIX: &str = "The agent could not start: ";
 
 #[test]
