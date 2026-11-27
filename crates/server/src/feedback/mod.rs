@@ -71,6 +71,16 @@ pub(crate) const STORE_UPLOAD: &str = "store the upload";
 pub(crate) const USE_NAME: &str =
     "prepare the issue folder: a folder, branch or file name is not safe to use";
 
+/// Why an `io_error` happened, for the two kinds a user can do something
+/// about: a fixed phrase, never the system's words.
+fn io_reason(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull => ": the disk is full",
+        std::io::ErrorKind::PermissionDenied => ": permission was denied",
+        _ => "",
+    }
+}
+
 /// Every message is a fixed sentence: nothing git or the system prints is
 /// in one.
 #[derive(Debug, thiserror::Error)]
@@ -110,9 +120,10 @@ pub enum FeedbackError {
     BranchBlocked(String),
     /// A file could not be read or written, or a name was not safe to use
     /// (`InvalidInput`). `what` is a fixed phrase for the situation (see
-    /// [`FeedbackError::io`]). The system's own words are the source, for
-    /// the log, and never part of the sentence.
-    #[error("could not {what}")]
+    /// [`FeedbackError::io`]), followed by a fixed reason where the kind of
+    /// failure has one ([`io_reason`]). The system's own words are the
+    /// source, for the log, and never part of the sentence.
+    #[error("could not {what}{}", io_reason(.source))]
     Io {
         what: &'static str,
         #[source]

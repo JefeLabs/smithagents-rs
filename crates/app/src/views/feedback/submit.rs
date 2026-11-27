@@ -863,9 +863,13 @@ impl FeedbackPane {
                         }
                         Some(submit_error_text(&e))
                     }
+                    // Not from a target that is partly a guess: that one
+                    // starts over below.
                     SendFailure::NotRecorded
                         if attempt == Attempt::Retry
-                            && pending.as_ref().is_some_and(|p| p.outcome.is_none()) =>
+                            && pending
+                                .as_ref()
+                                .is_some_and(|p| p.outcome.is_none() && !p.sent_guessed) =>
                     {
                         tracing::info!(
                             "no record of a submission whose answer never came; sending it again"

@@ -84,6 +84,11 @@ pub struct Pending {
     /// connection, a quit while sending): the daemon may still be making it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub awaiting: bool,
+    /// `sent` was read only in part (see [`read_pending`]): it names the
+    /// repository, and how it was sent is a guess. Enough to keep the draft
+    /// locked and to ask the daemon by id; never enough to upload it again.
+    #[serde(skip)]
+    pub sent_guessed: bool,
 }
 
 /// The repository and the kind of result a submission was sent for, and the
@@ -101,6 +106,11 @@ pub struct SentTo {
 /// it was sent when that part reads: the id is what keeps a re-send from
 /// being made a second time, and the daemon knows what became of it. Sent
 /// somewhere with no readable answer, it awaits one.
+///
+/// A `sent` of which only the repository reads still counts as sent
+/// ([`Pending::sent_guessed`]): something may exist under the id, so the
+/// draft stays locked. Only when not even that reads is the draft open
+/// again, under the same id.
 fn read_pending(bytes: &[u8]) -> Option<Pending> {
     match serde_json::from_slice::<Pending>(bytes) {
         Ok(pending) => return Some(pending),
@@ -110,14 +120,30 @@ fn read_pending(bytes: &[u8]) -> Option<Pending> {
     }
     let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let submission_id = serde_json::from_value(json.get("submission_id")?.clone()).ok()?;
-    let sent: Option<SentTo> = json
-        .get("sent")
-        .and_then(|sent| serde_json::from_value(sent.clone()).ok());
+    let (sent, sent_guessed) = match json.get("sent").filter(|sent| !sent.is_null()) {
+        None => (None, false),
+        Some(sent) => match serde_json::from_value::<SentTo>(sent.clone()) {
+            Ok(sent) => (Some(sent), false),
+            Err(e) => {
+                tracing::warn!(error = %e, "where the pending feedback submission was sent could not be read in full");
+                let repo_id = sent
+                    .get("repo_id")
+                    .and_then(|id| serde_json::from_value(id.clone()).ok());
+                let guessed = repo_id.map(|repo_id| SentTo {
+                    repo_id,
+                    send_as: SendAs::Intent,
+                    idea: None,
+                });
+                (guessed, guessed.is_some())
+            }
+        },
+    };
     Some(Pending {
         submission_id,
         outcome: None,
         sent,
         awaiting: sent.is_some(),
+        sent_guessed,
     })
 }
 
@@ -754,6 +780,8 @@ impl Feedback {
         self.retired
             .extend(self.thumbnails.drain().map(|(_, thumbnail)| thumbnail));
         self.draft = Draft::default();
+        // A main idea still waiting to be written goes with its draft.
+        self.idea_save = None;
         if let Err(e) = self.files.clear() {
             tracing::warn!(error = %e, "could not delete the feedback draft");
             self.add_notice(io_text(&e));
@@ -972,6 +1000,7 @@ impl Feedback {
             outcome: None,
             sent: None,
             awaiting: false,
+            sent_guessed: false,
         });
         self.save_pending();
         cx.notify();
@@ -1151,10 +1180,14 @@ impl Feedback {
     /// changed, so the last success sentence goes.
     fn save(&mut self) -> bool {
         self.result = None;
-        // The whole draft is written, a waiting main idea with it.
-        self.idea_save = None;
         match self.files.save(&self.draft) {
-            Ok(()) => true,
+            Ok(()) => {
+                // The whole draft is written, a waiting main idea with it.
+                // After a failure the idea is still owed to the disk: the
+                // next save, send, close or quit writes it.
+                self.idea_save = None;
+                true
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "could not save the feedback draft");
                 self.add_notice(io_text(&e));

@@ -1273,6 +1273,42 @@ fn a_submission_file_read_only_in_part_keeps_its_id_and_its_lock(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
+fn a_submission_sent_in_a_way_this_version_cannot_read_stays_locked(cx: &mut TestAppContext) {
+    // It was sent, to a repository that still reads; how it was sent does
+    // not. Something may exist under its id, so the draft must not change:
+    // the daemon would finish the old request and the app would then delete
+    // the edited draft as "created".
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let alpha = repos[0].id;
+    let (id, opened) = restart_with_a_changed_submission_file(cx, &setup, &repos, |json| {
+        json["outcome"] = serde_json::json!(7);
+        json["sent"]["send_as"] = serde_json::json!("a way this version does not know");
+    });
+    let window = opened.window;
+
+    let pending = cx
+        .read(|cx| opened.feedback.read(cx).pending().cloned())
+        .expect("the submission is still pending");
+    assert_eq!(pending.submission_id, id);
+    assert_eq!(pending.sent.map(|sent| sent.repo_id), Some(alpha));
+    assert!(cx.read(|cx| opened.feedback.read(cx).locked()));
+    open_submit(cx, &opened, no_remotes(&repos));
+    assert!(idea_disabled(cx, window));
+
+    // Retry asks the daemon by id. It has no record: nothing is uploaded
+    // again from a target that is partly a guess; the submission starts over.
+    opened
+        .fake
+        .queue_outcome(Err(api(404, "submission_not_found", "no such submission")));
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.retries(), [id]);
+    assert!(opened.fake.submits().is_empty(), "uploaded from a guess");
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert!(!idea_disabled(cx, window));
+}
+
+#[gpui_kit::test]
 fn a_submission_file_with_only_its_id_readable_keeps_the_id(cx: &mut TestAppContext) {
     // Where it was sent cannot be read either, so the draft is not locked;
     // but a new send still goes out under the old id, which the daemon knows.

@@ -606,11 +606,12 @@ fn git_failed(step: &'static str) -> impl Fn(GitError) -> FeedbackError {
     }
 }
 
-/// git could not be started, or its pipes failed: a git failure with no exit
-/// status, not a problem with the issue folder. The system's reason goes to
-/// the log by its kind only (its words may name paths).
+/// git could not be started, its pipes failed, or a file it works with could
+/// not be handled: a git failure with no exit status, not a problem with the
+/// issue folder. The system's reason goes to the log by its kind only (its
+/// words may name paths).
 pub(super) fn git_not_run(step: &'static str, e: &io::Error) -> FeedbackError {
-    tracing::warn!(step, kind = ?e.kind(), "git could not be run");
+    tracing::warn!(step, kind = ?e.kind(), "git could not be run, or a file it works with failed");
     FeedbackError::Git { step, status: None }
 }
 
@@ -1150,6 +1151,16 @@ mod tests {
         assert_eq!((err.code(), err.status().as_u16()), ("io_error", 500));
         let source = std::error::Error::source(&err).expect("the system's error is the source");
         assert_eq!(source.to_string(), "No space left on device (os error 28)");
+        // A reason the user can act on is named, in fixed words.
+        let io = FeedbackError::io(crate::feedback::STORE_UPLOAD);
+        assert_eq!(
+            io(io::ErrorKind::StorageFull.into()).to_string(),
+            "could not store the upload: the disk is full"
+        );
+        assert_eq!(
+            io(io::ErrorKind::PermissionDenied.into()).to_string(),
+            "could not store the upload: permission was denied"
+        );
 
         // A refused name keeps the sentence it always had.
         let err = git_failed(COMMIT_STEP)(GitError::UnsafeArgument);

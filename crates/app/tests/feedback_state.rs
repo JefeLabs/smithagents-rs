@@ -1031,6 +1031,50 @@ fn a_main_idea_still_waiting_is_written_when_the_window_closes(cx: &mut TestAppC
 }
 
 #[gpui_kit::test]
+fn a_main_idea_that_could_not_be_written_is_written_at_the_next_chance(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let setup = FeedbackSetup::new();
+    let (window, shell, feedback) = setup.open(cx);
+    // A draft exists, so its folder does; then the folder cannot be written.
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_kind(smithagents_core::feedback::FeedbackKind::Bug, cx)
+    });
+    fs::set_permissions(setup.draft_dir(), fs::Permissions::from_mode(0o500)).unwrap();
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_main_idea("Fix the zoom".to_owned(), cx)
+    });
+    cx.executor().advance_clock(IDEA_SAVE_DELAY * 2);
+    cx.run_until_parked();
+    assert_eq!(idea_on_disk(&setup), "", "the write failed");
+    fs::set_permissions(setup.draft_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    // The typing is still owed to the disk: closing the window writes it.
+    drop((shell, feedback));
+    cx.update_window(window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(idea_on_disk(&setup), "Fix the zoom");
+}
+
+#[gpui_kit::test]
+fn a_discard_forgets_a_main_idea_that_was_still_waiting(cx: &mut TestAppContext) {
+    let setup = FeedbackSetup::new();
+    let (window, _shell, feedback) = setup.open(cx);
+    act(cx, window, &feedback, |f, _, cx| {
+        f.set_main_idea("Fix the zoom".to_owned(), cx)
+    });
+
+    act(cx, window, &feedback, |f, _, cx| f.discard_all(cx));
+    cx.executor().advance_clock(IDEA_SAVE_DELAY * 2);
+    cx.run_until_parked();
+
+    // The pause ended after the discard: no draft comes back.
+    assert!(!setup.draft_dir().join("draft.json").exists());
+}
+
+#[gpui_kit::test]
 fn a_main_idea_still_waiting_is_written_before_it_is_sent(cx: &mut TestAppContext) {
     let setup = FeedbackSetup::new();
     let (window, _shell, feedback) = setup.open(cx);
