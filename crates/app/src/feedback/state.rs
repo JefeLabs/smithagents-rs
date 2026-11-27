@@ -10,6 +10,14 @@
 //! dropped, work already running on another thread writes nothing more once
 //! it sees the cancel, and deletes what it wrote when the cancel came while
 //! it wrote. Files the draft does not name are swept away after a removal.
+//!
+//! Submitting: the draft gets one submission id ([`Pending`], kept in
+//! `submission.json`), used for every send and retry of it until it
+//! succeeds, is started over or discarded. While a submission is under way,
+//! and once the daemon has seen it, the draft is [`Feedback::locked`]: it
+//! stays as it was sent (the daemon may already have committed it), so
+//! nothing is added, removed, annotated or retyped. Only a success deletes
+//! the draft and its files.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,22 +31,78 @@ use futures::FutureExt as _;
 use gpui_kit::{
     App, AppContext as _, Context, EventEmitter, PathPromptOptions, RenderImage, Task, Window,
 };
+use serde::{Deserialize, Serialize};
 use smithagents_capture::{CaptureError, Capturer, Frame, WindowTarget};
+use smithagents_client::FeedbackFile;
+use smithagents_core::feedback::{
+    FeedbackAttachment, FeedbackBox, FeedbackKind, FeedbackOutcome, SendAs, SubmissionId,
+};
+use smithagents_core::ids::RepoId;
 
 use super::annotation::Annotation;
-use super::draft::{Attachment, AttachmentId, AttachmentKind, Draft, DraftStore, Loaded};
+use super::draft::{
+    annotated_name, Attachment, AttachmentId, AttachmentKind, Draft, DraftStore, Loaded,
+};
 use super::files::{FileKind, Refusal};
 use super::render::decode;
+use super::submit_vm::wire_kind;
 use super::text::{
     capture_failed_text, more_files_text, more_notices_text, picker_failed_text,
     CAPTURE_FRAMES_MISSED, CAPTURE_FRAMES_TIMEOUT, CAPTURE_PICTURE_TIMEOUT, CAPTURE_TOO_SLOW,
     DRAFT_FULL_TEXT, MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_NOTICES,
-    MAX_TOTAL_BYTES,
+    MAX_TOTAL_BYTES, SUBMISSION_LOCKED_TEXT,
 };
 use super::work::{
     capture_error_text, copy_in, io_text, read_thumbnail, redraw, render_image, take_picture,
     Copied, Files, JobError, Picture,
 };
+
+/// How long a submission (an upload of up to 100 MB, a commit, a push and
+/// `gh`) or a retry may go unanswered before the Submit screen gives up on
+/// it.
+pub const SUBMIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The draft's submission, until it succeeds, is started over or discarded:
+/// its id, sent with every send and retry of the draft (the daemon makes one
+/// commit, intent or issue per id), and what became of it. Kept in
+/// `<draft dir>/submission.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pending {
+    pub submission_id: SubmissionId,
+    /// The daemon's answer when a step after the commit failed.
+    #[serde(default)]
+    pub outcome: Option<FeedbackOutcome>,
+    /// Where the submission went, once the daemon has seen it (it answered,
+    /// or took the request and did not answer in time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<SentTo>,
+}
+
+/// The repository and the kind of result a submission was sent for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentTo {
+    pub repo_id: RepoId,
+    pub send_as: SendAs,
+}
+
+/// The feedback kinds by their wire names.
+const KINDS: [FeedbackKind; 3] = [
+    FeedbackKind::NewFeature,
+    FeedbackKind::Enhancement,
+    FeedbackKind::Bug,
+];
+
+/// A box as the daemon takes it.
+fn wire_box(annotation: &Annotation) -> FeedbackBox {
+    let rect = annotation.rect;
+    FeedbackBox {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        comment: annotation.comment.clone(),
+    }
+}
 
 /// Asks the user for files. Ok(None) is "cancelled"; Err carries the reason the picker failed.
 pub type FilePicker =
@@ -164,6 +228,12 @@ pub struct Feedback {
     thumbnails: HashMap<AttachmentId, Arc<RenderImage>>,
     /// Thumbnails no longer shown, for the pane to release.
     retired: Vec<Arc<RenderImage>>,
+    /// The draft's submission, from `submission.json`.
+    pending: Option<Pending>,
+    /// A submission or a retry of the draft is under way.
+    submitting: bool,
+    /// The last success sentence, until the draft changes.
+    result: Option<String>,
 }
 
 impl EventEmitter<FeedbackEvent> for Feedback {}
@@ -185,6 +255,15 @@ impl Feedback {
             None => Files::Memory(Arc::default()),
         };
         let Loaded { draft, notices } = files.load();
+        let pending = files.read_submission().and_then(|bytes| {
+            match serde_json::from_slice::<Pending>(&bytes) {
+                Ok(pending) => Some(pending),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the pending feedback submission could not be read");
+                    None
+                }
+            }
+        });
         let mut this = Self {
             files,
             capturer,
@@ -205,6 +284,9 @@ impl Feedback {
             jobs: HashMap::new(),
             thumbnails: HashMap::new(),
             retired: Vec::new(),
+            pending,
+            submitting: false,
+            result: None,
         };
         this.set_notices(notices);
         let starting: Vec<(AttachmentId, AttachmentKind, bool)> = this
@@ -270,6 +352,9 @@ impl Feedback {
     /// way, so Capture never stays disabled.
     pub fn capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.capturing || self.annotating.is_some() {
+            return;
+        }
+        if self.refused_while_locked(cx) {
             return;
         }
         if self.draft.attachments.len() >= MAX_ATTACHMENTS {
@@ -450,7 +535,7 @@ impl Feedback {
     /// sentence counting the files not looked at. Ignored while an earlier
     /// pick is being added.
     pub fn add_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.adding.is_some() {
+        if self.adding.is_some() || self.refused_while_locked(cx) {
             return;
         }
         let picked = match &self.picker {
@@ -568,6 +653,9 @@ impl Feedback {
     /// the files the draft does not name are swept away; when the save
     /// fails the files stay, since the draft on disk still names them.
     pub fn remove(&mut self, id: &AttachmentId, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
         let Some(index) = self.draft.attachments.iter().position(|a| &a.id == id) else {
             return;
         };
@@ -589,9 +677,15 @@ impl Feedback {
         cx.notify();
     }
 
-    /// Empties the draft and deletes its directory. Files still being added
-    /// are dropped; every thumbnail is retired.
+    /// Empties the draft and deletes its directory, the pending submission
+    /// included. Files still being added are dropped; every thumbnail is
+    /// retired. Not while a submission is under way.
     pub fn discard_all(&mut self, cx: &mut Context<Self>) {
+        if self.submitting {
+            return;
+        }
+        self.result = None;
+        self.pending = None;
         self.adding = None;
         self.sweep_after_pick = false;
         self.jobs.clear();
@@ -601,8 +695,12 @@ impl Feedback {
         if let Err(e) = self.files.clear() {
             tracing::warn!(error = %e, "could not delete the feedback draft");
             self.add_notice(io_text(&e));
-            // Whatever is left, the next start finds an empty draft.
+            // Whatever is left, the next start finds an empty draft with no
+            // submission.
             self.save();
+            if let Err(e) = self.files.remove_submission() {
+                tracing::warn!(error = %e, "could not delete the pending feedback submission");
+            }
         }
         self.close_annotator(cx);
         cx.notify();
@@ -611,7 +709,7 @@ impl Feedback {
     /// Opens the annotator on a screenshot (not while capturing or already
     /// annotating).
     pub fn open_annotator(&mut self, id: &AttachmentId, cx: &mut Context<Self>) {
-        if self.capturing || self.annotating.is_some() {
+        if self.capturing || self.annotating.is_some() || self.locked() {
             return;
         }
         let is_screenshot = self
@@ -631,6 +729,9 @@ impl Feedback {
     /// loads it back: one outside the picture is clamped or dropped, a
     /// comment is cut at [`MAX_COMMENT_CHARS`], and at most [`MAX_BOXES`].
     pub fn set_boxes(&mut self, id: &AttachmentId, boxes: Vec<Annotation>, cx: &mut Context<Self>) {
+        if self.locked() {
+            return;
+        }
         let Some(shot) = self
             .draft
             .attachments
@@ -717,13 +818,206 @@ impl Feedback {
         })
     }
 
+    // ---- Submitting ------------------------------------------------------
+
+    /// Keeps the main idea (the first line is the title). Not while locked.
+    pub fn set_main_idea(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.locked() || self.draft.main_idea == text {
+            return;
+        }
+        self.draft.main_idea = text;
+        self.save();
+        cx.notify();
+    }
+
+    /// Keeps the kind, by its wire name. Not while locked.
+    pub fn set_kind(&mut self, kind: FeedbackKind, cx: &mut Context<Self>) {
+        let name = kind.intent_kind().wire_name();
+        if self.locked() || self.draft.kind.as_deref() == Some(name) {
+            return;
+        }
+        self.draft.kind = Some(name.to_owned());
+        self.save();
+        cx.notify();
+    }
+
+    /// The draft's kind; a new feature when none (or an unknown one) is kept.
+    pub fn kind(&self) -> FeedbackKind {
+        let name = self.draft.kind.as_deref();
+        KINDS
+            .into_iter()
+            .find(|kind| Some(kind.intent_kind().wire_name()) == name)
+            .unwrap_or(FeedbackKind::NewFeature)
+    }
+
+    pub fn pending(&self) -> Option<&Pending> {
+        self.pending.as_ref()
+    }
+
+    /// A submission is under way ([`Feedback::set_submitting`]).
+    pub fn submitting(&self) -> bool {
+        self.submitting
+    }
+
+    /// The draft stays as it was sent: a submission is under way, or the
+    /// daemon has seen the pending one. Nothing can be added, removed,
+    /// annotated or retyped then.
+    pub fn locked(&self) -> bool {
+        self.submitting || self.pending.as_ref().is_some_and(|p| p.sent.is_some())
+    }
+
+    /// Marks a submission (or a retry) as under way, or over.
+    pub fn set_submitting(&mut self, submitting: bool, cx: &mut Context<Self>) {
+        if self.submitting != submitting {
+            self.submitting = submitting;
+            cx.notify();
+        }
+    }
+
+    /// The pending submission's id, or a new one, written to
+    /// `submission.json` (a failed write is said; the id still holds for
+    /// this run).
+    pub fn begin_submission(&mut self, cx: &mut Context<Self>) -> SubmissionId {
+        if let Some(pending) = &self.pending {
+            return pending.submission_id;
+        }
+        let id = SubmissionId::new();
+        tracing::debug!(submission_id = %id, "a new feedback submission");
+        self.pending = Some(Pending {
+            submission_id: id,
+            outcome: None,
+            sent: None,
+        });
+        self.save_pending();
+        cx.notify();
+        id
+    }
+
+    /// The daemon has seen the pending submission, sent for `to`: the draft
+    /// is locked from here on.
+    pub fn mark_sent(&mut self, to: SentTo, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        if pending.sent == Some(to) {
+            return;
+        }
+        pending.sent = Some(to);
+        self.save_pending();
+        cx.notify();
+    }
+
+    /// Keeps the daemon's answer of a submission whose step failed.
+    pub fn record_outcome(&mut self, outcome: FeedbackOutcome, cx: &mut Context<Self>) {
+        let Some(pending) = self
+            .pending
+            .as_mut()
+            .filter(|pending| pending.submission_id == outcome.submission_id)
+        else {
+            tracing::warn!(submission_id = %outcome.submission_id, "an outcome of another submission");
+            return;
+        };
+        pending.outcome = Some(outcome);
+        self.save_pending();
+        cx.notify();
+    }
+
+    /// Drops the pending submission (what it committed stays where it is):
+    /// the next send is a new one, and the draft can change again.
+    pub fn forget_submission(&mut self, cx: &mut Context<Self>) {
+        if self.pending.take().is_none() {
+            return;
+        }
+        if let Err(e) = self.files.remove_submission() {
+            tracing::warn!(error = %e, "could not delete the pending feedback submission");
+            self.add_notice(io_text(&e));
+        }
+        cx.notify();
+    }
+
+    /// What the daemon is sent: each attachment as the request lists it,
+    /// and its files as parts (`file-<i>`, and `annotated-<i>` for a
+    /// screenshot, `i` its 1-based position). `None` while a screenshot's
+    /// annotated picture does not match its boxes, and for a draft kept in
+    /// memory only (there are no files to send).
+    pub fn upload(&self) -> Option<(Vec<FeedbackAttachment>, Vec<FeedbackFile>)> {
+        let store = self.store()?;
+        let mut attachments = Vec::with_capacity(self.draft.attachments.len());
+        let mut files = Vec::new();
+        for (at, attachment) in self.draft.attachments.iter().enumerate() {
+            let number = at + 1;
+            let screenshot = attachment.kind == AttachmentKind::Screenshot;
+            if screenshot && !attachment.rendered {
+                return None;
+            }
+            attachments.push(FeedbackAttachment {
+                kind: wire_kind(attachment.kind),
+                original_name: attachment.original_name.clone(),
+                boxes: attachment.boxes.iter().map(wire_box).collect(),
+            });
+            files.push(FeedbackFile {
+                part: format!("file-{number}"),
+                path: store.path_of(&attachment.stored_name),
+            });
+            if screenshot {
+                files.push(FeedbackFile {
+                    part: format!("annotated-{number}"),
+                    path: store.path_of(&annotated_name(&attachment.stored_name)),
+                });
+            }
+        }
+        Some((attachments, files))
+    }
+
+    /// The last success sentence; the next change to the draft clears it.
+    pub fn result(&self) -> Option<&str> {
+        self.result.as_deref()
+    }
+
+    /// The daemon confirmed the submission: the draft, its files and the
+    /// pending submission go, and `result` is what the pane says.
+    pub fn finish_submission(&mut self, result: String, cx: &mut Context<Self>) {
+        self.submitting = false;
+        self.discard_all(cx);
+        self.result = Some(result);
+        cx.notify();
+    }
+
+    /// Whether a change is refused because the draft is locked; if so, the
+    /// pane says why.
+    fn refused_while_locked(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.locked() {
+            return false;
+        }
+        self.set_notices(vec![SUBMISSION_LOCKED_TEXT.to_string()]);
+        cx.emit(FeedbackEvent::RevealPane);
+        cx.notify();
+        true
+    }
+
+    /// Writes `submission.json` (a failure is said).
+    fn save_pending(&mut self) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let written = serde_json::to_vec_pretty(pending)
+            .map_err(std::io::Error::other)
+            .and_then(|json| self.files.write_submission(&json));
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "could not save the pending feedback submission");
+            self.add_notice(io_text(&e));
+        }
+    }
+
     /// Thumbnails no longer shown, each answered once; the pane releases them.
     pub fn take_retired_images(&mut self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut self.retired)
     }
 
-    /// Saves the draft; whether it was saved (a failure is said).
+    /// Saves the draft; whether it was saved (a failure is said). The draft
+    /// changed, so the last success sentence goes.
     fn save(&mut self) -> bool {
+        self.result = None;
         match self.files.save(&self.draft) {
             Ok(()) => true,
             Err(e) => {

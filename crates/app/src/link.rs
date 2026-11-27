@@ -14,10 +14,14 @@ use std::time::Duration;
 
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt as _, StreamExt};
-use smithagents_client::{ensure_daemon_with, Client, ClientError, EnsureError, SpawnOptions};
+use smithagents_client::{
+    ensure_daemon_with, Client, ClientError, EnsureError, FeedbackFile, SpawnOptions,
+};
 use smithagents_core::agent::{Agent, Repo};
 use smithagents_core::daemon::read_lockfile;
-use smithagents_core::feedback::FeedbackSettings;
+use smithagents_core::feedback::{
+    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets, SubmissionId,
+};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     AgentDefaults, AnswerInput, CreateIntentRequest, Intent, IntentFilter, Patch, ReviewAction,
@@ -382,6 +386,54 @@ impl DaemonLink {
         })
     }
 
+    /// The repositories Submit can choose from and the tools' readiness.
+    pub fn feedback_targets(
+        &self,
+    ) -> impl Future<Output = Result<FeedbackTargets, LinkError>> + Send + 'static {
+        self.cmd
+            .clone()
+            .run(move |c, _| async move { Ok(c.feedback_targets().await?) })
+    }
+
+    /// Sends a submission; an intent it created reaches the UI as
+    /// `Action::IntentUpserted` before the answer does, from the link's
+    /// runtime like [`DaemonLink::add_repo`]'s.
+    pub fn submit_feedback(
+        &self,
+        request: FeedbackRequest,
+        files: Vec<FeedbackFile>,
+    ) -> impl Future<Output = Result<FeedbackOutcome, LinkError>> + Send + 'static {
+        self.feedback_command(move |c| async move { c.submit_feedback(&request, &files).await })
+    }
+
+    /// Runs the steps of a recorded submission that did not succeed; answered
+    /// as [`DaemonLink::submit_feedback`] is.
+    pub fn retry_feedback(
+        &self,
+        id: SubmissionId,
+    ) -> impl Future<Output = Result<FeedbackOutcome, LinkError>> + Send + 'static {
+        self.feedback_command(move |c| async move { c.retry_feedback(id).await })
+    }
+
+    /// Runs one submission or retry; an intent in its outcome reaches the UI
+    /// as `Action::IntentUpserted` first.
+    fn feedback_command<F, Fut>(
+        &self,
+        command: F,
+    ) -> impl Future<Output = Result<FeedbackOutcome, LinkError>> + Send + 'static
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<FeedbackOutcome, ClientError>> + Send + 'static,
+    {
+        self.cmd.clone().run(move |c, tx| async move {
+            let outcome = command(c).await?;
+            if let Some(intent) = &outcome.intent {
+                let _ = tx.send(Action::IntentUpserted(intent.clone())).await;
+            }
+            Ok(outcome)
+        })
+    }
+
     /// Runs one intent command and hands its answer to the UI as
     /// `Action::IntentUpserted` too, from the link's runtime, so the model
     /// has it even when the caller drops the future (the event of the same
@@ -509,12 +561,25 @@ impl IntentCommands for DaemonLink {
 /// The commands the Feedback tool and Settings → Source repositories send to
 /// the daemon. [`DaemonLink`] is the production implementation; headless tests
 /// inject a fake through `ShellOptions::feedback_commands`. As for
-/// [`IntentCommands`], the link tells the model of each answer itself.
+/// [`IntentCommands`], the link tells the model of each answer itself: the
+/// settings, and the intent an outcome carries (`Action::IntentUpserted`,
+/// before the outcome is answered).
 pub trait FeedbackCommands {
     fn set_feedback_settings(
         &self,
         settings: FeedbackSettings,
     ) -> LocalBoxFuture<'static, Result<FeedbackSettings, LinkError>>;
+    fn feedback_targets(&self) -> LocalBoxFuture<'static, Result<FeedbackTargets, LinkError>>;
+    /// Sends `request` and uploads `files` (each local file as its part).
+    fn submit_feedback(
+        &self,
+        request: FeedbackRequest,
+        files: Vec<FeedbackFile>,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>>;
+    fn retry_feedback(
+        &self,
+        id: SubmissionId,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>>;
 }
 
 impl FeedbackCommands for DaemonLink {
@@ -523,6 +588,25 @@ impl FeedbackCommands for DaemonLink {
         settings: FeedbackSettings,
     ) -> LocalBoxFuture<'static, Result<FeedbackSettings, LinkError>> {
         DaemonLink::set_feedback_settings(self, settings).boxed_local()
+    }
+
+    fn feedback_targets(&self) -> LocalBoxFuture<'static, Result<FeedbackTargets, LinkError>> {
+        DaemonLink::feedback_targets(self).boxed_local()
+    }
+
+    fn submit_feedback(
+        &self,
+        request: FeedbackRequest,
+        files: Vec<FeedbackFile>,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>> {
+        DaemonLink::submit_feedback(self, request, files).boxed_local()
+    }
+
+    fn retry_feedback(
+        &self,
+        id: SubmissionId,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>> {
+        DaemonLink::retry_feedback(self, id).boxed_local()
     }
 }
 

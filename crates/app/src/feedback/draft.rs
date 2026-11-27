@@ -4,7 +4,8 @@
 //! draft is set aside instead of failing (only the newest set-aside draft is
 //! kept). A draft that cannot be set aside is never written over, and a link
 //! in the directory's place is never read, written or swept through. Files
-//! the draft does not name are swept away.
+//! the draft does not name are swept away. The draft's pending submission,
+//! once there is one, is `submission.json` next to `draft.json`.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -27,6 +28,8 @@ use super::text::{
 pub const DRAFT_VERSION: u32 = 1;
 
 const DRAFT_FILE: &str = "draft.json";
+/// The draft's pending submission (see `state::Pending`).
+pub const SUBMISSION_FILE: &str = "submission.json";
 /// A set-aside draft is the whole directory renamed to this and a number.
 const SET_ASIDE_PREFIX: &str = "draft.broken-";
 /// A real draft is a few KB; anything bigger than this is not ours.
@@ -172,10 +175,10 @@ impl Draft {
             .filter(|a| a.kind == AttachmentKind::Screenshot)
     }
 
-    /// Every file name the draft uses: `draft.json` and each attachment's
-    /// stored, annotated and thumbnail files.
+    /// Every file name the draft uses: `draft.json`, `submission.json` and
+    /// each attachment's stored, annotated and thumbnail files.
     pub fn file_names(&self) -> HashSet<String> {
-        let mut names = HashSet::from([DRAFT_FILE.to_string()]);
+        let mut names = HashSet::from([DRAFT_FILE.to_string(), SUBMISSION_FILE.to_string()]);
         for a in &self.attachments {
             names.insert(a.stored_name.clone());
             names.insert(annotated_name(&a.stored_name));
@@ -209,6 +212,7 @@ fn is_plain_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
         && name != DRAFT_FILE
+        && name != SUBMISSION_FILE
         && !name.contains(['/', '\\', '\0'])
         && Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
 }
@@ -543,6 +547,38 @@ impl DraftStore {
                     tracing::warn!(error = %e, file = %name, "could not remove a feedback file");
                 }
             }
+        }
+    }
+
+    /// `submission.json`'s bytes; `None` when there is none, or it is not a
+    /// regular file of a sensible size.
+    pub fn read_submission(&self) -> Option<Vec<u8>> {
+        let path = self.dir().join(SUBMISSION_FILE);
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.file_type().is_file() || meta.len() > MAX_DRAFT_JSON_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .ok()?
+            .take(MAX_DRAFT_JSON_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some(bytes)
+    }
+
+    /// Atomic, like [`DraftStore::save`].
+    pub fn write_submission(&self, bytes: &[u8]) -> io::Result<()> {
+        let dir = self.writable_dir()?;
+        crate::atomic_file::write_private(&dir, SUBMISSION_FILE, bytes)
+    }
+
+    /// Removes `submission.json`; a missing one is not an error.
+    pub fn remove_submission(&self) -> io::Result<()> {
+        let dir = self.writable_dir()?;
+        match fs::remove_file(dir.join(SUBMISSION_FILE)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
         }
     }
 

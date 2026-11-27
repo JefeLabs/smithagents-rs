@@ -1,0 +1,1065 @@
+//! The Feedback pane's Submit screen, one scrolling column, top to bottom:
+//! "Back"; the attachments, read-only; the main idea (kept in the draft as
+//! it is typed); the kind (three buttons); the repository (a menu); "Send it
+//! as" (an intent, or a GitHub issue when the repository's `origin` is on
+//! GitHub and `gh` is ready, else why not); what Create will do; the
+//! public-repository warning; the error line; and Create, or Retry and
+//! Start over.
+//!
+//! One command at a time: while a submission or a retry is under way every
+//! control waits and the pressed button shows the spinner; nothing changes
+//! before the daemon answers. Sending to a repository that is (or may be)
+//! public asks first, every time. The limits the daemon checks are checked
+//! here first, so nothing is uploaded that it would refuse.
+//!
+//! The draft keeps one submission id ([`Pending`]) for every send of it. A
+//! success deletes the draft, says what was created on the draft screen and
+//! opens a created intent in the Intents pane. Once the daemon has seen the
+//! submission (it answered, or took the request and did not answer in
+//! time), the text, kind and target stay as sent: the screen offers Retry
+//! (the failed step, or the same request again) and Start over (a new
+//! submission; what was committed stays). Only "could not reach the daemon"
+//! leaves the form as it was.
+//!
+//! Escape and "Back" go back to the draft (not while a command is under way),
+//! and the focus returns to where it was when the screen opened.
+
+use std::borrow::Cow;
+use std::fs;
+use std::path::Path;
+
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::radio::Radio;
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _,
+};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    div, rems, AnyElement, App, AppContext as _, Context, ElementId, Entity, FocusHandle,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Role,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TestSupportExt as _,
+    WeakEntity, Window,
+};
+use smithagents_client::{ClientError, FeedbackFile};
+use smithagents_core::feedback::{
+    effective_meta_repo, FeedbackKind, FeedbackOutcome, FeedbackRequest, FeedbackTarget,
+    FeedbackTargets, SendAs, SubmissionId,
+};
+use smithagents_core::ids::RepoId;
+
+use super::card::cards;
+use super::{confirm, Confirmation, FeedbackPane, FeedbackScreen, Paint};
+use crate::feedback::state::{Pending, SentTo, SUBMIT_TIMEOUT};
+use crate::feedback::submit_vm::{
+    can_confirm, confirm_label, failure_text, issue_reason, public_warning, result_text,
+    starting_repo, submit_error_text, summary, upload_problem,
+};
+use crate::feedback::text::{
+    BACK_LABEL, CHOOSE_REPO_TEXT, KIND_LABEL, MAIN_IDEA_HINT, MAIN_IDEA_LABEL,
+    NOTHING_CREATED_TEXT, PUBLIC_CONFIRM_CANCEL, PUBLIC_CONFIRM_TITLE, REPO_LABEL, RETRY_LABEL,
+    SEND_AS_INTENT, SEND_AS_ISSUE, SEND_AS_LABEL, START_OVER_LABEL,
+};
+use crate::intent_vm::kind_label;
+use crate::link::LinkError;
+use crate::view_models::{
+    repo_title, RepoChoiceVm, SettingsSection, DAEMON_SILENT_TEXT, NEED_REPO_TEXT,
+    NOT_CONNECTED_TEXT,
+};
+use crate::views::answered;
+
+/// Key context of the Submit screen (on the pane while it shows the
+/// screen), for Escape.
+pub const SUBMIT_KEY_CONTEXT: &str = "FeedbackSubmit";
+pub const SUBMIT_BACK_ID: &str = "feedback-submit-back";
+/// Element id of the frame around the main idea's text box (the box itself
+/// is named "Main idea").
+pub const SUBMIT_IDEA_ID: &str = "feedback-main-idea";
+/// Element ids of the main idea's name above its box and the hint below.
+pub const SUBMIT_IDEA_LABEL_ID: &str = "feedback-main-idea-label";
+pub const SUBMIT_IDEA_HINT_ID: &str = "feedback-main-idea-hint";
+/// Element id of the repository button: the menu's, or the way to Settings.
+pub const SUBMIT_REPO_ID: &str = "feedback-repo";
+pub const SEND_INTENT_ID: &str = "feedback-send-intent";
+pub const SEND_ISSUE_ID: &str = "feedback-send-issue";
+/// Element id of why "A GitHub issue" cannot be chosen.
+pub const SEND_ISSUE_REASON_ID: &str = "feedback-send-issue-reason";
+pub const SUBMIT_SUMMARY_ID: &str = "feedback-submit-summary";
+pub const PUBLIC_WARNING_ID: &str = "feedback-public-warning";
+/// Element id of the screen's one error line (a status).
+pub const SUBMIT_ERROR_ID: &str = "feedback-submit-error";
+pub const SUBMIT_CONFIRM_ID: &str = "feedback-submit-confirm";
+pub const SUBMIT_RETRY_ID: &str = "feedback-submit-retry";
+pub const SUBMIT_START_OVER_ID: &str = "feedback-submit-start-over";
+/// Element ids in the dialog a send to a public repository opens.
+pub const PUBLIC_CONFIRM_TITLE_ID: &str = "feedback-public-confirm-title";
+pub const PUBLIC_CANCEL_ID: &str = "feedback-public-cancel";
+pub const PUBLIC_CONFIRM_ID: &str = "feedback-public-confirm";
+
+const SCREEN_ID: &str = "feedback-submit";
+const KINDS: [FeedbackKind; 3] = [
+    FeedbackKind::NewFeature,
+    FeedbackKind::Enhancement,
+    FeedbackKind::Bug,
+];
+/// The main idea grows from this many lines to this many, then scrolls.
+const IDEA_ROWS: (usize, usize) = (3, 10);
+/// The repository menu's label and widest, in rems.
+const REPO_MENU_LABEL: &str = "Send feedback to";
+const REPO_MENU_MAX_WIDTH: f32 = 26.;
+
+/// Element id of `kind`'s button: `feedback-kind-<wire name>`.
+pub fn submit_kind_id(kind: FeedbackKind) -> ElementId {
+    ElementId::Name(format!("feedback-kind-{}", kind.intent_kind().wire_name()).into())
+}
+
+/// Element id of `repo`'s entry in the repository menu.
+pub fn submit_repo_item_id(repo: RepoId) -> ElementId {
+    ElementId::Name(format!("feedback-repo-{repo}").into())
+}
+
+/// What a press sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// The draft as a request (a first send, or the same one again).
+    Submit,
+    /// The steps of the recorded submission that did not succeed.
+    Retry,
+}
+
+/// The Submit screen's state, kept in the pane.
+pub(super) struct Submit {
+    /// The main idea's text box.
+    idea: Entity<TextareaState>,
+    /// The daemon's targets; `None` while they load.
+    targets: Option<FeedbackTargets>,
+    targets_task: Option<Task<()>>,
+    /// The repository picked in the menu.
+    picked_repo: Option<RepoId>,
+    send_as: SendAs,
+    /// The screen's error line.
+    error: Option<String>,
+    /// The command under way, and its task; dropping the task gives it up.
+    busy: Option<Attempt>,
+    command: Option<Task<()>>,
+    /// Where the focus was when the screen opened.
+    focus_before: Option<FocusHandle>,
+}
+
+impl Submit {
+    pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
+        let idea = cx.new(|cx| TextareaState::new(window, cx).auto_grow(IDEA_ROWS.0, IDEA_ROWS.1));
+        Self {
+            idea,
+            targets: None,
+            targets_task: None,
+            picked_repo: None,
+            send_as: SendAs::Intent,
+            error: None,
+            busy: None,
+            command: None,
+            focus_before: None,
+        }
+    }
+}
+
+/// Keeps the draft's main idea as the box changes.
+pub(super) fn follow_main_idea(
+    submit: &Submit,
+    window: &mut Window,
+    cx: &mut Context<FeedbackPane>,
+) -> Subscription {
+    cx.subscribe_in(
+        &submit.idea,
+        window,
+        |this, idea, event: &InputEvent, _, cx| {
+            if let InputEvent::Change = event {
+                let text = idea.read(cx).value().to_string();
+                this.feedback
+                    .update(cx, |feedback, cx| feedback.set_main_idea(text, cx));
+                cx.notify();
+            }
+        },
+    )
+}
+
+/// The size of each file on disk; `None` for one that is not a regular file.
+fn sizes_on_disk(files: Vec<FeedbackFile>) -> Vec<(FeedbackFile, Option<u64>)> {
+    files
+        .into_iter()
+        .map(|file| {
+            let size = size_of(&file.path);
+            (file, size)
+        })
+        .collect()
+}
+
+fn size_of(path: &Path) -> Option<u64> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.file_type().is_file())
+        .map(|meta| meta.len())
+}
+
+/// Whether the daemon answered: only then did it surely see the request.
+fn answered_by_daemon(error: &LinkError) -> bool {
+    matches!(error, LinkError::Client(ClientError::Api { .. }))
+}
+
+fn is_code(error: &LinkError, wanted: &str) -> bool {
+    matches!(error, LinkError::Client(ClientError::Api { code, .. }) if code == wanted)
+}
+
+/// What the repository line shows.
+enum RepoLine {
+    /// No repository yet: the way to Settings.
+    Missing,
+    /// The chosen repository's name (or "Choose a repository"), and the
+    /// menu of all.
+    Menu {
+        label: String,
+        choices: Vec<RepoChoiceVm>,
+    },
+}
+
+impl FeedbackPane {
+    /// Whether a submission or a retry is under way (the pressed button
+    /// shows the spinner).
+    pub fn submitting(&self) -> bool {
+        self.submit.busy.is_some()
+    }
+
+    /// The main idea's text box as typed.
+    pub fn main_idea_text(&self, cx: &App) -> String {
+        self.submit.idea.read(cx).value().to_string()
+    }
+
+    /// Opens the Submit screen and asks the daemon for the targets. Needs an
+    /// attachment, no work on the draft and the daemon ("Submit…" is
+    /// disabled otherwise). A pending submission whose step failed shows its
+    /// failure at once.
+    pub(super) fn open_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (empty, busy, pending) = {
+            let feedback = self.feedback.read(cx);
+            (
+                feedback.draft().is_empty(),
+                feedback.busy(),
+                feedback.pending().cloned(),
+            )
+        };
+        let Some(targets) = self
+            .state
+            .read(cx)
+            .feedback_commands()
+            .filter(|_| !empty && !busy)
+            .map(|commands| commands.feedback_targets())
+        else {
+            return;
+        };
+        tracing::debug!("feedback submit screen");
+        self.submit.focus_before = window.focused(cx);
+        self.screen = FeedbackScreen::Submit;
+        let submit = &mut self.submit;
+        submit.error = pending
+            .as_ref()
+            .and_then(|p| p.outcome.as_ref())
+            .and_then(failure_text);
+        submit.picked_repo = None;
+        submit.send_as = SendAs::Intent;
+        submit.targets = None;
+        let timer = cx
+            .background_executor()
+            .timer(self.state.read(cx).command_timeout());
+        submit.targets_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let answer = answered(targets, timer).await;
+            let _ = this.update(cx, |this, cx| {
+                this.submit.targets_task = None;
+                match answer {
+                    Some(Ok(targets)) => this.submit.targets = Some(targets),
+                    Some(Err(e)) => {
+                        tracing::warn!("the feedback targets did not load: {e}");
+                        this.submit.error.get_or_insert(submit_error_text(&e));
+                    }
+                    None => {
+                        tracing::warn!("the daemon did not answer the feedback targets in time");
+                        this.submit
+                            .error
+                            .get_or_insert(DAEMON_SILENT_TEXT.to_owned());
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        let main_idea = self.feedback.read(cx).draft().main_idea.clone();
+        let locked = self.feedback.read(cx).locked();
+        self.submit.idea.update(cx, |idea, cx| {
+            if idea.value() != main_idea {
+                idea.set_value(main_idea, window, cx);
+            }
+            if !locked {
+                idea.focus(window, cx);
+            }
+        });
+        if locked {
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Back to the draft, unless a command is under way; the focus returns
+    /// to where it was when the screen opened (onto the pane when that is
+    /// gone).
+    pub(super) fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen != FeedbackScreen::Submit || self.submit.busy.is_some() {
+            return;
+        }
+        self.close_submit(window, cx);
+    }
+
+    fn close_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::debug!("feedback draft screen");
+        self.screen = FeedbackScreen::Draft;
+        self.submit.error = None;
+        self.submit.targets_task = None;
+        let before = self.submit.focus_before.take();
+        // Only a focus still in the screen goes back: an answer that comes
+        // later never takes the focus from where the user is now.
+        if self.focus.contains_focused(window, cx) {
+            let restore = before
+                .filter(|focus| *focus == self.submit_button_focus || focus.is_rendered(window));
+            restore
+                .unwrap_or_else(|| self.focus.clone())
+                .focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The pending submission, once the daemon has seen it: what it was
+    /// sent for.
+    fn sent_to(&self, cx: &App) -> Option<SentTo> {
+        self.feedback.read(cx).pending().and_then(|p| p.sent)
+    }
+
+    /// The repository Create sends to: the one sent to, the one picked
+    /// while it exists, else the last used, else the meta repository.
+    fn chosen_repo(&self, cx: &App) -> Option<RepoId> {
+        if let Some(sent) = self.sent_to(cx) {
+            return Some(sent.repo_id);
+        }
+        let state = self.state.read(cx);
+        let model = state.model();
+        let repos = model.repos();
+        if let Some(picked) = self
+            .submit
+            .picked_repo
+            .filter(|id| repos.iter().any(|repo| repo.id == *id))
+        {
+            return Some(picked);
+        }
+        let stored = model
+            .feedback_settings()
+            .and_then(|settings| settings.meta_repo_id)
+            .or_else(|| self.submit.targets.as_ref()?.meta_repo_id);
+        starting_repo(
+            repos,
+            state.last_repo_id(),
+            effective_meta_repo(stored, repos),
+        )
+    }
+
+    fn target(&self, repo: Option<RepoId>) -> Option<&FeedbackTarget> {
+        let repo = repo?;
+        self.submit
+            .targets
+            .as_ref()?
+            .repos
+            .iter()
+            .find(|target| target.repo_id == repo)
+    }
+
+    /// Why "A GitHub issue" cannot be chosen for `repo`; `None` while the
+    /// targets load (it is disabled then, with no reason).
+    fn issue_reason(&self, repo: Option<RepoId>) -> Option<Cow<'static, str>> {
+        let targets = self.submit.targets.as_ref()?;
+        issue_reason(self.target(repo), &targets.gh)
+    }
+
+    /// What Create sends as: the one sent as; else the choice, an intent
+    /// whenever the issue is unavailable.
+    fn chosen_send_as(&self, repo: Option<RepoId>, cx: &App) -> SendAs {
+        if let Some(sent) = self.sent_to(cx) {
+            return sent.send_as;
+        }
+        let available = self.submit.targets.is_some() && self.issue_reason(repo).is_none();
+        match self.submit.send_as {
+            SendAs::GithubIssue if available => SendAs::GithubIssue,
+            _ => SendAs::Intent,
+        }
+    }
+
+    fn pick_repo(&mut self, repo: RepoId, cx: &mut Context<Self>) {
+        tracing::debug!(%repo, "feedback goes to");
+        self.submit.picked_repo = Some(repo);
+        if self.issue_reason(Some(repo)).is_some() || self.submit.targets.is_none() {
+            self.submit.send_as = SendAs::Intent;
+        }
+        cx.notify();
+    }
+
+    fn choose_send_as(&mut self, send_as: SendAs, cx: &mut Context<Self>) {
+        if self.submit.busy.is_none() && !self.feedback.read(cx).locked() {
+            self.submit.send_as = send_as;
+            cx.notify();
+        }
+    }
+
+    fn choose_kind(&mut self, kind: FeedbackKind, cx: &mut Context<Self>) {
+        if self.submit.busy.is_none() {
+            self.feedback
+                .update(cx, |feedback, cx| feedback.set_kind(kind, cx));
+        }
+    }
+
+    /// Create: asks first for a public repository, then sends.
+    fn press_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submit.busy.is_some() || self.feedback.read(cx).locked() {
+            return;
+        }
+        let repo = self.chosen_repo(cx);
+        let send_as = self.chosen_send_as(repo, cx);
+        let reason = self.issue_reason(repo);
+        let main_idea = self.feedback.read(cx).draft().main_idea.clone();
+        if !can_confirm(&main_idea, repo, send_as, reason.as_deref(), None) {
+            return;
+        }
+        let Some(repo) = repo else {
+            return;
+        };
+        self.ask_then_send(
+            SentTo {
+                repo_id: repo,
+                send_as,
+            },
+            Attempt::Submit,
+            window,
+            cx,
+        );
+    }
+
+    /// Retry: the failed step of a recorded submission, else the same
+    /// request again.
+    fn press_retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submit.busy.is_some() {
+            return;
+        }
+        let Some(pending) = self.feedback.read(cx).pending().cloned() else {
+            return;
+        };
+        let Some(to) = pending.sent else {
+            return;
+        };
+        let attempt = if pending.outcome.as_ref().is_some_and(|o| o.failed.is_some()) {
+            Attempt::Retry
+        } else {
+            Attempt::Submit
+        };
+        self.ask_then_send(to, attempt, window, cx);
+    }
+
+    /// Start over: the pending submission is dropped (what it committed
+    /// stays) and the form can change again, on the same choices.
+    fn start_over(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submit.busy.is_some() {
+            return;
+        }
+        let sent = self.sent_to(cx);
+        tracing::debug!("feedback submission started over");
+        self.feedback
+            .update(cx, |feedback, cx| feedback.forget_submission(cx));
+        if let Some(sent) = sent {
+            self.submit.picked_repo = Some(sent.repo_id);
+            self.submit.send_as = sent.send_as;
+        }
+        self.submit.error = None;
+        self.submit
+            .idea
+            .update(cx, |idea, cx| idea.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Sends now, or, for a GitHub issue in a repository that is or may be
+    /// public, after the user confirms (every time).
+    fn ask_then_send(
+        &mut self,
+        to: SentTo,
+        attempt: Attempt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(warning) = public_warning(to.send_as, self.target(Some(to.repo_id))) else {
+            self.send(to, attempt, window, cx);
+            return;
+        };
+        let pane: WeakEntity<Self> = cx.entity().downgrade();
+        let ask = Confirmation {
+            title_id: PUBLIC_CONFIRM_TITLE_ID,
+            title: PUBLIC_CONFIRM_TITLE,
+            description: warning.to_owned(),
+            cancel_id: PUBLIC_CANCEL_ID,
+            cancel: PUBLIC_CONFIRM_CANCEL,
+            confirm_id: PUBLIC_CONFIRM_ID,
+            confirm: match attempt {
+                Attempt::Submit if self.sent_to(cx).is_none() => confirm_label(to.send_as),
+                _ => RETRY_LABEL,
+            },
+        };
+        confirm(
+            ask,
+            move |window, cx| {
+                let _ = pane.update(cx, |pane, cx| pane.send(to, attempt, window, cx));
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Sends the draft (or retries the pending submission) to `to`: one at
+    /// a time, with every control waiting, for at most [`SUBMIT_TIMEOUT`].
+    /// A draft the daemon would refuse is not sent: the error line says why.
+    fn send(&mut self, to: SentTo, attempt: Attempt, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submit.busy.is_some() {
+            tracing::debug!("a feedback submission is already under way");
+            return;
+        }
+        if self.state.read(cx).feedback_commands().is_none() {
+            self.submit.error = Some(NOT_CONNECTED_TEXT.to_owned());
+            cx.notify();
+            return;
+        }
+        enum Sending {
+            Submit(FeedbackRequest, Vec<FeedbackFile>),
+            Retry(SubmissionId),
+        }
+        let sending = match attempt {
+            Attempt::Retry => {
+                let Some(id) = self.feedback.read(cx).pending().map(|p| p.submission_id) else {
+                    return;
+                };
+                tracing::info!(submission_id = %id, "retrying a feedback submission");
+                Sending::Retry(id)
+            }
+            Attempt::Submit => {
+                let (upload, main_idea, kind) = {
+                    let feedback = self.feedback.read(cx);
+                    (
+                        feedback.upload(),
+                        feedback.draft().main_idea.clone(),
+                        feedback.kind(),
+                    )
+                };
+                let Some((attachments, files)) = upload else {
+                    tracing::debug!("the draft is not ready to send");
+                    return;
+                };
+                let files = sizes_on_disk(files);
+                if let Some(problem) = upload_problem(&main_idea, &attachments, &files) {
+                    tracing::info!("the feedback draft is over a limit; nothing is sent");
+                    self.submit.error = Some(problem);
+                    cx.notify();
+                    return;
+                }
+                let submission_id = self
+                    .feedback
+                    .update(cx, |feedback, cx| feedback.begin_submission(cx));
+                let request = FeedbackRequest {
+                    submission_id,
+                    main_idea,
+                    kind,
+                    repo_id: to.repo_id,
+                    send_as: to.send_as,
+                    idea: None,
+                    app_version: smithagents_core::VERSION.to_owned(),
+                    platform: std::env::consts::OS.to_owned(),
+                    attachments,
+                };
+                tracing::info!(%submission_id, send_as = ?to.send_as, "sending feedback");
+                Sending::Submit(request, files.into_iter().map(|(file, _)| file).collect())
+            }
+        };
+        let Some(command) = self
+            .state
+            .read(cx)
+            .feedback_commands()
+            .map(|commands| match sending {
+                Sending::Submit(request, files) => commands.submit_feedback(request, files),
+                Sending::Retry(id) => commands.retry_feedback(id),
+            })
+        else {
+            return;
+        };
+        self.submit.busy = Some(attempt);
+        self.submit.error = None;
+        self.feedback
+            .update(cx, |feedback, cx| feedback.set_submitting(true, cx));
+        let timer = cx.background_executor().timer(SUBMIT_TIMEOUT);
+        self.submit.command = Some(cx.spawn_in(window, async move |this, cx| {
+            let answer = answered(command, timer).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish(to, attempt, answer, window, cx)
+            });
+        }));
+        cx.notify();
+    }
+
+    /// `answer` is `None` when the daemon did not answer in time.
+    fn finish(
+        &mut self,
+        to: SentTo,
+        attempt: Attempt,
+        answer: Option<Result<FeedbackOutcome, LinkError>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit.busy = None;
+        self.submit.command = None;
+        self.feedback
+            .update(cx, |feedback, cx| feedback.set_submitting(false, cx));
+        match answer {
+            None => {
+                tracing::warn!(
+                    ?attempt,
+                    "the daemon did not answer a feedback submission in time"
+                );
+                // It took the request: it may still make it.
+                self.feedback
+                    .update(cx, |feedback, cx| feedback.mark_sent(to, cx));
+                self.submit.error = Some(DAEMON_SILENT_TEXT.to_owned());
+            }
+            Some(Ok(outcome)) => match result_text(&outcome) {
+                Some(result) => self.succeeded(outcome, result, window, cx),
+                None => {
+                    tracing::warn!(
+                        submission_id = %outcome.submission_id,
+                        step = ?outcome.failed.as_ref().map(|f| f.step),
+                        "a feedback submission is committed, but a step failed"
+                    );
+                    self.submit.error = failure_text(&outcome);
+                    self.feedback.update(cx, |feedback, cx| {
+                        feedback.mark_sent(to, cx);
+                        feedback.record_outcome(outcome, cx);
+                    });
+                }
+            },
+            Some(Err(e)) if is_code(&e, "submission_not_found") => {
+                tracing::info!("the daemon has no such feedback submission; starting over");
+                self.feedback
+                    .update(cx, |feedback, cx| feedback.forget_submission(cx));
+                self.submit.error = Some(NOTHING_CREATED_TEXT.to_owned());
+            }
+            Some(Err(e)) => {
+                tracing::warn!(?attempt, "a feedback submission failed: {e}");
+                if answered_by_daemon(&e) {
+                    self.feedback
+                        .update(cx, |feedback, cx| feedback.mark_sent(to, cx));
+                }
+                self.submit.error = Some(submit_error_text(&e));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The daemon made it all: the repository becomes the last used, the
+    /// draft goes, the draft screen says what was created, and a created
+    /// intent opens in the Intents pane.
+    fn succeeded(
+        &mut self,
+        outcome: FeedbackOutcome,
+        result: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::info!(submission_id = %outcome.submission_id, "feedback submitted");
+        self.state
+            .update(cx, |state, _| state.set_last_repo_id(outcome.repo_id));
+        self.feedback
+            .update(cx, |feedback, cx| feedback.finish_submission(result, cx));
+        self.submit.picked_repo = None;
+        self.submit.send_as = SendAs::Intent;
+        self.close_submit(window, cx);
+        if let Some(intent) = outcome.intent {
+            self.state
+                .update(cx, |state, cx| state.open_intent(intent.id, cx));
+        }
+    }
+
+    // ---- Drawing --------------------------------------------------------
+
+    pub(super) fn submit_screen(&self, paint: &Paint, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.submit.busy;
+        let (locked, pending, kind, draft) = {
+            let feedback = self.feedback.read(cx);
+            (
+                feedback.pending().is_some_and(|p| p.sent.is_some()),
+                feedback.pending().cloned(),
+                feedback.kind(),
+                feedback.draft().clone(),
+            )
+        };
+        // While the daemon has the submission, or a command is under way.
+        let frozen = locked || busy.is_some();
+        let repo = self.chosen_repo(cx);
+        let send_as = self.chosen_send_as(repo, cx);
+        let reason = self.issue_reason(repo);
+        let issue_disabled = frozen || self.submit.targets.is_none() || reason.is_some();
+        let warning = public_warning(send_as, self.target(repo));
+        let cards = cards(self.feedback.read(cx));
+        v_flex()
+            .id(SCREEN_ID)
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .w_full()
+                    .px_3()
+                    .pb_3()
+                    .gap_3()
+                    .child(
+                        h_flex().child(
+                            Button::new(SUBMIT_BACK_ID)
+                                .label(BACK_LABEL)
+                                .ghost()
+                                .small()
+                                .disabled(busy.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
+                        ),
+                    )
+                    .child(
+                        v_flex().w_full().gap_1p5().children(
+                            cards
+                                .into_iter()
+                                .map(|card| self.card(card, false, paint, cx)),
+                        ),
+                    )
+                    .child(self.idea_field(frozen, paint))
+                    .child(self.kind_row(kind, frozen, paint, cx))
+                    .child(self.repo_row(repo, frozen, paint, cx))
+                    .child(self.send_as_row(
+                        send_as,
+                        issue_disabled,
+                        reason.as_deref(),
+                        frozen,
+                        paint,
+                        cx,
+                    ))
+                    .child(
+                        Label::new(summary(send_as, None, &draft))
+                            .id(SUBMIT_SUMMARY_ID)
+                            .text_xs()
+                            .text_color(paint.muted_foreground),
+                    )
+                    .when_some(warning, |this, warning| {
+                        this.child(
+                            Label::new(warning)
+                                .id(PUBLIC_WARNING_ID)
+                                .text_xs()
+                                .text_color(paint.warning),
+                        )
+                    })
+                    .children(self.error_line(paint))
+                    .child(self.actions(
+                        locked,
+                        pending.as_ref(),
+                        repo,
+                        send_as,
+                        reason.as_deref(),
+                        cx,
+                    )),
+            )
+    }
+
+    /// "Main idea", its text box and the hint.
+    fn idea_field(&self, frozen: bool, paint: &Paint) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(section_label(MAIN_IDEA_LABEL, paint).id(SUBMIT_IDEA_LABEL_ID))
+            .child(
+                div().id(SUBMIT_IDEA_ID).test_support().w_full().child(
+                    Textarea::new(&self.submit.idea)
+                        .aria_label(MAIN_IDEA_LABEL)
+                        .disabled(frozen)
+                        .small(),
+                ),
+            )
+            .child(
+                Label::new(MAIN_IDEA_HINT)
+                    .id(SUBMIT_IDEA_HINT_ID)
+                    .text_xs()
+                    .text_color(paint.muted_foreground),
+            )
+    }
+
+    fn kind_row(
+        &self,
+        chosen: FeedbackKind,
+        frozen: bool,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(section_label(KIND_LABEL, paint))
+            .child(h_flex().flex_wrap().gap_1().children(KINDS.map(|kind| {
+                Button::new(submit_kind_id(kind))
+                    .label(kind_label(kind.intent_kind()))
+                    .outline()
+                    .small()
+                    .selected(kind == chosen)
+                    .toggled(kind == chosen)
+                    .disabled(frozen)
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_kind(kind, cx)))
+            })))
+    }
+
+    /// "Repository": a menu of the repositories (its button names the
+    /// chosen one), or the way to Settings when there is none.
+    fn repo_row(
+        &self,
+        chosen: Option<RepoId>,
+        frozen: bool,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let line = {
+            let repos = self.state.read(cx).model().repos();
+            if repos.is_empty() {
+                RepoLine::Missing
+            } else {
+                let label = chosen
+                    .and_then(|id| repos.iter().find(|repo| repo.id == id))
+                    .map_or_else(
+                        || CHOOSE_REPO_TEXT.to_owned(),
+                        |repo| repo_title(&repo.path),
+                    );
+                // No entry is checked until one is chosen.
+                let choices = repos
+                    .iter()
+                    .map(|repo| RepoChoiceVm {
+                        id: repo.id,
+                        title: repo_title(&repo.path),
+                        path: repo.path.display().to_string(),
+                        preselected: Some(repo.id) == chosen,
+                    })
+                    .collect();
+                RepoLine::Menu { label, choices }
+            }
+        };
+        let button: AnyElement = match line {
+            RepoLine::Missing => Button::new(SUBMIT_REPO_ID)
+                .label(NEED_REPO_TEXT)
+                .outline()
+                .small()
+                .disabled(frozen)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.request_settings_focus(SettingsSection::Repositories, cx)
+                    })
+                }))
+                .into_any_element(),
+            RepoLine::Menu { label, choices } => {
+                let pane = cx.entity().downgrade();
+                Button::new(SUBMIT_REPO_ID)
+                    .label(label)
+                    .outline()
+                    .small()
+                    .dropdown_caret(true)
+                    .disabled(frozen)
+                    .dropdown_menu(move |menu, window, cx| {
+                        repo_menu(menu, &choices, &pane, window, cx)
+                    })
+                    .into_any_element()
+            }
+        };
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(section_label(REPO_LABEL, paint))
+            .child(h_flex().min_w_0().child(button))
+    }
+
+    /// "Send it as": two radios, and why the issue cannot be chosen.
+    fn send_as_row(
+        &self,
+        send_as: SendAs,
+        issue_disabled: bool,
+        reason: Option<&str>,
+        frozen: bool,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .gap_1p5()
+            .child(section_label(SEND_AS_LABEL, paint))
+            .child(
+                Radio::new(SEND_INTENT_ID)
+                    .label(SEND_AS_INTENT)
+                    .small()
+                    .checked(send_as == SendAs::Intent)
+                    .disabled(frozen)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        if *checked {
+                            this.choose_send_as(SendAs::Intent, cx)
+                        }
+                    })),
+            )
+            .child(
+                Radio::new(SEND_ISSUE_ID)
+                    .label(SEND_AS_ISSUE)
+                    .small()
+                    .checked(send_as == SendAs::GithubIssue)
+                    .disabled(issue_disabled)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        if *checked {
+                            this.choose_send_as(SendAs::GithubIssue, cx)
+                        }
+                    })),
+            )
+            .when_some(reason.filter(|_| !frozen), |this, reason| {
+                this.child(
+                    Label::new(reason.to_owned())
+                        .id(SEND_ISSUE_REASON_ID)
+                        .text_xs()
+                        .text_color(paint.muted_foreground),
+                )
+            })
+    }
+
+    /// The screen's error line, a status that announces itself.
+    fn error_line(&self, paint: &Paint) -> Option<AnyElement> {
+        let text = self.submit.error.clone()?;
+        Some(
+            div()
+                .id(SUBMIT_ERROR_ID)
+                .role(Role::Status)
+                .test_support()
+                .aria_label(text.clone())
+                .w_full()
+                .text_xs()
+                .text_color(paint.destructive)
+                .child(text)
+                .into_any_element(),
+        )
+    }
+
+    /// Create, or (once the daemon has seen the submission) Retry and Start
+    /// over.
+    fn actions(
+        &self,
+        locked: bool,
+        pending: Option<&Pending>,
+        repo: Option<RepoId>,
+        send_as: SendAs,
+        reason: Option<&str>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let busy = self.submit.busy;
+        let row = h_flex().w_full().justify_end().gap_1();
+        if locked && pending.is_some() {
+            return row
+                .child(
+                    Button::new(SUBMIT_START_OVER_ID)
+                        .label(START_OVER_LABEL)
+                        .ghost()
+                        .small()
+                        .disabled(busy.is_some())
+                        .on_click(cx.listener(|this, _, window, cx| this.start_over(window, cx))),
+                )
+                .child(
+                    Button::new(SUBMIT_RETRY_ID)
+                        .label(RETRY_LABEL)
+                        .primary()
+                        .small()
+                        .disabled(busy.is_some())
+                        .loading(busy.is_some())
+                        .on_click(cx.listener(|this, _, window, cx| this.press_retry(window, cx))),
+                );
+        }
+        let (main_idea, ready) = {
+            let feedback = self.feedback.read(cx);
+            (
+                feedback.draft().main_idea.clone(),
+                feedback.upload().is_some(),
+            )
+        };
+        let enabled =
+            busy.is_none() && ready && can_confirm(&main_idea, repo, send_as, reason, None);
+        row.child(
+            Button::new(SUBMIT_CONFIRM_ID)
+                .label(confirm_label(send_as))
+                .primary()
+                .small()
+                .disabled(!enabled)
+                .loading(busy == Some(Attempt::Submit))
+                .on_click(cx.listener(|this, _, window, cx| this.press_confirm(window, cx))),
+        )
+    }
+}
+
+/// A section's name over its control.
+fn section_label(text: &'static str, paint: &Paint) -> Label {
+    Label::new(text)
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(paint.muted_foreground)
+}
+
+/// The repository menu: one entry per repository, its folder's name over its
+/// full path, the chosen one checked.
+fn repo_menu(
+    mut menu: PopupMenu,
+    choices: &[RepoChoiceVm],
+    pane: &WeakEntity<FeedbackPane>,
+    window: &Window,
+    cx: &App,
+) -> PopupMenu {
+    let muted = cx.theme().muted_foreground;
+    // The menu takes its width in pixels; it follows the text size.
+    let max_width = rems(REPO_MENU_MAX_WIDTH).to_pixels(window.rem_size());
+    menu = menu.label(REPO_MENU_LABEL).max_w(max_width);
+    for choice in choices {
+        let (title, path, repo) = (choice.title.clone(), choice.path.clone(), choice.id);
+        let pane = pane.clone();
+        menu = menu.item(
+            // As the intent tool's menu: the entry carries its own named node.
+            PopupMenuItem::element(move |_, _| {
+                v_flex()
+                    .id(submit_repo_item_id(repo))
+                    .role(Role::Group)
+                    .test_support()
+                    .aria_label(format!("{title}, {path}"))
+                    .min_w_0()
+                    .py_0p5()
+                    .child(div().text_sm().child(title.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .truncate()
+                            .child(path.clone()),
+                    )
+            })
+            .checked(choice.preselected)
+            .on_click(move |_, _, cx| {
+                let _ = pane.update(cx, |pane, cx| pane.pick_repo(repo, cx));
+            }),
+        );
+    }
+    menu
+}

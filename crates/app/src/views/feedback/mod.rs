@@ -3,13 +3,18 @@
 //! ([`annotator`]). The pane shares the dock with Settings and Intents and is
 //! drawn only while the rail has it selected ([`ShellState::right_entry`]).
 //!
-//! Top to bottom: the heading; "How to submit feedback", collapsed until
-//! the user opens it (not remembered); the notices, a status in the
-//! `destructive` color, while there are any (at most [`NOTICES_MAX_HEIGHT`]
-//! tall, then they scroll); one card per attachment ([`card`]), or what to
-//! do when there is none; and the buttons. "Capture" takes a picture of the
-//! window as it is, "Add files…" asks for files, "Discard" asks first, and
-//! "Submit…" waits for the next update.
+//! The pane shows one [`FeedbackScreen`] at a time. The draft, top to
+//! bottom: the heading; "How to submit feedback", collapsed until the user
+//! opens it (not remembered); the notices, a status in the `destructive`
+//! color, while there are any (at most [`NOTICES_MAX_HEIGHT`] tall, then
+//! they scroll); the last submission's result, a status; one card per
+//! attachment ([`card`]), or what to do when there is none; and the buttons.
+//! "Capture" takes a picture of the window as it is, "Add files…" asks for
+//! files, "Discard" asks first, and "Submit…" opens the Submit screen
+//! ([`submit`]), once the draft has an attachment and the daemon is there.
+//! While the draft is locked (its submission is under way or was sent), it
+//! cannot be changed: Capture and Add files are disabled and the cards have
+//! no remove button.
 //!
 //! The pane only shows the [`Feedback`] entity and calls it: the draft, the
 //! disk, the capturer and the picker are all there. It does release the
@@ -22,6 +27,7 @@
 mod annotator;
 mod card;
 mod hold;
+mod submit;
 
 pub use annotator::{
     badge_id, Annotator, ANNOTATOR_BAR_HEIGHT, ANNOTATOR_COMMENT_ERROR_ID, ANNOTATOR_COMMENT_ID,
@@ -31,6 +37,13 @@ pub use annotator::{
 };
 pub use card::{card_id, card_remove_id, comment_badge_id};
 pub use hold::{HoldButton, HoldEvent, HOLD_RING_ID};
+pub use submit::{
+    submit_kind_id, submit_repo_item_id, PUBLIC_CANCEL_ID, PUBLIC_CONFIRM_ID,
+    PUBLIC_CONFIRM_TITLE_ID, PUBLIC_WARNING_ID, SEND_INTENT_ID, SEND_ISSUE_ID,
+    SEND_ISSUE_REASON_ID, SUBMIT_BACK_ID, SUBMIT_CONFIRM_ID, SUBMIT_ERROR_ID, SUBMIT_IDEA_HINT_ID,
+    SUBMIT_IDEA_ID, SUBMIT_IDEA_LABEL_ID, SUBMIT_KEY_CONTEXT, SUBMIT_REPO_ID, SUBMIT_RETRY_ID,
+    SUBMIT_START_OVER_ID, SUBMIT_SUMMARY_ID,
+};
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -40,6 +53,7 @@ use gpui_kit::assets::IconName as CatalogIcon;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelControl, PanelEvent};
+use gpui_kit::component::input::Escape;
 use gpui_kit::component::label::Label;
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
@@ -48,20 +62,21 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, rems, AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Rems, Render, Role,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, Subscription,
-    TestSupportExt as _, Window,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Rems,
+    Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled,
+    Subscription, TestSupportExt as _, Window,
 };
 
 use crate::feedback::draft::AttachmentId;
 use crate::feedback::state::Feedback;
 use crate::feedback::text::{
     discard_description, DISCARD_CANCEL, DISCARD_CONFIRM, DISCARD_TITLE, EMPTY_TEXT, HELP_LINES,
-    HELP_TITLE, SUBMIT_TOOLTIP,
+    HELP_TITLE, SUBMIT_EMPTY_TOOLTIP,
 };
 use crate::shell::FEEDBACK_PANEL;
 use crate::shell_state::ShellState;
 use crate::theme_adapter::{region_paint, token_paint, Region};
+use crate::view_models::NOT_CONNECTED_TEXT;
 use crate::views::pane_heading;
 use crate::views::rail::RailEntry;
 
@@ -84,6 +99,8 @@ pub const FEEDBACK_ADD_FILES_ID: &str = "feedback-add-files";
 pub const FEEDBACK_CAPTURE_ID: &str = "feedback-capture";
 pub const FEEDBACK_DISCARD_ID: &str = "feedback-discard";
 pub const FEEDBACK_SUBMIT_ID: &str = "feedback-submit";
+/// Element id of the last submission's result, on the draft (a status).
+pub const FEEDBACK_RESULT_ID: &str = "feedback-result";
 /// Element ids in the dialog Discard opens.
 pub const DISCARD_DIALOG_TITLE_ID: &str = "feedback-discard-title";
 pub const DISCARD_CANCEL_ID: &str = "feedback-discard-cancel";
@@ -101,10 +118,32 @@ const SUBMIT_LABEL: &str = "Submit…";
 /// buttons keep their room.
 pub const NOTICES_MAX_HEIGHT: Rems = rems(10.);
 
+/// Registers the pane's key bindings: Escape on the Submit screen
+/// ([`SUBMIT_KEY_CONTEXT`]) goes back to the draft. A text field handles
+/// Escape itself and passes it on.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("escape", Escape, Some(SUBMIT_KEY_CONTEXT))]);
+}
+
+/// What the pane shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedbackScreen {
+    /// The draft: its cards and the buttons.
+    Draft,
+    /// The Submit screen ([`submit`]).
+    Submit,
+}
+
 pub struct FeedbackPane {
     state: Entity<ShellState>,
     feedback: Entity<Feedback>,
     focus: FocusHandle,
+    screen: FeedbackScreen,
+    /// The Submit screen's own state.
+    submit: submit::Submit,
+    /// "Submit…"'s focus, so a keyboard user gets it back when the Submit
+    /// screen closes.
+    submit_button_focus: FocusHandle,
     /// Whether "How to submit feedback" is expanded; it starts collapsed.
     help_open: bool,
     /// The cards' scroll position.
@@ -124,8 +163,10 @@ impl FeedbackPane {
     ) -> Self {
         // The dock draws the pane from a cache: the theme reaches it through
         // the state, the draft through the feedback entity.
+        let submit = submit::Submit::new(window, cx);
         let subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),
+            submit::follow_main_idea(&submit, window, cx),
             cx.observe_in(&feedback, window, |_, feedback, window, cx| {
                 // Thumbnails whose cards are gone leave the window's atlas.
                 // `Some(window)`: the window being updated is skipped otherwise.
@@ -140,11 +181,18 @@ impl FeedbackPane {
             state,
             feedback,
             focus: cx.focus_handle(),
+            screen: FeedbackScreen::Draft,
+            submit,
+            submit_button_focus: cx.focus_handle().tab_stop(true),
             help_open: false,
             scroll: ScrollHandle::new(),
             card_focus: HashMap::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn screen(&self) -> &FeedbackScreen {
+        &self.screen
     }
 
     /// "How to submit feedback": a header button, then the three sentences
@@ -206,7 +254,27 @@ impl FeedbackPane {
     }
 
     /// Add files and Capture on the left; Discard and Submit on the right.
-    fn buttons(&self, capturing: bool, empty: bool, cx: &Context<Self>) -> impl IntoElement {
+    /// "Submit…" needs an attachment, no work running on the draft and the
+    /// daemon; disabled, it says why (an empty draft, or no daemon).
+    fn buttons(&self, empty: bool, cx: &Context<Self>) -> impl IntoElement {
+        let (capturing, locked, busy, submitting) = {
+            let feedback = self.feedback.read(cx);
+            (
+                feedback.capturing(),
+                feedback.locked(),
+                feedback.busy(),
+                feedback.submitting(),
+            )
+        };
+        let connected = self.state.read(cx).feedback_commands().is_some();
+        let why_not = if empty {
+            Some(SUBMIT_EMPTY_TOOLTIP)
+        } else if !connected {
+            Some(NOT_CONNECTED_TEXT)
+        } else {
+            None
+        };
+        let can_submit = why_not.is_none() && !busy;
         h_flex()
             .flex_none()
             .w_full()
@@ -224,6 +292,7 @@ impl FeedbackPane {
                             .label(ADD_FILES_LABEL)
                             .outline()
                             .small()
+                            .disabled(locked)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.feedback
                                     .update(cx, |feedback, cx| feedback.add_files(window, cx))
@@ -235,7 +304,7 @@ impl FeedbackPane {
                             .label(CAPTURE_LABEL)
                             .outline()
                             .small()
-                            .disabled(capturing)
+                            .disabled(capturing || locked)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.feedback
                                     .update(cx, |feedback, cx| feedback.capture(window, cx))
@@ -250,7 +319,7 @@ impl FeedbackPane {
                             .label(DISCARD_LABEL)
                             .ghost()
                             .small()
-                            .disabled(empty)
+                            .disabled(empty || submitting)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.ask_to_discard(window, cx)),
                             ),
@@ -260,10 +329,34 @@ impl FeedbackPane {
                             .label(SUBMIT_LABEL)
                             .primary()
                             .small()
-                            .disabled(true)
-                            .tooltip(SUBMIT_TOOLTIP),
+                            .track_focus(&self.submit_button_focus)
+                            .disabled(!can_submit)
+                            .when_some(why_not, |this, why| this.tooltip(why))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_submit(window, cx)),
+                            ),
                     ),
             )
+    }
+
+    /// The last submission's result, a status, while there is one.
+    fn result_line(&self, paint: &Paint, cx: &Context<Self>) -> Option<AnyElement> {
+        let text = self.feedback.read(cx).result()?.to_owned();
+        Some(
+            div()
+                .id(FEEDBACK_RESULT_ID)
+                .role(Role::Status)
+                .test_support()
+                .aria_label(text.clone())
+                .flex_none()
+                .w_full()
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(paint.foreground)
+                .child(text)
+                .into_any_element(),
+        )
     }
 
     fn ask_to_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -465,12 +558,45 @@ impl Focusable for FeedbackPane {
 impl Render for FeedbackPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = Paint::new(self.state.read(cx), cx);
-        let (cards, notices, capturing) = {
+        let on_submit = self.screen == FeedbackScreen::Submit;
+        let content = if on_submit {
+            self.submit_screen(&paint, cx).into_any_element()
+        } else {
+            self.draft_screen(&paint, cx).into_any_element()
+        };
+        v_flex()
+            .id(FEEDBACK_PANEL)
+            .test_support()
+            .track_focus(&self.focus)
+            // On the pane, so Escape reaches it wherever the focus is in it.
+            .when(on_submit, |this| {
+                this.key_context(SUBMIT_KEY_CONTEXT)
+                    .on_action(cx.listener(|this, _: &Escape, window, cx| this.back(window, cx)))
+            })
+            .size_full()
+            .bg(paint.surface)
+            .text_color(paint.foreground)
+            .child(
+                pane_heading(FEEDBACK_TITLE_ID, HEADING, paint.foreground)
+                    .flex_none()
+                    .px_3()
+                    .pt_3()
+                    .pb_2(),
+            )
+            .child(content)
+    }
+}
+
+impl FeedbackPane {
+    /// The draft: the help, the notices, the result, the cards and the
+    /// buttons.
+    fn draft_screen(&mut self, paint: &Paint, cx: &mut Context<Self>) -> impl IntoElement {
+        let (cards, notices, editable) = {
             let feedback = self.feedback.read(cx);
             (
                 cards(feedback),
-                notices_block(feedback.notices(), &paint),
-                feedback.capturing(),
+                notices_block(feedback.notices(), paint),
+                !feedback.locked(),
             )
         };
         self.sync_card_focus(&cards, cx);
@@ -502,27 +628,22 @@ impl Render for FeedbackPane {
                 .px_2()
                 .py_2()
                 .gap_1p5()
-                .children(cards.into_iter().map(|card| self.card(card, &paint, cx)))
+                .children(
+                    cards
+                        .into_iter()
+                        .map(|card| self.card(card, editable, paint, cx)),
+                )
                 .into_any_element()
         };
         v_flex()
-            .id(FEEDBACK_PANEL)
-            .test_support()
-            .track_focus(&self.focus)
-            .size_full()
-            .bg(paint.surface)
-            .text_color(paint.foreground)
-            .child(
-                pane_heading(FEEDBACK_TITLE_ID, HEADING, paint.foreground)
-                    .flex_none()
-                    .px_3()
-                    .pt_3()
-                    .pb_2(),
-            )
-            .child(self.help(&paint, cx))
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(self.help(paint, cx))
             .children(notices)
+            .children(self.result_line(paint, cx))
             .child(content)
-            .child(self.buttons(capturing, empty, cx))
+            .child(self.buttons(empty, cx))
     }
 }
 
@@ -531,8 +652,11 @@ struct Paint {
     surface: Hsla,
     foreground: Hsla,
     muted_foreground: Hsla,
-    /// The notices, and the comment badges' fill.
+    /// The notices, the Submit screen's error line, and the comment badges'
+    /// fill.
     destructive: Hsla,
+    /// The Submit screen's public-repository warning.
+    warning: Hsla,
     /// The comment badges' number.
     background: Hsla,
     border: Hsla,
@@ -552,6 +676,7 @@ impl Paint {
             foreground,
             muted_foreground: token("muted-foreground"),
             destructive: token("destructive"),
+            warning: token("status-warn"),
             background: token("background"),
             border: token("border"),
             hover: token("muted"),

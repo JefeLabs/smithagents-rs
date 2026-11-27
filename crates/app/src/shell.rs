@@ -73,7 +73,7 @@ use crate::view_models::{update_button, LeftPaneMode};
 use crate::views::agents::AgentsPane;
 use crate::views::center::{notify_tab_failure, CenterPanel};
 use crate::views::feedback::{Annotator, FeedbackPane, HoldButton, HoldEvent};
-use crate::views::intents::IntentsPane;
+use crate::views::intents::{IntentsPane, Screen as IntentScreen};
 use crate::views::rail::{rail, RailEntry, RAIL_WIDTH};
 use crate::views::settings::SettingsPane;
 use crate::views::status_bar::status_bar;
@@ -138,9 +138,10 @@ const LAYOUT_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// - `cmd-w` closes the active tab, `ctrl-tab` and `ctrl-shift-tab` cycle
 ///   the tabs;
 ///
-/// plus the agents pane's, the settings view's and the intents pane's own
-/// ([`crate::views::agents::init`], [`crate::views::settings::init`],
-/// [`crate::views::intents::init`]). (v1 is
+/// plus the agents pane's, the settings view's, the intents pane's and the
+/// feedback pane's own ([`crate::views::agents::init`],
+/// [`crate::views::settings::init`], [`crate::views::intents::init`],
+/// [`crate::views::feedback::init`]). (v1 is
 /// macOS only. `KeyBinding::new` does not resolve the portable `secondary-`
 /// modifier and panics on it.) The menu bar ([`app_menus`]) shows these
 /// keys as its items' key equivalents.
@@ -167,6 +168,7 @@ pub fn init(cx: &mut App) {
     crate::views::agents::init(cx);
     crate::views::settings::init(cx);
     crate::views::intents::init(cx);
+    crate::views::feedback::init(cx);
 }
 
 /// The macOS menu bar: the app menu (Quit), View (the pane toggles) and
@@ -269,8 +271,9 @@ pub struct ShellOptions {
     /// Settings → Agent defaults), so headless tests need no daemon; `None`
     /// sends them through the link.
     pub intent_commands: Option<Rc<dyn IntentCommands>>,
-    /// Replaces the daemon link for the feedback commands (Settings → Source
-    /// repositories); `None` sends them through the link.
+    /// Replaces the daemon link for the feedback commands (the Feedback
+    /// pane's Submit, Settings → Source repositories); `None` sends them
+    /// through the link.
     pub feedback_commands: Option<Rc<dyn FeedbackCommands>>,
     /// The clock the views read ([`ShellState::now`]); `None` is the local
     /// clock. Headless tests inject a fixed one.
@@ -299,6 +302,8 @@ pub struct Shell {
     right_panels: Vec<(RailEntry, PanelId)>,
     /// The left pane's content: the agents pane, in either mode.
     left_pane: Entity<AgentsPane>,
+    /// The Intents pane, which [`ShellEvent::OpenIntent`] opens on a detail.
+    intents: Entity<IntentsPane>,
     feedback: Entity<Feedback>,
     /// The rail's Feedback button: a click toggles the pane, a hold
     /// captures.
@@ -453,7 +458,7 @@ impl Shell {
             let right = DockLayout::tabs()
                 .panel_view(panel_handle(settings), cx)
                 .panel_view(panel_handle(feedback_pane), cx)
-                .panel_view(panel_handle(intents), cx);
+                .panel_view(panel_handle(intents.clone()), cx);
             area.set_center(center, window, cx);
             area.set_dock(DockPlacement::Right, right, window, cx);
             area.set_dock_size(DockPlacement::Right, right_size, window, cx);
@@ -512,6 +517,15 @@ impl Shell {
                     ShellEvent::ThemeChanged => {}
                     ShellEvent::TabOpenFailed(text) => {
                         notify_tab_failure(text.clone(), window, cx);
+                    }
+                    ShellEvent::OpenIntent(id) => {
+                        tracing::debug!(source = "open intent", intent = %id, "rail show");
+                        this.show_rail_entry(RailEntry::Intents, window, cx);
+                        let id = *id;
+                        this.intents.update(cx, |pane, cx| {
+                            pane.open_screen(IntentScreen::Detail(id), window, cx)
+                        });
+                        cx.notify();
                     }
                     // The settings view handles its own focus.
                     ShellEvent::FocusSettings(_) => {}
@@ -611,6 +625,7 @@ impl Shell {
             dock,
             right_panels,
             left_pane,
+            intents,
             feedback,
             hold_button,
             annotator: None,

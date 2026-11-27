@@ -2,7 +2,9 @@
 //! a paperclip when there is none), the title (the screenshot's number and
 //! comment count, or the file's name), each comment after its numbered
 //! badge, and a remove button. A screenshot card is a tab stop; clicking it,
-//! or Enter or Space on it, reopens the annotator.
+//! or Enter or Space on it, reopens the annotator. A card that is not
+//! editable (the Submit screen's, a locked draft's) shows the same without
+//! the remove button, and is neither clickable nor a tab stop.
 
 use std::sync::Arc;
 
@@ -55,9 +57,15 @@ impl FeedbackPane {
         }
     }
 
-    /// One attachment's card; a screenshot's is a button that reopens the
-    /// annotator.
-    pub(super) fn card(&self, card: Card, paint: &Paint, cx: &Context<Self>) -> impl IntoElement {
+    /// One attachment's card; an editable screenshot's is a button that
+    /// reopens the annotator.
+    pub(super) fn card(
+        &self,
+        card: Card,
+        editable: bool,
+        paint: &Paint,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let Card {
             id,
             title,
@@ -67,6 +75,7 @@ impl FeedbackPane {
         } = card;
         let (hover, ring) = (paint.hover, paint.ring);
         let remove = id.clone();
+        let opens = screenshot && editable;
         // A screen reader hears the card's title, then its comments.
         let described = (!comments.is_empty()).then(|| {
             comments
@@ -78,11 +87,7 @@ impl FeedbackPane {
         });
         v_flex()
             .id(card_id(&id))
-            .role(if screenshot {
-                Role::Button
-            } else {
-                Role::ListItem
-            })
+            .role(if opens { Role::Button } else { Role::ListItem })
             .test_support()
             .aria_label(title.clone())
             .when_some(described, |this, described| {
@@ -97,7 +102,7 @@ impl FeedbackPane {
             .border_color(paint.border)
             .rounded(cx.theme().radius)
             .bg(paint.surface)
-            .when(screenshot, |this| {
+            .when(opens, |this| {
                 let open = id.clone();
                 this.track_focus(&self.card_focus[&id])
                     .cursor_pointer()
@@ -132,20 +137,25 @@ impl FeedbackPane {
                             .truncate()
                             .child(title),
                     )
-                    .child(
-                        Button::new(card_remove_id(&remove))
-                            .icon(Icon::new(CatalogIcon::Trash).text_color(paint.muted_foreground))
-                            .ghost()
-                            .xsmall()
-                            .tooltip(REMOVE_LABEL)
-                            .accessibility_label(REMOVE_LABEL)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // Not a click on the card.
-                                cx.stop_propagation();
-                                this.feedback
-                                    .update(cx, |feedback, cx| feedback.remove(&remove, cx));
-                            })),
-                    ),
+                    .when(editable, |this| {
+                        this.child(
+                            Button::new(card_remove_id(&remove))
+                                .icon(
+                                    Icon::new(CatalogIcon::Trash)
+                                        .text_color(paint.muted_foreground),
+                                )
+                                .ghost()
+                                .xsmall()
+                                .tooltip(REMOVE_LABEL)
+                                .accessibility_label(REMOVE_LABEL)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // Not a click on the card.
+                                    cx.stop_propagation();
+                                    this.feedback
+                                        .update(cx, |feedback, cx| feedback.remove(&remove, cx));
+                                })),
+                        )
+                    }),
             )
             .when_some(thumbnail, |this, thumbnail| {
                 this.child(thumbnail_view(thumbnail))

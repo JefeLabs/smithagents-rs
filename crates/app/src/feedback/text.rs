@@ -32,7 +32,6 @@ pub const BROKEN_DRAFT_TEXT: &str =
     "The saved feedback draft could not be read and was set aside. This is a new, empty draft.";
 pub const TOO_MANY_BOXES_TEXT: &str = "A screenshot can have at most 20 boxes.";
 pub const COMMENT_TOO_LONG_TEXT: &str = "A comment can be at most 500 characters.";
-pub const SUBMIT_TOOLTIP: &str = "Submitting arrives with the next update";
 pub const COMMENT_HINT: &str = "Enter saves · Esc drops";
 pub const EMPTY_TEXT: &str =
     "No feedback yet. Hold the Feedback button for 3 seconds, or press Capture.";
@@ -154,3 +153,106 @@ pub fn annotator_discard_description(comments: usize) -> String {
         format!("Its {comments} comments are deleted.")
     }
 }
+
+// ---- Submit ------------------------------------------------------------------
+
+/// The most characters a main idea may have (the daemon's limit).
+pub const MAIN_IDEA_MAX_CHARS: usize = 20_000;
+
+/// Why "Submit…" is disabled on an empty draft.
+pub const SUBMIT_EMPTY_TOOLTIP: &str = "Add a screenshot or a file first";
+pub const MAIN_IDEA_LABEL: &str = "Main idea";
+pub const MAIN_IDEA_HINT: &str = "The first line is the title.";
+pub const KIND_LABEL: &str = "Kind";
+pub const REPO_LABEL: &str = "Repository";
+pub const SEND_AS_LABEL: &str = "Send it as";
+pub const SEND_AS_INTENT: &str = "An intent to work on now";
+pub const SEND_AS_ISSUE: &str = "A GitHub issue";
+/// The repository button while repositories exist but none is chosen.
+pub const CHOOSE_REPO_TEXT: &str = "Choose a repository";
+pub const BACK_LABEL: &str = "Back";
+pub const CREATE_INTENT_LABEL: &str = "Create intent";
+pub const CREATE_ISSUE_LABEL: &str = "Create issue";
+pub const RETRY_LABEL: &str = "Retry";
+pub const START_OVER_LABEL: &str = "Start over";
+
+/// Why the issue choice is unavailable.
+pub const NO_REMOTE_REASON: &str = "This repository has no GitHub remote.";
+pub const GH_MISSING_REASON: &str = "Install the GitHub CLI (gh) to create issues.";
+pub const GH_SIGNED_OUT_REASON: &str = "Sign in first: gh auth login";
+/// The daemon's reason while the feedback plugin is disabled, failed to load
+/// or was stopped.
+pub const GH_TURNED_OFF: &str = "turned off or not running";
+pub const PLUGIN_OFF_REASON: &str = "The feedback plugin is turned off or not running.";
+
+/// Any other reason the daemon gives for `gh` not being ready.
+pub fn gh_not_ready_reason(reason: &str) -> String {
+    format!("The GitHub CLI (gh) is not ready: {reason}.")
+}
+
+pub const PUBLIC_WARNING: &str =
+    "This repository is public. The screenshots will be visible to anyone.";
+pub const MAYBE_PUBLIC_WARNING: &str =
+    "This repository may be public. The screenshots will be visible to anyone.";
+/// The question asked before every send to a repository that is (or may
+/// be) public; the warning is its description.
+pub const PUBLIC_CONFIRM_TITLE: &str = "Send the screenshots to GitHub?";
+pub const PUBLIC_CONFIRM_CANCEL: &str = "Cancel";
+
+pub fn summary_intent(attachments: &str) -> String {
+    format!(
+        "Creates the issue folder with {attachments} on a new branch, and an intent to review and send."
+    )
+}
+
+pub fn summary_issue(attachments: &str) -> String {
+    format!(
+        "Creates the issue folder with {attachments}, pushes the branch to origin and opens a GitHub issue."
+    )
+}
+
+/// `parts` is already joined ("an explainer doc, diagrams and a demo video").
+pub fn summary_idea(attachments: &str, parts: &str) -> String {
+    format!(
+        "Creates the issue folder with {attachments}. An agent adds {parts} on an idea branch, and you open the pull request."
+    )
+}
+
+pub fn result_intent(title: &str, branch: &str, sha7: &str) -> String {
+    format!("Created the intent “{title}”. Files: {branch} ({sha7}).")
+}
+
+pub fn result_issue(url: &str, branch: &str, sha7: &str) -> String {
+    format!("Created {url}. Files: {branch} ({sha7}).")
+}
+
+/// The result of an issue whose address is not one the app shows (not a
+/// github.com issue address).
+pub fn result_issue_unnamed(branch: &str, sha7: &str) -> String {
+    format!("Created a GitHub issue. Files: {branch} ({sha7}).")
+}
+
+pub fn partial_text(branch: &str, sha7: &str, message: &str) -> String {
+    format!("The files are committed on {branch} ({sha7}), but: {message}")
+}
+
+pub const NOTHING_CREATED_TEXT: &str = "Nothing was created. Submit again.";
+pub const ISSUE_UNCONFIRMED_TEXT: &str =
+    "GitHub has not confirmed whether the issue was created. Try again in a minute.";
+/// A change to the draft while its submission is sent or under way.
+pub const SUBMISSION_LOCKED_TEXT: &str =
+    "This feedback was sent. Retry or start over in Submit before changing it.";
+pub const MAIN_IDEA_TOO_LONG_TEXT: &str = "The main idea can be at most 20,000 characters.";
+pub const UPLOAD_TOO_LARGE_TEXT: &str =
+    "The attachments cannot be sent: together they are larger than 100 MB.";
+
+/// Why attachment `number` (1-based) cannot be sent; `reason` ends with a
+/// full stop.
+pub fn attachment_refused_text(number: usize, reason: &str) -> String {
+    format!("Attachment {number} cannot be sent: {reason}")
+}
+
+pub const TOO_MANY_BOXES_REASON: &str = "a screenshot can have at most 20 boxes.";
+pub const COMMENT_TOO_LONG_REASON: &str = "a comment can be at most 500 characters.";
+pub const IMAGE_TOO_LARGE_REASON: &str = "an image can be at most 10 MB.";
+pub const VIDEO_TOO_LARGE_REASON: &str = "a video can be at most 50 MB.";

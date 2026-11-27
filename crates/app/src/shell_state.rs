@@ -24,7 +24,7 @@ use chrono::{DateTime, FixedOffset};
 use gpui_kit::{App, Context, EventEmitter, Pixels, Task, WeakEntity};
 use raw_window_handle::HasWindowHandle;
 use smithagents_center_host::{validated_origin, CenterTabHost, PixelRect};
-use smithagents_core::ids::{AgentId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, RepoId};
 use smithagents_theme::native::NativeTheme;
 use smithagents_theme::state::{AppearanceSettings, ThemeState};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
@@ -118,6 +118,9 @@ pub enum ShellEvent {
     /// closed again: show a notification with this sentence. The status bar
     /// already has the error.
     TabOpenFailed(String),
+    /// Show the Intents view on this intent's detail. See
+    /// [`ShellState::open_intent`].
+    OpenIntent(IntentId),
 }
 
 pub struct ShellState {
@@ -438,6 +441,14 @@ impl ShellState {
     pub fn reveal(&mut self, entry: RailEntry, cx: &mut Context<Self>) {
         tracing::debug!(?entry, "reveal requested");
         cx.emit(ShellEvent::Reveal(entry));
+    }
+
+    /// Asks the shell to show the Intents view on `id`'s detail
+    /// ([`ShellEvent::OpenIntent`]): what Submit does with the intent it
+    /// created.
+    pub fn open_intent(&mut self, id: IntentId, cx: &mut Context<Self>) {
+        tracing::debug!(intent = %id, "open intent requested");
+        cx.emit(ShellEvent::OpenIntent(id));
     }
 
     /// Applies one action (from the user or the link), queues its effects and

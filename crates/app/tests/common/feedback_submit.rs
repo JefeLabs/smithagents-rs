@@ -1,7 +1,8 @@
 //! [`FakeFeedback`]: feedback commands that record each call, then answer it
-//! with the next result queued, or else wait until the test answers it (or
-//! forever), like `FakeIntents`. As there, the link's `Action` for an answer
-//! is left to the test.
+//! with the next result queued for its kind, or else wait until the test
+//! answers it (or forever), like `FakeIntents`. As there, the link's `Action`
+//! for an answer is left to the test. Plus builders for the targets and the
+//! outcomes the Submit tests answer with.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -10,47 +11,138 @@ use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
 use smithagents_app::link::{FeedbackCommands, LinkError};
-use smithagents_core::feedback::FeedbackSettings;
+use smithagents_client::FeedbackFile;
+use smithagents_core::feedback::{
+    FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTarget, FeedbackTargets,
+    SubmissionId, ToolReadiness,
+};
+use smithagents_core::ids::RepoId;
+use smithagents_core::intent::Intent;
+
+/// The branch every outcome built here names.
+pub const BRANCH: &str = "feedback/2026-11-26-fix-the-zoom";
+/// The commit every outcome built here names (its first 7 characters are
+/// what the sentences show).
+pub const COMMIT: &str = "0123abc4567";
+pub const FOLDER: &str = "docs/issues/2026-11-26-fix-the-zoom";
 
 /// One feedback command, as a view sent it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FeedbackCall {
     SetSettings(FeedbackSettings),
+    Targets,
+    Submit(FeedbackRequest, Vec<FeedbackFile>),
+    Retry(SubmissionId),
 }
 
 type Reply = Result<FeedbackSettings, LinkError>;
+type TargetsReply = Result<FeedbackTargets, LinkError>;
+type OutcomeReply = Result<FeedbackOutcome, LinkError>;
+
+/// Answers of one kind: queued ones first, else the calls wait.
+struct Answers<T> {
+    queued: VecDeque<T>,
+    waiting: VecDeque<oneshot::Sender<T>>,
+}
+
+impl<T> Default for Answers<T> {
+    fn default() -> Self {
+        Self {
+            queued: VecDeque::new(),
+            waiting: VecDeque::new(),
+        }
+    }
+}
+
+impl<T: 'static> Answers<T> {
+    fn reply(&mut self, gone: impl FnOnce() -> T + 'static) -> LocalBoxFuture<'static, T> {
+        if let Some(result) = self.queued.pop_front() {
+            return async move { result }.boxed_local();
+        }
+        let (tx, rx) = oneshot::channel();
+        self.waiting.push_back(tx);
+        async move { rx.await.unwrap_or_else(|_| gone()) }.boxed_local()
+    }
+
+    fn answer(&mut self, result: T, what: &str) {
+        let sender = self
+            .waiting
+            .pop_front()
+            .unwrap_or_else(|| panic!("a {what} command waits for an answer"));
+        let _ = sender.send(result);
+    }
+}
 
 #[derive(Default)]
 pub struct FakeFeedback {
     pub calls: RefCell<Vec<FeedbackCall>>,
-    results: RefCell<VecDeque<Reply>>,
-    pending: RefCell<VecDeque<oneshot::Sender<Reply>>>,
+    settings: RefCell<Answers<Reply>>,
+    targets: RefCell<Answers<TargetsReply>>,
+    outcomes: RefCell<Answers<OutcomeReply>>,
 }
 
 impl FakeFeedback {
-    /// The answer of the next call.
+    /// The answer of the next settings call.
     pub fn queue(&self, result: Reply) {
-        self.results.borrow_mut().push_back(result);
+        self.settings.borrow_mut().queued.push_back(result);
     }
 
-    /// Answers the oldest call still waiting.
+    /// Answers the oldest settings call still waiting.
     pub fn answer(&self, result: Reply) {
-        let sender = self
-            .pending
-            .borrow_mut()
-            .pop_front()
-            .expect("a feedback command waits for an answer");
-        let _ = sender.send(result);
+        self.settings.borrow_mut().answer(result, "settings");
     }
 
-    fn reply(&self, call: FeedbackCall) -> LocalBoxFuture<'static, Reply> {
+    /// The answer of the next targets call.
+    pub fn queue_targets(&self, result: TargetsReply) {
+        self.targets.borrow_mut().queued.push_back(result);
+    }
+
+    /// Answers the oldest targets call still waiting.
+    pub fn answer_targets(&self, result: TargetsReply) {
+        self.targets.borrow_mut().answer(result, "targets");
+    }
+
+    /// The answer of the next submit or retry.
+    pub fn queue_outcome(&self, result: OutcomeReply) {
+        self.outcomes.borrow_mut().queued.push_back(result);
+    }
+
+    /// Answers the oldest submit or retry still waiting.
+    pub fn answer_outcome(&self, result: OutcomeReply) {
+        self.outcomes.borrow_mut().answer(result, "submit or retry");
+    }
+
+    /// How many submits and retries wait for an answer.
+    pub fn outcomes_waiting(&self) -> usize {
+        self.outcomes.borrow().waiting.len()
+    }
+
+    /// The submits sent, in order.
+    pub fn submits(&self) -> Vec<(FeedbackRequest, Vec<FeedbackFile>)> {
+        self.calls
+            .borrow()
+            .iter()
+            .filter_map(|call| match call {
+                FeedbackCall::Submit(request, files) => Some((request.clone(), files.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The retries sent, in order.
+    pub fn retries(&self) -> Vec<SubmissionId> {
+        self.calls
+            .borrow()
+            .iter()
+            .filter_map(|call| match call {
+                FeedbackCall::Retry(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn record(&self, call: FeedbackCall) {
         self.calls.borrow_mut().push(call);
-        if let Some(result) = self.results.borrow_mut().pop_front() {
-            return async move { result }.boxed_local();
-        }
-        let (tx, rx) = oneshot::channel();
-        self.pending.borrow_mut().push_back(tx);
-        async move { rx.await.unwrap_or(Err(LinkError::Stopped)) }.boxed_local()
     }
 }
 
@@ -59,6 +151,88 @@ impl FeedbackCommands for FakeFeedback {
         &self,
         settings: FeedbackSettings,
     ) -> LocalBoxFuture<'static, Result<FeedbackSettings, LinkError>> {
-        self.reply(FeedbackCall::SetSettings(settings))
+        self.record(FeedbackCall::SetSettings(settings));
+        self.settings.borrow_mut().reply(|| Err(LinkError::Stopped))
+    }
+
+    fn feedback_targets(&self) -> LocalBoxFuture<'static, Result<FeedbackTargets, LinkError>> {
+        self.record(FeedbackCall::Targets);
+        self.targets.borrow_mut().reply(|| Err(LinkError::Stopped))
+    }
+
+    fn submit_feedback(
+        &self,
+        request: FeedbackRequest,
+        files: Vec<FeedbackFile>,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>> {
+        self.record(FeedbackCall::Submit(request, files));
+        self.outcomes.borrow_mut().reply(|| Err(LinkError::Stopped))
+    }
+
+    fn retry_feedback(
+        &self,
+        id: SubmissionId,
+    ) -> LocalBoxFuture<'static, Result<FeedbackOutcome, LinkError>> {
+        self.record(FeedbackCall::Retry(id));
+        self.outcomes.borrow_mut().reply(|| Err(LinkError::Stopped))
+    }
+}
+
+/// Targets for these repositories, each `(id, has a GitHub remote, is
+/// public)`, with `gh` and `agent-browser` ready or not installed. No meta
+/// repository is stored.
+pub fn targets(
+    repos: &[(RepoId, bool, Option<bool>)],
+    gh: bool,
+    agent_browser: bool,
+) -> FeedbackTargets {
+    let readiness = |ready: bool| ToolReadiness {
+        ready,
+        reason: (!ready).then(|| "not installed".to_owned()),
+    };
+    FeedbackTargets {
+        repos: repos
+            .iter()
+            .map(|&(repo_id, has_github_remote, is_public)| FeedbackTarget {
+                repo_id,
+                has_github_remote,
+                is_public,
+            })
+            .collect(),
+        meta_repo_id: None,
+        gh: readiness(gh),
+        agent_browser: readiness(agent_browser),
+    }
+}
+
+/// A complete outcome of submission `id` that created `intent`, in the
+/// intent's repository, on [`BRANCH`] at [`COMMIT`].
+pub fn outcome_with_intent(id: SubmissionId, intent: Intent) -> FeedbackOutcome {
+    FeedbackOutcome {
+        submission_id: id,
+        repo_id: intent.repo_id,
+        branch: BRANCH.to_owned(),
+        commit: COMMIT.to_owned(),
+        folder: FOLDER.to_owned(),
+        pushed: false,
+        intent: Some(intent),
+        issue_url: None,
+        failed: None,
+    }
+}
+
+/// A complete outcome of submission `id` that opened the GitHub issue at
+/// `url` in `repo`.
+pub fn outcome_with_issue(id: SubmissionId, repo: RepoId, url: &str) -> FeedbackOutcome {
+    FeedbackOutcome {
+        submission_id: id,
+        repo_id: repo,
+        branch: BRANCH.to_owned(),
+        commit: COMMIT.to_owned(),
+        folder: FOLDER.to_owned(),
+        pushed: true,
+        intent: None,
+        issue_url: Some(url.to_owned()),
+        failed: None,
     }
 }
