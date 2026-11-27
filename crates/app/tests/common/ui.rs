@@ -63,7 +63,7 @@ pub const TEST_TOKEN: &str = "test-token-not-a-real-one";
 /// [`TEST_PORT`] and [`TEST_TOKEN`], as a connected link would, so tabs open
 /// without a daemon.
 pub fn fake_connection() -> ConnectionInfoSource {
-    Rc::new(|| Some((TEST_PORT, TEST_TOKEN.to_owned())))
+    Rc::new(|| Some((TEST_PORT, TEST_TOKEN.into())))
 }
 
 /// Opens the shell, offline (no daemon link, no layout file), in a

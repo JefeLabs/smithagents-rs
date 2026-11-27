@@ -262,6 +262,9 @@ async fn a_client_lists_enables_syncs_and_reads_a_wasm_plugin() {
         .expect("a lockfile")
         .token;
     let log = home.log();
-    assert!(!log.contains(&token), "the token is in the daemon log");
+    assert!(
+        !log.contains(token.expose()),
+        "the token is in the daemon log"
+    );
     assert!(!log.contains(SECRET), "a secret is in the daemon log");
 }

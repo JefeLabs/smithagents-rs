@@ -291,7 +291,10 @@ async fn the_real_daemon_runs_packed_native_plugins_and_survives_a_panic() {
     // Neither the daemon's token nor the secret reached its log.
     let log = daemon.log();
     let daemon_token = read_lockfile(&daemon.home()).unwrap().unwrap().token;
-    assert!(!log.contains(&daemon_token), "the daemon token is logged");
+    assert!(
+        !log.contains(daemon_token.expose()),
+        "the daemon token is logged"
+    );
     assert!(!log.contains(SECRET), "a secret is logged");
 }
 

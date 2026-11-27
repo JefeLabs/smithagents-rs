@@ -249,7 +249,7 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     let info = DaemonInfo {
         pid: std::process::id(),
         port,
-        token,
+        token: token.into(),
         version: smithagents_core::VERSION.to_owned(),
     };
     write_lockfile(paths, &info)?;

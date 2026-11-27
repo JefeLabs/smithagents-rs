@@ -20,6 +20,7 @@ use smithagents_center_host::{
     TabKind, TabSpec,
 };
 use smithagents_core::agent::Agent;
+use smithagents_core::daemon::DaemonToken;
 use smithagents_core::ids::AgentId;
 use smithagents_theme::state::ThemeState;
 
@@ -71,25 +72,16 @@ pub enum TabError {
     Host(#[from] HostError),
 }
 
-/// The daemon a tab's page was booted for. Compared, never printed.
-#[derive(Clone, PartialEq, Eq)]
+/// The daemon a tab's page was booted for.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DaemonIdentity {
     port: u16,
-    token: String,
+    token: DaemonToken,
 }
 
 impl DaemonIdentity {
-    fn is(&self, port: u16, token: &str) -> bool {
-        self.port == port && self.token == token
-    }
-}
-
-impl std::fmt::Debug for DaemonIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DaemonIdentity")
-            .field("port", &self.port)
-            .field("token", &"<redacted>")
-            .finish()
+    fn is(&self, port: u16, token: &DaemonToken) -> bool {
+        self.port == port && &self.token == token
     }
 }
 
@@ -207,7 +199,7 @@ impl<H: CenterTabHost> TabManager<H> {
         &mut self,
         effect: Effect,
         agent: Option<&Agent>,
-        conn: Option<(u16, &str)>,
+        conn: Option<(u16, &DaemonToken)>,
     ) -> Result<(), TabError> {
         match effect {
             Effect::OpenCenterTab(id) => self.open_and_show(id, agent, conn),
@@ -260,7 +252,7 @@ impl<H: CenterTabHost> TabManager<H> {
     /// caller must drop them from its model.
     pub fn on_connection(
         &mut self,
-        conn: Option<(u16, &str)>,
+        conn: Option<(u16, &DaemonToken)>,
         agents: &dyn Fn(AgentId) -> Option<Agent>,
     ) -> Vec<(AgentId, TabError)> {
         let Some((port, token)) = conn else {
@@ -318,7 +310,7 @@ impl<H: CenterTabHost> TabManager<H> {
         &mut self,
         id: AgentId,
         agent: Option<&Agent>,
-        conn: Option<(u16, &str)>,
+        conn: Option<(u16, &DaemonToken)>,
     ) -> Result<(), TabError> {
         if self.find(id).is_some() {
             self.show(id);
@@ -336,7 +328,12 @@ impl<H: CenterTabHost> TabManager<H> {
 
     /// Boots and opens a page for `agent`, positioned when a rectangle is
     /// known; not shown and not recorded.
-    fn open_tab(&mut self, agent: &Agent, port: u16, token: &str) -> Result<OpenTab, TabError> {
+    fn open_tab(
+        &mut self,
+        agent: &Agent,
+        port: u16,
+        token: &DaemonToken,
+    ) -> Result<OpenTab, TabError> {
         if self.shut_down {
             return Err(HostError::Engine("the web engine has shut down".into()).into());
         }
@@ -349,7 +346,7 @@ impl<H: CenterTabHost> TabManager<H> {
             },
             title: agent.name.clone(),
         };
-        let boot = page_boot(&spec, port, token, &self.theme, &self.page_origin)?;
+        let boot = page_boot(&spec, port, token.expose(), &self.theme, &self.page_origin)?;
         tracing::debug!(tab = id.0, agent = %agent.id, page_url = boot.page_url(), "opening a chat tab");
         self.host.open(spec, boot)?;
         if let Some(rect) = self.bounds {
@@ -360,7 +357,7 @@ impl<H: CenterTabHost> TabManager<H> {
             id,
             daemon: DaemonIdentity {
                 port,
-                token: token.to_owned(),
+                token: token.clone(),
             },
         })
     }
