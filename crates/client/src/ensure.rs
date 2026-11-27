@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use smithagents_core::daemon::{lockfile_path, read_lockfile, DaemonInfo};
@@ -22,10 +22,9 @@ use crate::api::Client;
 
 /// Lockfile polling interval while a daemon starts.
 const POLL: Duration = Duration::from_millis(50);
-/// How long one start attempt waits for a healthy daemon.
+/// How long one find-or-start waits for a healthy daemon, however many
+/// starts it takes (see [`Started::Retry`]).
 const START_DEADLINE: Duration = Duration::from_secs(5);
-/// Start attempts before giving up (see [`Started::Retry`]).
-const START_ATTEMPTS: u32 = 3;
 /// A health check slower than this counts as no answer.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 /// After losing the instance lock, how long to wait for the winner's lockfile
@@ -53,8 +52,37 @@ pub enum EnsureError {
     },
     #[error("smithagentsd did not become ready in time; see run/daemon.log in the home directory")]
     StartTimeout,
-    #[error(transparent)]
-    Io(#[from] io::Error),
+    /// A file, a folder or the daemon binary could not be used. `what` is
+    /// what was tried, as the message starts ("could not read"), and `path`
+    /// is what it was tried on: the lockfile, the home or its `run/` folder,
+    /// the daemon's log, or the daemon binary.
+    #[error("{what} {}: {source}", path.display())]
+    Io {
+        what: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    /// The started daemon exited before it was ready, and not because another
+    /// daemon holds the instance lock. Its output is in `log`.
+    #[error(
+        "{} exited with {status} before it was ready; see {}",
+        bin.display(),
+        log.display()
+    )]
+    Exited {
+        bin: PathBuf,
+        status: ExitStatus,
+        log: PathBuf,
+    },
+}
+
+/// For `map_err`: the [`EnsureError::Io`] of `what` failing on `path`.
+fn io_error<'a>(what: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> EnsureError + 'a {
+    move |source| EnsureError::Io {
+        what,
+        path: path.to_owned(),
+        source,
+    }
 }
 
 /// Extra settings for a daemon that [`ensure_daemon_with`] starts. They do not
@@ -90,11 +118,15 @@ pub async fn ensure_daemon(
 ///   replaces it if it wins.
 /// - Start: `daemon_bin --home <home> <options.args>` in its own process group,
 ///   stdin null, stdout and stderr appended to `<home>/run/daemon.log`. The
-///   lockfile is then polled every 50 ms for up to 5 s until it names a daemon
-///   that answers. Concurrent callers all end up on the daemon that won the
+///   lockfile is then polled every 50 ms until it names a daemon that
+///   answers. Concurrent callers all end up on the daemon that won the
 ///   instance lock: the others exit with code 3 and their callers keep
-///   polling. When a loser exits while there is no lockfile at all (the winner
-///   is shutting down), the whole find-or-start is retried, up to 3 times.
+///   polling. When a loser exits and no lockfile appears within a second (the
+///   winner is shutting down, or still starting), the find-or-start is done
+///   again.
+/// - One deadline covers the whole call: 5 s after it began, whatever it is
+///   then waiting for, it gives up with [`EnsureError::StartTimeout`]. A
+///   daemon it started is left to finish starting, so a later call finds it.
 ///
 /// The started daemon is never waited on after this returns and is not killed
 /// when the returned client or this future is dropped.
@@ -104,18 +136,19 @@ pub async fn ensure_daemon_with(
     expected_version: &str,
     options: &SpawnOptions,
 ) -> Result<Client, EnsureError> {
-    for _ in 0..START_ATTEMPTS {
+    let deadline = Instant::now() + START_DEADLINE;
+    let log = log_path(home);
+    loop {
         if let Some(client) = connect_existing(home, expected_version).await? {
             return Ok(client);
         }
-        let log = log_path(home);
         let child = spawn_daemon(home, daemon_bin, options, &log)?;
-        match wait_until_ready(home, expected_version, child, daemon_bin, &log).await? {
+        match wait_until_ready(home, expected_version, child, daemon_bin, &log, deadline).await? {
             Started::Ready(client) => return Ok(client),
-            Started::Retry => {}
+            Started::Retry if Instant::now() < deadline => {}
+            Started::Retry => return Err(EnsureError::StartTimeout),
         }
     }
-    Err(EnsureError::StartTimeout)
 }
 
 /// The daemon the lockfile names, if it answers. A lockfile whose pid is dead
@@ -133,13 +166,13 @@ async fn connect_existing(home: &Path, expected: &str) -> Result<Option<Client>,
 
 /// The lockfile, or `None` when it is absent or unreadable as JSON (the daemon
 /// writes it atomically, so a corrupt one is garbage a new daemon overwrites).
-fn lockfile(home: &Path) -> io::Result<Option<DaemonInfo>> {
+fn lockfile(home: &Path) -> Result<Option<DaemonInfo>, EnsureError> {
     match read_lockfile(home) {
         Err(e) if e.kind() == io::ErrorKind::InvalidData => {
             tracing::debug!("ignoring an unparseable lockfile: {e}");
             Ok(None)
         }
-        other => other,
+        other => other.map_err(io_error("could not read", &lockfile_path(home))),
     }
 }
 
@@ -248,9 +281,9 @@ fn spawn_daemon(
     daemon_bin: &Path,
     options: &SpawnOptions,
     log: &Path,
-) -> io::Result<Child> {
+) -> Result<Child, EnsureError> {
     let out = open_log(log)?;
-    let err = out.try_clone()?;
+    let err = out.try_clone().map_err(io_error("could not open", log))?;
     let mut cmd = Command::new(daemon_bin);
     cmd.arg("--home")
         .arg(home)
@@ -262,25 +295,26 @@ fn spawn_daemon(
         .kill_on_drop(false);
     #[cfg(unix)]
     cmd.process_group(0);
-    cmd.spawn()
+    cmd.spawn().map_err(io_error("could not start", daemon_bin))
 }
 
 /// Opens the log for appending (0600), creating the home and `run/` (both
 /// 0700) if needed. The daemon tightens existing ones itself.
-fn open_log(log: &Path) -> io::Result<File> {
+fn open_log(log: &Path) -> Result<File, EnsureError> {
+    const CREATE: &str = "could not create";
     let run = log.parent().expect("the log lives in run/");
     if let Some(home) = run.parent() {
         if let Some(parent) = home.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(io_error(CREATE, parent))?;
         }
-        create_private_dir(home)?;
+        create_private_dir(home).map_err(io_error(CREATE, home))?;
     }
-    create_private_dir(run)?;
+    create_private_dir(run).map_err(io_error(CREATE, run))?;
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(log)
+    opts.open(log).map_err(io_error("could not open", log))
 }
 
 /// Creates `dir` with mode 0700 unless it exists; its parent must exist.
@@ -297,20 +331,22 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 enum Started {
     Ready(Client),
     /// The started daemon lost the instance lock to a daemon that has no
-    /// lockfile and published none since: it is shutting down (or starting
-    /// unusually slowly). Starting over finds the lock free once it is gone.
+    /// lockfile and published none since: it is shutting down, or still
+    /// starting. Starting over finds the lock free once it is gone, or the
+    /// lockfile once it is written; the caller does so until its deadline.
     Retry,
 }
 
-/// Polls the lockfile until it names a daemon that answers.
+/// Polls the lockfile until it names a daemon that answers, until `child`
+/// fails, or until `deadline` (that of the whole find-or-start).
 async fn wait_until_ready(
     home: &Path,
     expected: &str,
     mut child: Child,
     daemon_bin: &Path,
     log: &Path,
+    deadline: Instant,
 ) -> Result<Started, EnsureError> {
-    let deadline = Instant::now() + START_DEADLINE;
     let mut lost = false;
     let mut absent_since: Option<Instant> = None;
     loop {
@@ -321,14 +357,16 @@ async fn wait_until_ready(
             }
         }
         if !lost {
-            if let Some(status) = child.try_wait()? {
+            let exited = child
+                .try_wait()
+                .map_err(io_error("could not wait for", daemon_bin))?;
+            if let Some(status) = exited {
                 if status.code() != Some(EXIT_ALREADY_RUNNING) {
-                    return Err(io::Error::other(format!(
-                        "{} exited with {status} before it was ready; see {}",
-                        daemon_bin.display(),
-                        log.display()
-                    ))
-                    .into());
+                    return Err(EnsureError::Exited {
+                        bin: daemon_bin.to_owned(),
+                        status,
+                        log: log.to_owned(),
+                    });
                 }
                 // Another daemon holds the instance lock: wait for its lockfile.
                 lost = true;
@@ -347,5 +385,32 @@ async fn wait_until_ready(
             }
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_that_cannot_be_created_is_named() {
+        // A file where the home's parent belongs, so nothing below it can be
+        // made, whoever runs the test.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("a-file");
+        fs::write(&blocked, b"").unwrap();
+        let log = log_path(&blocked.join("home"));
+
+        let err = open_log(&log).expect_err("the home cannot be created");
+
+        assert!(
+            matches!(&err, EnsureError::Io { path, .. } if *path == blocked),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!("could not create {}: ", blocked.display())),
+            "{text}"
+        );
     }
 }

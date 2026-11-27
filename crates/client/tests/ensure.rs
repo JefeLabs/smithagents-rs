@@ -285,10 +285,24 @@ async fn ensure_deletes_only_a_stale_lockfile() {
         )
         .await
         .expect_err("the daemon binary fails");
-        // A start that fails outright is reported at once, not as a timeout.
+        // A start that fails outright is reported at once, not as a timeout,
+        // with the program that exited and where its output went.
+        let log = home.path().join("run").join("daemon.log");
         assert!(
-            matches!(&err, EnsureError::Io(e) if e.to_string().contains("exit status: 1")),
+            matches!(
+                &err,
+                EnsureError::Exited { bin, status, log: named }
+                    if *bin == failing && status.code() == Some(1) && *named == log
+            ),
             "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} exited with exit status: 1 before it was ready; see {}",
+                failing.display(),
+                log.display()
+            )
         );
         assert_eq!(
             read_lockfile(home.path()).unwrap(),
@@ -338,6 +352,95 @@ async fn ensure_creates_the_home_owner_only() {
 }
 
 #[tokio::test]
+async fn a_lockfile_that_cannot_be_read_is_named() {
+    // A folder where the lockfile belongs: reading it fails for every user.
+    let home = TestHome::new();
+    bounded(async {
+        let lockfile = lockfile_path(home.path());
+        std::fs::create_dir_all(&lockfile).unwrap();
+
+        let err = within(
+            "ensure_daemon",
+            ensure_daemon(home.path(), daemon_bin(), VERSION),
+        )
+        .await
+        .expect_err("the lockfile cannot be read");
+        assert!(
+            matches!(&err, EnsureError::Io { path, .. } if *path == lockfile),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!("could not read {}: ", lockfile.display())),
+            "{text}"
+        );
+        // The daemon binary is not what failed, and is not named.
+        assert!(
+            !text.contains(&daemon_bin().display().to_string()),
+            "{text}"
+        );
+        assert!(!home.path().join("run").join("daemon.log").exists());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_log_that_cannot_be_opened_is_named() {
+    let home = TestHome::new();
+    bounded(async {
+        let log = home.path().join("run").join("daemon.log");
+        std::fs::create_dir_all(&log).unwrap();
+
+        let err = within(
+            "ensure_daemon",
+            ensure_daemon(home.path(), daemon_bin(), VERSION),
+        )
+        .await
+        .expect_err("the log cannot be opened");
+        assert!(
+            matches!(&err, EnsureError::Io { path, .. } if *path == log),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!("could not open {}: ", log.display())),
+            "{text}"
+        );
+        assert_eq!(read_lockfile(home.path()).unwrap(), None, "nothing started");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_daemon_binary_that_cannot_be_run_is_named() {
+    let home = TestHome::new();
+    bounded(async {
+        let missing = home.scratch().join("no-such-daemon");
+
+        let err = within(
+            "ensure_daemon",
+            ensure_daemon(home.path(), &missing, VERSION),
+        )
+        .await
+        .expect_err("there is no such program");
+        assert!(
+            matches!(
+                &err,
+                EnsureError::Io { path, source, .. }
+                    if *path == missing && source.kind() == std::io::ErrorKind::NotFound
+            ),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!("could not start {}: ", missing.display())),
+            "{text}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn ensure_starts_over_when_the_lock_holder_has_no_lockfile() {
     // The first start loses the instance lock (exit 3) to a daemon that has
     // already removed its lockfile on the way out; a later start wins.
@@ -369,7 +472,38 @@ async fn ensure_starts_over_when_the_lock_holder_has_no_lockfile() {
 }
 
 #[tokio::test]
-async fn ensure_gives_up_after_three_lost_starts_without_a_lockfile() {
+async fn ensure_keeps_starting_over_until_a_start_wins() {
+    // Three starts in a row lose the instance lock to a daemon that publishes
+    // no lockfile (one still loading its plugins looks the same); the fourth
+    // wins. The call has one deadline, not a number of attempts.
+    let home = TestHome::new();
+    bounded(async {
+        let started = home.scratch().join("starts");
+        let script = shell_script(
+            &home.scratch().join("daemon"),
+            &format!(
+                "{}\nif [ $(wc -l < '{starts}') -le 3 ]; then exit 3; fi\nexec '{bin}' \"$@\"",
+                script_starts_line(&started),
+                starts = started.display(),
+                bin = daemon_bin().display(),
+            ),
+        );
+
+        let client = within(
+            "ensure_daemon",
+            ensure_daemon(home.path(), &script, VERSION),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ensure_daemon failed: {e}; log:\n{}", home.log()));
+        let health = client.health().await.unwrap();
+        assert_eq!(read_lockfile(home.path()).unwrap().unwrap().pid, health.pid);
+        assert_eq!(starts(&started), 4);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ensure_gives_up_at_its_deadline_when_every_start_loses() {
     let home = TestHome::new();
     bounded(async {
         let started = home.scratch().join("starts");
@@ -378,6 +512,7 @@ async fn ensure_gives_up_after_three_lost_starts_without_a_lockfile() {
             &format!("{}\nexit 3", script_starts_line(&started)),
         );
 
+        let began = std::time::Instant::now();
         let err = within(
             "ensure_daemon",
             ensure_daemon(home.path(), &script, VERSION),
@@ -385,7 +520,13 @@ async fn ensure_gives_up_after_three_lost_starts_without_a_lockfile() {
         .await
         .expect_err("no daemon ever publishes a lockfile");
         assert!(matches!(err, EnsureError::StartTimeout), "{err:?}");
-        assert_eq!(starts(&started), 3);
+        // A lost start is tried again about once a second, for the whole 5 s.
+        assert!(starts(&started) >= 4, "{} starts", starts(&started));
+        assert!(
+            began.elapsed() >= Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
     })
     .await;
 }

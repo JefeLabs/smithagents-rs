@@ -190,19 +190,33 @@ async fn a_file_that_cannot_be_opened_is_an_error_before_anything_is_sent() {
     let port = closed.local_addr().unwrap().port();
     drop(closed);
     let tmp = tempfile::tempdir().unwrap();
+    let gone = tmp.path().join("gone.png");
 
     let err = client(port)
         .submit_feedback(
             &request(),
             &[FeedbackFile {
                 part: "file-1".into(),
-                path: tmp.path().join("gone.png"),
+                path: gone.clone(),
             }],
         )
         .await
         .unwrap_err();
 
-    assert!(matches!(err, ClientError::File(_)), "{err:?}");
+    // The error says which file, and why.
+    assert!(
+        matches!(
+            &err,
+            ClientError::File { path, source }
+                if *path == gone && source.kind() == std::io::ErrorKind::NotFound
+        ),
+        "{err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.starts_with(&format!("could not open {} to upload: ", gone.display())),
+        "{text}"
+    );
 }
 
 #[tokio::test]
