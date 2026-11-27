@@ -68,6 +68,7 @@ impl ServiceError {
             Self::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
             Self::Git(GitError::NoDefaultBranch) => (S::BAD_REQUEST, "no_default_branch"),
             Self::Git(GitError::BranchExists(_)) => (S::CONFLICT, "branch_exists"),
+            Self::Git(GitError::WorktreeExists(_)) => (S::CONFLICT, "worktree_exists"),
             Self::Git(_) => (S::INTERNAL_SERVER_ERROR, "git_error"),
             Self::Store(StoreError::DuplicateRepoPath) => (S::CONFLICT, "repo_exists"),
             Self::Store(_) => (S::INTERNAL_SERVER_ERROR, "store_error"),
@@ -961,6 +962,19 @@ mod tests {
             .repo_worktrees_dir(&fx.repo)
             .join("intent-taken")
             .exists());
+    }
+
+    #[test]
+    fn a_taken_worktree_folder_is_a_conflict_like_a_taken_branch() {
+        let taken = |e: GitError| ServiceError::Git(e).status_and_code();
+        assert_eq!(
+            taken(GitError::WorktreeExists("/home/worktrees/app/a-b".into())),
+            (StatusCode::CONFLICT, "worktree_exists")
+        );
+        assert_eq!(
+            taken(GitError::BranchExists("a/b".into())),
+            (StatusCode::CONFLICT, "branch_exists")
+        );
     }
 
     #[tokio::test]
