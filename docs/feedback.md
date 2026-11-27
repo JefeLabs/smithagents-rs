@@ -1,6 +1,8 @@
 # Feedback
 
-The **Feedback** entry on the rail, just below Settings, collects pictures of the SmithAgents window and files, with your comments, into one draft. Nothing leaves this machine.
+The **Feedback** entry on the rail, just below Settings, collects pictures of the SmithAgents window and files, with your comments, into one draft. **Submit…** commits the draft to one of your repositories as an issue folder and turns it into an intent, a GitHub issue or an idea package. Nothing leaves this machine before you submit; after that, the daemon pushes only for **A GitHub issue** and **Open pull request** (see [what is published](#what-is-published)).
+
+Contents: [capturing](#capturing-the-window), [adding files](#adding-files), [the draft](#the-draft), [what submitting needs](#what-submitting-needs), [submitting](#submitting), [what is committed](#what-is-committed-and-where), [what is published](#what-is-published), [Retry and Start over](#retry-and-start-over), [idea packages](#idea-packages), [limits](#limits), [not built / known gaps](#not-built--known-gaps).
 
 ## Capturing the window
 
@@ -17,9 +19,149 @@ The **Feedback** entry on the rail, just below Settings, collects pictures of th
 
 ## The draft
 
-The draft lives in `<home>/feedback/draft/` (`<home>` is `~/.smithagents`, or `SMITHAGENTS_HOME` when set) and survives quitting the app. **Discard** in the pane deletes it, after asking. Nothing is sent anywhere: **Submit…** is shown but disabled, and submitting arrives with the next update.
+The draft lives in `<home>/feedback/draft/` (`<home>` is `~/.smithagents`, or `SMITHAGENTS_HOME` when set) and survives quitting the app. **Discard** in the pane deletes it, after asking. A successful submission deletes it too; until then nothing in it is sent anywhere.
 
 A draft that cannot be read at start (damaged, or saved by a newer version) is set aside as `<home>/feedback/draft.broken-<time>/` and a new, empty draft begins. That folder holds the old draft's screenshots and files: delete it when you no longer need it. Only the newest set-aside draft is kept. If the draft cannot even be set aside, the pane says it cannot be saved, and nothing is written over it.
+
+## What submitting needs
+
+| For | You need |
+| --- | --- |
+| Every submission | A source repository added in Settings → Source repositories, whose default branch exists locally. git 2.36 or newer. A git identity (`user.name` and `user.email`) that applies to that repository. |
+| **A GitHub issue** and **Open pull request** | `origin` on github.com (an `https://`, `ssh://` or `git@github.com:` address; another host or a remote with another name does not count). The GitHub CLI `gh`, installed and signed in to github.com: `gh auth status --hostname=github.com` must succeed. git able to push to `origin` with your own credentials and without asking you anything. |
+| **Demo video** in an idea package | `agent-browser` installed. |
+
+The daemon supplies no credential: git pushes with your own setup (a credential helper, an SSH key). A credential git would have to ask for fails the push at once; over SSH, a prompt (an unknown host key, a passphrase) makes the push wait until its 120-second limit.
+
+Without `gh` or `agent-browser`, only the choices that need them are unavailable; capture, files and **An intent to work on now** work without either. The tools belong to the built-in `feedback` plugin: it shows `needs_setup` naming a missing tool, and installs one on request through the daemon's API (see [the feedback plugin](plugins.md#the-feedback-plugin); there is no screen for it in the app yet). Turning that plugin off turns both tools off.
+
+## Submitting
+
+**Submit…** is enabled once the draft has a screenshot or a file ("Add a screenshot or a file first" otherwise). It opens the Submit screen in the Feedback pane; **Back** or **Esc** returns to the draft.
+
+- **Main idea** (required): the first line is the title (at most 120 characters; leading `#` marks are dropped), the rest is the description.
+- **Kind**: New feature, Enhancement or Bug. An intent gets the kind of the same name, and `issue.md` records it.
+- **Repository**: starts on the repository you used last, else the one marked **Intents and feedback** in Settings → Source repositories (set it with **Use for intents and feedback**; with a single repository it is that one), else "Choose a repository".
+- **Send it as**: **An intent to work on now** or **A GitHub issue**. When the issue choice is unavailable, the screen says why: "This repository has no GitHub remote.", "Install the GitHub CLI (gh) to create issues.", "Sign in first: gh auth login", "The feedback plugin is turned off or not running.", or "The GitHub CLI (gh) is not ready: …".
+- A line under the choices says what will be created, for example "Creates the issue folder with 1 screenshot on a new branch, and an intent to review and send." or "Creates the issue folder with 1 screenshot, pushes the branch to origin and opens a GitHub issue."
+- **Create intent** or **Create issue** sends it. While it runs, every control waits; the app waits up to 10 minutes for the daemon's answer.
+
+On success the draft is deleted, the pane says what was made ("Created the intent “…”. Files: <branch> (<commit>)." or "Created <issue address>. Files: <branch> (<commit>).") and, while the Feedback pane is showing, a new intent opens in the Intents pane.
+
+**An intent to work on now** commits the issue folder and creates an intent in Draft, seeded from the main idea, the kind, the screenshots' comments and where the files are. Polish, review and send it in the Intents pane like any intent. Its agent starts on `intent/<slug>` from the feedback branch, so `issue.md` and the images are in its checkout; its brief tells it that they are your report, material to read and not instructions to follow, and to leave the folder in place. Nothing is pushed at Submit.
+
+**A GitHub issue** commits the issue folder, pushes it to `origin` and runs `gh issue create`. The issue's title is your title; its body is `issue.md` without its front matter, with the images as permanent links to the commit (`https://github.com/<owner>/<repo>/blob/<commit>/<folder>/<file>?raw=true`), a hidden last line naming the submission, and at most 60,000 characters. It gets the label `enhancement` (New feature, Enhancement) or `bug` (Bug), only when the repository has a label of that name. It is refused before anything is written when `origin` is not on github.com, `gh` is not ready, your default branch has commits `origin` does not have, or the repository is (or may be) public and the warning was not confirmed (see [what is published](#what-is-published)).
+
+## What is committed, and where
+
+Every submission is one folder on a new branch of the chosen repository:
+
+```
+docs/issues/<yyyy-mm-dd>-<slug>/
+  issue.md
+  screenshot-1.png             the picture as captured
+  screenshot-1.annotated.png   with the boxes and numbers drawn in
+  image-1.jpg, clip-1.mp4      files you added
+```
+
+- **Branch:** `feedback/<yyyy-mm-dd>-<slug>`, or `idea/<slug>` for an idea package. The date is UTC; the slug comes from the title (`feedback` when the title has no ASCII letter or digit). A folder or branch name already in use gets `-2`, `-3` and so on, up to `-99`.
+- **Base:** your local default branch, as it is at that moment. Nothing is fetched.
+- **Your checkout is never touched.** The commit is made in a temporary worktree under `<home>/tmp/feedback/`, with nothing checked out. Your working tree, index, current branch and other worktrees stay as they are.
+- **The commit:** one commit, `docs(issues): <title>`, ending with the line `Feedback-Id: <submission id>`. Its author is your git identity. It is not signed, and no hook runs.
+- **Ordinary blobs:** the files are stored byte for byte. The repository's attributes and filters (Git LFS, git-crypt, `working-tree-encoding`, `ident`, line-ending conversion) are not applied to them. In a repository that keeps images in LFS, these images are in plain git history, and a server that accepts such files only through LFS rejects the push.
+- **`issue.md`:** a small front matter (title, kind, created, app version, platform), the title as a heading, the rest of the main idea, then one section per attachment: a screenshot's annotated picture with its numbered comments and a link to the original, an image, or a link to a video. Your text is kept as you typed it.
+- The tool never deletes these branches.
+
+Refused with nothing made: a default branch that does not exist locally ("the repository's default branch main does not exist locally"), a file where the folders go ("docs/issues is a file in this repository, so feedback cannot be stored there."), a branch named `feedback` or `idea` ("a branch named feedback exists in this repository, so no branch can be created under feedback/"), and no git identity ("git has no user.name and user.email set for this repository").
+
+## What is published
+
+Nothing leaves this machine before Submit. The daemon pushes only for **A GitHub issue** (at Submit or Retry) and **Open pull request**, only to `origin` of the repository shown, never forced. What it pushes is the recorded commit itself, whatever the local branch points at by then.
+
+**The push guard.** The folder commit is made on top of your local default branch, so pushing it would also publish every commit of yours that `origin` does not have. Before an issue submission commits anything, and again right before every push (Submit, Retry, Open pull request), the daemon checks, from what git last fetched and without using the network, that everything under the folder commit is already on `origin` (`refs/remotes/origin/*`). If it is not, it refuses with code `unpushed_commits` and one of:
+
+- "The default branch has commits that are not on origin. Push them first, so they are not published with this feedback."
+- "This repository has never been fetched from origin, so it is not known what is already published. Run git fetch first."
+
+Refused before the commit, nothing is made and the form stays editable. Refused at a push, nothing is pushed: push your commits (or fetch), then Retry or press **Open pull request** again. An intent is not refused at Submit, since nothing is pushed then; an idea's **Open pull request** is checked like any push. The check reads your remote-tracking branches, so after a push made elsewhere, `git fetch` first.
+
+**Public repositories.** Screenshots can show chat text and file paths. With **A GitHub issue** chosen, the Submit screen says "This repository is public. The screenshots will be visible to anyone." (or "This repository may be public. The screenshots will be visible to anyone." when `gh` cannot tell), and before every send to such a repository, Retry included, it asks "Send the screenshots to GitHub?". **Open pull request…** always asks first: "Pushes the idea branch to origin and opens a draft pull request. If the repository is public, the screenshots will be visible to anyone."
+
+The daemon enforces this itself. A repository that is public, or whose visibility `gh` cannot tell, counts as public: an issue submission and **Open pull request** are refused (code `public_not_acknowledged`, nothing committed or pushed) unless the request says the warning was confirmed, with "This repository is public. The screenshots will be visible to anyone. Confirm that before sending." or "This repository may be public. The screenshots will be visible to anyone. Confirm that before sending." The app says so only after its question was confirmed for that send. If the daemon refuses although the app took the repository for private, the app asks the same question (with the "may be public" warning) and, on confirm, sends again under the same id; on Cancel nothing is sent and the form stays editable. An issue submission is checked once, before its commit: a recorded submission that is continued or retried is not asked again. **Open pull request** is checked on every press. **An intent to work on now** pushes nothing and is never asked. Whether a repository is public is asked of `gh` and remembered for 10 minutes.
+
+**Mentions.** In what is sent to GitHub (an issue's title and body, a pull request's title and body), an `@` that GitHub would read as a mention (`@name`, `(@name)`, `@org/team`) gets an invisible zero-width space after it, so nobody is notified; `a@b.com` and `photo@2x.png` stay as typed. The committed files keep your text unchanged.
+
+**An idea agent's commits** are published as the agent wrote them, messages and authors included, when you open the pull request. Before pushing, the daemon checks that every commit on top of the idea's own changes only files inside the issue folder; otherwise nothing is pushed.
+
+**An intent's agent.** Once you send a feedback intent, its agent is told, as every intent's agent is, to open a pull request of its work when it is done (when the repository has a GitHub remote). That pull request carries the issue folder with its screenshots. The Submit screen shows no public-repository warning for an intent.
+
+## Retry and Start over
+
+A draft keeps one submission id for every send and Retry, and the daemon makes at most one commit, one intent and one issue per id: sending the same id again, or twice at once, continues what it recorded instead of starting again.
+
+When a step after the commit fails (the intent, the push or the issue), the pane says "The files are committed on <branch> (<commit>), but: <sentence>" and offers **Retry** and **Start over**. Retry runs only what has not succeeded: the folder is never committed again, a push sends the same commit, and an issue is looked for before one is created.
+
+**When the draft locks.** The draft (text, kind, repository, attachments) locks while something may exist under its id: a step failed after the commit; no answer came within 10 minutes; the connection broke after the request left; the daemon answered with a server error or a code the app does not know. The app marks the draft as sent before the request leaves, so after a quit, a closed window or a lost connection it comes back locked, with Retry. While it is locked, nothing can be changed or added: "This feedback was sent. Retry or start over in Submit before changing it." Retry asks the daemon to continue first, and sends the files again only when the daemon has no record of the id.
+
+**When it stays editable.** The draft stays editable, under the same id, when the request never left (not connected, the connection refused, a file that could not be read) and when the daemon refused it before making anything (`invalid`, `unsupported_file`, `payload_too_large`, `no_github_remote`, `gh_not_ready`, `tool_missing`, `default_branch_missing`, `git_identity_missing`, `no_free_name`, `name_taken`, `folder_blocked`, `branch_blocked`, `unpushed_commits`, `public_not_acknowledged`). The refusal's sentence stays on the Submit screen until the next send. A repository that no longer exists says "That repository no longer exists." and the id is dropped.
+
+**Start over** drops the pending submission and unlocks the form. The screenshots, the text, the repository, the choice and the idea boxes stay as they were, and the next **Create** sends them as a new submission, with a new id; what was already committed stays on its branch. When no answer came, it asks first: "The daemon may still be finishing this submission. Starting over can create it twice." **Discard** works whenever a submission is pending.
+
+**Duplicates.**
+
+- A submission keeps running in the daemon when the app quits, and the daemon does not stop for idleness while one runs. There is no way to cancel it.
+- After `gh issue create` ran without a usable answer, Retry creates nothing for a minute: "GitHub has not confirmed whether the issue was created. Try again in a minute."
+- After the daemon restarts, a second issue is prevented only by a search of your own issues (`--author=@me`) for the submission's hidden line. GitHub's search can lag: an issue created seconds before may not be found, and a second one is then created.
+- If the daemon stopped between the commit and its record, sending the same draft again takes up that commit (found by its `Feedback-Id` line) instead of committing again, but only in the same repository and only while that branch still points at the commit. Otherwise a second commit is made, on a branch of its own.
+
+## Idea packages
+
+Under **An intent to work on now**, tick **Prepare an idea PR for teammates** and choose its parts: **Demo video**, **Diagrams**, **Explainer doc**. Ticking it ticks **Explainer doc**; at least one part is needed ("Choose at least one part."). The boxes start unticked each time the Submit screen opens. The line under the choices then reads, for example, "Creates the issue folder with 1 screenshot. An agent adds an explainer doc and a demo video on an idea branch, and you open the pull request."
+
+The feedback becomes an idea intent, committed on `idea/<slug>`, that you polish, review and send in the Intents pane like any intent. Its agent prepares the package in the issue folder and does not implement the idea, push, or open a pull request; polish asks what the package should cover, never how to implement it. Each part is an instruction to the agent and a fixed acceptance criterion:
+
+| Part | The agent is told | Fixed criterion |
+| --- | --- | --- |
+| **Explainer doc** | Write `explainer.md` with the sections "What", "Why", "How it could work" and "Open questions". | `explainer.md` exists in the issue folder and covers what, why, how it could work and open questions. |
+| **Diagrams** | Add diagrams to `explainer.md` as Mermaid code blocks; if a Mermaid renderer is installed, also save one rendered image per diagram in the folder and link it. | `explainer.md` has at least one Mermaid diagram of the idea. |
+| **Demo video** | Run the project, reproduce the bug or walk through the idea in a browser with `agent-browser`, save the recording as `demo.mp4` (at most 50 MB) and the steps taken in `demo.md`. Offered only while `agent-browser` is installed ("Only works for projects a browser can show."); otherwise disabled with "Install agent-browser to record a demo video." | `demo.mp4` (at most 50 MB) shows the bug or the idea in a browser, and `demo.md` lists the steps taken. |
+| Always | If a part cannot be produced, say why under a "Not done" heading in `explainer.md` and go on. Commit only files inside the folder, then stop. | Only files inside the issue folder are changed, and nothing is implemented. |
+
+With **Explainer doc** unticked there is no prose explainer: with **Diagrams**, the agent writes only a minimal `explainer.md` that holds the diagrams and, if a part is not done, the "Not done" list; without **Diagrams**, it creates no `explainer.md` unless a part is not done, and then puts only the "Not done" list in it.
+
+The fixed criteria are accepted from the start and cannot be edited or dropped: the review buttons refuse ("this item is fixed: it cannot be edited or dropped"), and polish keeps them first and unchanged. An intent made from feedback cannot move to another repository ("This intent's evidence is in its repository, so the repository cannot be changed."), nor can one with a fixed dependency ("This intent depends on another intent in its repository, so the repository cannot be changed.").
+
+**Open pull request…** appears in the idea intent's detail once the intent is sent and its agent is done, or once it is resolved. After you confirm, the daemon (on a public repository, only with that confirmation: see [what is published](#what-is-published)):
+
+1. takes the agent's branch (`intent/<slug>`) as it is, and refuses with nothing pushed when a commit on it changes a file outside the issue folder ("the idea agent changed files outside the issue folder, so nothing was pushed"), when it does not contain the idea's commit, when it has more than 1000 commits on top of it, or when `issue.md` is gone ("The idea's issue.md is missing from the agent's branch, so a pull request cannot be opened.");
+2. records that commit, then pushes it to `origin` as `idea/<slug>`, never forced (with the push guard above);
+3. opens a draft pull request into the default branch with `gh pr create --draft`: the intent's title, and a body of `issue.md` and `explainer.md` with the images as permanent links. A pull request you already opened from that branch is used instead.
+
+The detail then shows the pull request's address, which opens in the browser, with a **Copy link** button beside it, and the agent's "Not done" section, if `explainer.md` has one ("Not done: …"). If the push or `gh` fails, press **Open pull request…** again: what succeeded is not repeated, and the same commit is pushed. After `gh pr create` ran without a usable answer, nothing is opened for a minute: "GitHub has not confirmed whether the pull request was opened. Try again in a minute."
+
+**Create implementation intent** makes, once, the intent that implements the idea: same kind and repository, starting from the idea agent's branch (so the package is in its checkout), depending on the idea intent (a fixed dependency), seeded with "Implement the idea “<title>”." and where the package is. It opens in the Intents pane; pressing again opens the same intent. Nothing is pushed and `gh` does not run.
+
+## Limits
+
+| What | Limit |
+| --- | --- |
+| Attachments per submission | 10 |
+| One image, screenshot, or annotated screenshot | 10 MiB (10 × 1024 × 1024 bytes) |
+| One video | 50 MiB |
+| All files of a submission, annotated screenshots included | 100 MiB |
+| Boxes per screenshot | 20 |
+| A comment | 500 characters |
+| The main idea | 20,000 characters |
+| The title (the first line) | 120 characters; the rest is cut |
+| An issue's body on GitHub | 60,000 characters |
+| Folders of one name on one day | 99 |
+| `demo.mp4` | 50 MB, as the agent is told; the daemon does not check it |
+| Commits on the idea agent's branch, for a pull request | 1000 |
+| A push | 120 seconds |
+| One `gh` call; the sign-in and visibility checks | 60 seconds; 5 seconds |
+| The app waiting for the daemon's answer | 10 minutes |
+
+Files are recognised by their first bytes, not by their names: PNG, JPEG, GIF, WebP and MP4; a screenshot and its annotated picture must be PNG. A video is recognised by the `ftyp` box every ISO media file starts with, so MOV and other ISO media files sent as video are accepted too, and stored as `clip-<n>.mp4`.
 
 ## Screen Recording permission (macOS)
 
@@ -29,15 +171,33 @@ The first capture asks macOS for Screen Recording permission. Allow SmithAgents 
 
 A Linux build of the workspace needs libclang and the PipeWire development packages, which the capture library uses; on Debian or Ubuntu its own list is `pkg-config libclang-dev libxcb1-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev`. Capture on Linux and Windows has never been built or run.
 
+## Not built / known gaps
+
+- **Capture on Linux and Windows** has never been built or run, and no test covers it.
+- **No cancel.** Once a submission's upload or push has started, it cannot be stopped from the app; the daemon finishes it.
+- **The system git configuration applies.** The daemon's git reads the system-wide configuration, which the push needs for a system credential helper. A system `url.<base>.insteadOf` there can also send the push to another address.
+- **Open owner decisions:**
+  - whether commits that will be pushed should be built on `origin`'s default branch instead of your local one (today the push guard refuses when your local branch is ahead);
+  - whether **Open pull request** should publish one commit the daemon makes instead of the agent's own commits, which are published as the agent wrote them.
+
 ## Manual check before release (for testers)
 
-Real capture has never been run by the automated tests: they use a fake capturer, and no test opens the file dialog. After a build, run `cargo run -p host-desktop` with `SMITHAGENTS_HOME` set to a scratch directory (macOS then asks Screen Recording permission for the terminal, not SmithAgents), and check:
+Real capture has never been run by the automated tests: they use a fake capturer, and no test opens the file dialog. Nor has a real `gh`, `agent-browser` or push to GitHub: the tests use fake tools and local repositories. After a build, run `cargo run -p host-desktop` with `SMITHAGENTS_HOME` set to a scratch directory (macOS then asks Screen Recording permission for the terminal, not SmithAgents), and check:
 
 1. The first capture shows the system's permission prompt, and capture works after allowing it and reopening the app.
 2. A real capture of the app's own window works on the primary display and on a second display.
 3. The captured image is not gray or empty (the capture library uses a macOS call Apple has deprecated).
 4. The 3-second hold and its ring feel right.
 5. Writing a large screenshot does not stutter when the annotator opens.
-6. The disabled **Submit…** button shows its tooltip.
+6. On an empty draft, **Submit…** is disabled and shows its tooltip.
 7. The annotator can be used from the keyboard.
 8. A Linux build, with the packages under **Building on Linux**, compiles; it has not been tried.
+
+With a throwaway private GitHub repository of your own:
+
+9. The `feedback` plugin shows `needs_setup` naming a missing tool, and `ready` once `gh` and `agent-browser` are installed.
+10. Submitting as an intent creates the branch and opens the intent, and the working tree is untouched.
+11. Submitting as an issue pushes with your own git credentials; the issue shows its images and has the right label.
+12. With the network off, the push fails with a plain sentence, and Retry works once it is back.
+13. An idea package: the agent writes `explainer.md` and, when `agent-browser` really records, `demo.mp4`; **Open pull request** opens a draft. Record what `agent-browser` actually produced: the recording has never been run.
+14. The public-repository warning shows for a public repository.

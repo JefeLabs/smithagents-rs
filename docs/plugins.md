@@ -11,7 +11,7 @@ Contents: [how it works](#how-it-works), [the contract](#the-contract),
 [secrets](#secrets), [command-line tools](#command-line-tools),
 [host modes and discovery](#host-modes-and-discovery),
 [the API](#the-api), [the GitHub plugin](#the-github-plugin),
-[packing](#packing-plugins), [checking with curl](#checking-with-curl),
+[the feedback plugin](#the-feedback-plugin), [packing](#packing-plugins), [checking with curl](#checking-with-curl),
 [limits](#limits), [not built yet](#not-built-yet).
 
 ## How it works
@@ -293,6 +293,25 @@ through the host.
   built-in plugins only. An installed plugin that declares a tool shows
   `needs_setup`, because approving a third party's tools is not built yet.
 
+**Tools the daemon's own code runs.** A built-in plugin whose behaviour is
+daemon code (today the [feedback plugin](#the-feedback-plugin)) has its
+tools run through the plugin manager (`run_tool`): only a tool that this
+built-in plugin's own manifest declares, with the given arguments, in a given
+directory (absolute; a relative one is refused), under the same rules as
+every tool above (lookup, no shell, stdin closed, stderr discarded, no
+`SMITHAGENTS_*` variable, a timeout, at most 64 KiB of output, the first line
+returned). While the plugin is disabled, failed, or the daemon is stopping,
+its tools are refused and nothing runs; the feedback tool reports them as
+"turned off or not running". A run that fails carries nothing the tool
+printed: through the API it is `tool_failed` (502) with a fixed sentence
+such as "the tool failed (exit status 1)".
+
+**A plugin without resources** never runs, so nothing checks its tools
+before a run. Its tools are checked when its status is read instead (a check
+is trusted for 60 seconds): a missing or too old one makes its state
+`needs_setup`, naming the tool, with the install hints. For such a plugin
+this is advice and holds nothing back.
+
 ## Host modes and discovery
 
 `host` in the manifest picks how the plugin's code runs.
@@ -302,7 +321,7 @@ through the host.
 | `dylib` | A native library, loaded into the daemon's process through a stable ABI (`stabby`). | Built-in plugins only: the directory next to the daemon executable. Third-party code never runs natively in the daemon. |
 | `wasm` | A WebAssembly component (`wasm32-wasip2`), run in a sandbox (Wasmtime). | Built-in and installed plugins. This is the mode for third-party plugins. |
 | `process` | Reserved. Not built; a manifest that asks for it is refused. | Nobody yet. |
-| `in-process` | Parses, but no directory loads it: the daemon refuses it. Tests link a plugin straight into the manager instead. | Tests only. |
+| `in-process` | A plugin compiled into the daemon, registered from a manifest embedded in the binary. No directory can ask for it. | Built-in plugins inside the daemon, and tests. |
 
 **The wasm sandbox.** The linker provides no filesystem, no sockets and no
 `wasi:http`: the guest can compute and call `host.http` and `host.log`, and
@@ -323,6 +342,8 @@ answering and other plugins are unaffected.
 
 **Where plugins live.**
 
+- Embedded: compiled into the daemon (today only `feedback`). They are
+  listed before every plugin directory and start enabled.
 - Built-in: `<directory of the daemon executable>/plugins/<id>/`. Built-in
   plugins start enabled.
 - Installed: `<home>/plugins/<id>/` (home defaults to `~/.smithagents`).
@@ -340,8 +361,11 @@ writable by group or others. Also:
 - the directory name must equal the manifest's `id`;
 - an installed plugin may not use the id of anything found in the built-in
   directory (built-in ids are reserved, even when the built-in one is broken);
+- no directory, built-in or installed, may use the id of a plugin compiled
+  into the daemon (`feedback`): it is skipped with "a built-in plugin has this
+  id" before anything in it is loaded;
 - an installed plugin may not be `dylib`, and `process` and `in-process` are
-  refused for every plugin;
+  refused for every plugin directory;
 - the installed directory may not overlap the built-in one;
 - the built-in directory must not be a symbolic link; if it is, nothing in it
   loads and no installed plugin loads either (the ids it would reserve cannot
@@ -403,7 +427,8 @@ now), `plugin_not_ready` (409, a sync of an enabled plugin that cannot run
 now: settings missing or invalid, `failed`, `load_failed`, or tools that need
 approval; the message says why), `install_in_progress` (409),
 `mise_missing` (409); `install_failed` (502, mise failed or timed out);
-`internal` (500).
+`tool_failed` (502, a command-line tool the daemon ran for a built-in plugin
+failed; a fixed sentence with an exit status at most); `internal` (500).
 
 Events on `/v1/events` include `plugin_updated` (a status changed) and
 `resource_synced` (a run stored items: plugin, resource, counts).
@@ -449,6 +474,163 @@ Details that matter when something looks off:
 - On a fresh home with no `repositories` setting, `github` is listed as a
   built-in and enabled, with state `needs_settings`. Nothing runs and nothing is
   requested until the setting is given.
+
+## The feedback plugin
+
+`feedback` is the daemon side of the app's Feedback pane (see
+[`docs/feedback.md`](feedback.md)). Its manifest is embedded in the daemon
+binary (host mode `in-process`); it is listed with `builtin: true`, starts
+enabled, and no plugin directory can take its id. It syncs nothing: it has no
+resources, hosts, secrets or settings, only two tools:
+
+```toml
+id = "feedback"
+name = "Feedback"
+version = "0.1.0"
+contract = 1
+host = "in-process"
+
+[[tools]]
+name = "gh"
+label = "GitHub CLI"
+install_url = "https://cli.github.com"
+install = { mise = "gh", brew = "gh" }
+
+[[tools]]
+name = "agent-browser"
+label = "agent-browser"
+install = { mise = "npm:agent-browser" }
+```
+
+- **`gh`** is the only tool the daemon runs for it: `gh auth status
+  --hostname=github.com` (signed in?), `gh repo view` (is the repository
+  public?), `gh label list`, `gh issue list` and `gh issue create` for "A
+  GitHub issue", and `gh pr list` and `gh pr create --draft` for "Open pull
+  request". It runs from the daemon's home, never inside a repository, always
+  with `--repo=github.com/<owner>/<name>`, and with `GH_PROMPT_DISABLED=1`,
+  `GH_NO_UPDATE_NOTIFIER=1` and `NO_COLOR=1`. Its searches for an issue or a
+  pull request made before look only at the signed-in user's own
+  (`--author=@me`).
+- **`agent-browser`** is only looked up: "Demo video" is offered while it is
+  installed, and the idea intent's agent runs it.
+- **State.** `ready`, or `needs_setup` naming a missing tool. This is advice
+  (see [a plugin without resources](#command-line-tools)): capture, files and
+  the intent path work without either tool, and only the choices that need
+  one are unavailable. `POST /v1/plugins/feedback/tools/gh/install` and
+  `.../tools/agent-browser/install` install them with mise.
+- **Turned off** (`POST /v1/plugins/feedback/disable`), both tools are
+  refused; the app says "The feedback plugin is turned off or not running."
+  and the intent path still works.
+- **What it pushes.** Nothing, except for an issue submission (`send_as:
+  github_issue`) and `POST /v1/intents/{id}/pull-request`: then the recorded
+  commit itself, to `origin`, never forced, with the user's own git
+  credentials (the daemon supplies none). A push is refused (`unpushed_commits`)
+  unless everything under the folder commit is already on
+  `refs/remotes/origin/*`, so the user's unpushed commits are never published
+  with it. On a repository that is public, or whose visibility `gh` cannot
+  tell, both are refused (`public_not_acknowledged`) unless the request says
+  `public_acknowledged: true`.
+
+All routes are behind the daemon's bearer token. The ones that commit or
+push run detached: a client that goes away does not stop them half-way, and
+the daemon does not stop for idleness while one runs.
+
+| Route | What it does |
+| --- | --- |
+| `GET /v1/feedback/targets` | Every repository with `has_github_remote` (its configured `origin` is on github.com) and `is_public` (`true`, `false`, or `null` when unknown), the meta repository, and whether `gh` (signed in) and `agent-browser` are ready, with a `reason` when not. No remote URL is returned. |
+| `GET /v1/settings/feedback`, `PUT /v1/settings/feedback` | The meta repository, the one feedback goes to by default: `{"meta_repo_id": "<repo id>" \| null}`. |
+| `POST /v1/feedback` | A submission (below). Answers with the outcome: `submission_id`, `repo_id`, `branch`, `commit`, `folder`, `pushed`, `intent`, `issue_url`, and `failed` (`step`, `code`, `message`) when a step after the commit failed. The same id again continues that submission: nothing is committed twice, and only what has not succeeded runs. |
+| `POST /v1/feedback/{id}/retry` | Runs what has not succeeded of the recorded submission `id` (the intent, or the push and then the issue); the same answer. |
+| `POST /v1/intents/{id}/pull-request` | An idea intent's "Open pull request". Optional body `{"public_acknowledged": true \| false}` (none means `false`). Answers with the intent; `origin.idea.pr_url` holds the pull request. |
+| `POST /v1/intents/{id}/implementation` | An idea intent's "Create implementation intent": 201 with the new intent, or with the one made before. |
+
+**The submission** is `multipart/form-data`: the part `request` first, then
+`file-<i>` for every attachment and `annotated-<i>` for every screenshot (`i`
+is the attachment's 1-based position), each exactly once. The daemon names
+every file; a part's own file name is never used as a path. Files are checked
+by their first bytes (a screenshot's two parts are PNG; an image is PNG,
+JPEG, GIF or WebP; a video has an ISO media `ftyp` box). Parts are written
+to a private directory under `<home>/tmp/feedback/` as they stream in,
+removed when the request ends, and leftovers are removed at daemon start. The
+`request` part:
+
+```json
+{
+  "submission_id": "<a uuid the client makes, one per draft>",
+  "main_idea": "Fix the zoom\n\nThe page jumps when I zoom in.",
+  "kind": "bug",
+  "repo_id": "<repo id>",
+  "send_as": "intent",
+  "idea": {"explainer": true, "diagrams": false, "demo_video": false},
+  "public_acknowledged": false,
+  "app_version": "0.1.0",
+  "platform": "macos",
+  "attachments": [
+    {"kind": "screenshot", "original_name": "screenshot.png",
+     "boxes": [{"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.1, "comment": "This jumps"}]}
+  ]
+}
+```
+
+`kind` is `new_feature`, `enhancement` or `bug`; `send_as` is `intent` or
+`github_issue`; `idea` (optional) needs `intent` and at least one part;
+`public_acknowledged` (optional, `false` when left out) matters only for an
+issue; an attachment's `kind` is `screenshot`, `image` or `video`, and only a
+screenshot has `boxes`, given as fractions of the image (0 to 1);
+`app_version` and `platform` are 1 to 32 of `A-Z a-z 0-9 . _ + -`.
+
+Error codes (errors are `{"error": "<code>", "message": "<text>"}`; every
+message is a fixed sentence, never something git or `gh` printed):
+
+- `POST /v1/feedback`, before anything is committed or recorded: `invalid`
+  (400: the request or the upload's shape, a box outside its image, an idea
+  package with no part or sent as an issue), `unsupported_file` (400: "screenshot
+  1 is not a png file"), `payload_too_large` (413: a part, the request part or
+  the whole upload over its limit), `repo_not_found` (404); 409
+  `default_branch_missing`, `git_identity_missing`, `no_free_name`,
+  `name_taken`, `folder_blocked`, `branch_blocked`, `tool_missing` (Demo video
+  without `agent-browser`), and for an issue `no_github_remote`,
+  `gh_not_ready`, `unpushed_commits` and `public_not_acknowledged`. Also 500
+  `git_failed`, `io_error`, `store_error`.
+- `POST /v1/feedback/{id}/retry`: `submission_not_found` (404), `bad_request`
+  (400, not a submission id).
+- In `failed` (a 200 answer: the commit exists): step `create_intent` with the
+  intent service's code; step `push` with `push_rejected`, `push_auth`,
+  `push_no_remote`, `push_timeout`, `push_failed`, `commit_missing` ("The
+  feedback commit is no longer in this repository, so it cannot be pushed.")
+  or `unpushed_commits`; step `create_issue` with `gh_not_ready`, `gh_failed`,
+  `gh_timeout`, `gh_bad_answer`, `issue_unconfirmed` ("GitHub has not
+  confirmed whether the issue was created. Try again in a minute."),
+  `no_github_remote`, `git_failed` or `io_error`.
+- `POST /v1/intents/{id}/pull-request`, with nothing pushed: `bad_request`
+  (400, a malformed body or id); `intent_not_found`, `repo_not_found` (404); 409 `not_an_idea`, `invalid_state` (not sent yet, or
+  the agent is still working), `idea_out_of_scope` (the agent's branch changes
+  files outside the issue folder, lacks the idea's commit, or has more than
+  1000 commits on top of it), `idea_incomplete` ("The idea's issue.md is
+  missing from the agent's branch, so a pull request cannot be opened."),
+  `unpushed_commits`, `public_not_acknowledged`, `no_github_remote`,
+  `gh_not_ready`. A failed push or `gh` call is 502 with the step's own code
+  (the push codes above, `gh_failed`, `gh_timeout`, `gh_bad_answer`,
+  `pr_unconfirmed`, `git_failed`, `io_error`); what succeeded before it stays
+  done.
+- `POST /v1/intents/{id}/implementation`: `intent_not_found`,
+  `repo_not_found` (404); 409 `not_an_idea`, `invalid_state`; the intent
+  service's codes when the intent cannot be made.
+- `PUT /v1/settings/feedback`: `repo_not_found` (404), `bad_request` (400).
+
+The two `unpushed_commits` sentences: "The default branch has commits that
+are not on origin. Push them first, so they are not published with this
+feedback." and, when the repository has no `refs/remotes/origin/*` at all,
+"This repository has never been fetched from origin, so it is not known what
+is already published. Run git fetch first." The two `public_not_acknowledged`
+sentences: "This repository is public. The screenshots will be visible to
+anyone. Confirm that before sending." and, when `gh` cannot tell, "This
+repository may be public. The screenshots will be visible to anyone. Confirm
+that before sending." An issue submission is asked for the acknowledgement
+only before its commit; a recorded submission that is continued or retried
+is not asked again. The pull-request route is asked on every call.
+
+Limits: see [limits](#limits).
 
 ## Packing plugins
 
@@ -533,6 +715,20 @@ Do not paste it into a bug report; it is not in the daemon's log by design.
 | Wasm component file | 64 MiB |
 | Log lines per call | 100, then one warning; the rest are dropped |
 | One log line | 2 KiB |
+| Feedback: attachments per submission | 10 |
+| Feedback: one image (a screenshot and its annotated picture each count as one) | 10 MiB |
+| Feedback: one video | 50 MiB |
+| Feedback: every file part together | 100 MiB |
+| Feedback: the `request` part | 1 MiB |
+| Feedback: the whole upload body | 101 MiB (every file part plus 1 MiB) |
+| Feedback: boxes per screenshot; a comment; the main idea | 20; 500 characters; 20,000 characters |
+| Feedback: the issue body sent to GitHub | 60,000 characters |
+| Feedback: a push | 120 seconds |
+| Feedback: one `gh` call; `gh auth status` and `gh repo view` | 60 seconds; 5 seconds |
+| Feedback: a local git command | 60 seconds |
+
+The feedback sentences print sizes as "MB" (`10 MB`, `100 MB`); they are
+binary megabytes, as in this table.
 
 A page over a limit, with a duplicate id, an empty id, `fields` that is not an
 object, or a bad `url` is refused as a whole and the run fails.
@@ -542,8 +738,8 @@ object, or a bad `url` is refused as a whole and the run fails.
 Be aware before relying on these; they do not exist today.
 
 - Views for plugin data and a settings or sign-in screen in the app. Today a
-  plugin is configured through the API (or `curl`) and `secrets.toml`; the
-  manifest has no `views`.
+  plugin is configured, and a built-in plugin's tools are installed, through
+  the API (or `curl`) and `secrets.toml`; the manifest has no `views`.
 - Writes: proposals, approval, conflict detection and audit. During a sync a
   plugin can only read, and `POST` and friends are refused.
 - The Keeper as a secrets source (only `secrets.toml`, the environment and

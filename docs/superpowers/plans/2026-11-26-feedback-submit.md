@@ -864,7 +864,7 @@ With a scratch `SMITHAGENTS_HOME` and a throwaway private GitHub repository of t
 - **Visibility** is cached for 10 minutes and asked only for `github.com`; a repository made public in between is reported as private until the cache ends.
 - **Idea package extras**: rendering Mermaid to images in the daemon; checking `demo.mp4` against 50 MB before the pull request; a pull request for a plain feedback intent.
 - **The app**: a plugin screen that shows `needs_setup` and installs a tool with one click (today: the API); remembering the idea checkboxes; a size check in the app that counts annotated images before uploading.
-- **A drop of fixed items**: the review routes can still drop a fixed criterion; nothing stops the owner, and polish does not bring it back.
+- **Fixed items** (corrected 2026-11-26; this note first said the review routes could still drop a fixed criterion): the review routes refuse to edit or drop a fixed item (400 `invalid`, "this item is fixed: it cannot be edited or dropped"), and polish keeps fixed items first and unchanged. Nothing is left to follow up here.
 - **Search delay**: the marker search before `gh issue create` depends on GitHub's index; an issue created seconds before a retry may not be found, and a second one is then created.
 
 ## Self-review
