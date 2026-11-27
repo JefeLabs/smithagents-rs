@@ -583,7 +583,7 @@ async fn an_issue_submission_pushes_and_creates_the_issue() {
     assert_eq!(
         calls[1],
         format!(
-            r#"issue list {REPO_ARG} --author=@me --state=all --search={id} in:body --json=url --jq=.[0].url // """#
+            r#"issue list {REPO_ARG} --author=@me --state=all --search="{id}" in:body --json=url --jq=.[0].url // """#
         )
     );
     for call in &calls[1..] {
@@ -808,18 +808,23 @@ async fn mentions_are_neutralised_only_in_what_github_gets() {
         format!("# @{ZWSP}octocat the zoom\n"),
         format!("@{ZWSP}hubot, see (@{ZWSP}reviewer) and @{ZWSP}org/team."),
         format!("cc @{ZWSP}someone and me@example.com"),
+        // D-M3: after anything but a letter, digit or `_`, as GitHub may read it.
+        format!("Mail a@b.com or pkg/@{ZWSP}scope."),
     ] {
         assert!(body.contains(&neutral), "{neutral:?} in {body}");
     }
-    for raw in ["@octocat", "@hubot", "@reviewer", "@org", "@someone"] {
+    for raw in [
+        "@octocat",
+        "@hubot",
+        "@reviewer",
+        "@org",
+        "@someone",
+        "@scope",
+    ] {
         assert!(!body.contains(raw), "{raw} in {body}");
     }
-    // An `@` that is not where a mention starts stays as typed.
-    for kept in [
-        "Mail a@b.com or pkg/@scope.",
-        "## photo@2x.png",
-        "me@example.com",
-    ] {
+    // An `@` after a letter or digit stays as typed.
+    for kept in ["Mail a@b.com or", "## photo@2x.png", "me@example.com"] {
         assert!(body.contains(kept), "{kept} in {body}");
     }
 
@@ -2094,4 +2099,29 @@ async fn each_github_repository_gets_its_own_answer() {
             "public first: {public_first}"
         );
     }
+}
+
+#[tokio::test]
+async fn what_gh_left_unconfirmed_is_forgotten_after_the_wait() {
+    // D-M10: the memory of an unanswered `gh issue create` never grows.
+    let fx = fixture_with(Opts {
+        gh_timeout: Some(Duration::from_millis(300)),
+        ..Opts::default()
+    })
+    .await;
+    let (repo, _bare) = fx.github_repo("r1").await;
+    fx.fake.set("hang", "issue create");
+    let (_, out) = fx.submit_shot(&issue_request(&repo)).await;
+    assert_eq!(out["failed"]["code"], "gh_timeout", "{out}");
+    assert_eq!(fx.state.feedback.unconfirmed_for_test(), 1);
+    fx.clear("hang");
+
+    // Another submission, past the wait: the old entry is dropped.
+    fx.minutes.store(2, Ordering::SeqCst);
+    let mut other = issue_request(&repo);
+    other["main_idea"] = json!("Another idea");
+    let (status, made) = fx.submit_shot(&other).await;
+    assert_eq!(status, StatusCode::OK, "{made}");
+    assert_eq!(made["issue_url"], ISSUE_URL);
+    assert_eq!(fx.state.feedback.unconfirmed_for_test(), 0);
 }

@@ -250,11 +250,14 @@ fn hostile_names_and_comments_cannot_break_the_file() {
         &a,
         &[FileKind::Png, FileKind::Png, FileKind::Gif, FileKind::Mp4],
     );
-    assert!(got.contains("## passwd  pwnhttp://x\n"), "{got}");
+    // Everything up to the last `/` is dropped (D-M8).
+    assert!(got.contains("\n## x\n"), "{got}");
     assert!(!got.lines().any(|l| l.starts_with("# pwn")));
     assert!(got.contains("\n1. a \\#\\# b\n"), "{got}");
     assert!(!got.lines().any(|l| l.starts_with("## b")));
-    assert!(!got.contains("![x]"), "{got}");
+    // The comment's image link is text (the image itself is now named `x`).
+    assert!(!got.contains("![x](http"), "{got}");
+    assert!(got.contains("\n2. \\!\\[x\\]\\(http"), "{got}");
     let unescaped = got.replace("\\<", "");
     assert!(
         !unescaped.contains("<script") && !unescaped.contains("<img"),
@@ -470,6 +473,11 @@ fn mentions_are_neutralised_only_where_a_mention_starts() {
         ("line\n@name", format!("line\n@{z}name")),
         ("x, @a and @b", format!("x, @{z}a and @{z}b")),
         ("\u{e9}@name", format!("\u{e9}@{z}name")),
+        // D-M3: only a letter, digit or `_` before it keeps an `@` as typed.
+        ("x.@name", format!("x.@{z}name")),
+        ("x-@name", format!("x-@{z}name")),
+        ("pkg/@name", format!("pkg/@{z}name")),
+        ("@@name", format!("@@{z}name")),
     ] {
         assert_eq!(no_mentions(text), want, "{text:?}");
     }
@@ -477,11 +485,8 @@ fn mentions_are_neutralised_only_where_a_mention_starts() {
     for kept in [
         "a@b.com",
         "photo@2x.png",
-        "pkg/@scope",
-        "x.@y",
-        "x-@y",
         "x_@y",
-        "@@y",
+        "X9@y",
         "@ y",
         "@-y",
         "@",
@@ -539,4 +544,51 @@ fn a_pull_request_body_is_the_issue_then_the_explainer() {
     let long = "x".repeat(50_000);
     let body = pull_request_body(&long, Some(&long), &files, &base);
     assert_eq!(body.chars().count(), 60_000);
+}
+
+#[test]
+fn a_whole_comment_arrives_whatever_its_script() {
+    // A-I4: capped at 500 characters, never cut by bytes.
+    for comment in ["漢".repeat(500), "\u{1f600}".repeat(500)] {
+        assert!(comment.len() > 1024);
+        let got = render("T", "T", &[shot(&[&comment])], &[FileKind::Png]);
+        assert!(
+            got.contains(&format!("\n1. {comment}\n")),
+            "{}",
+            comment.len()
+        );
+    }
+    // Longer than 500 characters: the first 500.
+    let long = "漢".repeat(600);
+    let got = render("T", "T", &[shot(&[&long])], &[FileKind::Png]);
+    assert!(
+        got.contains(&format!("\n1. {}\n", "漢".repeat(500))),
+        "{got}"
+    );
+    assert!(!got.contains(&"漢".repeat(501)));
+}
+
+#[test]
+fn a_file_name_loses_all_of_its_folders() {
+    // D-M8: a folder named after a person never reaches a heading.
+    for (original, shown) in [
+        ("C:\\Users\\Some One\\Desktop\\shot.png", "shot.png"),
+        ("/home/some one/pictures/my shot.png", "my shot.png"),
+        ("plain name.png", "plain name.png"),
+    ] {
+        let got = render(
+            "T",
+            "T",
+            &[file(AttachmentKind::Image, original)],
+            &[FileKind::Png],
+        );
+        assert!(
+            got.contains(&format!("\n## {shown}\n")),
+            "{original}: {got}"
+        );
+        assert!(
+            !got.contains("Some One") && !got.contains("some one"),
+            "{got}"
+        );
+    }
 }

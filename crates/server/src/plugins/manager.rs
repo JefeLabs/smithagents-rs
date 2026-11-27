@@ -22,7 +22,7 @@ mod schedule;
 mod status;
 mod tools;
 
-pub(crate) use status::clean_message;
+pub(crate) use status::{clean_message, clean_text};
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

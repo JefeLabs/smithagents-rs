@@ -227,7 +227,10 @@ pub async fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, GitEr
     git_ok(repo_root, &["show-ref", "--verify", "--quiet", &reference]).await
 }
 
-/// Creates `branch` from `base` in a new worktree under `worktrees_dir`.
+/// Creates `branch` from `base` in a new worktree under `worktrees_dir`,
+/// tracking nothing (`--no-track`: with `branch.autoSetupMerge=always` a
+/// local `base` would otherwise become the branch's upstream, and a bare
+/// `git push` would go there).
 ///
 /// The directory is `worktrees_dir/<branch with '/' replaced by '-'>`.
 pub async fn create_worktree(
@@ -245,7 +248,16 @@ pub async fn create_worktree(
     let dir_arg = dir.to_string_lossy().into_owned();
     let out = git_raw(
         repo_root,
-        &["worktree", "add", "-b", branch, "--", &dir_arg, base],
+        &[
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            "--",
+            &dir_arg,
+            base,
+        ],
     )
     .await?;
     if out.status.success() {

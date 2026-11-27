@@ -47,8 +47,8 @@ use super::github::{
 use super::issue::{no_mentions, not_done_section, permalink_base, pull_request_body, title_of};
 use super::upload::StagingDir;
 use super::{
-    locked, repo, FeedbackError, FeedbackService, Running, BODY_FILE, ISSUE_MD, ISSUE_MD_MAX_BYTES,
-    UNCONFIRMED_WAIT_SECS,
+    locked, recent, repo, FeedbackError, FeedbackService, Running, BODY_FILE, ISSUE_MD,
+    ISSUE_MD_MAX_BYTES,
 };
 use crate::git::{self, Changes, GitError};
 use crate::intents::CreateExtras;
@@ -444,16 +444,12 @@ impl FeedbackService {
             locked(&self.parts.unconfirmed_prs).remove(&id);
             return Ok(url);
         }
-        let last = locked(&self.parts.unconfirmed_prs).get(&id).copied();
-        if let Some(at) = last {
-            // A clock that went back counts as no time passed.
-            if (self.clock)() - at < chrono::TimeDelta::seconds(UNCONFIRMED_WAIT_SECS) {
-                return Err(FeedbackFailure {
-                    step: FeedbackStep::OpenPullRequest,
-                    code: "pr_unconfirmed".to_owned(),
-                    message: UNCONFIRMED.to_owned(),
-                });
-            }
+        if recent(&self.parts.unconfirmed_prs, id, (self.clock)()) {
+            return Err(FeedbackFailure {
+                step: FeedbackStep::OpenPullRequest,
+                code: "pr_unconfirmed".to_owned(),
+                message: UNCONFIRMED.to_owned(),
+            });
         }
         let write_failed = |kind: std::io::ErrorKind| {
             tracing::warn!(intent_id = %id, step = "open_pull_request", ?kind, "could not write the pull request's body");

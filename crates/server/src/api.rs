@@ -1289,12 +1289,13 @@ mod tests {
             IntentError::DependencyCrossRepo => "DependencyCrossRepo",
             IntentError::EvidenceInRepo => "EvidenceInRepo",
             IntentError::FixedDependency => "FixedDependency",
+            IntentError::BaseBranchFailed => "BaseBranchFailed",
             IntentError::Service(_) => "Service",
             IntentError::Store(_) => "Store",
         }
     }
 
-    const VARIANTS: [&str; 13] = [
+    const VARIANTS: [&str; 14] = [
         "NotFound",
         "RepoNotFound",
         "AgentNotFound",
@@ -1306,6 +1307,7 @@ mod tests {
         "DependencyCrossRepo",
         "EvidenceInRepo",
         "FixedDependency",
+        "BaseBranchFailed",
         "Service",
         "Store",
     ];
@@ -1361,6 +1363,11 @@ mod tests {
                 IntentError::FixedDependency,
                 S::CONFLICT,
                 "fixed_dependency",
+            ),
+            (
+                IntentError::BaseBranchFailed,
+                S::CONFLICT,
+                "base_branch_failed",
             ),
             // A wrapped agent-service error keeps that error's own mapping.
             (

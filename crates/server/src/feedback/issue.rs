@@ -10,7 +10,7 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use smithagents_core::feedback::{AttachmentKind, FeedbackAttachment, FeedbackKind, SubmissionId};
 use smithagents_core::intent::slugify;
 
-use crate::plugins::clean_message;
+use crate::plugins::{clean_message, clean_text};
 
 /// The stored format of a file the daemon writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,17 +212,16 @@ fn escape_md(text: &str) -> String {
 }
 
 /// A name for a heading or a link text: cleaned, without `[ ] ( ) ` #`,
-/// without its leading path, `attachment` when empty.
+/// without its leading path (all of it, up to the last `/` or `\`, spaces
+/// in it or not: a folder may be named after a person), `attachment` when
+/// empty.
 fn display_name(original: &str) -> String {
     let cleaned: String = one_line(original, 4 * NAME_MAX_CHARS)
         .chars()
         .filter(|c| !matches!(c, '[' | ']' | '(' | ')' | '`' | '#'))
         .collect();
     let cleaned = cleaned.trim();
-    // A path comes first and has no spaces to speak of: drop it from the
-    // first word, wherever its last separator is.
-    let word_end = cleaned.find(char::is_whitespace).unwrap_or(cleaned.len());
-    let start = cleaned[..word_end].rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let start = cleaned.rfind(['/', '\\']).map_or(0, |i| i + 1);
     let name: String = cleaned[start..]
         .trim()
         .chars()
@@ -303,17 +302,29 @@ fn idea_body(main_idea: &str) -> String {
     rest.trim().to_string()
 }
 
-/// The text of a comment, as one line.
+/// The most characters of a comment (the app's and the upload's limit).
+const COMMENT_MAX_CHARS: usize = 500;
+
+/// The text of a comment, as one line: cleaned as [`one_line`] cleans, and
+/// cut at 500 characters only, never by bytes (a comment in a 3- or 4-byte
+/// script arrives whole).
 fn comment_line(comment: &str) -> String {
-    one_line(comment, 500)
+    let head: String = comment.chars().take(COMMENT_MAX_CHARS * 4).collect();
+    clean_text(&head)
+        .trim()
+        .chars()
+        .take(COMMENT_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
-/// `text` with a zero-width space after each `@` where GitHub would read a
-/// mention (and notify whoever it names): an `@` at the start or after a
-/// character that is not an ASCII letter or digit, `_`, `.`, `-`, `/` or
-/// `@`, and followed by an ASCII letter or digit. So `@name`, `(@name)` and
-/// `@org/team` mention no one, and `a@b.com`, `photo@2x.png` and
-/// `pkg/@scope` stay as typed. For what is sent to GitHub only; files keep
+/// `text` with a zero-width space after each `@` where GitHub may read a
+/// mention (and notify whoever it names): every `@` followed by an ASCII
+/// letter or digit, unless the character before it is an ASCII letter or
+/// digit or `_`. So `@name`, `(@name)`, `.@name`, `-@name`, `/@name`,
+/// `@@name` and `@org/team` mention no one, and `a@b.com`, `photo@2x.png`
+/// and `x_@y` stay as typed. For what is sent to GitHub only; files keep
 /// the user's text.
 pub fn no_mentions(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -322,9 +333,7 @@ pub fn no_mentions(text: &str) -> String {
     while let Some(c) = chars.next() {
         out.push(c);
         if c == '@' {
-            let starts = before.is_none_or(|b| {
-                !(b.is_ascii_alphanumeric() || matches!(b, '_' | '.' | '-' | '/' | '@'))
-            });
+            let starts = before.is_none_or(|b| !(b.is_ascii_alphanumeric() || b == '_'));
             let names = chars.peek().is_some_and(char::is_ascii_alphanumeric);
             if starts && names {
                 out.push('\u{200b}');

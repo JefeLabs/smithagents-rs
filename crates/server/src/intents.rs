@@ -141,6 +141,10 @@ pub enum IntentError {
         "This intent depends on another intent in its repository, so the repository cannot be changed."
     )]
     FixedDependency,
+    /// The agent's worktree could not be made from the intent's base branch
+    /// (HTTP 409); what git said is not kept.
+    #[error("The intent's base branch could not be checked out.")]
+    BaseBranchFailed,
     #[error(transparent)]
     Service(ServiceError),
     #[error(transparent)]
@@ -173,6 +177,7 @@ impl IntentError {
             IntentError::DependencyCrossRepo => "dependency_cross_repo",
             IntentError::EvidenceInRepo => "evidence_in_repo",
             IntentError::FixedDependency => "fixed_dependency",
+            IntentError::BaseBranchFailed => "base_branch_failed",
             IntentError::Service(_) => "service_error",
             IntentError::Store(_) => "store_error",
         }
@@ -193,7 +198,8 @@ impl IntentError {
             | IntentError::DependencyCycle
             | IntentError::DependencyCrossRepo
             | IntentError::EvidenceInRepo
-            | IntentError::FixedDependency => S::CONFLICT,
+            | IntentError::FixedDependency
+            | IntentError::BaseBranchFailed => S::CONFLICT,
             IntentError::Invalid(_) => S::BAD_REQUEST,
             IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
         };
@@ -1073,7 +1079,7 @@ impl IntentService {
             base: base.clone(),
         };
         let branch = git::branch_name_for_intent(&intent.slug);
-        let agent = match agents
+        let created = match agents
             .create_agent_with(intent.repo_id, options(branch.clone()))
             .await
         {
@@ -1082,9 +1088,20 @@ impl IntentService {
                 let suffixed = format!("{branch}-{}", &hex[..BRANCH_SUFFIX_HEX]);
                 agents
                     .create_agent_with(intent.repo_id, options(suffixed))
-                    .await?
+                    .await
             }
-            other => other?,
+            other => other,
+        };
+        let agent = match created {
+            Ok(agent) => agent,
+            // What git said of a branch the user's repository holds is never
+            // kept: the start error is a fixed sentence, the log a code.
+            Err(ServiceError::Git(_)) if base.is_some() => {
+                let e = IntentError::BaseBranchFailed;
+                tracing::warn!(intent_id = %intent.id, code = e.code(), "the agent's worktree could not be made");
+                return Err(e);
+            }
+            Err(e) => return Err(e.into()),
         };
         if let Err(e) = agents.send_message(agent.id, brief.first_message).await {
             self.discard_agent(agent.id).await;

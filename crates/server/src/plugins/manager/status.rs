@@ -33,6 +33,21 @@ pub(crate) fn clean_message(text: &str) -> String {
     out
 }
 
+/// [`clean_message`]'s cleaning without its byte cap, for user text the
+/// caller bounds by characters itself: every control character, line or
+/// paragraph separator and bidirectional override or isolate as a space.
+pub(crate) fn clean_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || is_separator_or_bidi(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// U+2028 and U+2029, U+202A to U+202E and U+2066 to U+2069.
 fn is_separator_or_bidi(c: char) -> bool {
     matches!(

@@ -211,8 +211,14 @@ pub fn compose(intent: &Intent, deps: &[DepSummary]) -> Brief {
         // The worktree branches off the intent's base branch: the local
         // default branch, which may predate the dependencies' merges, or the
         // branch the intent names (an implementation intent's is its idea
-        // agent's branch).
-        parts.push(format!("{depends}\n\n{REBASE_ON_DEPENDENCIES}"));
+        // agent's branch). An idea intent's agent is never told to rebase:
+        // that rewrites the idea's commit, which "Open pull request" then
+        // refuses for good.
+        if idea_of(intent).is_some() {
+            parts.push(depends);
+        } else {
+            parts.push(format!("{depends}\n\n{REBASE_ON_DEPENDENCIES}"));
+        }
     }
 
     // An idea intent's agent never gets the append that asks for a pull

@@ -1833,3 +1833,29 @@ async fn a_maximal_request_in_a_three_byte_script_is_accepted() {
     assert_eq!(status, StatusCode::OK, "{out}");
     assert!(out["intent"]["id"].is_string(), "{out}");
 }
+
+#[tokio::test]
+async fn an_intent_made_but_not_recorded_is_taken_up_not_made_again() {
+    // D-M6: both saves of the intent's id failed; the retry finds it by its
+    // origin.
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    let req = request_json(repo.id, "intent");
+    fx.state.feedback.fail_next_saves_for_test(2);
+    let (status, out) = fx.submit(&req, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    let made = out["intent"]["id"].clone();
+    let sid: SubmissionId = serde_json::from_value(req["submission_id"].clone()).unwrap();
+    let row = fx.state.store.get_submission(sid).await.unwrap().unwrap();
+    assert_eq!(row.intent_id, None, "not recorded");
+
+    let (status, again) = fx
+        .call(Method::POST, &format!("/v1/feedback/{sid}/retry"), None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["intent"]["id"], made, "the same intent");
+    assert_eq!(fx.intents().await.len(), 1);
+    let row = fx.state.store.get_submission(sid).await.unwrap().unwrap();
+    assert_eq!(json!(row.intent_id), made, "recorded now");
+}

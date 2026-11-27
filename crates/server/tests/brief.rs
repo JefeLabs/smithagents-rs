@@ -516,3 +516,27 @@ fn system_append_covers_the_fixed_instructions() {
         assert!(s.contains(needle), "missing {needle:?} in {s}");
     }
 }
+
+#[test]
+fn an_idea_intent_is_never_told_to_rebase() {
+    // D-M7: a rebase rewrites the idea's commit, which "Open pull request"
+    // then refuses for good.
+    let deps = vec![DepSummary {
+        slug: "auth-core".into(),
+        title: "Auth core".into(),
+        current_behavior: "Tokens are checked.".into(),
+    }];
+    let rebase = "rebase this branch onto the remote's default branch";
+    let idea = compose(
+        &idea_intent("docs/issues/x", idea(true, false, false)),
+        &deps,
+    )
+    .first_message;
+    assert!(
+        idea.contains("## Depends on\n\n- Auth core (auth-core)"),
+        "{idea}"
+    );
+    assert!(!idea.contains(rebase), "{idea}");
+    let plain = compose(&fixture(), &deps).first_message;
+    assert!(plain.contains(rebase), "{plain}");
+}

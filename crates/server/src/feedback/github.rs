@@ -287,9 +287,10 @@ pub fn label_for(kind: FeedbackKind) -> &'static str {
 }
 
 /// The issue of submission `id` on `repo` that the signed-in user opened,
-/// found by the id the last line of every body Submit sends names: `gh
-/// issue list --repo=… --author=@me --state=all --search=<id> in:body
-/// --json=url --jq=.[0].url // ""`, within `gh.timeout`. A first line that
+/// found by the id the last line of every body Submit sends names, as a
+/// quoted phrase: `gh issue list --repo=… --author=@me --state=all
+/// --search="<id>" in:body --json=url --jq=.[0].url // ""`, within
+/// `gh.timeout`. A first line that
 /// is an issue of `repo` is that issue; an empty one is none; anything else
 /// is `gh_bad_answer` (and nothing may be created then).
 pub async fn find_issue(
@@ -300,7 +301,7 @@ pub async fn find_issue(
     let mut search = args(["issue", "list"]);
     search.push(repo.repo_arg());
     search.extend(args(["--author=@me", "--state=all"]));
-    search.push(format!("--search={id} in:body"));
+    search.push(format!("--search=\"{id}\" in:body"));
     search.extend(args(["--json=url", r#"--jq=.[0].url // """#]));
     match gh.run(&search, gh.timeout).await {
         Ok(None) => Ok(None),

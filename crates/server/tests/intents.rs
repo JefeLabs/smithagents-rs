@@ -2925,3 +2925,63 @@ async fn a_fixed_dependency_keeps_the_intent_in_its_repository() {
     assert_eq!(renamed.content.title, "Renamed");
     assert_eq!(renamed.content.depends_on, before.content.depends_on);
 }
+
+#[tokio::test]
+async fn a_base_branch_that_cannot_be_checked_out_is_a_fixed_sentence() {
+    // A-M7: git's words (here a path) never reach the start error. Both
+    // worktree directories the start tries are in the way.
+    let f = real_fx().await;
+    let (repo, _dir) = f.feedback_repo().await;
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+    let hex = x.id.0.simple().to_string();
+    for name in [
+        "intent-fix-the-zoom".to_owned(),
+        format!("intent-fix-the-zoom-{}", &hex[..6]),
+    ] {
+        let taken = f.paths.worktrees_dir().join("r1").join(name);
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("LEAK.txt"), "in the way").unwrap();
+    }
+
+    let err = f.svc.send(x.id).await.unwrap_err();
+
+    assert_eq!(err.code(), "base_branch_failed");
+    assert_eq!(
+        err.to_string(),
+        "The intent's base branch could not be checked out."
+    );
+    let now = f.svc.get(x.id).await.unwrap();
+    assert_eq!(now.state, IntentState::Complete);
+    assert_eq!(
+        now.last_start_error.as_deref(),
+        Some("could not start the agent: The intent's base branch could not be checked out.")
+    );
+    assert!(f.store.list_agents(true).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_branch_tracks_nothing_whatever_the_repository_says() {
+    // D-M4: with `branch.autoSetupMerge=always` the agent's bare `git push`
+    // would otherwise go to the local base branch.
+    let f = real_fx().await;
+    let (repo, dir) = f.feedback_repo().await;
+    common::git(&dir, &["config", "branch.autoSetupMerge", "always"]);
+    let x = f.complete_intent(&repo, Some("feedback/x"), None).await;
+
+    let sent = f.svc.send(x.id).await.unwrap();
+
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    for key in ["remote", "merge"] {
+        let name = format!("branch.{}.{key}", agent.branch);
+        assert_eq!(
+            git_stdout(&dir, &["config", "--get", &name]),
+            None,
+            "{name}"
+        );
+    }
+}

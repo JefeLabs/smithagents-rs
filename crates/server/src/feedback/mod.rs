@@ -507,6 +507,13 @@ impl FeedbackService {
         }
     }
 
+    /// How many `gh` runs without a usable answer are remembered (issues and
+    /// pull requests), tests only.
+    #[cfg(feature = "test-util")]
+    pub fn unconfirmed_for_test(&self) -> usize {
+        locked(&self.parts.unconfirmed).len() + locked(&self.parts.unconfirmed_prs).len()
+    }
+
     /// Submissions and idea actions being made now (waiting for their turn
     /// or running): the daemon is not idle while there is one.
     pub fn running_submissions(&self) -> usize {
@@ -1009,9 +1016,9 @@ impl FeedbackService {
                     .await
                     .map_err(FeedbackError::Intent)?,
             ),
-            (SendAs::Intent, None) => match self.create_intent(&s).await {
+            (SendAs::Intent, None) => match self.intent_for(&s).await {
                 Ok(intent) => {
-                    tracing::info!(submission_id = %s.id, step = "create_intent", "feedback intent created");
+                    tracing::info!(submission_id = %s.id, step = "create_intent", "feedback intent created or found");
                     s.intent_id = Some(intent.id);
                     s.updated_at = (self.clock)();
                     // The intent exists either way, so it is the answer (a
@@ -1048,6 +1055,33 @@ impl FeedbackService {
             issue_url: s.issue_url,
             failed,
         })
+    }
+
+    /// The submission's intent: one made for it before whose record was not
+    /// saved (the daemon stopped, or both saves failed), found by its origin
+    /// (this submission's folder, branch and commit, which only it has),
+    /// else a new one ([`Self::create_intent`]).
+    async fn intent_for(&self, s: &Submission) -> Result<Intent, IntentError> {
+        let filter = smithagents_core::intent::IntentFilter {
+            state: None,
+            repo_id: Some(s.repo_id),
+        };
+        let made = self
+            .store
+            .list_intents(filter)
+            .await
+            .map_err(IntentError::Store)?
+            .into_iter()
+            .find(|i| {
+                i.origin.as_ref().is_some_and(|o| {
+                    o.folder == s.folder && o.branch == s.branch && o.commit == s.commit
+                })
+            });
+        if let Some(made) = made {
+            tracing::info!(submission_id = %s.id, intent_id = %made.id, step = "create_intent", "taking up a feedback intent made before");
+            return Ok(made);
+        }
+        self.create_intent(s).await
     }
 
     /// An intent of the submission's kind, seeded from its text and the
@@ -1204,16 +1238,14 @@ impl FeedbackService {
             locked(&self.parts.unconfirmed).remove(&s.id);
             return Ok(url);
         }
-        let last = locked(&self.parts.unconfirmed).get(&s.id).copied();
-        if let Some(at) = last {
-            // A clock that went back counts as no time passed.
-            if (self.clock)() - at < chrono::TimeDelta::seconds(UNCONFIRMED_WAIT_SECS) {
-                return Err(FeedbackFailure {
-                    step: FeedbackStep::CreateIssue,
-                    code: "issue_unconfirmed".to_owned(),
-                    message: "GitHub has not confirmed whether the issue was created. Try again in a minute.".to_owned(),
-                });
-            }
+        if recent(&self.parts.unconfirmed, s.id, (self.clock)()) {
+            return Err(FeedbackFailure {
+                step: FeedbackStep::CreateIssue,
+                code: "issue_unconfirmed".to_owned(),
+                message:
+                    "GitHub has not confirmed whether the issue was created. Try again in a minute."
+                        .to_owned(),
+            });
         }
         let body = issue_text(s, repo, github).await?;
         let scratch = StagingDir::scratch(&self.staging_root(), s.id).map_err(|e| {
@@ -1273,6 +1305,21 @@ async fn issue_text(
             })
         }
     }
+}
+
+/// Whether `gh` ran for `id` without a usable answer less than
+/// [`UNCONFIRMED_WAIT_SECS`] before `now` (a clock that went back counts as
+/// no time passed). Every entry older than that is dropped from `map` here,
+/// so it never grows.
+fn recent<K: Eq + std::hash::Hash>(
+    map: &Mutex<HashMap<K, DateTime<Utc>>>,
+    id: K,
+    now: DateTime<Utc>,
+) -> bool {
+    let wait = chrono::TimeDelta::seconds(UNCONFIRMED_WAIT_SECS);
+    let mut map = locked(map);
+    map.retain(|_, at| now - *at < wait);
+    map.contains_key(&id)
 }
 
 /// A refusal at `step` after the commit, as a failure.
