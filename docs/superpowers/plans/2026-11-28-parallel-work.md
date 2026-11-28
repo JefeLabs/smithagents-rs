@@ -18,8 +18,8 @@ Last updated 2026-11-28.
 
 | Track | Part | State | Branch | Worktree | Taken by | Waits for |
 |---|---|---|---|---|---|---|
-| Folder mode | source control optional per repository | built; last review of the fixes running | `feat/folder-mode` | `.worktrees/workspaces` | `smithagents-rs-51` | the owner: pull request and merge |
-| D1 | plugin typed data and tools in the daemon | design approved, plan written (`plans/2026-11-28-plugin-typed-data-and-tools.md`, not committed yet) | `feat/plugin-typed-data` | `.worktrees/plugin-typed-data` | nobody yet | folder mode merged, or stacked on it |
+| Folder mode | source control optional per repository | merged into `main` on this machine on 2026-11-28; not pushed | (merged) | (removed) | `smithagents-rs-51` | the owner: push `main` |
+| D1 | plugin typed data and tools in the daemon | design approved, plan written (`plans/2026-11-28-plugin-typed-data-and-tools.md`, not committed yet) | `feat/plugin-typed-data` | `.worktrees/plugin-typed-data` | nobody yet | nothing: it can start from `main` |
 | C1 | resource and usage limits | facts gathered, no design | `design/resource-limits` | `.worktrees/resource-limits` | nobody yet | a design the owner approves |
 | B1 | several Workspaces and remote runtimes | decisions recorded, no design | `design/remote-runtimes` | `.worktrees/remote-runtimes` | nobody yet | a design the owner approves |
 | A1 | secrets service and the agent environment | decisions recorded, no design | `design/secrets-service` | `.worktrees/secrets-service` | nobody yet | D1 merged |
@@ -65,23 +65,22 @@ Take a number here before you write the file that uses it.
 
 | Thing | In use | Reserved | Rule |
 |---|---|---|---|
-| Database migrations (`crates/server/migrations`) | `0001` to `0004` on `main`; `0005_source_control` (folder mode) | `0006` for D1; `0007` for C1 | A migration's number is final once it is on `main`. An unmerged branch renames its file if another branch merged first; a development database made from the unmerged branch is then thrown away. |
-| `smithagents_core::PROTOCOL` | `1` on `main`; `2` (folder mode) | none | It goes up by one, at merge time, in every branch that changes what goes over the wire incompatibly: rebase, then take `main`'s number plus one. |
+| Database migrations (`crates/server/migrations`) | `0001` to `0005` on `main` (`0005_source_control` is folder mode's) | `0006` for D1; `0007` for C1 | A migration's number is final once it is on `main`. An unmerged branch renames its file if another branch merged first; a development database made from the unmerged branch is then thrown away. |
+| `smithagents_core::PROTOCOL` | `2` on `main` (folder mode) | none | It goes up by one, at merge time, in every branch that changes what goes over the wire incompatibly: rebase, then take `main`'s number plus one. |
 | Plugin contract version | `1` | `2` for D3 (actions) | D1 keeps it at 1 on purpose. |
 | Error codes | the nine of folder mode (see its plan) | | A code is never reused with another meaning. Search `status_and_code` before adding one. |
 
 ## The order things merge in
 
-1. Folder mode merges first. Everything else is based on it.
+1. Folder mode merged first (done). Everything else is based on it.
 2. D1 before anything in chain A.
 3. Otherwise first ready, first merged. Before its last full check a branch
    rebases onto `main`; the check that counts is the one after the rebase.
 4. A branch is merged with a merge commit pinned to the commit that was
    checked, and only when the owner says so.
 
-A branch may be started before folder mode is merged by basing it on
-`feat/folder-mode` and rebasing onto `main` once that has merged. Say so on
-the board.
+Until `main` is pushed, "`main`" here means the `main` of this machine's
+checkout, which is ahead of `origin/main` by folder mode.
 
 ## Rules every track follows
 
@@ -107,9 +106,8 @@ the board.
 
 ## Open with the owner
 
-- Folder mode: open the pull request and merge.
-- Who builds D1, and whether it starts now, stacked on folder mode, or after
-  the merge.
+- Pushing `main`: folder mode is merged on this machine only.
+- Who builds D1, and when it starts.
 - The plugin plan and its design are not committed: they sit untracked in the
   root checkout.
 - Folder mode's queue rule: an intent holds its plain folder until it is
