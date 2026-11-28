@@ -20,6 +20,11 @@ use tokio::net::TcpStream;
 
 const DAEMON: &str = env!("CARGO_BIN_EXE_smithagentsd");
 const FAKE_CLAUDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/bin/fake-claude");
+/// A turn that says hello and completes, for `FAKE_CLAUDE_FIXTURE`.
+const HELLO_TURN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/claude_stream_hello.jsonl"
+);
 /// Upper bound for anything the daemon should do promptly (start, answer, exit).
 const PATIENCE: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(25);
@@ -682,25 +687,31 @@ async fn a_daemon_runs_no_git_until_git_is_asked_for() {
     let home = tmp.path().join("home");
     let calls = tmp.path().join("git-calls");
     let git = recording_git(&tmp.path().join("bin"), &calls);
-    let mut daemon = Daemon::spawn(
+    let mut daemon = Daemon::spawn_with_env(
         tmp.path(),
         "daemon",
         &home,
         &["--git-bin", git.to_str().unwrap()],
         None,
+        &[("FAKE_CLAUDE_FIXTURE", Some(OsStr::new(HELLO_TURN)))],
     );
     let info = daemon.wait_for_lockfile(&home).await;
     let client = smithagents_client::Client::new(&info);
     assert_eq!(client.health().await.unwrap().git, None);
 
-    // A git repository added as a plain folder runs no git either.
+    // A git repository added as a plain folder runs no git either, nor does
+    // an agent working in it.
     let folder = tmp.path().join("folder");
     make_git_repo(&folder);
     let plain = client
         .add_repo(&folder, AddSourceControl::None)
         .await
         .unwrap();
-    assert_eq!(client.list_repos().await.unwrap(), vec![plain]);
+    assert_eq!(client.list_repos().await.unwrap(), vec![plain.clone()]);
+    let agent = client.create_agent(plain.id).await.unwrap();
+    client.send_message(agent.id, "hello").await.unwrap();
+    let ended = turn_ended(&client, &daemon, agent.id).await;
+    assert_eq!(ended.state, AgentState::Done, "log:\n{}", daemon.log_text());
     assert_eq!(client.health().await.unwrap().git, None);
     assert!(
         !calls.exists(),
@@ -720,6 +731,86 @@ async fn a_daemon_runs_no_git_until_git_is_asked_for() {
     assert_eq!(client.health().await.unwrap().git, Some(true));
     let ran = std::fs::read_to_string(&calls).unwrap();
     assert!(ran.lines().any(|call| call == "--version"), "{ran}");
+}
+
+/// Agent `id` once its turn has ended (`Done` or `Dead`).
+async fn turn_ended(client: &smithagents_client::Client, daemon: &Daemon, id: AgentId) -> Agent {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let agents = client.list_agents(false).await.unwrap();
+        let agent = agents.into_iter().find(|a| a.id == id).expect("open agent");
+        if matches!(agent.state, AgentState::Done | AgentState::Dead) {
+            return agent;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the turn did not end; log:\n{}",
+            daemon.log_text()
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_plain_folder_is_worked_in_without_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let no_git = tmp.path().join("no-such-git");
+    let mut daemon = Daemon::spawn_with_env(
+        tmp.path(),
+        "daemon",
+        &home,
+        &["--git-bin", no_git.to_str().unwrap()],
+        None,
+        &[("FAKE_CLAUDE_FIXTURE", Some(OsStr::new(HELLO_TURN)))],
+    );
+    let info = daemon.wait_for_lockfile(&home).await;
+    let client = smithagents_client::Client::new(&info);
+
+    // A git repository, made with the test's own git and holding a file
+    // git does not track, added as a plain folder.
+    let folder = tmp.path().join("folder");
+    make_git_repo(&folder);
+    std::fs::write(folder.join("notes.txt"), "draft\n").unwrap();
+    let git_state = || {
+        [
+            &["status", "--porcelain"][..],
+            &["log", "--all", "--format=%H %s"],
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+            &["worktree", "list", "--porcelain"],
+        ]
+        .map(|args| git_out(&folder, args))
+    };
+    let before = git_state();
+    assert_eq!(before[0], "?? notes.txt");
+    let plain = client
+        .add_repo(&folder, AddSourceControl::None)
+        .await
+        .unwrap();
+
+    let agent = client
+        .create_agent(plain.id)
+        .await
+        .unwrap_or_else(|e| panic!("{e}; log:\n{}", daemon.log_text()));
+    assert_eq!(agent.worktree_path, plain.path);
+    assert_eq!(agent.branch, None);
+    client.send_message(agent.id, "hello").await.unwrap();
+    let ended = turn_ended(&client, &daemon, agent.id).await;
+    assert_eq!(ended.state, AgentState::Done, "log:\n{}", daemon.log_text());
+    assert_eq!(ended.worktree_path, plain.path);
+    let reply = client.messages(agent.id, 0).await.unwrap();
+    assert_eq!(
+        reply.last().map(|m| m.text.as_str()),
+        Some("Hi! How can I help you today?")
+    );
+
+    assert_eq!(git_state(), before, "the folder's git is as it was");
+    assert_eq!(
+        client.health().await.unwrap().git,
+        None,
+        "git was not looked for"
+    );
+    assert!(daemon.exited().is_none(), "log:\n{}", daemon.log_text());
 }
 
 /// A daemon whose HOME is the test's own, `<tmp>/user-home`, holding
