@@ -778,12 +778,8 @@ From a design conversation about using SmithAgents without git. Each line is
   daemon persists no credential, so a secret is always a pointer to a
   provider, an environment variable or a command. [the pointer rule is my
   reading of the anti-goal]
-- **Order** [my call]: (1) folder mode, in
-  `2026-11-27-folder-mode-design.md`; (2) the secrets service and the
-  agent environment; (3) the sign-in service and its Settings section;
-  (4) hosts through plugins, with clone from a provider; (5) several
-  Workspaces and remote runtimes; (6) runtime providers that create Coder
-  spaces and RunPod pods. Only (1) is needed to use SmithAgents without git.
+- **Order**: see "Roadmap after folder mode" below, which replaces the list
+  of six parts that stood here.
 - **Start page** [my call]: choosing or creating a Workspace, and the
   progress of a remote install, are a page inside the main window, not a
   separate splash window.
@@ -795,6 +791,64 @@ From a design conversation about using SmithAgents without git. Each line is
   for the machine, a budget per day for tokens, queued intents only, and
   starts spaced out so a measurement can catch up; to build after folder
   mode, whose plan changes the same queue function]
+
+### Roadmap after folder mode (2026-11-28) [my call unless marked]
+
+Folder mode (`2026-11-27-folder-mode-design.md`) merges first: every chain
+below builds on its changes. After it, the work is four chains. Inside a
+chain the order is fixed; the chains can run side by side.
+
+```
+Chain A  credentials and hosts
+  A1 secrets service: providers such as Keeper, and the named environment
+     variables an agent's process is given         needs D1
+  A2 sign-in service and its Settings section      needs A1
+  A3 hosts through plugins: pull requests, issues, clone from a provider,
+     built as plugin actions                       needs A2 and D3
+
+Chain B  where a Workspace runs
+  B1 several Workspaces and remote runtimes (SSH to install and recover,
+     HTTPS and WebSockets for data)
+  B2 runtime providers that create Coder spaces and RunPod pods
+                                                   needs B1 and A2
+  B3 one Workspace across several runtimes (open question below)
+                                                   needs B1
+
+Chain C  resource and usage limits (stands alone)
+  C1 CPU, memory and free disk space of the daemon's machine, the tokens
+     and cost of each turn, the plan's own usage windows; each can hold the
+     queue. Called a "monitor" in the conversation; renamed here because
+     chain D has "Monitors and alerts" for plugin records.
+
+Chain D  the plugin design, `2026-11-27-plugin-tools-views-actions-design.md`
+         [owner approved 2026-11-28], in its own seven plans
+  D1 typed data and tools in the daemon
+     (`plans/2026-11-28-plugin-typed-data-and-tools.md`, ready to build)
+  D2 tools in the app                              needs D1
+  D3 actions                                       needs D1 and D2
+  D4 command plugins                               needs D1
+  D5 monitors and alerts                           needs D1
+  D6 vocabulary overrides and links
+  D7 prompt-based operations                       needs D1 and D2
+```
+
+Why the links between chains:
+
+- **A1 waits for D1.** D1's first task renames the manifest's `[[tools]]` to
+  `[[commands]]` and `from_tool` to `from_command`, the code the secrets
+  service is built on.
+- **A3 is built on D3.** The plugin design's actions are how a plugin changes
+  something in a service, with the owner's approval; opening a pull request
+  or an issue is one of them. The plugin design leaves sign-in screens and
+  the provider role out, which A1 and A2 supply.
+- **Everything shares a few files**: the daemon's routes, the database
+  migrations (take the next free number, as D1's plan says), the protocol
+  number, and the Settings pane. Two builds at once is comfortable on one
+  machine; the full check uses all of it for about six minutes.
+
+What can run side by side once folder mode is merged: D1 (the only part with
+a finished plan), C1's design and build, and B1's design. Chain A waits for
+D1. Only folder mode was needed to use SmithAgents without git.
 
 ### Open questions (owner only)
 
