@@ -151,9 +151,9 @@ contract; the manifest must be allowed to have zero resources]
 
 ## The meta repository
 
-One per Space (one daemon is one Space): the repository that holds the
-Space's intents and feedback files. [owner] It is one of the Space's source
-repositories, chosen in Settings → Source repositories ("Use for intents and
+One per Workspace (one daemon is one Workspace; called a Space before
+2026-11-27): the repository that holds the Workspace's intents and feedback
+files. [owner] It is one of the Workspace's source repositories, chosen in Settings → Source repositories ("Use for intents and
 feedback"). With a single source repository it is that one. Until it is
 set, the picker has no default and Submit asks for a repository.
 
