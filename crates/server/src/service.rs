@@ -162,7 +162,10 @@ struct Inner {
     /// Serializes `create_agent` so concurrent creates never pick the same name or color.
     create_lock: tokio::sync::Mutex<()>,
     /// Serializes adding repositories and switching their source control,
-    /// so two cannot both pass the overlap check.
+    /// so two cannot both pass the overlap check. Feedback holds it too
+    /// ([`AgentService::hold_repos`]) around its check of a repository's
+    /// source control and the insert of an intent with an origin there, or
+    /// the store of the META choice.
     repos_lock: tokio::sync::Mutex<()>,
     reserved: Mutex<Reserved>,
 }
@@ -207,6 +210,8 @@ impl Reservation {
     /// Claims the folder of plain repository `repo` as well; `FolderBusy`
     /// while another agent's turn holds it.
     fn claim_folder(&mut self, repo: RepoId) -> Result<(), ServiceError> {
+        // A second claim would overwrite the first, which then never frees.
+        debug_assert!(self.folder.is_none(), "a reservation holds one folder");
         if !self.inner.reserved().folders.insert(repo) {
             return Err(ServiceError::FolderBusy);
         }
@@ -428,7 +433,7 @@ impl AgentService {
     /// source control under it stays true until the guard is dropped. The
     /// feedback service holds it while it checks a repository and makes an
     /// intent with an origin there, or stores the META choice.
-    pub async fn hold_repos(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    pub(crate) async fn hold_repos(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.repos_lock.lock().await
     }
 
@@ -1436,8 +1441,8 @@ mod tests {
         std::fs::create_dir_all(fx.repo_dir.join("docs")).unwrap();
         let with_slash = PathBuf::from(format!("{}/", x.display()));
 
-        #[allow(unused_mut)]
         let missing = fx.tmp.path().join("missing");
+        #[allow(unused_mut)]
         let mut refused = vec![
             x.join("sub"),
             x.parent().unwrap().to_owned(),
@@ -2731,6 +2736,28 @@ mod tests {
         ) -> Result<StructuredResult, HarnessError> {
             Err(HarnessError::Failed("not used".into()))
         }
+    }
+
+    #[tokio::test]
+    async fn a_reservation_dropped_with_its_folder_frees_both() {
+        let fx = fixture(vec![a_turn()]).await;
+        let plain = add_plain(&fx, "notes").await;
+        let a = fx.svc.create_agent(plain.id).await.unwrap();
+        let b = fx.svc.create_agent(plain.id).await.unwrap();
+        // A turn's claim given up before the turn runs (an early return, or
+        // a caller that stops waiting) is released by its `Drop`.
+        let mut r = fx.svc.reserve(a.id, Slot::Turn).unwrap();
+        r.claim_folder(plain.id).unwrap();
+        assert!(fx.svc.folder_busy(plain.id) && fx.svc.turn_in_flight(a.id));
+        drop(r);
+        assert!(!fx.svc.folder_busy(plain.id), "the folder is free");
+        assert!(!fx.svc.turn_in_flight(a.id), "and so is the agent");
+        // Another agent of the folder can send at once.
+        let mut rx = fx.live();
+        fx.svc.send_message(b.id, "go".into()).await.unwrap();
+        until_turn_ends(&mut rx, b.id).await;
+        assert!(!fx.svc.folder_busy(plain.id));
+        assert_eq!(fx.agent(b.id).await.state, AgentState::Done);
     }
 
     #[tokio::test]

@@ -1256,7 +1256,10 @@ impl FeedbackService {
     /// made under [`AgentService::hold_repos`], the lock source control is
     /// switched under: either the intent exists before the repository is
     /// switched, which then refuses (`repo_has_feedback_intents`), or the
-    /// switch came first and no intent is made.
+    /// switch came first and no intent is made. The lock is held here while
+    /// [`IntentService::create_with`] runs its insert detached, so a caller
+    /// must not drop this future before it ends, or the insert could land
+    /// after a switch; every route that reaches it is detached today.
     async fn create_feedback_intent(
         &self,
         req: CreateIntentRequest,

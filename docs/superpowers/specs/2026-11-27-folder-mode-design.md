@@ -259,6 +259,13 @@ and rebase:
   or its agents.
 - Each new refusal (`folder_busy`, `repo_in_use`, `git_not_installed`, the
   META one) has its own sentence, like the existing repository errors.
+- A queued intent on a plain repository says why it waits when no
+  dependency holds it. While another intent of the repository is Sent and
+  its agent is still open (the one sent first, by its title):
+  `Waiting for "<that intent's title>" to be resolved or its agent closed. One intent works in this folder at a time.`
+  Else, while an agent that works in place there is Working or Quiet:
+  `Waiting: another agent is working in this folder.` Otherwise, and on a
+  git repository, the slot sentence stays.
 
 ### Upgrade
 
