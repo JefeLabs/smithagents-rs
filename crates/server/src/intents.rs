@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
 use smithagents_core::agent::{AgentState, Repo};
 use smithagents_core::event::{Event, EventKind};
@@ -951,10 +951,13 @@ impl IntentService {
     // ------------------------------------------------------------- execution
 
     /// Sends a `Complete` intent to a new agent, writing its `Send` version.
-    /// It starts now when every accepted dependency is `Resolved` and the
-    /// queue has a slot for it (older ready intents go first); otherwise it
-    /// becomes `Queued` for the scheduler. A failed immediate start returns
-    /// the error and leaves the intent `Complete` with `last_start_error` set.
+    /// It starts now when every accepted dependency is `Resolved`, the queue
+    /// has a slot for it (older ready intents go first) and its folder is not
+    /// held; otherwise it becomes `Queued` for the scheduler. So it does when
+    /// another agent's turn takes its plain folder before the new agent's
+    /// first message: `folder_busy` is answered only to a chat message. A
+    /// failed immediate start returns the error and leaves the intent
+    /// `Complete` with `last_start_error` set.
     pub async fn send(&self, id: IntentId) -> Result<Intent, IntentError> {
         let svc = self.clone();
         detached(async move { svc.send_now(id).await }).await
@@ -983,18 +986,31 @@ impl IntentService {
         if queue::next_startable(&queued, &resolved, running, limit, &held).contains(&id) {
             return self.start_reserved(intent).await;
         }
-        intent.state = IntentState::Queued;
-        intent.queued_at = Some(now);
-        intent.last_start_error = None;
-        touch(&mut intent);
-        store
-            .save_intent_with_version(&intent, &snapshot(&intent, VersionAuthor::Send))
-            .await?;
-        self.publish_updated(&intent);
+        self.save_queued(&mut intent, now).await?;
         drop(reservation);
         drop(starts);
         self.kick_scheduler();
         Ok(intent)
+    }
+
+    /// Saves a `Complete` intent as `Queued` at `queued_at`, with its `Send`
+    /// version and no start error, as Send leaves an intent that cannot start
+    /// now, and publishes it.
+    async fn save_queued(
+        &self,
+        intent: &mut Intent,
+        queued_at: DateTime<Utc>,
+    ) -> Result<(), IntentError> {
+        intent.state = IntentState::Queued;
+        intent.queued_at = Some(queued_at);
+        intent.last_start_error = None;
+        touch(intent);
+        self.inner
+            .store
+            .save_intent_with_version(intent, &snapshot(intent, VersionAuthor::Send))
+            .await?;
+        self.publish_updated(intent);
+        Ok(())
     }
 
     /// Plain repositories the queue may not start an intent on now. Their
@@ -1043,8 +1059,11 @@ impl IntentService {
     /// Starts the intent's agent now, from `Complete` (writing the `Send`
     /// version, as `send` does) or `Queued`. An intent already `Sent` is
     /// returned unchanged, so repeated or concurrent starts make one agent.
-    /// Dependencies and the queue limit are not checked here: the scheduler
-    /// and [`Self::send`] decide when to start.
+    /// Dependencies, the queue limit and held folders are not checked here:
+    /// the scheduler and [`Self::send`] decide when to start. An intent whose
+    /// plain folder another agent's turn takes before its agent's first
+    /// message is returned `Queued` (a `Complete` one queued as `send`
+    /// queues it), with no start error.
     pub async fn start(&self, id: IntentId) -> Result<Intent, IntentError> {
         let svc = self.clone();
         detached(async move {
@@ -1065,6 +1084,11 @@ impl IntentService {
     /// saved as `Sent`. On a failure the intent keeps its state, with the
     /// error in `last_start_error`; an agent already made is closed.
     ///
+    /// A first message refused with `FolderBusy` is no failed start: another
+    /// agent's turn took the plain folder after the decision to start, so the
+    /// folder is held. The agent is closed, and the intent waits `Queued`
+    /// with no start error for the scheduler, which that turn's end wakes.
+    ///
     /// An open agent already attached to the intent (left by a start that
     /// stopped between creating it and saving `Sent`, or by a failed start
     /// whose agent could not be closed) blocks the start until it is closed,
@@ -1084,6 +1108,14 @@ impl IntentService {
         }
         let agent_id = match self.launch_agent(&intent).await {
             Ok(id) => id,
+            Err(IntentError::Service(ServiceError::FolderBusy)) => {
+                tracing::debug!(intent_id = %intent.id, "another agent's turn took the folder; the intent waits");
+                if intent.state == IntentState::Complete {
+                    self.save_queued(&mut intent, Utc::now()).await?;
+                    self.kick_scheduler();
+                }
+                return Ok(intent);
+            }
             Err(e) => {
                 tracing::warn!(intent_id = %intent.id, "could not start the intent's agent: {e}");
                 self.record_start_error(&mut intent, format!("could not start the agent: {e}"))

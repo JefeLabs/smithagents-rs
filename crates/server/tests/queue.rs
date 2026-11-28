@@ -1053,6 +1053,98 @@ async fn intents_on_one_plain_folder_run_one_after_the_other() {
     assert_eq!((agent.branch, agent.worktree_path), (None, folder.path));
 }
 
+impl Fx {
+    /// Holds the gate and starts a chat turn of a new agent of `folder`,
+    /// started for no intent: the folder is busy until a release.
+    async fn chat_in(&self, folder: &Repo) -> Agent {
+        self.h.hold();
+        let chat = self.agents.create_agent(folder.id).await.unwrap();
+        self.agents
+            .send_message(chat.id, "hello".into())
+            .await
+            .unwrap();
+        assert!(self.agents.folder_busy(folder.id));
+        chat
+    }
+}
+
+/// `start` does not look at held folders, so a start while a chat turn runs
+/// in the folder is a chat turn taking the folder between the decision to
+/// start an intent and its agent's first message.
+#[tokio::test]
+async fn a_start_that_finds_the_folder_taken_waits_with_no_start_error() {
+    let f = fx().await;
+    let folder = f.plain_repo().await;
+    f.chat_in(&folder).await;
+    let mut q = f.intent_on(&folder, "q", &[]).await;
+    q.state = IntentState::Queued;
+    q.queued_at = Some(Utc::now());
+    f.store.save_intent(&q).await.unwrap();
+    // Complete, as Send hands an intent to the start.
+    let x = f.intent_on(&folder, "x", &[]).await;
+
+    // A queued intent stays as it is.
+    let waiting = f.svc.start(q.id).await.unwrap();
+    assert_eq!(
+        (waiting.state, waiting.last_start_error.clone()),
+        (IntentState::Queued, None)
+    );
+    assert_eq!(f.get(q.id).await, q);
+    let made = f.agents_for(q.id).await;
+    assert_eq!(made.len(), 1);
+    assert!(made[0].closed_at.is_some());
+
+    // A complete one is queued as Send queues it.
+    let seq = f.bus.latest_seq();
+    let queued = f.svc.start(x.id).await.unwrap();
+    assert_eq!(
+        (queued.state, queued.last_start_error.clone()),
+        (IntentState::Queued, None)
+    );
+    assert!(queued.queued_at.is_some());
+    assert_eq!(f.get(x.id).await, queued);
+    assert_eq!(
+        f.authors(x.id).await,
+        [VersionAuthor::Seed, VersionAuthor::Send]
+    );
+    assert_eq!(f.updates_since(seq, x.id).last(), Some(&queued));
+    assert!(f
+        .agents_for(x.id)
+        .await
+        .iter()
+        .all(|a| a.closed_at.is_some()));
+
+    // The chat turn ends: the scheduler starts the older one with no other
+    // call, and the folder is then its.
+    f.h.release(1);
+    let sent = f.wait_sent(q.id).await;
+    assert_eq!(sent.last_start_error, None);
+    f.sched().run_pass().await;
+    let later = f.get(x.id).await;
+    assert_eq!(
+        (later.state, later.last_start_error),
+        (IntentState::Queued, None)
+    );
+}
+
+#[tokio::test]
+async fn send_while_a_chat_turn_runs_in_the_folder_queues() {
+    let f = fx().await;
+    let folder = f.plain_repo().await;
+    f.chat_in(&folder).await;
+    let x = f.intent_on(&folder, "x", &[]).await;
+
+    let queued = f.svc.send(x.id).await.unwrap();
+
+    assert_eq!(
+        (queued.state, queued.last_start_error),
+        (IntentState::Queued, None)
+    );
+    assert!(f.agents_for(x.id).await.is_empty());
+    f.h.release(1);
+    f.wait_sent(x.id).await;
+}
+
 #[tokio::test]
 async fn closing_the_agent_frees_the_folder_for_the_next_intent() {
     let f = fx().await;
