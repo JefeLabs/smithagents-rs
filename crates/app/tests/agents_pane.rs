@@ -46,7 +46,7 @@ use smithagents_app::views::agents::{
 use smithagents_app::views::rail::RailEntry;
 use smithagents_app::views::tabs::TOGGLE_AGENTS_ID;
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, AgentState, Repo, SourceControl};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, Repo, SourceControl};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
@@ -98,7 +98,11 @@ impl AgentCommands for FakeCommands {
         async move { result }.boxed_local()
     }
     /// The agents pane never adds a repository.
-    fn add_repo(&self, path: &std::path::Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+    fn add_repo(
+        &self,
+        path: &std::path::Path,
+        _: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         panic!("the agents pane added a repository: {}", path.display())
     }
 }

@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{self, BoxStream, StreamExt};
-use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo, Role};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, ChatMessage, Repo, Role};
 use smithagents_core::event::EventKind;
 use smithagents_core::ids::{AgentId, IntentId, ItemId};
 use smithagents_core::intent::{
@@ -155,7 +155,10 @@ async fn fx_with(quiet_after: Duration) -> Fx {
     );
     let repo_dir = tmp.path().join("repo");
     common::init_repo(&repo_dir);
-    let repo = agents.add_repo(&repo_dir).await.unwrap();
+    let repo = agents
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let svc = service(&store, &bus, &h, &agents, &paths);
     let sched = Scheduler::start(svc.clone(), agents.clone(), store.clone(), bus.clone());
     Fx {

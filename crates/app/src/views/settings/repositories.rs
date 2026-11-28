@@ -27,7 +27,7 @@ use gpui_kit::{
     PathPromptOptions, Role, StatefulInteractiveElement as _, Styled as _, TestSupportExt as _,
     Window,
 };
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{AddSourceControl, Repo};
 use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::RepoId;
 
@@ -167,7 +167,9 @@ impl SettingsPane {
             (
                 state
                     .agent_commands()
-                    .map(|commands| commands.add_repo(&path)),
+                    // A git repository until the add flow offers the
+                    // choice of three.
+                    .map(|commands| commands.add_repo(&path, AddSourceControl::Git)),
                 state.command_timeout(),
             )
         };

@@ -50,7 +50,7 @@ use smithagents_app::views::settings::{
     TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID, THEME_LABEL, THEME_OPTIONS_ID,
 };
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, Repo, SourceControl};
+use smithagents_core::agent::{AddSourceControl, Agent, Repo, SourceControl};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_theme::native::NativeTheme;
 use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
@@ -61,6 +61,8 @@ use smithagents_theme::tokens::{Appearance, ThemeSet};
 #[derive(Default)]
 struct FakeRepos {
     adds: RefCell<Vec<PathBuf>>,
+    /// The source control each add asked for.
+    choices: RefCell<Vec<AddSourceControl>>,
     results: RefCell<VecDeque<Result<Repo, LinkError>>>,
     pending: RefCell<Vec<oneshot::Sender<Result<Repo, LinkError>>>>,
 }
@@ -81,8 +83,13 @@ impl AgentCommands for FakeRepos {
         panic!("the settings pane closed an agent")
     }
 
-    fn add_repo(&self, path: &Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+    fn add_repo(
+        &self,
+        path: &Path,
+        choice: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         self.adds.borrow_mut().push(path.to_owned());
+        self.choices.borrow_mut().push(choice);
         if let Some(result) = self.results.borrow_mut().pop_front() {
             return async move { result }.boxed_local();
         }
@@ -674,6 +681,11 @@ fn adding_a_path_sends_one_add_disables_the_controls_and_clears_on_success(
         *setup.commands.adds.borrow(),
         [PathBuf::from("/src/my app")],
         "exactly one add, with the trimmed path"
+    );
+    assert_eq!(
+        *setup.commands.choices.borrow(),
+        [AddSourceControl::Git],
+        "a git repository, until the add flow offers the choice"
     );
     assert!(add_disabled(cx, window), "disabled while the add runs");
     with_window(cx, window, |window, _| {

@@ -26,6 +26,7 @@ use smithagents_app::intent_vm::{
 use smithagents_app::link::{DaemonLink, LinkConfig};
 use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_client::SpawnOptions;
+use smithagents_core::agent::AddSourceControl;
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{
     AnswerInput, CreateIntentRequest, Intent, IntentKind, ReviewAction, SeedInput,
@@ -208,7 +209,10 @@ async fn create_review_send_through_the_link() {
         shell.next("connected").await,
         Action::ConnectionChanged(Connection::Connected)
     );
-    let repo = link.add_repo(&repo_dir).await.unwrap();
+    let repo = link
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
 
     // Create: pass 1 proposes the title, the body and one question; the
     // kind chosen at create is kept.

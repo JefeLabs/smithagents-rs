@@ -22,12 +22,12 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
 use axum::http::{header, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
-use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, ChatMessage, Repo};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::feedback::{
     FeedbackOutcome, FeedbackSettings, FeedbackTargets, SubmissionId,
@@ -45,6 +45,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::events::{BusError, EventBus, Subscription};
 use crate::feedback::{upload, FeedbackError, FeedbackService};
+use crate::git;
 use crate::intents::{IntentError, IntentService};
 use crate::plugins::{clean_message, ManagerError, PluginManager};
 use crate::service::{AgentService, ServiceError};
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/repos", post(add_repo).get(list_repos))
+        .route("/v1/repos/{id}", patch(set_source_control))
         .route("/v1/agents", post(create_agent).get(list_agents))
         .route("/v1/agents/{id}/close", post(close_agent))
         .route(
@@ -604,7 +606,9 @@ fn agent_id(raw: &str) -> Result<AgentId, ApiError> {
 // -------------------------------------------------------------- handlers
 
 /// `latest_seq` and `instance_id` let a client tell whether its last seen
-/// event seq still means anything: seqs restart with every daemon.
+/// event seq still means anything: seqs restart with every daemon. `git`
+/// says whether git could be run when last checked, which costs nothing
+/// here: clients poll this while a daemon starts.
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "version": smithagents_core::VERSION,
@@ -614,18 +618,55 @@ async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
         "latest_seq": s.bus.latest_seq(),
         "running_agents": s.service.running_agent_count(),
         "ws_clients": s.ws_clients.load(Ordering::SeqCst),
+        "git": git::installed_when_last_checked().await,
     }))
 }
 
 #[derive(Deserialize)]
 struct AddRepoBody {
     path: PathBuf,
+    /// Absent or `null`: `none`, a plain folder.
+    #[serde(default)]
+    source_control: Option<AddSourceControl>,
 }
 
 async fn add_repo(State(s): State<AppState>, body: Bytes) -> Result<Json<Repo>, ApiError> {
-    let AddRepoBody { path } = json_body(&body)?;
+    let AddRepoBody {
+        path,
+        source_control,
+    } = json_body(&body)?;
     let svc = s.service;
-    detached(async move { svc.add_repo(&path).await })
+    detached(async move {
+        svc.add_repo(&path, source_control.unwrap_or_default())
+            .await
+    })
+    .await
+    .map(Json)
+}
+
+/// What `PATCH /v1/repos/{id}` switches a repository to.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SwitchTo {
+    None,
+    Git,
+}
+
+#[derive(Deserialize)]
+struct SetSourceControlBody {
+    source_control: SwitchTo,
+}
+
+async fn set_source_control(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<Repo>, ApiError> {
+    let id: RepoId = path_id(&id, "repo")?;
+    let SetSourceControlBody { source_control } = json_body(&body)?;
+    let on = matches!(source_control, SwitchTo::Git);
+    let svc = s.service;
+    detached(async move { svc.set_source_control(id, on).await })
         .await
         .map(Json)
 }

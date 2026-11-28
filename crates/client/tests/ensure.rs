@@ -14,7 +14,7 @@ use serde_json::json;
 use smithagents_client::{
     ensure_daemon, ensure_daemon_with, Client, ClientError, EnsureError, SpawnOptions,
 };
-use smithagents_core::agent::{AgentState, ChatMessage, Role};
+use smithagents_core::agent::{AddSourceControl, AgentState, ChatMessage, Role};
 use smithagents_core::daemon::{lockfile_path, read_lockfile, DaemonInfo};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, MessageId};
@@ -786,7 +786,10 @@ async fn restarted_daemon_rejects_a_seq_from_before_the_restart() {
         let repo_dir = home.scratch().join("repo");
         init_repo(&repo_dir);
         let client = ensure(&home).await;
-        let repo = client.add_repo(&repo_dir).await.unwrap();
+        let repo = client
+            .add_repo(&repo_dir, AddSourceControl::Git)
+            .await
+            .unwrap();
         client.create_agent(repo.id).await.unwrap();
         client.create_agent(repo.id).await.unwrap();
         let before = client.health().await.unwrap();
@@ -828,7 +831,10 @@ async fn events_stream_yields_agent_created() {
         let repo_dir = home.scratch().join("repo");
         init_repo(&repo_dir);
         let client = ensure(&home).await;
-        let repo = client.add_repo(&repo_dir).await.unwrap();
+        let repo = client
+            .add_repo(&repo_dir, AddSourceControl::Git)
+            .await
+            .unwrap();
 
         let mut live = client.events(None).await.unwrap();
         let agent = client.create_agent(repo.id).await.unwrap();
@@ -861,9 +867,9 @@ async fn client_covers_the_api() {
         .unwrap_or_else(|e| panic!("ensure_daemon_with failed: {e}; log:\n{}", home.log()));
 
         assert_eq!(client.list_repos().await.unwrap(), vec![]);
-        let repo = client.add_repo(&repo_dir).await.unwrap();
+        let repo = client.add_repo(&repo_dir, AddSourceControl::Git).await.unwrap();
         assert_eq!(client.list_repos().await.unwrap(), vec![repo.clone()]);
-        let dup = client.add_repo(&repo_dir).await.unwrap_err();
+        let dup = client.add_repo(&repo_dir, AddSourceControl::Git).await.unwrap_err();
         assert!(
             matches!(&dup, ClientError::Api { status: 409, code, .. } if code == "repo_exists"),
             "{dup:?}"

@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
-use smithagents_core::agent::{Agent, Repo, Role};
+use smithagents_core::agent::{AddSourceControl, Agent, Repo, Role};
 use smithagents_core::event::EventKind;
 use smithagents_core::feedback::FeedbackOrigin;
 use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
@@ -370,7 +370,10 @@ impl Fx {
     async fn repo(&self, name: &str) -> Repo {
         let dir = self.tmp.path().join(name);
         common::init_repo(&dir);
-        self.agents.add_repo(&dir).await.unwrap()
+        self.agents
+            .add_repo(&dir, AddSourceControl::Git)
+            .await
+            .unwrap()
     }
 
     async fn agent(&self, repo: &Repo) -> Agent {
@@ -2421,7 +2424,13 @@ impl Fx {
         common::git(&dir, &["add", "--", "docs/issues/x/issue.md"]);
         common::git(&dir, &["commit", "-m", "docs(issues): Fix the zoom"]);
         common::git(&dir, &["switch", "main"]);
-        (self.agents.add_repo(&dir).await.unwrap(), dir)
+        (
+            self.agents
+                .add_repo(&dir, AddSourceControl::Git)
+                .await
+                .unwrap(),
+            dir,
+        )
     }
 
     /// A text intent created with `base_branch` and `origin` as Submit

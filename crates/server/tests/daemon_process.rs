@@ -1,5 +1,6 @@
 //! Runs the real `smithagentsd` binary against a temporary home.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -7,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::Value;
-use smithagents_core::agent::{Agent, AgentState, Repo, SourceControl};
+use smithagents_client::ClientError;
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, Repo, SourceControl};
 use smithagents_core::daemon::{read_lockfile, DaemonInfo};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::palette;
@@ -34,6 +36,19 @@ impl Daemon {
     /// logging to `<dir>/<name>.log`. `SMITHAGENTS_HOME` is set to `env_home`
     /// when given and removed otherwise.
     fn spawn(dir: &Path, name: &str, home: &Path, extra: &[&str], env_home: Option<&Path>) -> Self {
+        Self::spawn_with_env(dir, name, home, extra, env_home, &[])
+    }
+
+    /// [`Daemon::spawn`] with `env` as well: each variable set to its value,
+    /// or removed for `None`.
+    fn spawn_with_env(
+        dir: &Path,
+        name: &str,
+        home: &Path,
+        extra: &[&str],
+        env_home: Option<&Path>,
+        env: &[(&str, Option<&OsStr>)],
+    ) -> Self {
         let log = dir.join(format!("{name}.log"));
         let out = File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
@@ -49,6 +64,12 @@ impl Daemon {
             Some(dir) => cmd.env("SMITHAGENTS_HOME", dir),
             None => cmd.env_remove("SMITHAGENTS_HOME"),
         };
+        for (name, value) in env {
+            match value {
+                Some(value) => cmd.env(name, value),
+                None => cmd.env_remove(name),
+            };
+        }
         Daemon {
             child: cmd.spawn().unwrap(),
             log,
@@ -418,7 +439,10 @@ async fn a_running_submission_keeps_an_idle_daemon_up() {
     let client = smithagents_client::Client::new(&info);
     // A connected client keeps the daemon up while the test sets up.
     let events = client.events(None).await.unwrap();
-    let repo = client.add_repo(&repo_dir).await.unwrap();
+    let repo = client
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let request = FeedbackRequest {
         submission_id: SubmissionId::new(),
         main_idea: "Fix the zoom".into(),
@@ -558,4 +582,143 @@ async fn agents_left_running_by_a_previous_daemon_start_dead() {
     assert_eq!(agents[0].id, agent.id);
     assert_eq!(agents[0].state, AgentState::Dead);
     assert_eq!(agents[0].harness_session_id.as_deref(), Some("s1"));
+}
+
+/// The code a refused client call was answered with.
+fn refusal<T: std::fmt::Debug>(answer: Result<T, ClientError>) -> (u16, String) {
+    match answer {
+        Err(ClientError::Api { status, code, .. }) => (status, code),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_without_git_starts_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let no_git = tmp.path().join("no-such-git");
+    let no_git = no_git.to_str().unwrap();
+    let mut daemon = Daemon::spawn(tmp.path(), "daemon", &home, &["--git-bin", no_git], None);
+    let info = daemon.wait_for_lockfile(&home).await;
+    let client = smithagents_client::Client::new(&info);
+    assert!(!client.health().await.unwrap().git);
+
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let plain = client
+        .add_repo(&folder, AddSourceControl::None)
+        .await
+        .unwrap();
+    assert_eq!(plain.source_control, None);
+
+    let folder2 = tmp.path().join("folder2");
+    std::fs::create_dir(&folder2).unwrap();
+    let answer = client.add_repo(&folder2, AddSourceControl::Git).await;
+    assert_eq!(refusal(answer), (400, "git_not_installed".into()));
+    let folder3 = tmp.path().join("folder3");
+    let answer = client.add_repo(&folder3, AddSourceControl::NewGit).await;
+    assert_eq!(refusal(answer), (400, "git_not_installed".into()));
+    assert!(!folder3.exists(), "nothing is made without git");
+    let answer = client.set_source_control(plain.id, true).await;
+    assert_eq!(refusal(answer), (400, "git_not_installed".into()));
+
+    assert_eq!(client.list_repos().await.unwrap(), vec![plain]);
+    assert!(!client.health().await.unwrap().git);
+    assert!(daemon.exited().is_none(), "log:\n{}", daemon.log_text());
+}
+
+/// A daemon whose HOME is the test's own, `<tmp>/user-home`, holding
+/// `gitconfig` as its `.gitconfig`: git's identity is the test's, not this
+/// machine's. Nothing else names one: the system's configuration is not
+/// read, and what the test process inherited is not passed on.
+fn spawn_in_own_git_home(tmp: &Path, home: &Path, gitconfig: &str) -> Daemon {
+    let user_home = tmp.join("user-home");
+    std::fs::create_dir_all(&user_home).unwrap();
+    std::fs::write(user_home.join(".gitconfig"), gitconfig).unwrap();
+    let xdg = user_home.join(".config");
+    let env: [(&str, Option<&OsStr>); 12] = [
+        ("HOME", Some(user_home.as_os_str())),
+        ("XDG_CONFIG_HOME", Some(xdg.as_os_str())),
+        ("GIT_CONFIG_NOSYSTEM", Some(OsStr::new("1"))),
+        ("GIT_CONFIG_GLOBAL", None),
+        ("GIT_CONFIG_SYSTEM", None),
+        ("GIT_CONFIG_PARAMETERS", None),
+        ("GIT_CONFIG_COUNT", None),
+        ("GIT_AUTHOR_NAME", None),
+        ("GIT_AUTHOR_EMAIL", None),
+        ("GIT_COMMITTER_NAME", None),
+        ("GIT_COMMITTER_EMAIL", None),
+        ("EMAIL", None),
+    ];
+    Daemon::spawn_with_env(tmp, "daemon", home, &[], None, &env)
+}
+
+/// `git <args>` in `dir`, its output trimmed.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[tokio::test]
+async fn a_new_git_repository_starts_with_one_commit_on_main() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let gitconfig = "[user]\n\tname = Test User\n\temail = test@example.invalid\n";
+    let mut daemon = spawn_in_own_git_home(tmp.path(), &home, gitconfig);
+    let info = daemon.wait_for_lockfile(&home).await;
+    let client = smithagents_client::Client::new(&info);
+    assert!(client.health().await.unwrap().git);
+
+    let fresh = tmp.path().join("fresh");
+    let repo = client
+        .add_repo(&fresh, AddSourceControl::NewGit)
+        .await
+        .unwrap_or_else(|e| panic!("{e}; log:\n{}", daemon.log_text()));
+    assert_eq!(repo.default_branch(), Some("main"));
+    assert_eq!(repo.path, std::fs::canonicalize(&fresh).unwrap());
+    assert_eq!(git_out(&fresh, &["rev-list", "--count", "main"]), "1");
+    assert_eq!(
+        git_out(&fresh, &["log", "-1", "--format=%s"]),
+        "Initial commit"
+    );
+    assert_eq!(
+        git_out(&fresh, &["log", "-1", "--format=%an <%ae>"]),
+        "Test User <test@example.invalid>",
+        "the identity is the user's own"
+    );
+    assert_eq!(git_out(&fresh, &["status", "--porcelain"]), "");
+
+    // A worktree can branch from that commit.
+    let agent = client.create_agent(repo.id).await.unwrap();
+    assert!(agent.worktree_path.is_dir());
+    assert!(daemon.exited().is_none(), "log:\n{}", daemon.log_text());
+}
+
+#[tokio::test]
+async fn a_new_repository_without_a_git_identity_is_refused_and_leaves_no_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let mut daemon = spawn_in_own_git_home(tmp.path(), &home, "[user]\n\tuseConfigOnly = true\n");
+    let info = daemon.wait_for_lockfile(&home).await;
+    let client = smithagents_client::Client::new(&info);
+
+    let fresh = tmp.path().join("fresh");
+    let answer = client.add_repo(&fresh, AddSourceControl::NewGit).await;
+    assert_eq!(refusal(answer), (400, "git_identity_missing".into()));
+    assert!(!fresh.exists(), "the folder it made is removed");
+    // A folder that was there and empty stays, as empty as it was.
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let answer = client.add_repo(&empty, AddSourceControl::NewGit).await;
+    assert_eq!(refusal(answer), (400, "git_identity_missing".into()));
+    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+
+    assert_eq!(client.list_repos().await.unwrap(), vec![]);
+    assert!(daemon.exited().is_none(), "log:\n{}", daemon.log_text());
 }

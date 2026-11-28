@@ -17,7 +17,7 @@ use futures::{FutureExt as _, StreamExt};
 use smithagents_client::{
     ensure_daemon_with, Client, ClientError, EnsureError, FeedbackFile, SpawnOptions,
 };
-use smithagents_core::agent::{Agent, Repo};
+use smithagents_core::agent::{AddSourceControl, Agent, Repo};
 use smithagents_core::daemon::{read_lockfile, DaemonToken};
 use smithagents_core::feedback::{
     FeedbackOutcome, FeedbackRequest, FeedbackSettings, FeedbackTargets, SubmissionId,
@@ -274,16 +274,18 @@ impl DaemonLink {
             .run(move |c, _| async move { Ok(c.create_agent(repo_id).await?) })
     }
 
-    /// Adds the repo and tells the UI with `Action::RepoAdded` (repos have no
-    /// event). The action is sent from the link's runtime, so it is not lost
-    /// when the caller drops the future.
+    /// Adds the repo, with the source control `choice` says, and tells the
+    /// UI with `Action::RepoAdded` (repos have no event). The action is sent
+    /// from the link's runtime, so it is not lost when the caller drops the
+    /// future.
     pub fn add_repo(
         &self,
         path: &Path,
+        choice: AddSourceControl,
     ) -> impl Future<Output = Result<Repo, LinkError>> + Send + 'static {
         let path = path.to_owned();
         self.cmd.clone().run(move |c, tx| async move {
-            let repo = c.add_repo(&path).await?;
+            let repo = c.add_repo(&path, choice).await?;
             let _ = tx.send(Action::RepoAdded(repo.clone())).await;
             Ok(repo)
         })
@@ -495,10 +497,14 @@ impl DaemonLink {
 pub trait AgentCommands {
     fn create_agent(&self, repo_id: RepoId) -> LocalBoxFuture<'static, Result<Agent, LinkError>>;
     fn close_agent(&self, id: AgentId) -> LocalBoxFuture<'static, Result<(), LinkError>>;
-    /// Adds the local git repository at `path`. The model learns of it
-    /// through `Action::RepoAdded`, which the link sends itself (a fake
-    /// leaves that to the test).
-    fn add_repo(&self, path: &Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>>;
+    /// Adds the local folder at `path`, with the source control `choice`
+    /// says. The model learns of it through `Action::RepoAdded`, which the
+    /// link sends itself (a fake leaves that to the test).
+    fn add_repo(
+        &self,
+        path: &Path,
+        choice: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>>;
 }
 
 impl AgentCommands for DaemonLink {
@@ -510,8 +516,12 @@ impl AgentCommands for DaemonLink {
         DaemonLink::close_agent(self, id).boxed_local()
     }
 
-    fn add_repo(&self, path: &Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
-        DaemonLink::add_repo(self, path).boxed_local()
+    fn add_repo(
+        &self,
+        path: &Path,
+        choice: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        DaemonLink::add_repo(self, path, choice).boxed_local()
     }
 }
 

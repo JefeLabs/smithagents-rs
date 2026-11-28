@@ -34,6 +34,19 @@ pub enum SourceControl {
     Git { default_branch: String },
 }
 
+/// How `POST /v1/repos` adds a folder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddSourceControl {
+    /// The folder as it is, with no source control: no git runs for it.
+    #[default]
+    None,
+    /// The existing git repository the folder is in, recorded at its root.
+    Git,
+    /// A new git repository, made in a folder that is missing or empty.
+    NewGit,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Repo {
     pub id: RepoId,
@@ -222,6 +235,20 @@ mod tests {
             let back: Repo = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
             assert_eq!(back, r);
         }
+    }
+
+    #[test]
+    fn the_add_choices_are_spelled_on_the_wire() {
+        let spelled: Vec<Value> = [
+            AddSourceControl::None,
+            AddSourceControl::Git,
+            AddSourceControl::NewGit,
+        ]
+        .iter()
+        .map(|c| serde_json::to_value(c).unwrap())
+        .collect();
+        assert_eq!(spelled, [json!("none"), json!("git"), json!("new_git")]);
+        assert_eq!(AddSourceControl::default(), AddSourceControl::None);
     }
 
     #[test]

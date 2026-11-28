@@ -33,7 +33,7 @@ use smithagents_app::views::title_bar::{
     TITLE_BAR_ID, TITLE_TEXT_ID, UPDATE_CHIP_ID, UPDATE_CHIP_MARGIN, UPDATE_CHIP_TOKENS,
 };
 use smithagents_center_host::PixelRect;
-use smithagents_core::agent::{Agent, Repo, SourceControl};
+use smithagents_core::agent::{AddSourceControl, Agent, Repo, SourceControl};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
@@ -460,7 +460,11 @@ impl AgentCommands for FakeCommands {
         async { Err(LinkError::NotConnected) }.boxed_local()
     }
 
-    fn add_repo(&self, _: &std::path::Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+    fn add_repo(
+        &self,
+        _: &std::path::Path,
+        _: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         async { Err(LinkError::NotConnected) }.boxed_local()
     }
 }

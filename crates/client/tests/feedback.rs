@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use smithagents_client::{ensure_daemon_with, Client, ClientError, FeedbackFile, SpawnOptions};
-use smithagents_core::agent::{Agent, AgentState};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState};
 use smithagents_core::daemon::read_lockfile;
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::feedback::{
@@ -573,7 +573,10 @@ async fn feedback_becomes_an_intent_whose_agent_has_the_files() {
     assert_eq!(plugin.state, PluginState::Ready, "{plugin:?}");
     assert!(plugin.resources.is_empty());
 
-    let repo = client.add_repo(&fx.repo_dir).await.unwrap();
+    let repo = client
+        .add_repo(&fx.repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let targets = client.feedback_targets().await.unwrap();
     let target = targets
         .repos
@@ -714,7 +717,10 @@ async fn feedback_becomes_an_intent_whose_agent_has_the_files() {
 async fn feedback_becomes_a_github_issue_and_a_failed_push_is_retried() {
     let fx = start(&passes_that_add_nothing(), &[]).await;
     let client = &fx.client;
-    let repo = client.add_repo(&fx.repo_dir).await.unwrap();
+    let repo = client
+        .add_repo(&fx.repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     // The remote refuses every push, saying something that must not reach
     // the daemon's log.
     let hook = fx.bare.join("hooks").join("pre-receive");
@@ -791,7 +797,10 @@ async fn an_idea_goes_from_feedback_to_a_draft_pull_request() {
     // A public repository: the pull request needs the acknowledgement.
     let fx = start(&passes_that_add_nothing(), &[("visibility", "PUBLIC")]).await;
     let client = &fx.client;
-    let repo = client.add_repo(&fx.repo_dir).await.unwrap();
+    let repo = client
+        .add_repo(&fx.repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let mut events = client.events(None).await.unwrap();
 
     let upload = fx.upload();
@@ -917,7 +926,10 @@ async fn an_idea_goes_from_feedback_to_a_draft_pull_request() {
 async fn unpushed_work_on_the_default_branch_is_never_published() {
     let fx = start(&passes_that_add_nothing(), &[]).await;
     let client = &fx.client;
-    let repo = client.add_repo(&fx.repo_dir).await.unwrap();
+    let repo = client
+        .add_repo(&fx.repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     // Work of the user's that origin has not got.
     fs::write(fx.repo_dir.join("plan.txt"), "not for anyone yet\n").unwrap();
     git(&fx.repo_dir, &["add", "plan.txt"]);

@@ -229,7 +229,11 @@ impl Fx {
         common::git(&dir, &["config", "user.name", "Test User"]);
         common::git(&dir, &["config", "user.email", "test@example.invalid"]);
         let (status, body) = self
-            .call(Method::POST, "/v1/repos", Some(json!({ "path": dir })))
+            .call(
+                Method::POST,
+                "/v1/repos",
+                Some(json!({ "path": dir, "source_control": "git" })),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         serde_json::from_value(body).unwrap()

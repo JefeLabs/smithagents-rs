@@ -10,7 +10,7 @@ use smithagents_app::link::{DaemonLink, IntentCommands, LinkConfig, LinkError, L
 use smithagents_app::model::{Action, Connection};
 use smithagents_app::view_models::repo_error_text;
 use smithagents_client::{Client, ClientError, SpawnOptions};
-use smithagents_core::agent::{AgentState, Repo};
+use smithagents_core::agent::{AddSourceControl, AgentState, Repo};
 use smithagents_core::daemon::{lockfile_path, read_lockfile};
 use smithagents_core::event::EventKind;
 use smithagents_core::feedback::FeedbackSettings;
@@ -136,7 +136,10 @@ async fn agent_created_elsewhere_arrives_as_event() {
     let repo_dir = home.scratch().join("repo");
     init_repo(&repo_dir);
     let other = client_for(&home);
-    let repo = other.add_repo(&repo_dir).await.unwrap();
+    let repo = other
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let agent = other.create_agent(repo.id).await.unwrap();
     let seen = until(&mut rx, "AgentCreated", |a| match a {
         Action::Event(e) => match &e.kind {
@@ -157,7 +160,10 @@ async fn killed_daemon_reconnects_with_a_fresh_snapshot() {
     let repo_dir = home.scratch().join("repo");
     init_repo(&repo_dir);
     let (link, mut rx) = connected(&home).await;
-    let repo = link.add_repo(&repo_dir).await.unwrap();
+    let repo = link
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let agent = link.create_agent(repo.id).await.unwrap();
     until(&mut rx, "AgentCreated", |a| match a {
         Action::Event(e) if matches!(e.kind, EventKind::AgentCreated(_)) => Some(()),
@@ -203,7 +209,10 @@ async fn intents_and_defaults_arrive_before_connected() {
     init_repo(&repo_dir);
     let (first, _first_rx) = connected(&home).await;
     let other = client_for(&home);
-    let repo = other.add_repo(&repo_dir).await.unwrap();
+    let repo = other
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let created = other
         .create_intent(text_seed(&repo, "The zoom is wrong"))
         .await
@@ -236,7 +245,10 @@ async fn an_intent_command_answers_and_upserts() {
     let repo_dir = home.scratch().join("repo");
     init_repo(&repo_dir);
     let (link, mut rx) = connected(&home).await;
-    let repo = link.add_repo(&repo_dir).await.unwrap();
+    let repo = link
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let intent = link
         .create_intent(text_seed(&repo, "The zoom is wrong"))
         .await
@@ -294,7 +306,7 @@ async fn refused_add(
     prefix: &str,
 ) -> LinkError {
     let err = link
-        .add_repo(path)
+        .add_repo(path, AddSourceControl::Git)
         .await
         .expect_err("the daemon refuses the add");
     match &err {
@@ -333,7 +345,10 @@ async fn add_repo_with_a_missing_path_returns_the_typed_error() {
     // A good one succeeds and also reaches the model, since repos have no event.
     let repo_dir = home.scratch().join("My Repo ünïcode");
     init_repo(&repo_dir);
-    let repo = link.add_repo(&repo_dir).await.unwrap();
+    let repo = link
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let added = until(&mut rx, "RepoAdded", |a| match a {
         Action::RepoAdded(r) => Some(r.id),
         _ => None,
@@ -357,7 +372,10 @@ async fn close_agent_emits_an_event() {
     let repo_dir = home.scratch().join("repo");
     init_repo(&repo_dir);
     let (link, mut rx) = connected(&home).await;
-    let repo = link.add_repo(&repo_dir).await.unwrap();
+    let repo = link
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let agent = link.create_agent(repo.id).await.unwrap();
     link.close_agent(agent.id).await.unwrap();
     until(&mut rx, "close event", |a| match a {
@@ -477,7 +495,10 @@ async fn a_working_agent_is_dead_in_the_snapshot_after_the_daemon_is_killed() {
     .await;
 
     let other = client_for(&home);
-    let repo = other.add_repo(&repo_dir).await.unwrap();
+    let repo = other
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let agent = other.create_agent(repo.id).await.unwrap();
     other.send_message(agent.id, "hello").await.unwrap();
     until(&mut rx, "Working", |a| match a {

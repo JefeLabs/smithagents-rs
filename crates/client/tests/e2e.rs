@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use smithagents_client::{ensure_daemon_with, Client, SpawnOptions};
-use smithagents_core::agent::{Agent, AgentState, Role};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, Role};
 use smithagents_core::daemon::read_lockfile;
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::AgentId;
@@ -214,7 +214,7 @@ fn lockfile_pid(home: &TestHome) -> Option<u32> {
 /// creates an agent on it.
 async fn new_agent(client: &Client, dir: &Path) -> Agent {
     init_repo(dir);
-    let repo = client.add_repo(dir).await.unwrap();
+    let repo = client.add_repo(dir, AddSourceControl::Git).await.unwrap();
     client.create_agent(repo.id).await.unwrap()
 }
 
@@ -712,7 +712,10 @@ async fn real_claude_polish_smoke() {
         .unwrap();
         git(&repo_dir, &["add", "greet.py"]);
         git(&repo_dir, &["commit", "-m", "add greet"]);
-        let repo = client.add_repo(&repo_dir).await.unwrap();
+        let repo = client
+            .add_repo(&repo_dir, AddSourceControl::Git)
+            .await
+            .unwrap();
         let agent = client.create_agent(repo.id).await.unwrap();
 
         client
