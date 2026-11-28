@@ -23,6 +23,7 @@ use common::{daemon_bin, fake_claude, git, init_repo, TestHome};
 use smithagents_app::link::{DaemonLink, LinkConfig};
 use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_client::{FeedbackFile, SpawnOptions};
+use smithagents_core::agent::AddSourceControl;
 use smithagents_core::feedback::{
     AttachmentKind, FeedbackAttachment, FeedbackBox, FeedbackKind, FeedbackRequest, SendAs,
     SubmissionId,
@@ -130,9 +131,12 @@ async fn the_created_intent_is_in_the_model_when_the_answer_arrives() {
     let (link, mut rx) = DaemonLink::start(config(&home, &tools));
     let mut model = ShellModel::new();
     until_connected(&mut rx, &mut model).await;
-    let repo = within("the repository", link.add_repo(&repo_dir))
-        .await
-        .unwrap();
+    let repo = within(
+        "the repository",
+        link.add_repo(&repo_dir, AddSourceControl::Git),
+    )
+    .await
+    .unwrap();
 
     let request = FeedbackRequest {
         submission_id: SubmissionId::new(),

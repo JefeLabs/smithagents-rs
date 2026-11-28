@@ -7,6 +7,8 @@
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -49,6 +51,21 @@ pub enum GitError {
     /// git did not finish in its time and was killed with its process group.
     #[error("git did not finish in time")]
     TimedOut,
+    /// The git program could not be started: there is none (see
+    /// [`set_program`]).
+    #[error("not installed (the git program could not be started)")]
+    NotInstalled,
+    /// git knows no name and email to make a new repository's first commit
+    /// with.
+    #[error("no name and email to commit with: set user.name and user.email")]
+    IdentityMissing,
+    /// A new repository was asked for where a folder holds something, or
+    /// something that is not a folder is.
+    #[error("a new repository needs an empty folder, and {} is not one", .0.display())]
+    FolderNotEmpty(PathBuf),
+    /// The folder is inside a git repository but not its root.
+    #[error("the folder is inside a git repository, not its root")]
+    NotRepoRoot,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -95,11 +112,77 @@ pub enum PushError {
     Failed { status: Option<i32> },
 }
 
+/// The git program every command runs; see [`set_program`].
+static PROGRAM: OnceLock<PathBuf> = OnceLock::new();
+
+/// Sets the git program the daemon runs (its `--git-bin`), once, when it
+/// starts and before any git runs. Until then, and without it, the program
+/// is `git` found on `PATH`. A later call changes nothing.
+pub fn set_program(program: PathBuf) {
+    let _ = PROGRAM.set(program);
+}
+
+fn program() -> &'static Path {
+    PROGRAM.get().map_or(Path::new("git"), PathBuf::as_path)
+}
+
+/// What git was last found to be: not looked for yet, missing, or there.
+static INSTALLED: AtomicU8 = AtomicU8::new(NOT_CHECKED);
+const NOT_CHECKED: u8 = 0;
+const MISSING: u8 = 1;
+const FOUND: u8 = 2;
+
+fn remember_installed(found: bool) {
+    INSTALLED.store(if found { FOUND } else { MISSING }, Ordering::Relaxed);
+}
+
+/// Whether git can be run: `<program> --version` starts and succeeds. The
+/// answer is kept for [`installed_as_last_found`].
+pub async fn is_installed() -> bool {
+    // `--version` needs no repository: any folder that exists will do.
+    let ran = run(
+        git_command(Path::new("/"), &["--version"]),
+        local_timeout(),
+        None,
+        ERROR_OUTPUT_MAX,
+    )
+    .await;
+    let found = matches!(ran, Ok(ran) if ran.status.success());
+    remember_installed(found);
+    found
+}
+
+/// What git was found to be the last time [`is_installed`] ran, or when it
+/// could not be started since; `None` before either. Runs no git, for
+/// `GET /v1/health`: the daemon looks for git only when something asks for
+/// it, since where git is not installed, running it can open the system's
+/// dialog offering to install it.
+pub fn installed_as_last_found() -> Option<bool> {
+    match INSTALLED.load(Ordering::Relaxed) {
+        FOUND => Some(true),
+        MISSING => Some(false),
+        _ => None,
+    }
+}
+
+/// [`GitError::NotInstalled`] for `e` that says the git program itself was
+/// not found, else `e`. Only for a command run in a folder known to exist:
+/// a missing working folder fails the same way.
+fn missing_program(e: GitError) -> GitError {
+    match e {
+        GitError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            remember_installed(false);
+            GitError::NotInstalled
+        }
+        e => e,
+    }
+}
+
 /// Builds a git command with a sanitized environment. `LC_ALL`/`LANGUAGE` are
 /// pinned to `C` so the stderr patterns we match are never localized, and no
 /// plugin secret is passed on.
 fn git_command(cwd: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(program());
     cmd.args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -153,11 +236,17 @@ async fn git_ok(cwd: &Path, args: &[&str]) -> Result<bool, GitError> {
 }
 
 /// Resolves `path` to its repository root and default branch. A path that is
-/// not an existing directory is [`GitError::PathNotFound`].
+/// not an existing directory is [`GitError::PathNotFound`]; git that cannot
+/// be started is [`GitError::NotInstalled`].
 ///
 /// The default branch is the one named by `origin/HEAD`, else the checked-out
 /// branch, else (detached HEAD) a local `main` or `master`.
 pub async fn validate_repo(path: &Path) -> Result<RepoInfo, GitError> {
+    // The folder exists by then, so a git that cannot start is not there.
+    repo_info(path).await.map_err(missing_program)
+}
+
+async fn repo_info(path: &Path) -> Result<RepoInfo, GitError> {
     // git runs in `path`, so without this a missing directory would surface
     // as an I/O error from starting git rather than as a bad path.
     match tokio::fs::metadata(path).await {
@@ -211,6 +300,138 @@ async fn default_branch(root: &Path) -> Result<String, GitError> {
         }
     }
     Err(GitError::NoDefaultBranch)
+}
+
+/// The branch of a new repository ([`init_repo`]).
+const NEW_REPO_BRANCH: &str = "main";
+/// The message of a new repository's first commit ([`init_repo`]).
+const FIRST_COMMIT_MESSAGE: &str = "Initial commit";
+
+/// Makes a new git repository at `path`: the folder, which must be missing
+/// or empty (else [`GitError::FolderNotEmpty`]), then `git init` on the
+/// branch [`NEW_REPO_BRANCH`] and one empty commit, [`FIRST_COMMIT_MESSAGE`],
+/// so that worktrees have something to branch from.
+///
+/// It is the user's repository and their first commit, so git runs with the
+/// user's own configuration and identity, not the isolated one of the
+/// feedback tool. Only an identity git would guess from the user and host
+/// names is refused (`user.useConfigOnly`): with none configured the answer
+/// is [`GitError::IdentityMissing`]. When anything fails, what was made is
+/// removed again: the folder, when it was missing, else what git put in it.
+///
+/// A path with a `..` part is refused before anything is made: after a
+/// missing folder, `..` names one folder to these checks and another to git
+/// once the missing one exists. The service passes a canonical path.
+pub async fn init_repo(path: &Path) -> Result<RepoInfo, GitError> {
+    let path = std::path::absolute(path)?;
+    if path
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(GitError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a new repository's path must not hold `..`",
+        )));
+    }
+    // The first folder this makes: the topmost one of `path` that is missing.
+    let made = match tokio::fs::symlink_metadata(&path).await {
+        Ok(_) if is_empty_folder(&path).await => None,
+        Ok(_) => return Err(GitError::FolderNotEmpty(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(first_missing(&path).await),
+        Err(e) => return Err(e.into()),
+    };
+    let created = async {
+        if made.is_some() {
+            tokio::fs::create_dir_all(&path).await?;
+        }
+        init_and_commit(&path).await.map_err(missing_program)
+    }
+    .await;
+    if created.is_err() {
+        take_back_init(&path, made.as_deref()).await;
+    }
+    created
+}
+
+/// Whether `path` is a folder (or a link to one) that holds nothing.
+async fn is_empty_folder(path: &Path) -> bool {
+    match tokio::fs::read_dir(path).await {
+        Ok(mut entries) => matches!(entries.next_entry().await, Ok(None)),
+        Err(_) => false,
+    }
+}
+
+/// The topmost of `path` and its parents that does not exist; `path` is
+/// absolute and missing.
+async fn first_missing(path: &Path) -> PathBuf {
+    let mut top = path;
+    for parent in path.ancestors().skip(1) {
+        if tokio::fs::symlink_metadata(parent).await.is_ok() {
+            break;
+        }
+        top = parent;
+    }
+    top.to_owned()
+}
+
+async fn init_and_commit(path: &Path) -> Result<RepoInfo, GitError> {
+    let init = git_raw(path, &["init", "--quiet", "-b", NEW_REPO_BRANCH]).await?;
+    if !init.status.success() {
+        return Err(GitError::Command {
+            stderr: stderr_of(&init),
+        });
+    }
+    let commit = git_raw(
+        path,
+        &[
+            "-c",
+            "user.useConfigOnly=true",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            FIRST_COMMIT_MESSAGE,
+        ],
+    )
+    .await?;
+    if !commit.status.success() {
+        let stderr = stderr_of(&commit);
+        return Err(if stderr.contains(IDENTITY_MISSING) {
+            GitError::IdentityMissing
+        } else {
+            GitError::Command { stderr }
+        });
+    }
+    repo_info(path).await
+}
+
+/// Removes what a failed [`init_repo`] made: `made`, the first folder it
+/// created, or else everything in `path`, which was an empty folder. Best
+/// effort: what cannot be removed stays, and is logged.
+async fn take_back_init(path: &Path, made: Option<&Path>) {
+    let removed = match made {
+        Some(made) => match tokio::fs::remove_dir_all(made).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
+        None => empty_out(path).await,
+    };
+    if let Err(e) = removed {
+        tracing::warn!("could not remove what a new repository that failed left behind: {e}");
+    }
+}
+
+/// Removes everything in the folder `path`, but not the folder.
+async fn empty_out(path: &Path) -> std::io::Result<()> {
+    let mut entries = tokio::fs::read_dir(path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            tokio::fs::remove_dir_all(entry.path()).await?;
+        } else {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Branch an intent's agent works on.
@@ -2470,6 +2691,26 @@ mod tests {
             matches!(&err, GitError::PathNotFound(p) if *p == file),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_new_repository_is_not_made_at_a_path_with_dot_dot() {
+        // `missing/..` names `tmp` to git once `missing` is made, so the
+        // checks and git would see different folders: nothing runs.
+        let tmp = TempDir::new().unwrap();
+        let full = tmp.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("notes.txt"), "keep me").unwrap();
+        let missing = tmp.path().join("missing");
+        let err = super::init_repo(&missing.join("..").join("full"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, GitError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "{err:?}"
+        );
+        assert!(!missing.exists());
+        assert!(!full.join(".git").exists());
     }
 
     #[tokio::test]

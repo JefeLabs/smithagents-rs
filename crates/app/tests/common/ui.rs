@@ -45,7 +45,7 @@ pub fn agent(name: &str) -> Agent {
         },
         repo_id: RepoId::new(),
         worktree_path: "/tmp/wt".into(),
-        branch: format!("agent/{name}"),
+        branch: Some(format!("agent/{name}")),
         harness_session_id: None,
         state: AgentState::Idle,
         created_at: at,

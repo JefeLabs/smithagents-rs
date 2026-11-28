@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures::{Stream, StreamExt};
 use serde_json::json;
 use smithagents_client::{ensure_daemon_with, Client, ClientError, SpawnOptions};
-use smithagents_core::agent::{AgentState, Role};
+use smithagents_core::agent::{AddSourceControl, AgentState, Role};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::intent::{
     Answer, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentKind, IntentState, Patch,
@@ -135,7 +135,10 @@ async fn full_loop_through_the_client() {
     let client = &fx.client;
     let repo_dir = fx.home.scratch().join("repo");
     init_repo(&repo_dir);
-    let repo = client.add_repo(&repo_dir).await.unwrap();
+    let repo = client
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let agent = client.create_agent(repo.id).await.unwrap();
     let mut events = client.events(None).await.unwrap();
 
@@ -340,7 +343,11 @@ async fn polish_model_env_reaches_the_cli() {
     .await;
     let repo_dir = fx.home.scratch().join("repo");
     init_repo(&repo_dir);
-    let repo = fx.client.add_repo(&repo_dir).await.unwrap();
+    let repo = fx
+        .client
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let mut events = fx.client.events(None).await.unwrap();
     let created = fx
         .client
@@ -385,7 +392,11 @@ async fn daemon_crash_during_pass_one_fails_the_intent_and_retry_works() {
     let fx = start().await;
     let repo_dir = fx.home.scratch().join("repo");
     init_repo(&repo_dir);
-    let repo = fx.client.add_repo(&repo_dir).await.unwrap();
+    let repo = fx
+        .client
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     // Pass 1 hangs, so the daemon dies in the middle of it.
     std::fs::write(fx.control_dir.join("sleep"), "30").unwrap();
     let created = fx
@@ -454,7 +465,10 @@ async fn chat_seed_carries_every_message() {
     let client = &fx.client;
     let repo_dir = fx.home.scratch().join("repo");
     init_repo(&repo_dir);
-    let repo = client.add_repo(&repo_dir).await.unwrap();
+    let repo = client
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let agent = client.create_agent(repo.id).await.unwrap();
     let mut events = client.events(None).await.unwrap();
     for text in ["first request", "second request"] {

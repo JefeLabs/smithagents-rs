@@ -11,7 +11,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// route or event type the other side relies on, a new variant of an enum on
 /// the wire, a field that is no longer optional, a changed meaning. A field
 /// the older side can ignore or default does not need it.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 pub mod agent;
 pub mod daemon;

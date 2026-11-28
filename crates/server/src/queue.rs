@@ -1,14 +1,17 @@
 //! The start queue for sent intents: a `Queued` intent starts once every
-//! dependency it accepted is `Resolved` and a slot under the queue limit is
-//! free, oldest `queued_at` first.
+//! dependency it accepted is `Resolved`, a slot under the queue limit is
+//! free, and, for an intent on a repository with no source control, its
+//! folder is not held (`IntentService::held_folders`); oldest `queued_at`
+//! first. An intent that waits for its folder takes no slot meanwhile.
 //!
 //! One background task ([`Scheduler`]) makes those decisions in passes. A pass
 //! runs at startup, on [`SchedulerHandle::kick`] (or a [`Kicker`] clone), and
 //! after `AgentUpdated` bus events, since an agent leaving `Working`/`Quiet`
-//! frees a slot, and `AgentClosed` events, since closing an agent left
-//! attached to an intent lets that intent start. Triggers that arrive while a
-//! pass runs coalesce into one more pass after it, so none is lost and passes
-//! never overlap. Each pass also holds the intent service's start lock, which
+//! frees a slot and the folder its turn held, and `AgentClosed` events, since
+//! closing an agent left attached to an intent lets that intent start, and
+//! closing the agent of a sent intent frees its folder. Triggers that arrive
+//! while a pass runs coalesce into one more pass after it, so none is lost
+//! and passes never overlap. Each pass also holds the intent service's start lock, which
 //! `IntentService::send` takes too, so the limit is checked and used
 //! atomically by both. A pass that panics is logged and the scheduler keeps
 //! running.
@@ -24,7 +27,7 @@ use std::panic::AssertUnwindSafe;
 
 use futures::FutureExt;
 use smithagents_core::event::{Event, EventKind};
-use smithagents_core::ids::IntentId;
+use smithagents_core::ids::{IntentId, RepoId};
 use smithagents_core::intent::{Intent, IntentFilter, IntentState, ItemStatus};
 use tokio::sync::broadcast::{self, error::RecvError, error::TryRecvError};
 use tokio::sync::{mpsc, oneshot};
@@ -36,14 +39,15 @@ use crate::service::AgentService;
 use crate::store::{Store, StoreError};
 
 /// The ids of the `Queued` intents to start now, oldest `queued_at` first: those
-/// whose accepted dependencies are all in `resolved`, at most `limit - running`
-/// of them. `limit` `None` (or `Some(0)`) means no limit. Intents in other
-/// states are ignored.
+/// whose accepted dependencies are all in `resolved` and whose repository is
+/// not in `held`, at most `limit - running` of them. `limit` `None` (or
+/// `Some(0)`) means no limit. Intents in other states are ignored.
 pub fn next_startable(
     queued: &[Intent],
     resolved: &HashSet<IntentId>,
     running: usize,
     limit: Option<u32>,
+    held: &HashSet<RepoId>,
 ) -> Vec<IntentId> {
     let free = match limit.filter(|&n| n > 0) {
         Some(n) => usize::try_from(n)
@@ -54,6 +58,7 @@ pub fn next_startable(
     let mut ready: Vec<&Intent> = queued
         .iter()
         .filter(|i| i.state == IntentState::Queued && dependencies_resolved(i, resolved))
+        .filter(|i| !held.contains(&i.repo_id))
         .collect();
     ready.sort_by_key(|i| (i.queued_at, i.id.0));
     ready.into_iter().take(free).map(|i| i.id).collect()
@@ -276,9 +281,11 @@ impl Scheduler {
         let limit = self.intents.agent_defaults().await?.queue_limit;
         loop {
             // Counted afresh for each start: the agent just started holds its
-            // slot already, and any turn that ended meanwhile has freed one.
+            // slot (and, in place, its folder) already, and any turn that
+            // ended meanwhile has freed one.
             let running = running_count(&self.agents);
-            let Some(id) = next_startable(&queued, &resolved, running, limit)
+            let held = self.intents.held_folders().await?;
+            let Some(id) = next_startable(&queued, &resolved, running, limit, &held)
                 .into_iter()
                 .next()
             else {
@@ -375,19 +382,31 @@ mod tests {
         intents.iter().map(|i| i.id).collect()
     }
 
+    /// No folder held.
+    fn free() -> HashSet<RepoId> {
+        HashSet::new()
+    }
+
     #[test]
     fn oldest_ready_first_up_to_the_free_slots() {
         let (a, b, c) = (queued(3, vec![]), queued(1, vec![]), queued(2, vec![]));
         let all = [a.clone(), b.clone(), c.clone()];
         let none = HashSet::new();
-        assert_eq!(next_startable(&all, &none, 0, None), ids(&[&b, &c, &a]));
-        assert_eq!(next_startable(&all, &none, 0, Some(2)), ids(&[&b, &c]));
-        assert_eq!(next_startable(&all, &none, 1, Some(2)), ids(&[&b]));
-        assert!(next_startable(&all, &none, 2, Some(2)).is_empty());
-        assert!(next_startable(&all, &none, 5, Some(2)).is_empty());
+        let held = free();
+        assert_eq!(
+            next_startable(&all, &none, 0, None, &held),
+            ids(&[&b, &c, &a])
+        );
+        assert_eq!(
+            next_startable(&all, &none, 0, Some(2), &held),
+            ids(&[&b, &c])
+        );
+        assert_eq!(next_startable(&all, &none, 1, Some(2), &held), ids(&[&b]));
+        assert!(next_startable(&all, &none, 2, Some(2), &held).is_empty());
+        assert!(next_startable(&all, &none, 5, Some(2), &held).is_empty());
         // Some(0) is no limit, like None.
-        assert_eq!(next_startable(&all, &none, 9, Some(0)).len(), 3);
-        assert!(next_startable(&[], &none, 0, None).is_empty());
+        assert_eq!(next_startable(&all, &none, 9, Some(0), &held).len(), 3);
+        assert!(next_startable(&[], &none, 0, None, &held).is_empty());
     }
 
     #[test]
@@ -405,13 +424,16 @@ mod tests {
         let dropped = queued(3, vec![dep(open, ItemStatus::Dropped)]);
         let all = [waits.clone(), ready.clone(), dropped.clone()];
         assert_eq!(
-            next_startable(&all, &resolved, 0, None),
+            next_startable(&all, &resolved, 0, None, &free()),
             ids(&[&ready, &dropped])
         );
         // A waiting intent never takes a slot from a ready one behind it.
-        assert_eq!(next_startable(&all, &resolved, 0, Some(1)), ids(&[&ready]));
+        assert_eq!(
+            next_startable(&all, &resolved, 0, Some(1), &free()),
+            ids(&[&ready])
+        );
         let both: HashSet<IntentId> = [done, open].into();
-        assert_eq!(next_startable(&all, &both, 0, None).len(), 3);
+        assert_eq!(next_startable(&all, &both, 0, None, &free()).len(), 3);
     }
 
     #[test]
@@ -420,7 +442,7 @@ mod tests {
         sent.state = IntentState::Sent;
         let q = queued(2, vec![]);
         assert_eq!(
-            next_startable(&[sent, q.clone()], &HashSet::new(), 0, None),
+            next_startable(&[sent, q.clone()], &HashSet::new(), 0, None, &free()),
             ids(&[&q])
         );
     }
@@ -430,8 +452,29 @@ mod tests {
         let a = queued(1, vec![]);
         let mut b = queued(1, vec![]);
         b.queued_at = a.queued_at;
-        let first = next_startable(&[a.clone(), b.clone()], &HashSet::new(), 0, None);
-        let second = next_startable(&[b, a], &HashSet::new(), 0, None);
+        let first = next_startable(&[a.clone(), b.clone()], &HashSet::new(), 0, None, &free());
+        let second = next_startable(&[b, a], &HashSet::new(), 0, None, &free());
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn an_intent_on_a_held_folder_waits_and_takes_no_slot() {
+        let (p, g) = (RepoId::new(), RepoId::new());
+        let on = |repo: RepoId, secs: i64| Intent {
+            repo_id: repo,
+            ..queued(secs, vec![])
+        };
+        // Oldest first: a and b on the plain folder P, c on repository G.
+        let (a, b, c) = (on(p, 1), on(p, 2), on(g, 3));
+        let all = [a.clone(), b, c.clone()];
+        let resolved = HashSet::new();
+        assert_eq!(
+            next_startable(&all, &resolved, 0, Some(1), &HashSet::from([p])),
+            vec![c.id]
+        );
+        assert_eq!(
+            next_startable(&all, &resolved, 0, Some(1), &free()),
+            vec![a.id]
+        );
     }
 }

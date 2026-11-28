@@ -1,10 +1,21 @@
 # SmithAgents: Context Console Architecture (Design)
 
-Status: draft for approval (revision 2). Date: 2026-11-23.
+Status: draft for approval (revision 3, 2026-11-27; revision 2 was 2026-11-23).
 Predecessor: "Intent IDE" v0.20 (pure TypeScript). This is a Rust rewrite.
 
 Legend: **[decided]** = stated by the owner. **[my call]** = proposed by the
 designer; owner should check these (collected in section 9).
+
+Revision 3 (owner decisions of 2026-11-27, listed at the end of section 9):
+
+- The grouping is a **Workspace**, not a "Space". "Space" came from Coder's
+  term in the legacy app; a machine on Coder is a "Coder space" here.
+- A remote daemon's data goes over HTTPS and WebSockets. SSH is for install,
+  upgrade and recovery (4.3).
+- Source control is optional per repository, and a new repository has none
+  until the owner turns it on. See
+  `2026-11-27-folder-mode-design.md`, which replaces "every agent works in
+  its own git worktree" for repositories without source control.
 
 ## 1. Intent and why
 
@@ -18,8 +29,8 @@ available to agents as context.
 
 Why rewrite: the TypeScript app keeps its control plane inside the desktop
 process. The agent queue only advances while the app is open (routines already run in
-the workspace, per the routine editor's note), and a lost workspace connection
-stalls work. Each added integration also adds concurrent
+the Coder space, per the routine editor's note), and a lost connection to that
+Coder space stalls work. Each added integration also adds concurrent
 sync, polling and caching load in a single event loop. The rewrite moves the
 control plane into a Rust daemon that runs wherever the work runs, with thin
 clients attached.
@@ -41,7 +52,7 @@ Non-goals
 - Not a general code editor or full IDE.
 - Not building an agent harness; agents run through existing headless CLIs or
   a custom SDK behind an adapter.
-- No multi-tenant SaaS; single user, one daemon per Space.
+- No multi-tenant SaaS; single user, one daemon per Workspace.
 - v1: no browser host, no mobile/tablet host, no Rust A2UI renderer for panes.
 
 Anti-goals (failure even if it "works")
@@ -79,7 +90,7 @@ Anti-goals (failure even if it "works")
 
 ```
 ┌ Left ───────┐┌ Center: web tabs ───────────────┐┌ Right ────────┐┌─┐
-│ Spaces      ││ [Chat] [Terminal] [Flow] [+]    ││ Settings      ││▣│ tool
+│ Workspaces  ││ [Chat] [Terminal] [Flow] [+]    ││ Settings      ││▣│ tool
 │ Agents      ││  Chat     AI Elements + A2UI    ││ Item detail   ││▣│ icon
 │ Queue       ││  Terminal xterm.js <-> daemon   ││ Integration   ││▣│ rail
 │ Routines    ││  Flow     react-flow            ││ config        ││▣│
@@ -104,7 +115,7 @@ Anti-goals (failure even if it "works")
   release channel, signed bundles and signature verification exist (see the
   plan's follow-ups). [owner decision 2026-11-25]
 
-- Left pane: full height of the main row (title bar to status bar). Space switcher (with connection and "browser
+- Left pane: full height of the main row (title bar to status bar). Workspace switcher (with connection and "browser
   signed out" status), personal dashboards (e.g. "Start of Day"; rendered in
   a center tab, a natural home for agent-composed UI [my call]), agents (named
   sessions with status dot), agent queue, routines (scheduled / on demand).
@@ -116,25 +127,25 @@ Anti-goals (failure even if it "works")
   [decided]
 - Right pane: shows the view chosen in the icon rail's top two groups
   [decided, from screenshots]:
-  - Space-context group: Notifications, Settings (incl. per-Space
+  - Workspace-context group: Notifications, Settings (incl. per-Workspace
     integrations), Intents (list with state filter, create "+"; selecting
     one opens the intent editor), Feedback, Terminal.
   - Agent/worktree-context group (follows the agent selected on the left):
     Active intent, Folder tree, Changed files, Browser, Terminal.
   - Terminal and Browser buttons focus or open a center tab (a shell in the
-    Space, a shell in the agent's worktree, a browser tab).
+    Workspace, a shell in the agent's worktree, a browser tab).
   - A third rail group lower down selects the bottom pane view (below).
 - Center tab strip holds dashboards, Browser and terminal tabs (several per
-  Space) among others; a connection banner ("Reconnecting to <space>") sits
+  Workspace) among others; a connection banner ("Reconnecting to <workspace>") sits
   above the center. [from screenshots]
 - Settings (right pane, collapsible sections) [owner: "suggestions"]:
-  - Space scope: Agent defaults (default provider with per-provider model and thinking
+  - Workspace scope: Agent defaults (default provider with per-provider model and thinking
     level, agent name pool, queue limit, resume message and auto-nudge),
-    Source repositories (repos the Space has, add from its organizations),
-    Integrations (each bottom-pane tool's per-Space setup).
+    Source repositories (repos the Workspace has, add from its organizations),
+    Integrations (each bottom-pane tool's per-Workspace setup).
   - App scope: Secrets (agent tokens from the Keeper vault), Sign-ins (how
     often the app checks), Appearance (theme, text size, font), Updates.
-- Sign-ins: the Space card shows "n signed out"; a popover lists Coder,
+- Sign-ins: the Workspace card shows "n signed out"; a popover lists Coder,
   Keeper, Jira and Browser with Signed in/out, Sign in, Check now, Sign out
   and "checked Ns ago". [from screenshot]
 - Right (and later bottom) panes hide; the left pane is never hidden: it
@@ -172,10 +183,17 @@ dev harness (in scope):
 
 1. Desktop local: `host-desktop` starts (or finds) a local `server` process.
    The GPUI panes and the web tabs both connect to it over loopback HTTP and
-   WebSocket, the same transport a remote daemon uses through a tunnel.
-2. Desktop + remote: `server` on a Coder workspace, RunPod pod or SSH host.
-   The desktop connects through an SSH tunnel to the daemon port. Panes use the
-   client API; web tabs use the same tunneled WebSocket/HTTP endpoints.
+   WebSocket, the same API a remote daemon serves over HTTPS.
+2. Desktop + remote: `server` on a Coder space, RunPod pod or SSH host.
+   SSH installs, upgrades, starts and recovers the daemon, and reads its
+   port, token and certificate fingerprint. Everything else goes straight to
+   the daemon over HTTPS and WebSockets (TLS, with the daemon's own
+   certificate pinned by that fingerprint): panes use the client API and web
+   tabs use the same endpoints. Where the host has no port the desktop can
+   reach, an SSH port-forward carries the same traffic as a fallback, and a
+   provider's own HTTPS proxy is used where it has one. [owner decision
+   2026-11-27; replaces "everything through an SSH tunnel"; pinning and the
+   fallback are my calls]
 3. Mock: `host-web-mock` for the web app.
 
 Native panes and web tabs are both clients of the daemon and subscribe to the
@@ -213,15 +231,15 @@ example "open this issue in a center tab").
     Consequences: agents receive the secrets they need at start (resolved by
     the provider plugin, held in the agent's environment, never persisted by
     the daemon); each agent works in its own git worktree; the blast radius
-    is the Space's host, so a Coder workspace or pod is the isolation unit.
+    is the Workspace's runtime host, so a Coder space or pod is the isolation unit.
     The daemon still audits what agents did (session log, commits, PRs) but
     does not block it.
   - Providers seen: Claude Code (e.g. Opus 5.5, 1M context) and GitHub
     Copilot (Claude Opus 5.5), each with its own model and thinking level;
-    one is the Space's default provider. A custom SDK adapter is still
+    one is the Workspace's default provider. A custom SDK adapter is still
     unspecified.
   - Naming: agents take the first unused name from a name pool (default
-    "Planets": Mercury through Neptune); an intent sent to the Space takes
+    "Planets": Mercury through Neptune); an intent sent to the Workspace takes
     the first name with no open agent.
   - Color [decided]: each agent created when an intent is sent gets a color
     from a palette of hues that share the same saturation and exclude red,
@@ -258,8 +276,8 @@ example "open this issue in a center tab").
   schedule]: a name and a prompt "sent to a new agent each run" (every run is
   a fresh agent session). Trigger is on demand only, or at times of day (one
   or more times, chosen weekdays, an explicit timezone, e.g. America/New_York).
-  Runs execute in the Space's workspace via the daemon scheduler even with no
-  client open, as long as the workspace is running. Left pane lists each with
+  Runs execute on the Workspace's runtime via the daemon scheduler even with no
+  client open, as long as that machine is running. Left pane lists each with
   its schedule ("Weekdays · 11:50", "On demand"); the editor has Save, Cancel
   and Delete. Agent, model and thinking level per routine follow Agent
   defaults. [from screenshot; per-routine agent settings are my call]
@@ -334,14 +352,14 @@ example "open this issue in a center tab").
     allowed-hosts list, but its calls are synchronous bytes-in/bytes-out with
     no typed contract or streams, and it runs on Wasmtime anyway. stabby is
     at 72.1.16 and ships a `libloading` integration.
-  - Costs accepted with `dylib`: the workspace forbids `unsafe`; loading a
+  - Costs accepted with `dylib`: the Cargo workspace forbids `unsafe`; loading a
     library needs it, so one small loader crate is exempted and nothing else.
     On macOS the hardened runtime only loads libraries signed by Apple or by
     our Team ID; built-in dylibs are signed with ours and library validation
     stays on. (This is also why third-party native libraries are ruled out:
     they would need the entitlement that disables library validation.)
 - `plugin.toml` manifest: name, version, supported protocol range, resources
-  with freshness mode, **settings** (form schema rendered per Space),
+  with freshness mode, **settings** (form schema rendered per Workspace),
   **auth** requirements (secret-backed token, OAuth, browser session; feeds
   the sign-in status model), **action prompts** (below), **views** (table columns, filters, sort, row actions,
   or a streaming-tail kind), required capabilities (hosts, secret keys),
@@ -359,7 +377,7 @@ example "open this issue in a center tab").
   rows and lists in the bottom pane, and on any dashboard tile bound to a
   matching view. Running one starts or targets an agent session with the
   bound data attached as context. Plugin-shipped prompts are the defaults;
-  users may add their own per Space. [user-defined prompts are my call]
+  users may add their own per Workspace. [user-defined prompts are my call]
   Prompts whose outcome is a plugin write go through the approval flow; what
   the agent then does on its own is not gated.
 - **One prompt concept** [my call]: a prompt is a template plus agent
@@ -564,7 +582,7 @@ unless marked otherwise.
   "landed on the default branch", so dependents build on it. Stacked
   branches are deferred.
 - **Surfaces**: left pane (agents list with status dots, "New agent", agent
-  queue, Space card minimal); center chat tabs (web); right pane Intents
+  queue, Workspace card minimal); center chat tabs (web); right pane Intents
   list and intent editor with a Send action; icon rail with the Intents and
   Settings entries (Agent defaults, Source repositories and Appearance only). No bottom
   pane content.
@@ -599,7 +617,7 @@ unless marked otherwise.
   When all four sections have no pending items the intent becomes Complete.
 - **Execute (step 7)**: Send on a Complete intent:
   - Creates a new agent (next name, next color), a git worktree off the
-    Space's repository on a branch named from the intent slug, and starts the
+    Workspace's repository on a branch named from the intent slug, and starts the
     harness with a brief composed from the intent (title, current behavior,
     preconditions, acceptance criteria, stories, answered steering questions,
     summaries of its dependencies) plus fixed instructions: work in this
@@ -626,8 +644,9 @@ unless marked otherwise.
 v1 already ships `core`, `server` (store, agent runner, minimal queue,
 polish jobs), `app`, `host-desktop` and `web/`. UI-to-daemon traffic uses the
 real network API from day one, and all file and PTY access stays daemon-side.
-1. Remote daemons: SSH tunnel, daemon install/upgrade on Coder, RunPod and
-   SSH hosts, per-Space connection and sign-in status. This is the main
+1. Remote daemons: daemon install/upgrade and recovery over SSH on Coder,
+   RunPod and SSH hosts, data over HTTPS and WebSockets (4.3), per-Workspace
+   connection and sign-in status. This is the main
    reason for the rewrite, so it comes first.
 2. Plugin system: `plugin-protocol`, plugin host, secrets provider (Keeper),
    GitHub plugin first, bottom-pane generic views, settings and auth
@@ -649,6 +668,9 @@ real network API from day one, and all file and PTY access stays daemon-side.
 - GPUI pre-1.0 API churn (tracks Zed).
 - CEF binary size and update story.
 - Reverse-tunnel security model for exposing desktop CDP.
+- A remote daemon reachable over the network runs agents with permissions
+  bypassed, so its token is remote code execution on that host: TLS,
+  certificate pinning, token handling and which address it listens on.
 - Streaming logs: backpressure from daemon to a virtualized GPUI list.
 
 ## 8. Left to the builder
@@ -671,7 +693,7 @@ transitions, plugin install/update UX, test strategy.
    the host environment, never stored.
 5. Intent state machine and queue/dependency semantics from Intent IDE.
 6. Reverse-tunnel opt-in for desktop CEF CDP.
-7. Space = one daemon; client may connect to several; intents persist on the
+7. Workspace = one daemon; client may connect to several; intents persist on the
    host volume.
 8. The local daemon is a separate process that outlives the app while agents
    are working and exits after 10 idle minutes (replaces the earlier
@@ -686,18 +708,18 @@ transitions, plugin install/update UX, test strategy.
 13. Crate and package names.
 14. Intent editor and steering cards are native typed UI in the right pane,
     not A2UI; A2UI is for agent-composed center content.
-15. Rail Terminal/Browser buttons open center tabs (Space shell, worktree
+15. Rail Terminal/Browser buttons open center tabs (Workspace shell, worktree
     shell, browser); Folder tree and Changed files are native right-pane views
     fed by the daemon from the agent's worktree.
 16. Personal dashboards render in center tabs.
-17. Plugins declare per-Space settings schemas and auth requirements in the
-    manifest; the daemon tracks per-Space sign-in state (Coder is a
+17. Plugins declare per-Workspace settings schemas and auth requirements in the
+    manifest; the daemon tracks per-Workspace sign-in state (Coder is a
     client-side connection; Keeper, Jira and Browser are daemon-side) and
     checks it on the interval set in Settings → Sign-ins.
 18. Dashboards are versioned declarative documents with data bindings, edited
     by prompt, with an "Ask" action per tile.
 20. Action prompts are plugin-shipped data with user-defined additions per
-    Space; applicability to a dashboard tile is decided by matching the
+    Workspace; applicability to a dashboard tile is decided by matching the
     prompt's declared scope and resource to the tile's bound view.
 21. Routines, scheduled runs and action prompts share one prompt store and
     runner in the daemon.
@@ -712,8 +734,8 @@ transitions, plugin install/update UX, test strategy.
     is at the host level; the daemon audits agent actions without gating them.
 23. Agent colors are allocated like names (first unused, wrapping) from an
     equal-saturation palette in the design tokens, never red/yellow/green.
-22. Space settings are stored on the daemon host as a human-editable
-    `~/.smithagents/spaces/<org>/<space>/space.yaml` [decided: `smithagents`
+22. Workspace settings are stored on the daemon host as a human-editable
+    `~/.smithagents/workspaces/<org>/<workspace>/workspace.yaml` [decided: `smithagents`
     naming, not `singularity`], so queue limits, routines and nudges work with
     no client open. Intent IDE stores its equivalent on the client machine
     under a different root, one reason its queue is tied to the open app. The
@@ -721,6 +743,112 @@ transitions, plugin install/update UX, test strategy.
     live under `~/.smithagents/` (env override for the root is my call).
 19. The settings screenshot was a rotated photo; section names and text were
     read sideways and may contain misreadings.
+
+### Owner decisions of 2026-11-27 (revision 3)
+
+From a design conversation about using SmithAgents without git. Each line is
+[decided] unless it says otherwise.
+
+- **Workspace.** The logical grouping of a runtime, dashboards, repositories,
+  agents, the agent queue and routines is a Workspace. The word "Space" in
+  earlier revisions came from Coder; a machine on Coder is a "Coder space".
+  One daemon home is one Workspace, and the client may connect to several
+  (item 7 already said so).
+- **Repositories and META.** A Workspace has one or more repositories, and
+  exactly one is the META repository, which holds its intents and feedback.
+- **Creating a Workspace** chooses, in this order: the runtime (local, or
+  remote: Coder, RunPod, a VPS or a machine on the local network; every
+  remote needs SSH access); then per repository, source control: none or a
+  provider. With none: a folder path. With a provider: an existing
+  repository, a clone from the provider, or a new repository. A Coder
+  runtime picks an existing Coder space or creates one.
+- **Remote data path.** HTTPS and WebSockets; SSH for install, upgrade and
+  recovery (4.3).
+- **Source control is optional, and comes from providers.** A repository has
+  no source control until the owner turns it on. Git is built into the
+  daemon; a host (GitHub first) is a plugin that supplies sign-in, pull
+  requests and issues, so another host needs only a plugin. Settings has
+  the provider choice. [my calls: the choice is per repository; the
+  daemon's own `gh` calls move behind a plugin capability]
+- **Secrets service and sign-in service**, both in the daemon. The secrets
+  service resolves secrets through providers such as Keeper, for plugins
+  and for the named environment variables an agent's process is given. The
+  sign-in service sits on top of it and tracks sign-in for every plugin
+  that needs one. No operating-system keychain. The anti-goal stands: the
+  daemon persists no credential, so a secret is always a pointer to a
+  provider, an environment variable or a command. [the pointer rule is my
+  reading of the anti-goal]
+- **Order**: see "Roadmap after folder mode" below, which replaces the list
+  of six parts that stood here.
+- **Start page** [my call]: choosing or creating a Workspace, and the
+  progress of a remote install, are a page inside the main window, not a
+  separate splash window.
+- **Resource and usage monitor** (wanted by the owner; not designed yet):
+  the daemon measures its machine's CPU, memory and free disk space, and
+  records each turn's token use and cost, which the agent CLI already
+  reports and the daemon drops today. Both can hold the queue, beside the
+  "Agents working at once" limit. [my calls so far: floors the owner sets
+  for the machine, a budget per day for tokens, queued intents only, and
+  starts spaced out so a measurement can catch up; to build after folder
+  mode, whose plan changes the same queue function]
+
+### Roadmap after folder mode (2026-11-28) [my call unless marked]
+
+Folder mode (`2026-11-27-folder-mode-design.md`) merges first: every chain
+below builds on its changes. After it, the work is four chains. Inside a
+chain the order is fixed; the chains can run side by side.
+
+```
+Chain A  credentials and hosts
+  A1 secrets service: providers such as Keeper, and the named environment
+     variables an agent's process is given         needs D1
+  A2 sign-in service and its Settings section      needs A1
+  A3 hosts through plugins: pull requests, issues, clone from a provider,
+     built as plugin actions                       needs A2 and D3
+
+Chain B  where a Workspace runs
+  B1 several Workspaces and remote runtimes (SSH to install and recover,
+     HTTPS and WebSockets for data)
+  B2 runtime providers that create Coder spaces and RunPod pods
+                                                   needs B1 and A2
+  B3 one Workspace across several runtimes (open question below)
+                                                   needs B1
+
+Chain C  resource and usage limits (stands alone)
+  C1 CPU, memory and free disk space of the daemon's machine, the tokens
+     and cost of each turn, the plan's own usage windows; each can hold the
+     queue. Called a "monitor" in the conversation; renamed here because
+     chain D has "Monitors and alerts" for plugin records.
+
+Chain D  the plugin design, `2026-11-27-plugin-tools-views-actions-design.md`
+         [owner approved 2026-11-28], in its own seven plans
+  D1 typed data and tools in the daemon
+     (`plans/2026-11-28-plugin-typed-data-and-tools.md`, ready to build)
+  D2 tools in the app                              needs D1
+  D3 actions                                       needs D1 and D2
+  D4 command plugins                               needs D1
+  D5 monitors and alerts                           needs D1
+  D6 vocabulary overrides and links
+  D7 prompt-based operations                       needs D1 and D2
+```
+
+Why the links between chains:
+
+- **A1 waits for D1.** D1's first task renames the manifest's `[[tools]]` to
+  `[[commands]]` and `from_tool` to `from_command`, the code the secrets
+  service is built on.
+- **A3 is built on D3.** The plugin design's actions are how a plugin changes
+  something in a service, with the owner's approval; opening a pull request
+  or an issue is one of them. The plugin design leaves sign-in screens and
+  the provider role out, which A1 and A2 supply.
+- **Everything shares a few files**: the daemon's routes, the database
+  migrations (take the next free number, as D1's plan says), the protocol
+  number, and the Settings pane. Two builds at once is comfortable on one
+  machine; the full check uses all of it for about six minutes.
+
+What can run side by side once folder mode is merged: D1 (the only part with
+a finished plan), C1's design and build, and B1's design. Chain A waits for
+D1. Only folder mode was needed to use SmithAgents without git.
 
 ### Open questions (owner only)
 
@@ -733,3 +861,10 @@ transitions, plugin install/update UX, test strategy.
 - (Resolved: v1 uses CEF for the center web views, to prove early that
   CEF embedded in GPUI works. See the Platform and first-milestone bullets.)
 - (Resolved: v1 is desktop only, no browser host.)
+- Raised by the owner 2026-11-27: should one Workspace run on several
+  runtimes, to spread the work, each with its own agents and queue and all
+  cloning the same repositories? Designer's pick, not decided: yes, after
+  remote runtimes, as one home runtime that owns the Workspace's intents,
+  dependencies and routines plus worker runtimes that only run agents; only
+  repositories with source control and a host can be on more than one. It
+  replaces "Workspace = one daemon" (item 7) when it is designed.

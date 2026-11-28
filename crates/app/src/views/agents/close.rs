@@ -4,6 +4,8 @@
 //! opens with the focus on Cancel, and Enter, which gpui-base binds to the
 //! dialog's `Confirm` (running `on_ok`), dismisses it without closing the
 //! agent. Only the "Close agent" button closes. Escape dismisses as usual.
+//! It says what stays: an agent's worktree, or, for an agent that works in
+//! place in a plain folder, that the folder is not touched.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -14,17 +16,24 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, IconName, WindowExt as _};
 use gpui_kit::{App, Context, ParentElement as _, Styled as _, WeakEntity, Window};
+use smithagents_core::agent::Agent;
 use smithagents_core::ids::AgentId;
 
 use super::{
     notify_link_error, notify_unreachable, AgentsPane, CANCEL_CLOSE_ID, CLOSE_AGENT_LABEL,
-    CLOSE_TITLE_ID, CONFIRM_CLOSE_ID,
+    CLOSE_DESCRIPTION_ID, CLOSE_TITLE_ID, CONFIRM_CLOSE_ID,
 };
 use crate::link::LinkError;
 use crate::view_models::{StatusMessage, DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT};
 use crate::views::answered;
 
 const FAILED: &str = "Could not close the agent";
+/// What the confirmation says of an agent with a worktree.
+const CLOSE_WORKTREE_TEXT: &str =
+    "Its chat tab closes and it leaves the list. Its worktree stays on disk.";
+/// What it says of an agent that works in place (`Agent::works_in_place`).
+const CLOSE_IN_PLACE_TEXT: &str =
+    "Its chat tab closes and it leaves the list. The folder is not touched.";
 
 impl AgentsPane {
     /// Sends the close, once per agent while one is in flight, and waits for
@@ -96,6 +105,16 @@ impl AgentsPane {
         }
     }
 
+    /// Whether agent `id` works in place in a plain folder, as the model has
+    /// it.
+    pub(super) fn works_in_place(&self, id: AgentId, cx: &App) -> bool {
+        self.state
+            .read(cx)
+            .model()
+            .agent(id)
+            .is_some_and(Agent::works_in_place)
+    }
+
     /// The context menu of an agent's row or marker.
     pub(super) fn close_menu(
         &self,
@@ -104,6 +123,7 @@ impl AgentsPane {
         cx: &Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let pane = cx.entity().downgrade();
+        let in_place = self.works_in_place(id, cx);
         move |menu, _, _| {
             let (pane, name) = (pane.clone(), name.clone());
             menu.item(
@@ -114,7 +134,7 @@ impl AgentsPane {
                         // After the menu has closed and given focus back, so
                         // the dialog keeps the focus it takes.
                         window.defer(cx, move |window, cx| {
-                            confirm_close(pane, id, name, window, cx)
+                            confirm_close(pane, id, name, in_place, window, cx)
                         });
                     }),
             )
@@ -124,13 +144,21 @@ impl AgentsPane {
 
 /// Asks before closing an agent: "Close <name>?" with Cancel (focused, and
 /// what Enter does) and a danger "Close agent" button, the only way to close.
+/// `in_place`: the agent works in place in a plain folder
+/// ([`AgentsPane::works_in_place`]).
 pub(super) fn confirm_close(
     pane: WeakEntity<AgentsPane>,
     id: AgentId,
     name: String,
+    in_place: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let description = if in_place {
+        CLOSE_IN_PLACE_TEXT
+    } else {
+        CLOSE_WORKTREE_TEXT
+    };
     let cancel_focus = cx.focus_handle();
     // The builder runs again whenever the dialog layer rebuilds; focus only
     // on the first run, so a rebuild never steals the focus back.
@@ -146,7 +174,11 @@ pub(super) fn confirm_close(
                     .id(CLOSE_TITLE_ID)
                     .text_color(cx.theme().popover_foreground),
             )
-            .description("Its chat tab closes and it leaves the list. Its worktree stays on disk.")
+            .description(
+                Label::new(description)
+                    .id(CLOSE_DESCRIPTION_ID)
+                    .text_color(cx.theme().muted_foreground),
+            )
             // Enter dispatches the dialog's `Confirm`, which runs this: here it
             // dismisses, like Cancel. Returning `true` closes the dialog.
             .on_ok(|_, _, _| true)

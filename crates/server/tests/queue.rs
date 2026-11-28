@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{self, BoxStream, StreamExt};
-use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo, Role};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, ChatMessage, Repo, Role};
 use smithagents_core::event::EventKind;
 use smithagents_core::ids::{AgentId, IntentId, ItemId};
 use smithagents_core::intent::{
@@ -47,6 +47,8 @@ struct GateHarness {
     held: AtomicBool,
     gate: Arc<Semaphore>,
     die: Arc<AtomicUsize>,
+    /// Turns the harness was asked to run.
+    turns: AtomicUsize,
 }
 
 impl GateHarness {
@@ -55,6 +57,21 @@ impl GateHarness {
             held: AtomicBool::new(false),
             gate: Arc::new(Semaphore::new(0)),
             die: Arc::new(AtomicUsize::new(0)),
+            turns: AtomicUsize::new(0),
+        }
+    }
+
+    /// Waits until the harness has been asked to run `n` turns, so a hold
+    /// or [`Self::unhold`] after it no longer changes theirs.
+    async fn wait_turns(&self, n: usize) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while self.turns.load(Ordering::SeqCst) < n {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out; {} turns asked for, expected {n}",
+                self.turns.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -64,6 +81,11 @@ impl GateHarness {
 
     fn release(&self, turns: usize) {
         self.gate.add_permits(turns);
+    }
+
+    /// Turns started from now on end at once again.
+    fn unhold(&self) {
+        self.held.store(false, Ordering::SeqCst);
     }
 
     /// The next turn to pass the gate ends with `Failed` (its agent `Dead`).
@@ -79,6 +101,7 @@ impl Harness for GateHarness {
         _req: TurnRequest,
     ) -> Result<BoxStream<'static, HarnessEvent>, HarnessError> {
         let gate = self.held.load(Ordering::SeqCst).then(|| self.gate.clone());
+        self.turns.fetch_add(1, Ordering::SeqCst);
         let die = self.die.clone();
         Ok(stream::once(async move {
             if let Some(gate) = gate {
@@ -155,7 +178,10 @@ async fn fx_with(quiet_after: Duration) -> Fx {
     );
     let repo_dir = tmp.path().join("repo");
     common::init_repo(&repo_dir);
-    let repo = agents.add_repo(&repo_dir).await.unwrap();
+    let repo = agents
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
     let svc = service(&store, &bus, &h, &agents, &paths);
     let sched = Scheduler::start(svc.clone(), agents.clone(), store.clone(), bus.clone());
     Fx {
@@ -219,6 +245,11 @@ impl Fx {
     /// Inserts a `Complete` intent with one accepted criterion and an
     /// accepted depends-on item per entry of `deps`.
     async fn intent(&self, slug: &str, deps: &[IntentId]) -> Intent {
+        self.intent_on(&self.repo, slug, deps).await
+    }
+
+    /// [`Self::intent`], on `repo`.
+    async fn intent_on(&self, repo: &Repo, slug: &str, deps: &[IntentId]) -> Intent {
         let content = Content {
             title: format!("Title of {slug}"),
             kind: IntentKind::Task,
@@ -232,14 +263,25 @@ impl Fx {
                 .map(|d| accepted("must land first", Some(*d)))
                 .collect(),
         };
-        self.insert(slug, IntentState::Complete, content).await
+        self.insert_on(repo, slug, IntentState::Complete, content)
+            .await
     }
 
     async fn insert(&self, slug: &str, state: IntentState, content: Content) -> Intent {
+        self.insert_on(&self.repo, slug, state, content).await
+    }
+
+    async fn insert_on(
+        &self,
+        repo: &Repo,
+        slug: &str,
+        state: IntentState,
+        content: Content,
+    ) -> Intent {
         let now = Utc::now();
         let intent = Intent {
             id: IntentId::new(),
-            repo_id: self.repo.id,
+            repo_id: repo.id,
             slug: slug.into(),
             state,
             phase: Phase::Review,
@@ -420,10 +462,10 @@ async fn send_starts_an_agent_with_the_brief() {
     assert_eq!(f.get(x.id).await, sent);
     let agent = f.agent(sent.agent_id.unwrap()).await;
     assert_eq!(agent.name, "Mercury");
-    assert_eq!(agent.branch, "intent/fix-login");
+    assert_eq!(agent.branch.as_deref(), Some("intent/fix-login"));
     assert_eq!(agent.intent_id, Some(x.id));
     assert!(agent.worktree_path.is_dir());
-    let brief = compose(&x, &[]);
+    let brief = compose(&x, &[], false);
     let first = &f.messages(agent.id).await[0];
     assert_eq!(
         (first.role, first.text.as_str()),
@@ -510,7 +552,7 @@ async fn dropped_dependencies_do_not_hold_an_intent() {
     assert_eq!(sent.state, IntentState::Sent);
     // A dropped dependency is not summarized in the brief either.
     let first = &f.messages(sent.agent_id.unwrap()).await[0];
-    assert_eq!(first.text, compose(&x, &[]).first_message);
+    assert_eq!(first.text, compose(&x, &[], false).first_message);
 }
 
 #[tokio::test]
@@ -540,7 +582,7 @@ async fn resolving_the_dependency_starts_the_dependent() {
         current_behavior: base.content.current_behavior.clone(),
     };
     let first = &f.messages(agent.id).await[0];
-    assert_eq!(first.text, compose(&x, &[dep]).first_message);
+    assert_eq!(first.text, compose(&x, &[dep], false).first_message);
     assert!(
         first.text.contains("Title of base (base)"),
         "{}",
@@ -931,6 +973,189 @@ async fn a_panicking_start_does_not_stop_the_scheduler() {
     assert_eq!(f.agents_for(q.id).await.len(), 1);
 }
 
+// ------------------------------------------------------------ plain folders
+
+impl Fx {
+    /// A folder added with no source control, beside the git repository.
+    async fn plain_repo(&self) -> Repo {
+        let dir = self.tmp.path().join("folder");
+        std::fs::create_dir_all(&dir).unwrap();
+        self.agents
+            .add_repo(&dir, AddSourceControl::None)
+            .await
+            .unwrap()
+    }
+}
+
+/// With a queue limit of 2, sends a and b on a plain folder and c on the git
+/// repository, in that order, and returns once a's turn has ended: a and c
+/// are `Sent`, and b has waited, with no start error, while a's turn ran and
+/// after it ended, though a slot was free.
+async fn two_intents_on_one_folder(f: &Fx) -> (Repo, Intent, Intent) {
+    f.svc
+        .set_agent_defaults(AgentDefaults {
+            queue_limit: Some(2),
+        })
+        .await
+        .unwrap();
+    let folder = f.plain_repo().await;
+    let a = f.intent_on(&folder, "a", &[]).await;
+    let b = f.intent_on(&folder, "b", &[]).await;
+    let c = f.intent("c", &[]).await;
+    f.h.hold();
+    let a = f.svc.send(a.id).await.unwrap();
+    assert_eq!(a.state, IntentState::Sent);
+    let queued = f.svc.send(b.id).await.unwrap();
+    assert_eq!(
+        (queued.state, queued.last_start_error),
+        (IntentState::Queued, None)
+    );
+    // c's turn ends at once, so only a's runs.
+    f.h.wait_turns(1).await;
+    f.h.unhold();
+    let c = f.svc.send(c.id).await.unwrap();
+    assert_eq!(c.state, IntentState::Sent);
+    wait_running(&f.agents, 1).await;
+    assert!(f.agents.turn_in_flight(a.agent_id.unwrap()));
+
+    f.sched().run_pass().await;
+    let waiting = f.get(b.id).await;
+    assert_eq!(
+        (waiting.state, waiting.last_start_error),
+        (IntentState::Queued, None)
+    );
+
+    f.h.release(1);
+    f.wait_agent(a.agent_id.unwrap(), |x| x.state == AgentState::Done)
+        .await;
+    wait_running(&f.agents, 0).await;
+    f.sched().run_pass().await;
+    let waiting = f.get(b.id).await;
+    assert_eq!(
+        (waiting.state, waiting.last_start_error),
+        (IntentState::Queued, None)
+    );
+    assert!(f.agents_for(b.id).await.is_empty());
+    assert_eq!(f.state(a.id).await, IntentState::Sent);
+    (folder, a, b)
+}
+
+#[tokio::test]
+async fn intents_on_one_plain_folder_run_one_after_the_other() {
+    let f = fx().await;
+    let (folder, a, b) = two_intents_on_one_folder(&f).await;
+
+    f.svc.resolve(a.id).await.unwrap();
+
+    // No other call: the scheduler starts b, in the folder itself.
+    let sent = f.wait_sent(b.id).await;
+    let agent = f.agent(sent.agent_id.unwrap()).await;
+    assert_eq!((agent.branch, agent.worktree_path), (None, folder.path));
+}
+
+impl Fx {
+    /// Holds the gate and starts a chat turn of a new agent of `folder`,
+    /// started for no intent: the folder is busy until a release.
+    async fn chat_in(&self, folder: &Repo) -> Agent {
+        self.h.hold();
+        let chat = self.agents.create_agent(folder.id).await.unwrap();
+        self.agents
+            .send_message(chat.id, "hello".into())
+            .await
+            .unwrap();
+        assert!(self.agents.folder_busy(folder.id));
+        chat
+    }
+}
+
+/// `start` does not look at held folders, so a start while a chat turn runs
+/// in the folder is a chat turn taking the folder between the decision to
+/// start an intent and its agent's first message.
+#[tokio::test]
+async fn a_start_that_finds_the_folder_taken_waits_with_no_start_error() {
+    let f = fx().await;
+    let folder = f.plain_repo().await;
+    f.chat_in(&folder).await;
+    let mut q = f.intent_on(&folder, "q", &[]).await;
+    q.state = IntentState::Queued;
+    q.queued_at = Some(Utc::now());
+    f.store.save_intent(&q).await.unwrap();
+    // Complete, as Send hands an intent to the start.
+    let x = f.intent_on(&folder, "x", &[]).await;
+
+    // A queued intent stays as it is.
+    let waiting = f.svc.start(q.id).await.unwrap();
+    assert_eq!(
+        (waiting.state, waiting.last_start_error.clone()),
+        (IntentState::Queued, None)
+    );
+    assert_eq!(f.get(q.id).await, q);
+    let made = f.agents_for(q.id).await;
+    assert_eq!(made.len(), 1);
+    assert!(made[0].closed_at.is_some());
+
+    // A complete one is queued as Send queues it.
+    let seq = f.bus.latest_seq();
+    let queued = f.svc.start(x.id).await.unwrap();
+    assert_eq!(
+        (queued.state, queued.last_start_error.clone()),
+        (IntentState::Queued, None)
+    );
+    assert!(queued.queued_at.is_some());
+    assert_eq!(f.get(x.id).await, queued);
+    assert_eq!(
+        f.authors(x.id).await,
+        [VersionAuthor::Seed, VersionAuthor::Send]
+    );
+    assert_eq!(f.updates_since(seq, x.id).last(), Some(&queued));
+    assert!(f
+        .agents_for(x.id)
+        .await
+        .iter()
+        .all(|a| a.closed_at.is_some()));
+
+    // The chat turn ends: the scheduler starts the older one with no other
+    // call, and the folder is then its.
+    f.h.release(1);
+    let sent = f.wait_sent(q.id).await;
+    assert_eq!(sent.last_start_error, None);
+    f.sched().run_pass().await;
+    let later = f.get(x.id).await;
+    assert_eq!(
+        (later.state, later.last_start_error),
+        (IntentState::Queued, None)
+    );
+}
+
+#[tokio::test]
+async fn send_while_a_chat_turn_runs_in_the_folder_queues() {
+    let f = fx().await;
+    let folder = f.plain_repo().await;
+    f.chat_in(&folder).await;
+    let x = f.intent_on(&folder, "x", &[]).await;
+
+    let queued = f.svc.send(x.id).await.unwrap();
+
+    assert_eq!(
+        (queued.state, queued.last_start_error),
+        (IntentState::Queued, None)
+    );
+    assert!(f.agents_for(x.id).await.is_empty());
+    f.h.release(1);
+    f.wait_sent(x.id).await;
+}
+
+#[tokio::test]
+async fn closing_the_agent_frees_the_folder_for_the_next_intent() {
+    let f = fx().await;
+    let (_, a, b) = two_intents_on_one_folder(&f).await;
+
+    f.agents.close_agent(a.agent_id.unwrap()).await.unwrap();
+
+    f.wait_sent(b.id).await;
+    assert_eq!(f.state(a.id).await, IntentState::Sent);
+}
+
 // ----------------------------------------------------------------- failures
 
 #[tokio::test]
@@ -941,7 +1166,7 @@ async fn branch_collision_retries_once_with_a_suffix() {
 
     let sent = f.svc.send(x.id).await.unwrap();
     let agent = f.agent(sent.agent_id.unwrap()).await;
-    assert_eq!(agent.branch, format!("intent/taken-{}", hex6(x.id)));
+    assert_eq!(agent.branch, Some(format!("intent/taken-{}", hex6(x.id))));
     assert_eq!(sent.last_start_error, None);
 
     // Both names taken: one retry only, then a typed error and no agent.
@@ -1047,7 +1272,7 @@ async fn failed_save_after_the_start_closes_the_agent() {
     assert_eq!(sent.state, IntentState::Sent);
     assert_eq!(sent.last_start_error, None);
     let agent = f.agent(sent.agent_id.unwrap()).await;
-    assert_eq!(agent.branch, format!("intent/x-{}", hex6(x.id)));
+    assert_eq!(agent.branch, Some(format!("intent/x-{}", hex6(x.id))));
 }
 
 // ------------------------------------------------------------------ resolve

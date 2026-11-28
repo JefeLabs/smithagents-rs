@@ -11,6 +11,7 @@ mod common;
 
 use std::rc::Rc;
 
+use common::feedback_submit::idea_intent;
 use common::intents::{fixed_clock, intent, item, model_with, FakeIntents, IntentCall};
 use common::ui::{agent, fake_connection, open_shell_options};
 use gpui_kit::base::Root;
@@ -25,12 +26,13 @@ use smithagents_app::shell::{Shell, ShellOptions, INTENTS_PANEL};
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::views::intents::{
     intent_card_id, item_confirm_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, DETAIL_STATE_ID,
-    DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, INTENT_ERROR_ID, OPEN_CHAT_ID, QUEUED_REASON_ID,
-    RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID, RESOLVE_DESCRIPTION, RESOLVE_DESCRIPTION_ID, RESOLVE_ID,
-    RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
+    DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, IMPLEMENT_ID, INTENT_ERROR_ID, OPEN_CHAT_ID,
+    OPEN_PR_ID, PR_URL_ID, QUEUED_REASON_ID, RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID,
+    RESOLVE_DESCRIPTION, RESOLVE_DESCRIPTION_ID, RESOLVE_ID, RESOLVE_TITLE_ID, SEND_ID,
+    START_ERROR_ID,
 };
 use smithagents_app::views::rail::RailEntry;
-use smithagents_core::agent::Agent;
+use smithagents_core::agent::{Agent, Repo, SourceControl};
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentState, Item, ItemStatus, Phase};
 
@@ -46,12 +48,22 @@ struct Opened {
 /// with these intents and agents, shows the Intents list and opens the first
 /// intent's detail.
 fn open_detail(cx: &mut TestAppContext, intents: Vec<Intent>, agents: Vec<Agent>) -> Opened {
+    open_detail_in(cx, intents, agents, vec![])
+}
+
+/// [`open_detail`] with these repositories too.
+fn open_detail_in(
+    cx: &mut TestAppContext,
+    intents: Vec<Intent>,
+    agents: Vec<Agent>,
+    repos: Vec<Repo>,
+) -> Opened {
     let first = intents[0].id;
     let fake = Rc::new(FakeIntents::default());
     let (window, shell) = open_shell_options(
         cx,
         ShellOptions {
-            model: model_with(intents, agents, vec![]),
+            model: model_with(intents, agents, repos),
             intent_commands: Some(fake.clone()),
             clock: Some(fixed_clock("2026-11-26T10:15:00-08:00")),
             connection_info: Some(fake_connection()),
@@ -573,6 +585,77 @@ fn mark_resolved_asks_first(cx: &mut TestAppContext) {
     assert!(!dialog_open(cx, window));
     assert!(calls(&opened).is_empty());
     assert_eq!(state_label(cx, window).as_deref(), Some("Sent"));
+}
+
+#[gpui_kit::test]
+fn the_resolved_hint_says_what_resolving_means_for_the_repository(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let intent = sent(&mercury);
+    let repo = |source_control| Repo {
+        id: intent.repo_id,
+        path: "/src/app".into(),
+        source_control,
+        created_at: intent.created_at,
+    };
+    for (source_control, hint) in [
+        (
+            None,
+            "This means the work is finished in the folder, so intents that depend on it can start.",
+        ),
+        (
+            Some(SourceControl::Git {
+                default_branch: "main".into(),
+            }),
+            "This means the work has landed on the default branch, so intents that depend on it can start.",
+        ),
+    ] {
+        let opened = open_detail_in(
+            cx,
+            vec![intent.clone()],
+            vec![mercury.clone()],
+            vec![repo(source_control.clone())],
+        );
+        click(cx, opened.window, RESOLVE_ID);
+        assert!(dialog_open(cx, opened.window));
+        assert_eq!(
+            label_of(cx, opened.window, RESOLVE_DESCRIPTION_ID).as_deref(),
+            Some(hint),
+            "{source_control:?}"
+        );
+        press(cx, opened.window, "escape");
+    }
+}
+
+#[gpui_kit::test]
+fn an_idea_on_a_plain_folder_offers_no_idea_actions(cx: &mut TestAppContext) {
+    let idea = idea_intent(IntentState::Resolved, None);
+    let repo = |source_control| Repo {
+        id: idea.repo_id,
+        path: "/src/app".into(),
+        source_control,
+        created_at: idea.created_at,
+    };
+    let git = repo(Some(SourceControl::Git {
+        default_branch: "main".into(),
+    }));
+    let folder = repo(None);
+
+    // With source control, both are offered.
+    let opened = open_detail_in(cx, vec![idea.clone()], vec![], vec![git]);
+    assert!(is_drawn(cx, opened.window, OPEN_PR_ID));
+    assert!(is_drawn(cx, opened.window, IMPLEMENT_ID));
+
+    // Once the folder has none, neither is: both could only be refused.
+    let opened = open_detail_in(cx, vec![idea.clone()], vec![], vec![folder.clone()]);
+    assert!(!is_drawn(cx, opened.window, OPEN_PR_ID));
+    assert!(!is_drawn(cx, opened.window, IMPLEMENT_ID));
+
+    // A pull request that exists is still shown.
+    let url = "https://github.com/acme/app/pull/7";
+    let with_pr = idea_intent(IntentState::Resolved, Some(url));
+    let opened = open_detail_in(cx, vec![with_pr], vec![], vec![folder]);
+    assert_eq!(label_of(cx, opened.window, PR_URL_ID).as_deref(), Some(url));
+    assert!(!is_drawn(cx, opened.window, IMPLEMENT_ID));
 }
 
 #[gpui_kit::test]

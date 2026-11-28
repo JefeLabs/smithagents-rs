@@ -28,7 +28,7 @@ use smithagents_app::views::intents::{
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_app::views::settings::SETTINGS_TITLE_ID;
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::ids::RepoId;
 use smithagents_core::intent::{CreateIntentRequest, IntentKind, IntentState, Phase, SeedInput};
 
@@ -40,7 +40,9 @@ fn repo(path: &str, created: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: PathBuf::from(path),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at,
     }
 }

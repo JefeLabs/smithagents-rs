@@ -33,7 +33,7 @@ use smithagents_app::views::title_bar::{
     TITLE_BAR_ID, TITLE_TEXT_ID, UPDATE_CHIP_ID, UPDATE_CHIP_MARGIN, UPDATE_CHIP_TOKENS,
 };
 use smithagents_center_host::PixelRect;
-use smithagents_core::agent::{Agent, Repo};
+use smithagents_core::agent::{AddSourceControl, Agent, Repo, SourceControl};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
 use smithagents_theme::tokens::{Appearance, ThemeSet};
@@ -460,7 +460,19 @@ impl AgentCommands for FakeCommands {
         async { Err(LinkError::NotConnected) }.boxed_local()
     }
 
-    fn add_repo(&self, _: &std::path::Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+    fn add_repo(
+        &self,
+        _: &std::path::Path,
+        _: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        async { Err(LinkError::NotConnected) }.boxed_local()
+    }
+
+    fn set_source_control(
+        &self,
+        _: RepoId,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         async { Err(LinkError::NotConnected) }.boxed_local()
     }
 }
@@ -471,7 +483,9 @@ fn creating_an_agent_sets_the_created_status(cx: &mut TestAppContext) {
     let repo = Repo {
         id: RepoId::new(),
         path: "/src/app".into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: mercury.created_at,
     };
     let mut model = connected();
@@ -500,7 +514,9 @@ fn a_repository_event_says_which_repository_was_added(cx: &mut TestAppContext) {
     let repo = Repo {
         id: RepoId::new(),
         path: "/src/my-app".into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: "2026-11-24T09:00:00Z".parse().unwrap(),
     };
     state.update(cx, |state, cx| state.dispatch(Action::RepoAdded(repo), cx));

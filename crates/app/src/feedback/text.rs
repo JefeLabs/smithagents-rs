@@ -278,6 +278,10 @@ pub const IMPLEMENT_CONFIRM_LABEL: &str = "Create implementation intent";
 /// The tooltip of the button that copies the pull request's address.
 pub const COPY_LINK_LABEL: &str = "Copy link";
 pub const REPO_GONE_TEXT: &str = "That repository no longer exists.";
+/// The Submit screen's Repository line when no repository has source
+/// control (Feedback works by committing files), and the daemon's refusal of
+/// a submission to a plain folder.
+pub const NEEDS_SOURCE_CONTROL_TEXT: &str = "Feedback needs a repository with source control.";
 pub const LINK_STOPPED_TEXT: &str = "The daemon link has stopped";
 /// "Start over"'s tooltip.
 pub const START_OVER_TOOLTIP: &str = "Keep the screenshots and text, and send as a new submission.";

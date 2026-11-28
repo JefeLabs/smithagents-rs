@@ -549,7 +549,7 @@ the daemon does not stop for idleness while one runs.
 
 | Route | What it does |
 | --- | --- |
-| `GET /v1/feedback/targets` | Every repository with `has_github_remote` (its configured `origin` is on github.com) and `is_public` (`true`, `false`, or `null` when unknown), the meta repository, and whether `gh` (signed in) and `agent-browser` are ready, with a `reason` when not. No remote URL is returned. |
+| `GET /v1/feedback/targets` | Every repository with source control (a plain folder is never a target), with `has_github_remote` (its configured `origin` is on github.com) and `is_public` (`true`, `false`, or `null` when unknown), the meta repository, and whether `gh` (signed in) and `agent-browser` are ready, with a `reason` when not. No remote URL is returned. |
 | `GET /v1/settings/feedback`, `PUT /v1/settings/feedback` | The meta repository, the one feedback goes to by default: `{"meta_repo_id": "<repo id>" \| null}`. |
 | `POST /v1/feedback` | A submission (below). Answers with the outcome: `submission_id`, `repo_id`, `branch`, `commit`, `folder`, `pushed`, `intent`, `issue_url`, and `failed` (`step`, `code`, `message`) when a step after the commit failed. The same id again continues that submission: nothing is committed twice, and only what has not succeeded runs. |
 | `POST /v1/feedback/{id}/retry` | Runs what has not succeeded of the recorded submission `id` (the intent, or the push and then the issue); the same answer. |
@@ -600,7 +600,10 @@ message is a fixed sentence, never something git or `gh` printed):
   package with no part or sent as an issue), `unsupported_file` (400: "screenshot
   1 is not a png file"), `payload_too_large` (413: a part, the request part or
   the whole upload over its limit), `repo_not_found` (404); 409
-  `origin_unreadable` ("git could not read this repository's settings. Check
+  `needs_source_control` ("Feedback needs a repository with source control.":
+  the repository is a plain folder; checked first, before git or `gh` runs,
+  also for a recorded submission that is continued), `origin_unreadable`
+  ("git could not read this repository's settings. Check
   that its folder is still a git repository.": its folder is gone or no
   longer a git repository; whatever the submission is sent as),
   `default_branch_missing`, `git_identity_missing`, `no_free_name`,
@@ -614,10 +617,13 @@ message is a fixed sentence, never something git or `gh` printed):
   `store_error`. A recorded submission that is continued can also answer
   `intent_not_found` (its intent was deleted) or `repo_not_found` (404).
 - `POST /v1/feedback/{id}/retry`: `bad_request` (400, not a submission id);
-  `submission_not_found`, `repo_not_found`, `intent_not_found` (404);
-  `store_error` (500).
-- In `failed` (a 200 answer: the commit exists): step `create_intent` with the
-  intent service's code; step `push` with `push_not_fast_forward` ("git could
+  `submission_not_found`, `repo_not_found`, `intent_not_found` (404); 409
+  `needs_source_control` (the recorded submission's repository has no source
+  control now; its commit stays on its branch); `store_error` (500).
+- In `failed` (a 200 answer: the commit exists): any step with
+  `needs_source_control` when the repository lost its source control after
+  the commit; step `create_intent` with the intent service's code; step
+  `push` with `push_not_fast_forward` ("git could
   not push to origin: origin already has that branch with other commits,
   perhaps from an earlier push. Delete the branch on origin if it is no
   longer wanted, then try again."), `push_rejected`, `push_auth`,
@@ -630,8 +636,10 @@ message is a fixed sentence, never something git or `gh` printed):
   `no_github_remote`, `origin_unreadable`, `git_failed` or `io_error`.
 - `POST /v1/intents/{id}/pull-request`, with nothing pushed: `bad_request`
   (400, a malformed body or id); `intent_not_found`, `repo_not_found` (404);
-  409 `not_an_idea`, `invalid_state` (not sent yet, or the agent is still
-  working), `idea_agent_missing` ("the idea intent's agent no longer
+  409 `needs_source_control` (the idea intent's repository is a plain folder;
+  checked before anything is read, run or recorded), `not_an_idea`,
+  `invalid_state` (not sent yet, or the agent is still working),
+  `idea_agent_missing` ("the idea intent's agent no longer
   exists"), `idea_branch_missing` ("the idea agent's branch no longer
   exists"), `idea_origin_invalid` ("the idea intent's folder or branch is not
   one Submit made"), `idea_out_of_scope` (the agent's branch changes
@@ -657,14 +665,17 @@ message is a fixed sentence, never something git or `gh` printed):
   `git_failed` is 500.)
 - `POST /v1/intents/{id}/implementation`: `bad_request` (400, a malformed
   body or id); `intent_not_found`, `repo_not_found` (404); 409
-  `not_an_idea`, `invalid_state`, `idea_agent_missing`,
+  `needs_source_control` (as for the pull request), `not_an_idea`,
+  `invalid_state`, `idea_agent_missing`,
   `idea_branch_missing`, `idea_origin_invalid`, `origin_unreadable`,
   `public_not_acknowledged` (its repository's `origin` is on GitHub, the body
   does not acknowledge, and `gh` does not say it is private; checked before
   anything is made); 500 `git_failed`, `io_error` (git could not read the
   repository or the agent's branch), `store_error`; the intent service's
   codes when the intent cannot be made.
-- `PUT /v1/settings/feedback`: `repo_not_found` (404), `bad_request` (400).
+- `PUT /v1/settings/feedback`: `repo_not_found` (404), `bad_request` (400),
+  `needs_source_control` (409: the repository named is a plain folder; the
+  stored choice stays).
 
 The two `unpushed_commits` sentences: "The default branch has commits that
 are not on origin. Push them first, so they are not published with this

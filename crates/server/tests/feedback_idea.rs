@@ -267,7 +267,11 @@ impl Fx {
         common::git(&dir, &["config", "user.name", "Test User"]);
         common::git(&dir, &["config", "user.email", "test@example.invalid"]);
         let (status, body) = self
-            .call(Method::POST, "/v1/repos", Some(json!({ "path": dir })))
+            .call(
+                Method::POST,
+                "/v1/repos",
+                Some(json!({ "path": dir, "source_control": "git" })),
+            )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         serde_json::from_value(body).unwrap()
@@ -1200,7 +1204,10 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
     let (repo, bare) = fx.github_repo("r1").await;
     let (idea, agent, head) = fx.sent_idea(&repo).await;
     // A tag named like the agent's branch, elsewhere: the branch is read.
-    common::git(&repo.path, &["tag", &agent.branch, "main"]);
+    common::git(
+        &repo.path,
+        &["tag", agent.branch.as_deref().unwrap(), "main"],
+    );
     // A title with a web address in it (a title is never a link).
     let mut titled = fx.state.intents.get(idea.id).await.unwrap();
     titled.content.title = "Fix the zoom of https://a.b/@x".into();
@@ -1925,7 +1932,7 @@ async fn an_implementation_intent_depends_on_the_idea_and_starts_from_its_branch
     let created: Intent = serde_json::from_value(body).unwrap();
     assert_ne!(created.id, idea_id);
     assert_eq!(created.repo_id, repo.id);
-    assert_eq!(created.base_branch.as_deref(), Some(agent.branch.as_str()));
+    assert_eq!(created.base_branch, agent.branch);
     assert_eq!(created.content.kind, idea.content.kind);
     let origin = created.origin.clone().expect("an origin");
     assert_eq!(
@@ -1934,7 +1941,7 @@ async fn an_implementation_intent_depends_on_the_idea_and_starts_from_its_branch
             origin.branch.as_str(),
             origin.commit.as_str()
         ),
-        (FOLDER, agent.branch.as_str(), head.as_str())
+        (FOLDER, agent.branch.as_deref().unwrap(), head.as_str())
     );
     assert_eq!(origin.idea, None);
     let depends: Vec<_> = created
@@ -2582,7 +2589,11 @@ async fn lasting_conditions_have_codes_of_their_own() {
     let (idea, agent, _) = fx.sent_idea(&repo).await;
     common::git(
         &repo.path,
-        &["update-ref", "-d", &format!("refs/heads/{}", agent.branch)],
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{}", agent.branch.as_deref().unwrap()),
+        ],
     );
     for route in ["pull-request", "implementation"] {
         let (status, body) = fx
@@ -2736,4 +2747,69 @@ async fn a_pull_request_in_a_private_repository_needs_no_acknowledgement() {
     assert_eq!(answer["origin"]["idea"]["pr_url"], PR_URL);
     assert_eq!(git_out(&bare, &["rev-parse", BRANCH]), head);
     assert_eq!(fx.calls_starting("repo view").len(), 1);
+}
+
+#[tokio::test]
+async fn the_idea_actions_refuse_a_repository_without_source_control() {
+    let fx = fixture_with(Opts {
+        turns: 1,
+        ..Opts::default()
+    })
+    .await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let (idea, agent, _) = fx.sent_idea(&repo).await;
+    // Source control can be turned off once the idea is resolved and its
+    // agent closed.
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/agents/{}/close", agent.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            &format!("/v1/intents/{}/resolve", idea.id),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = fx
+        .call(
+            Method::PATCH,
+            &format!("/v1/repos/{}", repo.id),
+            Some(json!({"source_control": "none"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A git that ran in the folder now would answer something else.
+    std::fs::rename(repo.path.join(".git"), fx.tmp.path().join("aside.git")).unwrap();
+    let package = fx.idea_of(idea.id).await;
+    let intents = fx.intents().await.len();
+
+    for route in ["pull-request", "implementation"] {
+        let (status, body) = fx
+            .call(
+                Method::POST,
+                &format!("/v1/intents/{}/{route}", idea.id),
+                Some(json!({"public_acknowledged": true})),
+            )
+            .await;
+        assert_eq!(
+            refusal(status, &body),
+            (
+                StatusCode::CONFLICT,
+                Some("needs_source_control"),
+                Some("Feedback needs a repository with source control.")
+            ),
+            "{route}"
+        );
+    }
+    // Nothing ran, was pushed, made or recorded.
+    assert!(fx.fake.calls().is_empty(), "{:?}", fx.fake.calls());
+    assert!(bare_branches(&bare).is_empty());
+    assert_eq!(fx.intents().await.len(), intents);
+    assert_eq!(fx.idea_of(idea.id).await, package);
 }

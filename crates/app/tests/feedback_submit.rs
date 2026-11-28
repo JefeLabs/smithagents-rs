@@ -54,7 +54,7 @@ use smithagents_app::views::feedback::{
 use smithagents_app::views::intents::{IntentsPane, Screen};
 use smithagents_app::views::rail::RailEntry;
 use smithagents_client::ClientError;
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::{
     AttachmentKind, FeedbackFailure, FeedbackKind, FeedbackSettings, FeedbackStep, FeedbackTargets,
     IdeaOptions, SendAs, ToolReadiness,
@@ -81,7 +81,9 @@ fn repo(path: &str, created: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at,
     }
 }
@@ -587,6 +589,108 @@ fn the_repository_starts_on_the_last_used_then_the_meta_repository(cx: &mut Test
             .read_with(cx, |shell, cx| shell.rail_active(cx)),
         Some(RailEntry::Settings)
     );
+}
+
+#[gpui_kit::test]
+fn feedback_goes_only_to_a_repository_with_source_control(cx: &mut TestAppContext) {
+    let alpha = repo("/work/alpha", "20");
+    let folder = Repo {
+        source_control: None,
+        ..repo("/work/folder", "21")
+    };
+
+    // Only a plain folder: the screen says what is needed, nothing can be
+    // sent, and the line leads to Settings.
+    let setup = FeedbackSetup::new();
+    let opened = open(cx, &setup, std::slice::from_ref(&folder), None);
+    let window = opened.window;
+    screenshot(cx, &opened, &setup, &[]);
+    open_submit(cx, &opened, targets(&[], true, false));
+    type_idea(cx, window, "Fix the zoom");
+    assert_eq!(
+        text_of(cx, window, SUBMIT_REPO_ID).as_deref(),
+        Some("Feedback needs a repository with source control.")
+    );
+    assert!(disabled(cx, window, SUBMIT_CONFIRM_ID));
+    click(cx, window, SUBMIT_REPO_ID);
+    assert_eq!(
+        opened
+            .shell
+            .read_with(cx, |shell, cx| shell.rail_active(cx)),
+        Some(RailEntry::Settings)
+    );
+    close(cx, opened);
+
+    // Beside a git repository: the folder, used last, is neither where the
+    // screen starts nor in the menu.
+    let setup = FeedbackSetup::new();
+    let opened = open(cx, &setup, &[folder.clone(), alpha.clone()], None);
+    let window = opened.window;
+    opened
+        .state
+        .update(cx, |state, _| state.set_last_repo_id(folder.id));
+    screenshot(cx, &opened, &setup, &[]);
+    open_submit(cx, &opened, no_remotes(std::slice::from_ref(&alpha)));
+    assert_eq!(
+        text_of(cx, window, SUBMIT_REPO_ID).as_deref(),
+        Some("alpha")
+    );
+    click(cx, window, SUBMIT_REPO_ID);
+    with_window(cx, window, |window, _| {
+        let menu = window.within("popup-menu");
+        assert!(menu.try_find(submit_repo_item_id(alpha.id)).is_some());
+        assert!(menu.try_find(submit_repo_item_id(folder.id)).is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn a_repository_that_lost_its_source_control_refuses_feedback(cx: &mut TestAppContext) {
+    let refused = || {
+        Err(api(
+            409,
+            "needs_source_control",
+            "Feedback needs a repository with source control.",
+        ))
+    };
+    // A first Create: nothing was made, so the form stays as it was.
+    let setup = FeedbackSetup::new();
+    let repos = two_repos();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    opened.fake.queue_outcome(refused());
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some("Feedback needs a repository with source control.")
+    );
+    assert!(!cx.read(|cx| opened.feedback.read(cx).locked()));
+    assert!(!idea_disabled(cx, window));
+    assert!(!drawn(cx, window, SUBMIT_RETRY_ID));
+    close(cx, opened);
+
+    // A Retry of a submission whose files are committed: they still are, so
+    // it stays locked.
+    let setup = FeedbackSetup::new();
+    let opened = ready_to_send(cx, &setup, &repos);
+    let window = opened.window;
+    click(cx, window, SUBMIT_CONFIRM_ID);
+    let id = sent_id(&opened);
+    let mut partial = outcome_with_intent(id, created_intent(repos[0].id));
+    partial.intent = None;
+    partial.failed = Some(push_failure());
+    opened.fake.answer_outcome(Ok(partial));
+    frame(cx, window);
+    opened.fake.queue_outcome(refused());
+    click(cx, window, SUBMIT_RETRY_ID);
+    assert_eq!(opened.fake.retries(), [id]);
+    assert_eq!(
+        text_of(cx, window, SUBMIT_ERROR_ID).as_deref(),
+        Some("Feedback needs a repository with source control.")
+    );
+    assert!(cx.read(|cx| opened.feedback.read(cx).locked()), "locked");
+    assert!(drawn(cx, window, SUBMIT_RETRY_ID));
+    assert!(drawn(cx, window, SUBMIT_START_OVER_ID));
+    assert!(idea_disabled(cx, window));
 }
 
 #[gpui_kit::test]

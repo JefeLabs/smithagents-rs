@@ -16,7 +16,7 @@ use reqwest::RequestBuilder;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use smithagents_core::agent::{Agent, ChatMessage, Repo};
+use smithagents_core::agent::{AddSourceControl, Agent, ChatMessage, Repo};
 use smithagents_core::daemon::{DaemonInfo, DaemonToken};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::feedback::{
@@ -61,6 +61,11 @@ pub struct Health {
     pub latest_seq: u64,
     pub running_agents: usize,
     pub ws_clients: usize,
+    /// Whether the daemon could run git the last time something asked for
+    /// git (adding or switching a repository); `None` until then, since the
+    /// daemon runs no git before it is asked to.
+    #[serde(default)]
+    pub git: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -145,14 +150,41 @@ impl Client {
             .await
     }
 
-    pub async fn add_repo(&self, path: &Path) -> Result<Repo, ClientError> {
+    /// Adds the folder at `path` as a repository, with the source control
+    /// `choice` says: none, the git repository it is in, or a new one.
+    pub async fn add_repo(
+        &self,
+        path: &Path,
+        choice: AddSourceControl,
+    ) -> Result<Repo, ClientError> {
         // Typed, not `json!`: a non-UTF-8 path is an error here, not a panic.
         #[derive(Serialize)]
         struct Body<'a> {
             path: &'a Path,
+            source_control: AddSourceControl,
         }
-        self.fetch(self.http.post(self.url("/v1/repos")).json(&Body { path }))
+        let body = Body {
+            path,
+            source_control: choice,
+        };
+        self.fetch(self.http.post(self.url("/v1/repos")).json(&body))
             .await
+    }
+
+    /// Turns source control on (git) or off for repository `id`; answered
+    /// with the repository as it then is.
+    pub async fn set_source_control(&self, id: RepoId, on: bool) -> Result<Repo, ClientError> {
+        let to = if on {
+            AddSourceControl::Git
+        } else {
+            AddSourceControl::None
+        };
+        self.fetch(
+            self.http
+                .patch(self.url(&format!("/v1/repos/{id}")))
+                .json(&json!({ "source_control": to })),
+        )
+        .await
     }
 
     pub async fn list_repos(&self) -> Result<Vec<Repo>, ClientError> {

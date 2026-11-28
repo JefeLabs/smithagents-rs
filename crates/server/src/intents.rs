@@ -34,9 +34,14 @@
 //! between creating the agent and saving `Sent` leaves it; so an intent never
 //! gets a second agent. `send`, `start`, `resolve` and `set_agent_defaults`
 //! run detached like `create`.
+//!
+//! On a repository with no source control the agent works in the folder
+//! itself, so its intents take turns: the queue starts none on a folder
+//! that `IntentService::held_folders` names, and Send on such a folder
+//! queues the intent.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -44,9 +49,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::FutureExt;
-use smithagents_core::agent::AgentState;
+use smithagents_core::agent::{AgentState, Repo};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::feedback::{FeedbackOrigin, IdeaPackage};
 use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
@@ -146,6 +151,10 @@ pub enum IntentError {
     /// (HTTP 409); what git said is not kept.
     #[error("The intent's base branch could not be checked out.")]
     BaseBranchFailed,
+    /// The intent names a branch to start from, or files on one, and its
+    /// repository has no source control (HTTP 409).
+    #[error("This intent needs a repository with source control.")]
+    NeedsSourceControl,
     #[error(transparent)]
     Service(ServiceError),
     #[error(transparent)]
@@ -179,6 +188,7 @@ impl IntentError {
             IntentError::EvidenceInRepo => "evidence_in_repo",
             IntentError::FixedDependency => "fixed_dependency",
             IntentError::BaseBranchFailed => "base_branch_failed",
+            IntentError::NeedsSourceControl => "needs_source_control",
             IntentError::Service(_) => "service_error",
             IntentError::Store(_) => "store_error",
         }
@@ -200,7 +210,8 @@ impl IntentError {
             | IntentError::DependencyCrossRepo
             | IntentError::EvidenceInRepo
             | IntentError::FixedDependency
-            | IntentError::BaseBranchFailed => S::CONFLICT,
+            | IntentError::BaseBranchFailed
+            | IntentError::NeedsSourceControl => S::CONFLICT,
             IntentError::Invalid(_) => S::BAD_REQUEST,
             IntentError::Store(_) => S::INTERNAL_SERVER_ERROR,
         };
@@ -939,10 +950,13 @@ impl IntentService {
     // ------------------------------------------------------------- execution
 
     /// Sends a `Complete` intent to a new agent, writing its `Send` version.
-    /// It starts now when every accepted dependency is `Resolved` and the
-    /// queue has a slot for it (older ready intents go first); otherwise it
-    /// becomes `Queued` for the scheduler. A failed immediate start returns
-    /// the error and leaves the intent `Complete` with `last_start_error` set.
+    /// It starts now when every accepted dependency is `Resolved`, the queue
+    /// has a slot for it (older ready intents go first) and its folder is not
+    /// held; otherwise it becomes `Queued` for the scheduler. So it does when
+    /// another agent's turn takes its plain folder before the new agent's
+    /// first message: `folder_busy` is answered only to a chat message. A
+    /// failed immediate start returns the error and leaves the intent
+    /// `Complete` with `last_start_error` set.
     pub async fn send(&self, id: IntentId) -> Result<Intent, IntentError> {
         let svc = self.clone();
         detached(async move { svc.send_now(id).await }).await
@@ -966,29 +980,89 @@ impl IntentService {
         queued.push(candidate);
         let resolved = queue::resolved_ids(store).await?;
         let running = queue::running_count(&self.inner.agents);
+        let held = self.held_folders().await?;
         let limit = self.agent_defaults().await?.queue_limit;
-        if queue::next_startable(&queued, &resolved, running, limit).contains(&id) {
+        if queue::next_startable(&queued, &resolved, running, limit, &held).contains(&id) {
             return self.start_reserved(intent).await;
         }
-        intent.state = IntentState::Queued;
-        intent.queued_at = Some(now);
-        intent.last_start_error = None;
-        touch(&mut intent);
-        store
-            .save_intent_with_version(&intent, &snapshot(&intent, VersionAuthor::Send))
-            .await?;
-        self.publish_updated(&intent);
+        self.save_queued(&mut intent, now).await?;
         drop(reservation);
         drop(starts);
         self.kick_scheduler();
         Ok(intent)
     }
 
+    /// Saves a `Complete` intent as `Queued` at `queued_at`, with its `Send`
+    /// version and no start error, as Send leaves an intent that cannot start
+    /// now, and publishes it.
+    async fn save_queued(
+        &self,
+        intent: &mut Intent,
+        queued_at: DateTime<Utc>,
+    ) -> Result<(), IntentError> {
+        intent.state = IntentState::Queued;
+        intent.queued_at = Some(queued_at);
+        intent.last_start_error = None;
+        touch(intent);
+        self.inner
+            .store
+            .save_intent_with_version(intent, &snapshot(intent, VersionAuthor::Send))
+            .await?;
+        self.publish_updated(intent);
+        Ok(())
+    }
+
+    /// Plain repositories the queue may not start an intent on now. Their
+    /// agents work in the folder itself, so one intent has it at a time: a
+    /// plain repository is held while a turn is in flight in it, or while
+    /// one of its intents is `Sent` and that intent's agent is not closed.
+    /// Resolving the intent or closing its agent frees the folder.
+    pub(crate) async fn held_folders(&self) -> Result<HashSet<RepoId>, IntentError> {
+        let store = &self.inner.store;
+        let plain: HashSet<RepoId> = store
+            .list_repos()
+            .await?
+            .iter()
+            .filter(|repo| repo.is_plain())
+            .map(|repo| repo.id)
+            .collect();
+        if plain.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut held: HashSet<RepoId> = plain
+            .iter()
+            .copied()
+            .filter(|&repo| self.inner.agents.folder_busy(repo))
+            .collect();
+        let open: HashSet<AgentId> = store
+            .list_agents(false)
+            .await?
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect();
+        let sent = store
+            .list_intents(IntentFilter {
+                state: Some(IntentState::Sent),
+                repo_id: None,
+            })
+            .await?;
+        held.extend(
+            sent.iter()
+                .filter(|i| plain.contains(&i.repo_id))
+                .filter(|i| i.agent_id.is_some_and(|agent| open.contains(&agent)))
+                .map(|i| i.repo_id),
+        );
+        Ok(held)
+    }
+
     /// Starts the intent's agent now, from `Complete` (writing the `Send`
     /// version, as `send` does) or `Queued`. An intent already `Sent` is
     /// returned unchanged, so repeated or concurrent starts make one agent.
-    /// Dependencies and the queue limit are not checked here: the scheduler
-    /// and [`Self::send`] decide when to start.
+    /// Dependencies, the queue limit and held folders are not checked here:
+    /// the scheduler and [`Self::send`] decide when to start. An intent whose
+    /// plain folder another agent's turn takes before its agent's first
+    /// message is returned `Queued` (a `Complete` one queued as `send`
+    /// queues it), with no start error.
     pub async fn start(&self, id: IntentId) -> Result<Intent, IntentError> {
         let svc = self.clone();
         detached(async move {
@@ -1009,6 +1083,11 @@ impl IntentService {
     /// saved as `Sent`. On a failure the intent keeps its state, with the
     /// error in `last_start_error`; an agent already made is closed.
     ///
+    /// A first message refused with `FolderBusy` is no failed start: another
+    /// agent's turn took the plain folder after the decision to start, so the
+    /// folder is held. The agent is closed, and the intent waits `Queued`
+    /// with no start error for the scheduler, which that turn's end wakes.
+    ///
     /// An open agent already attached to the intent (left by a start that
     /// stopped between creating it and saving `Sent`, or by a failed start
     /// whose agent could not be closed) blocks the start until it is closed,
@@ -1028,6 +1107,14 @@ impl IntentService {
         }
         let agent_id = match self.launch_agent(&intent).await {
             Ok(id) => id,
+            Err(IntentError::Service(ServiceError::FolderBusy)) => {
+                tracing::debug!(intent_id = %intent.id, "another agent's turn took the folder; the intent waits");
+                if intent.state == IntentState::Complete {
+                    self.save_queued(&mut intent, Utc::now()).await?;
+                    self.kick_scheduler();
+                }
+                return Ok(intent);
+            }
             Err(e) => {
                 tracing::warn!(intent_id = %intent.id, "could not start the intent's agent: {e}");
                 self.record_start_error(&mut intent, format!("could not start the agent: {e}"))
@@ -1065,34 +1152,55 @@ impl IntentService {
         Ok(sent)
     }
 
-    /// Creates the intent's agent on `intent/<slug>` (or, if that branch or
-    /// its worktree folder is taken, `intent/<slug>-<6 hex of the id>`) from
-    /// the intent's base branch (else the repository's default branch) and
-    /// sends it the brief.
+    /// Creates the intent's agent and sends it the brief. On a repository
+    /// with source control the agent works on `intent/<slug>` (or, if that
+    /// branch or its worktree folder is taken, `intent/<slug>-<6 hex of the
+    /// id>`) from the intent's base branch (else the repository's default
+    /// branch). On a plain repository it works in the folder itself, on no
+    /// branch, and no git runs; an intent there that names a base branch or
+    /// has an origin is `NeedsSourceControl`, before anything is made.
     /// An agent whose first message is refused is closed again.
     async fn launch_agent(&self, intent: &Intent) -> Result<AgentId, IntentError> {
-        let base = self.checked_base_branch(intent).await?;
-        let brief = brief::compose(intent, &self.dep_summaries(intent).await?);
+        let repo = self
+            .inner
+            .store
+            .get_repo(intent.repo_id)
+            .await?
+            .ok_or(IntentError::RepoNotFound)?;
+        let in_place = repo.is_plain();
+        if in_place && (intent.base_branch.is_some() || intent.origin.is_some()) {
+            return Err(IntentError::NeedsSourceControl);
+        }
+        let base = if in_place {
+            None
+        } else {
+            self.checked_base_branch(intent, &repo).await?
+        };
+        let brief = brief::compose(intent, &self.dep_summaries(intent).await?, in_place);
         let agents = &self.inner.agents;
-        let options = |branch: String| CreateAgentOptions {
-            branch: Some(branch),
+        let options = |branch: Option<String>| CreateAgentOptions {
+            branch,
             intent_id: Some(intent.id),
             system_prompt_append: Some(brief.system_append.clone()),
             base: base.clone(),
         };
-        let branch = git::branch_name_for_intent(&intent.slug);
-        let created = match agents
-            .create_agent_with(intent.repo_id, options(branch.clone()))
-            .await
-        {
-            Err(ServiceError::Git(GitError::BranchExists(_) | GitError::WorktreeExists(_))) => {
-                let hex = intent.id.0.simple().to_string();
-                let suffixed = format!("{branch}-{}", &hex[..BRANCH_SUFFIX_HEX]);
-                agents
-                    .create_agent_with(intent.repo_id, options(suffixed))
-                    .await
+        let created = if in_place {
+            agents.create_agent_with(repo.id, options(None)).await
+        } else {
+            let branch = git::branch_name_for_intent(&intent.slug);
+            match agents
+                .create_agent_with(repo.id, options(Some(branch.clone())))
+                .await
+            {
+                Err(ServiceError::Git(GitError::BranchExists(_) | GitError::WorktreeExists(_))) => {
+                    let hex = intent.id.0.simple().to_string();
+                    let suffixed = format!("{branch}-{}", &hex[..BRANCH_SUFFIX_HEX]);
+                    agents
+                        .create_agent_with(repo.id, options(Some(suffixed)))
+                        .await
+                }
+                other => other,
             }
-            other => other,
         };
         let agent = match created {
             Ok(agent) => agent,
@@ -1117,16 +1225,14 @@ impl IntentService {
     /// anything is made, and never replaced by the default branch: a name
     /// that is not valid, or a branch that is gone, is `Invalid` with a fixed
     /// sentence. Nothing is fetched, and nothing git prints is kept.
-    async fn checked_base_branch(&self, intent: &Intent) -> Result<Option<String>, IntentError> {
+    async fn checked_base_branch(
+        &self,
+        intent: &Intent,
+        repo: &Repo,
+    ) -> Result<Option<String>, IntentError> {
         let Some(name) = &intent.base_branch else {
             return Ok(None);
         };
-        let repo = self
-            .inner
-            .store
-            .get_repo(intent.repo_id)
-            .await?
-            .ok_or(IntentError::RepoNotFound)?;
         let git_error = |e: GitError| IntentError::from(ServiceError::Git(e));
         if !git::is_valid_branch_name(&repo.path, name)
             .await

@@ -113,6 +113,8 @@ pub const NEW_AGENT_LABEL: &str = "New agent";
 pub const CLOSE_AGENT_LABEL: &str = "Close agent";
 /// Element id of the confirmation's title ("Close <name>?").
 pub const CLOSE_TITLE_ID: &str = "close-agent-title";
+/// Element id of the confirmation's text (what stays on disk).
+pub const CLOSE_DESCRIPTION_ID: &str = "close-agent-description";
 /// Element id of the confirmation's Cancel button (focused when it opens).
 pub const CANCEL_CLOSE_ID: &str = "cancel-close-agent";
 /// Element id of the confirmation's "Close agent" button.
@@ -292,7 +294,8 @@ impl AgentsPane {
             return;
         };
         tracing::debug!(agent = %id, source = "keyboard", "close agent asked");
-        close::confirm_close(cx.entity().downgrade(), id, name, window, cx);
+        let in_place = self.works_in_place(id, cx);
+        close::confirm_close(cx.entity().downgrade(), id, name, in_place, window, cx);
     }
 
     /// The connection dropped while commands waited: their answers may never

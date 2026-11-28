@@ -105,7 +105,7 @@ mod tests {
             },
             repo_id: REPO_ID.parse::<RepoId>().unwrap(),
             worktree_path: "/tmp/wt/agent-mercury".into(),
-            branch: "agent/mercury-6f1d3a52".into(),
+            branch: Some("agent/mercury-6f1d3a52".into()),
             harness_session_id: Some("s1".into()),
             state: AgentState::Working,
             created_at: time("2026-11-24T09:00:00Z"),

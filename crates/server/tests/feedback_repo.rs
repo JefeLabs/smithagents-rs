@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::FeedbackFailure;
 use smithagents_core::feedback::{FeedbackStep, SubmissionId};
 use smithagents_core::ids::RepoId;
@@ -228,7 +228,9 @@ impl Fixture {
         let repo = Repo {
             id: RepoId::new(),
             path: std::fs::canonicalize(&root).unwrap(),
-            default_branch: "main".into(),
+            source_control: Some(SourceControl::Git {
+                default_branch: "main".into(),
+            }),
             created_at: Utc::now(),
         };
         let paths = Paths {
@@ -562,7 +564,9 @@ async fn an_unborn_repository_is_refused_with_the_same_sentence() {
     let repo = Repo {
         id: RepoId::new(),
         path: root,
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: Utc::now(),
     };
     let err = place(&repo, "Fix the zoom", date(), false)
@@ -763,6 +767,38 @@ async fn the_users_checkout_is_untouched() {
         assert_eq!(checkout_state(fx.root()), before, "checked out: {checkout}");
         assert_eq!(fx.worktree_lines(), 1, "checked out: {checkout}");
     }
+}
+
+#[tokio::test]
+async fn a_plain_folder_is_refused_before_git_runs() {
+    // A repository with no source control, at a folder git cannot run in: a
+    // git that ran first would answer something else.
+    let fx = Fixture::new();
+    let plain = Repo {
+        path: fx.tmp.path().join("no-such-folder"),
+        source_control: None,
+        ..fx.repo.clone()
+    };
+    let placement = Placement {
+        slug: "fix-the-zoom".into(),
+        folder: FOLDER.into(),
+        branch: BRANCH.into(),
+    };
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+
+    let placed = place(&plain, "Fix the zoom", date(), false).await;
+    let committed = commit_folder(&plain, &placement, &files, "Fix the zoom", id(), &scratch).await;
+
+    for err in [placed.map(drop), committed.map(drop)] {
+        assert!(
+            matches!(err, Err(FeedbackError::NeedsSourceControl)),
+            "{err:?}"
+        );
+    }
+    // The upload is where it was, and no worktree was made.
+    assert!(scratch.join("upload").join("file-1").is_file());
+    assert!(!scratch.join("wt").exists());
 }
 
 #[tokio::test]

@@ -8,7 +8,9 @@
 //! `RadioGroup` keeps its radios' focus to itself and has no arrow keys. Each
 //! option is a Tab stop; Space or Enter selects the focused one; Up/Left and
 //! Down/Right move the focus to the adjacent option and select it, wrapping
-//! at the ends, as radio groups conventionally do.
+//! at the ends, as radio groups conventionally do. The "Add repository"
+//! form's source control choice ([`super::repositories`]) is drawn the same
+//! way.
 
 use gpui_kit::base::Radio;
 use gpui_kit::component::button::Button;
@@ -22,9 +24,11 @@ use gpui_kit::{
 };
 use smithagents_theme::state::AppearanceSettings;
 
+use super::repositories::{ADD_CHOICES_ID, ADD_CHOICES_LABEL};
 use super::{caption, Paint, SettingsPane};
 use crate::view_models::{
     font_options, stepped_text_scale, text_scale_label, text_scale_steps, theme_options,
+    ADD_CHOICES,
 };
 
 gpui_kit::actions!(
@@ -75,11 +79,13 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// The section's two radio groups.
+/// The pane's radio groups: this section's two, and the add form's source
+/// control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Choice {
+pub(super) enum Choice {
     Theme,
     Font,
+    AddSourceControl,
 }
 
 impl Choice {
@@ -87,6 +93,7 @@ impl Choice {
         match self {
             Choice::Theme => THEME_OPTIONS_ID,
             Choice::Font => FONT_OPTIONS_ID,
+            Choice::AddSourceControl => ADD_CHOICES_ID,
         }
     }
 
@@ -94,25 +101,27 @@ impl Choice {
         match self {
             Choice::Theme => THEME_LABEL,
             Choice::Font => FONT_LABEL,
+            Choice::AddSourceControl => ADD_CHOICES_LABEL,
         }
     }
 }
 
 /// One option of a radio group: its label and whether it is selected.
-struct OptionVm {
-    label: String,
-    selected: bool,
+pub(super) struct OptionVm {
+    pub(super) label: String,
+    pub(super) selected: bool,
 }
 
 impl SettingsPane {
-    /// Keeps one focus handle per option of each radio group (the option
-    /// lists come from the token set, so they only grow with it).
+    /// Keeps one focus handle per option of each radio group (the theme and
+    /// font lists come from the token set, so they only grow with it).
     pub(super) fn sync_radio_focus(&mut self, cx: &mut Context<Self>) {
         let set = self.state.read(cx).theme_set();
         let (themes, fonts) = (set.themes.len() + 1, set.base.fonts.len());
         for (handles, count) in [
             (&mut self.theme_focus, themes),
             (&mut self.font_focus, fonts),
+            (&mut self.add_choice_focus, ADD_CHOICES.len()),
         ] {
             handles.truncate(count);
             while handles.len() < count {
@@ -125,7 +134,13 @@ impl SettingsPane {
         match choice {
             Choice::Theme => &self.theme_focus,
             Choice::Font => &self.font_focus,
+            Choice::AddSourceControl => &self.add_choice_focus,
         }
+    }
+
+    /// Whether `choice`'s radios wait: the add form's while an add runs.
+    pub(super) fn choice_disabled(&self, choice: Choice) -> bool {
+        choice == Choice::AddSourceControl && self.adding.is_some()
     }
 
     /// The settings now, changed by `change`, handed to the shell state.
@@ -144,6 +159,7 @@ impl SettingsPane {
         match choice {
             Choice::Theme => self.choose_theme(ix, cx),
             Choice::Font => self.choose_font(ix, cx),
+            Choice::AddSourceControl => self.choose_add_choice(ix, cx),
         }
     }
 
@@ -186,6 +202,9 @@ impl SettingsPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.choice_disabled(choice) {
+            return;
+        }
         let handles = self.focus_handles(choice);
         let count = handles.len();
         let Some(current) = handles.iter().position(|handle| handle.is_focused(window)) else {
@@ -216,8 +235,9 @@ impl SettingsPane {
     }
 
     /// A radio group named after `choice`: one Tab stop per option, arrow
-    /// keys between them.
-    fn radio_group(
+    /// keys between them. While [`SettingsPane::choice_disabled`], its
+    /// radios are disabled and dimmed.
+    pub(super) fn radio_group(
         &self,
         choice: Choice,
         options: Vec<OptionVm>,
@@ -226,6 +246,7 @@ impl SettingsPane {
     ) -> impl IntoElement {
         let handles = self.focus_handles(choice);
         let count = options.len();
+        let disabled = self.choice_disabled(choice);
         let pane = cx.entity().downgrade();
         v_flex()
             .id(choice.id())
@@ -253,6 +274,8 @@ impl SettingsPane {
                         Radio::new(ix)
                             .track_focus(handle)
                             .checked(option.selected)
+                            .disabled(disabled)
+                            .styles(|styles| styles.disabled(|style| style.opacity(0.5)))
                             .accessibility_label(option.label.clone())
                             .set_position(ix + 1, count)
                             .on_change(move |_, _, _, cx| {

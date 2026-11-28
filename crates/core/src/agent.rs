@@ -27,12 +27,48 @@ pub enum AgentState {
     Dead,
 }
 
+/// The source control a repository is under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceControl {
+    Git { default_branch: String },
+}
+
+/// How `POST /v1/repos` adds a folder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddSourceControl {
+    /// The folder as it is, with no source control: no git runs for it.
+    #[default]
+    None,
+    /// The existing git repository the folder is in, recorded at its root.
+    Git,
+    /// A new git repository, made in a folder that is missing or empty.
+    NewGit,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Repo {
     pub id: RepoId,
     pub path: PathBuf,
-    pub default_branch: String,
+    /// `None`: a plain folder.
+    pub source_control: Option<SourceControl>,
     pub created_at: DateTime<Utc>,
+}
+
+impl Repo {
+    /// The branch agents start from; `None` for a plain folder.
+    pub fn default_branch(&self) -> Option<&str> {
+        match &self.source_control {
+            Some(SourceControl::Git { default_branch }) => Some(default_branch),
+            None => None,
+        }
+    }
+
+    /// Whether this repository is a plain folder, with no source control.
+    pub fn is_plain(&self) -> bool {
+        self.source_control.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,8 +77,11 @@ pub struct Agent {
     pub name: String,
     pub color: AgentColor,
     pub repo_id: RepoId,
+    /// The folder the agent works in: its worktree, or for an agent on a
+    /// plain repository the repository's own folder.
     pub worktree_path: PathBuf,
-    pub branch: String,
+    /// `None`: the agent works in place, on a plain repository.
+    pub branch: Option<String>,
     pub harness_session_id: Option<String>,
     pub state: AgentState,
     pub created_at: DateTime<Utc>,
@@ -50,6 +89,13 @@ pub struct Agent {
     /// The intent this agent was started for, if any.
     #[serde(default)]
     pub intent_id: Option<IntentId>,
+}
+
+impl Agent {
+    /// Whether the agent works in its repository's own folder, on no branch.
+    pub fn works_in_place(&self) -> bool {
+        self.branch.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +138,7 @@ pub fn next_agent_name(pool: &[&str], open: &HashSet<String>) -> String {
 mod tests {
     use super::*;
     use crate::palette::palette;
+    use serde_json::{json, Value};
     use std::collections::HashSet;
 
     fn open(names: &[&str]) -> HashSet<String> {
@@ -127,7 +174,7 @@ mod tests {
             color: palette()[0],
             repo_id: RepoId::new(),
             worktree_path: "/tmp/wt".into(),
-            branch: "agent/earth".into(),
+            branch: Some("agent/earth".into()),
             harness_session_id: Some("s1".into()),
             state: AgentState::Working,
             created_at: chrono::Utc::now(),
@@ -138,6 +185,78 @@ mod tests {
         assert!(json.contains("\"working\""));
         let back: Agent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, agent);
+    }
+
+    fn repo(source_control: Option<SourceControl>) -> Repo {
+        Repo {
+            id: RepoId::new(),
+            path: "/r".into(),
+            source_control,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn agent(branch: Option<&str>) -> Agent {
+        Agent {
+            id: AgentId::new(),
+            name: "Earth".into(),
+            color: palette()[0],
+            repo_id: RepoId::new(),
+            worktree_path: "/r".into(),
+            branch: branch.map(Into::into),
+            harness_session_id: None,
+            state: AgentState::Idle,
+            created_at: chrono::Utc::now(),
+            closed_at: None,
+            intent_id: None,
+        }
+    }
+
+    #[test]
+    fn a_repository_says_its_source_control_on_the_wire() {
+        let plain = repo(None);
+        let git = repo(Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }));
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap()["source_control"],
+            Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(&git).unwrap()["source_control"],
+            json!({"git": {"default_branch": "main"}})
+        );
+        assert_eq!((plain.default_branch(), plain.is_plain()), (None, true));
+        assert_eq!(
+            (git.default_branch(), git.is_plain()),
+            (Some("main"), false)
+        );
+        for r in [plain, git] {
+            let back: Repo = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    #[test]
+    fn the_add_choices_are_spelled_on_the_wire() {
+        let spelled: Vec<Value> = [
+            AddSourceControl::None,
+            AddSourceControl::Git,
+            AddSourceControl::NewGit,
+        ]
+        .iter()
+        .map(|c| serde_json::to_value(c).unwrap())
+        .collect();
+        assert_eq!(spelled, [json!("none"), json!("git"), json!("new_git")]);
+        assert_eq!(AddSourceControl::default(), AddSourceControl::None);
+    }
+
+    #[test]
+    fn an_agent_that_works_in_place_has_no_branch() {
+        let json = serde_json::to_value(agent(None)).unwrap();
+        assert_eq!(json["branch"], Value::Null);
+        assert_eq!(serde_json::from_value::<Agent>(json).unwrap().branch, None);
+        assert!(agent(None).works_in_place() && !agent(Some("agent/x")).works_in_place());
     }
 
     #[test]

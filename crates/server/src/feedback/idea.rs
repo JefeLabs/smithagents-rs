@@ -53,8 +53,8 @@ use super::issue::{
 };
 use super::upload::StagingDir;
 use super::{
-    locked, recent, repo, FeedbackError, FeedbackService, Running, BODY_FILE, ISSUE_MD,
-    ISSUE_MD_MAX_BYTES,
+    locked, recent, repo, require_source_control, FeedbackError, FeedbackService, Running,
+    BODY_FILE, ISSUE_MD, ISSUE_MD_MAX_BYTES,
 };
 use crate::git::{self, Changes, GitError, LfsCheck};
 use crate::intents::CreateExtras;
@@ -156,6 +156,14 @@ fn idea_of(intent: &Intent) -> Result<(&FeedbackOrigin, &IdeaPackage), FeedbackE
     Ok((origin, idea))
 }
 
+/// The idea agent's branch; an agent that works in place has none.
+fn agent_branch(agent: &Agent) -> Result<&str, FeedbackError> {
+    agent
+        .branch
+        .as_deref()
+        .ok_or(FeedbackError::NeedsSourceControl)
+}
+
 /// Whether `folder` is `docs/issues/<name>` with a plain `name`, as Submit
 /// makes it.
 fn is_issue_folder(folder: &str) -> bool {
@@ -239,10 +247,13 @@ impl FeedbackService {
     /// draft pull request into the default branch, whose address and the
     /// explainer's "Not done" section are saved on the intent and published.
     ///
-    /// An intent with a pull request answers as it is. Refused, with
-    /// nothing pushed: an intent that is not an idea (`NotAnIdea`), not sent
-    /// or resolved, or whose agent still works (`NotReady`); one whose agent,
-    /// branch, folder or `issue.md` is not there (`IdeaBlocked`); a
+    /// An idea intent whose repository is a plain folder is refused first
+    /// (`NeedsSourceControl`), before git or `gh` runs and before anything
+    /// is recorded. Otherwise an intent with a pull request answers as it
+    /// is. Refused, with nothing pushed: an intent that is not an idea
+    /// (`NotAnIdea`), not sent or resolved, or whose agent still works
+    /// (`NotReady`); one whose agent, branch, folder or `issue.md` is not
+    /// there (`IdeaBlocked`); a
     /// repository git cannot read (`OriginUnreadable`) or whose `origin` is
     /// not on github.com (`NoGithubRemote`); `gh` not ready (`GhNotReady`);
     /// an agent's branch that changes more than the issue folder
@@ -262,6 +273,9 @@ impl FeedbackService {
         let _own = self.parts.ideas.lock(id).await;
         let intent = self.intent(id).await?;
         let (origin, idea) = idea_of(&intent)?;
+        // Before anything is read, run or recorded.
+        let repo = self.repo_of(&intent).await?;
+        require_source_control(&repo)?;
         if idea.pr_url.is_some() {
             return Ok(intent);
         }
@@ -269,7 +283,6 @@ impl FeedbackService {
         if let Some((url, not_done)) = remembered {
             return Ok(self.record_pull_request(&intent, url, not_done).await);
         }
-        let repo = self.repo_of(&intent).await?;
         if !is_issue_folder(&origin.folder) || !origin.branch.starts_with(IDEA_BRANCHES) {
             return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
         }
@@ -289,7 +302,10 @@ impl FeedbackService {
             .inspect_err(|e| {
                 tracing::warn!(intent_id = %id, step = "acknowledge", code = e.code(), "the idea branch was not pushed");
             })?;
-        for branch in [&repo.default_branch, &origin.branch] {
+        let default_branch = repo
+            .default_branch()
+            .ok_or(FeedbackError::NeedsSourceControl)?;
+        for branch in [default_branch, origin.branch.as_str()] {
             let valid = !branch.starts_with('-')
                 && git::bounded(git::is_valid_branch_name(&repo.path, branch))
                     .await
@@ -357,7 +373,7 @@ impl FeedbackService {
                 id,
                 &gh,
                 &github,
-                (&repo.default_branch, &origin.branch),
+                (default_branch, &origin.branch),
                 &head,
                 &title,
                 &text.body,
@@ -427,7 +443,7 @@ impl FeedbackService {
             return Ok(Some((commit.clone(), true)));
         }
         let kept = git::is_commit_id(commit)
-            && git::is_on_branch(&repo.path, commit, &agent.branch)
+            && git::is_on_branch(&repo.path, commit, agent_branch(agent)?)
                 .await
                 .map_err(read_failed)?;
         Ok(kept.then(|| (commit.clone(), false)))
@@ -515,11 +531,13 @@ impl FeedbackService {
     /// its id is saved on the idea intent, and an intent that already
     /// depends that way on the idea is taken (its id was not saved) instead
     /// of making another. Refused as [`Self::open_pull_request`] is for an
-    /// intent that is not an idea or whose agent is not done. Its agent's
-    /// pull request carries the idea's files, so in a repository whose
-    /// `origin` is on GitHub it needs `public_acknowledged` unless `gh`
-    /// says the repository is private (`PublicNotAcknowledged`, before
-    /// anything is made); acknowledged, no `gh` runs.
+    /// intent that is not an idea, whose repository is a plain folder (first,
+    /// as there, and again where the intent is made:
+    /// [`FeedbackService::create_feedback_intent`]) or whose agent is not
+    /// done. Its agent's pull request carries the idea's files, so in a
+    /// repository whose `origin` is on GitHub it needs `public_acknowledged`
+    /// unless `gh` says the repository is private (`PublicNotAcknowledged`,
+    /// before anything is made); acknowledged, no `gh` runs.
     pub async fn create_implementation_intent(
         &self,
         id: IntentId,
@@ -529,10 +547,12 @@ impl FeedbackService {
         let _own = self.parts.ideas.lock(id).await;
         let intent = self.intent(id).await?;
         let (origin, idea) = idea_of(&intent)?;
+        // Before anything is read, run or recorded.
+        let repo = self.repo_of(&intent).await?;
+        require_source_control(&repo)?;
         if let Some(existing) = self.implementation_of(&intent, idea).await? {
             return Ok(existing);
         }
-        let repo = self.repo_of(&intent).await?;
         if !is_issue_folder(&origin.folder) {
             return Err(FeedbackError::IdeaBlocked(IdeaBlocked::NotSubmits));
         }
@@ -545,30 +565,30 @@ impl FeedbackService {
                 })?;
         }
         let head = self.settled_head(&repo, &agent).await?;
+        let branch = agent_branch(&agent)?;
         let req = CreateIntentRequest {
             repo_id: Some(intent.repo_id),
             kind: Some(intent.content.kind),
             seed: SeedInput::Text(implementation_seed(&intent, &origin.folder)),
         };
         let extras = CreateExtras {
-            base_branch: Some(agent.branch.clone()),
+            base_branch: Some(branch.to_owned()),
             origin: Some(FeedbackOrigin {
                 folder: origin.folder.clone(),
-                branch: agent.branch.clone(),
+                branch: branch.to_owned(),
                 commit: head,
                 idea: None,
             }),
             fixed_criteria: Vec::new(),
             fixed_dependency: Some(id),
         };
+        // Its origin keeps source control on: made only while the
+        // repository still has it.
         let created = self
-            .parts
-            .intents
-            .create_with(req, extras)
+            .create_feedback_intent(req, extras)
             .await
-            .map_err(|e| {
-                tracing::warn!(intent_id = %id, step = "create_implementation_intent", code = e.status_and_code().1, "the implementation intent was not created");
-                FeedbackError::Intent(e)
+            .inspect_err(|e| {
+                tracing::warn!(intent_id = %id, step = "create_implementation_intent", code = e.code(), "the implementation intent was not created");
             })?;
         tracing::info!(intent_id = %id, implementation_intent_id = %created.id, step = "create_implementation_intent", "implementation intent created");
         self.record_implementation(id, created.id).await;
@@ -658,10 +678,11 @@ impl FeedbackService {
     /// flight; `NotReady` when one is, or when one started while the branch
     /// was read, since it may then hold a commit made in the middle of it.
     async fn settled_head(&self, repo: &Repo, agent: &Agent) -> Result<String, FeedbackError> {
+        let branch = agent_branch(agent)?;
         if self.parts.agents.turn_in_flight(agent.id) {
             return Err(FeedbackError::NotReady(STILL_WORKING.to_owned()));
         }
-        let head = git::rev_parse(&repo.path, &format!("refs/heads/{}", agent.branch))
+        let head = git::rev_parse(&repo.path, &format!("refs/heads/{branch}"))
             .await
             .map_err(read_failed)?
             .ok_or(FeedbackError::IdeaBlocked(IdeaBlocked::BranchGone))?;

@@ -4,10 +4,12 @@
 //!
 //! - Complete: "Send", which asks the daemon to queue the intent (it starts
 //!   an agent when a slot is free).
-//! - Queued: why it has not started yet ([`queued_reason`]).
+//! - Queued: why it has not started yet ([`queued_reason`]: a dependency, an
+//!   intent or agent that holds its plain folder, or the slot limit).
 //! - Sent: "Open chat", which selects the intent's agent and opens its tab
 //!   (disabled, with the tooltip "The agent was closed", once the model no
-//!   longer has the agent), and "Mark resolved…", which asks first.
+//!   longer has the agent), and "Mark resolved…", which asks first (in the
+//!   words of a plain folder for an intent on one: no branch is named).
 //! - A draft, or a resolved intent: no bar, except for an idea intent.
 //!
 //! An idea intent that is resolved, or sent with its agent done
@@ -20,7 +22,9 @@
 //! request will carry the idea's files) and opens the intent the daemon
 //! answers with while the idea's detail is still on screen. Both run through
 //! the feedback commands, disabled without them, and both are sent with the
-//! user's acknowledgement once confirmed.
+//! user's acknowledgement once confirmed. Neither button is offered once the
+//! intent's repository is a plain folder (Feedback needs source control);
+//! an existing pull request's address still is.
 //!
 //! The start error ("The agent could not start: …") is drawn in every state
 //! while the daemon keeps it. A Send the daemon refuses with that same error
@@ -63,6 +67,7 @@ use crate::feedback::text::{
 };
 use crate::intent_vm::{
     idea_actions_shown, not_done_text, queued_reason, shows_pull_request_url, start_error_text,
+    works_in_folder,
 };
 use crate::link::{FeedbackCommands, IntentAnswer};
 use crate::model::Action;
@@ -86,6 +91,10 @@ pub const START_ERROR_ID: &str = "intent-start-error";
 /// The confirmation's text.
 pub const RESOLVE_DESCRIPTION: &str =
     "This means the work has landed on the default branch, so intents that depend on it can start.";
+/// The confirmation's text for an intent on a plain folder, which has no
+/// branch ([`works_in_folder`]).
+pub const RESOLVE_IN_FOLDER_DESCRIPTION: &str =
+    "This means the work is finished in the folder, so intents that depend on it can start.";
 /// Element id of an idea intent's "Open pull request…" button (it opens the
 /// confirmation), and of the confirmation's title, text and buttons.
 pub const OPEN_PR_ID: &str = "intent-open-pr";
@@ -164,7 +173,8 @@ impl IntentsPane {
 
     /// An idea intent's parts of the bar: "Open pull request…" or its
     /// address, then "Create implementation intent". Empty for any other
-    /// intent.
+    /// intent. On a plain folder ([`works_in_folder`]) both buttons could
+    /// only be refused, so only an address that exists is shown.
     fn idea_parts(&self, intent: &Intent, cx: &Context<Self>) -> Vec<AnyElement> {
         let Some(idea) = intent
             .origin
@@ -176,8 +186,10 @@ impl IntentsPane {
         };
         let id = intent.id;
         let disabled = self.busy.is_some() || self.state.read(cx).feedback_commands().is_none();
+        let in_folder = works_in_folder(self.state.read(cx).model(), intent);
         let mut parts = Vec::new();
         match idea.pr_url.as_deref() {
+            None if in_folder => {}
             None => parts.push(
                 Button::new(OPEN_PR_ID)
                     .label(OPEN_PR_LABEL)
@@ -197,6 +209,9 @@ impl IntentsPane {
             // Not an address the app shows; there is a pull request all the
             // same, so no second one is offered.
             Some(_) => {}
+        }
+        if in_folder {
+            return parts;
         }
         parts.push(
             Button::new(IMPLEMENT_ID)
@@ -311,14 +326,23 @@ impl IntentsPane {
         );
     }
 
-    /// Opens the confirmation; nothing while a command is in flight.
+    /// Opens the confirmation, in the words of the intent's repository;
+    /// nothing while a command is in flight.
     fn ask_to_resolve(&mut self, id: IntentId, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
         }
+        let model = self.state.read(cx).model();
+        let in_folder = model
+            .intent(id)
+            .is_some_and(|intent| works_in_folder(model, intent));
         confirm(
             cx.entity().downgrade(),
-            &RESOLVE_CONFIRMATION,
+            if in_folder {
+                &RESOLVE_IN_FOLDER_CONFIRMATION
+            } else {
+                &RESOLVE_CONFIRMATION
+            },
             move |pane, window, cx| pane.resolve(id, window, cx),
             window,
             cx,
@@ -564,6 +588,12 @@ const RESOLVE_CONFIRMATION: Confirmation = Confirmation {
     cancel_id: RESOLVE_CANCEL_ID,
     confirm_id: RESOLVE_CONFIRM_ID,
     confirm: RESOLVE_CONFIRM_LABEL,
+};
+
+/// "Mark as resolved?" for an intent on a plain folder.
+const RESOLVE_IN_FOLDER_CONFIRMATION: Confirmation = Confirmation {
+    description: RESOLVE_IN_FOLDER_DESCRIPTION,
+    ..RESOLVE_CONFIRMATION
 };
 
 /// "Open a pull request?", which says that a public repository shows the

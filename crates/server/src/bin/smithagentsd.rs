@@ -22,6 +22,7 @@ use smithagents_plugin_host::{ConfiguredSecrets, SecretError, SecretSource, Wasm
 use smithagents_server::api::{router, AppState};
 use smithagents_server::events::EventBus;
 use smithagents_server::feedback::FeedbackService;
+use smithagents_server::git;
 use smithagents_server::harness::claude::ClaudeCodeHarness;
 use smithagents_server::intents::IntentService;
 use smithagents_server::lifecycle::{
@@ -38,8 +39,8 @@ use smithagents_server::service::AgentService;
 use smithagents_server::store::Store;
 use tokio::net::TcpListener;
 
-const USAGE: &str =
-    "usage: smithagentsd [--home <dir>] [--claude-bin <path>] [--idle-timeout-secs <n>]";
+const USAGE: &str = "usage: smithagentsd [--home <dir>] [--claude-bin <path>] [--git-bin <path>] \
+                     [--idle-timeout-secs <n>]";
 const EXIT_USAGE: u8 = 2;
 const EXIT_ALREADY_RUNNING: u8 = 3;
 
@@ -56,6 +57,8 @@ struct Options {
     /// `None` means `SMITHAGENTS_HOME`, else `~/.smithagents`.
     home: Option<PathBuf>,
     claude_bin: PathBuf,
+    /// The git program; repositories without source control need none.
+    git_bin: PathBuf,
     idle_timeout: Duration,
 }
 
@@ -69,6 +72,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
     let mut opts = Options {
         home: None,
         claude_bin: PathBuf::from("claude"),
+        git_bin: PathBuf::from("git"),
         idle_timeout: DEFAULT_IDLE_TIMEOUT,
     };
     let mut args = args.into_iter();
@@ -80,6 +84,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
             "-h" | "--help" => return Ok(Invocation::Help),
             "--home" => opts.home = Some(flag_value(&mut args, flag)?.into()),
             "--claude-bin" => opts.claude_bin = flag_value(&mut args, flag)?.into(),
+            "--git-bin" => opts.git_bin = flag_value(&mut args, flag)?.into(),
             "--idle-timeout-secs" => {
                 let raw = flag_value(&mut args, flag)?;
                 let secs = raw
@@ -135,6 +140,10 @@ fn main() -> ExitCode {
         }
     };
     init_logging();
+    // Before anything runs git. Nothing does at start: where git is not
+    // installed, running it can open the system's dialog offering to
+    // install it, and a Workspace of plain folders needs none.
+    git::set_program(opts.git_bin.clone());
 
     let paths = match resolve_paths(opts.home.clone()) {
         Ok(paths) => paths,
@@ -479,6 +488,7 @@ mod tests {
             Ok(Invocation::Run(Options {
                 home: None,
                 claude_bin: PathBuf::from("claude"),
+                git_bin: PathBuf::from("git"),
                 idle_timeout: Duration::from_secs(600),
             }))
         );
@@ -493,11 +503,14 @@ mod tests {
                 "--home",
                 "/h",
                 "--claude-bin",
-                "/bin/fake"
+                "/bin/fake",
+                "--git-bin",
+                "/opt/git/bin/git"
             ]),
             Ok(Invocation::Run(Options {
                 home: Some(PathBuf::from("/h")),
                 claude_bin: PathBuf::from("/bin/fake"),
+                git_bin: PathBuf::from("/opt/git/bin/git"),
                 idle_timeout: Duration::from_secs(5),
             }))
         );
@@ -534,6 +547,7 @@ mod tests {
             (&["extra"][..], "unknown argument 'extra'"),
             (&["--home"][..], "--home needs a value"),
             (&["--claude-bin", ""][..], "--claude-bin needs a value"),
+            (&["--git-bin"][..], "--git-bin needs a value"),
             (&["--idle-timeout-secs", "-1"][..], "expects whole seconds"),
             (&["--idle-timeout-secs", "10m"][..], "expects whole seconds"),
         ] {

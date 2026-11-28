@@ -156,15 +156,17 @@ pub struct FeedbackSettings {
 }
 
 /// The repository feedback goes to: `stored` while a repository with that id
-/// exists, else the only repository, else `None`.
+/// exists and has source control, else the only repository with source
+/// control, else `None`. A plain folder is never the META repository.
 pub fn effective_meta_repo(stored: Option<RepoId>, repos: &[Repo]) -> Option<RepoId> {
+    let mut eligible = repos.iter().filter(|r| !r.is_plain());
     if let Some(id) = stored {
-        if repos.iter().any(|r| r.id == id) {
+        if eligible.clone().any(|r| r.id == id) {
             return Some(id);
         }
     }
-    match repos {
-        [only] => Some(only.id),
+    match (eligible.next(), eligible.next()) {
+        (Some(only), None) => Some(only.id),
         _ => None,
     }
 }
@@ -193,7 +195,7 @@ pub struct FeedbackTargets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Repo;
+    use crate::agent::{Repo, SourceControl};
     use crate::ids::RepoId;
     use crate::intent::IntentKind;
     use chrono::Utc;
@@ -203,8 +205,17 @@ mod tests {
         Repo {
             id: RepoId::new(),
             path: "/r".into(),
-            default_branch: "main".into(),
+            source_control: Some(SourceControl::Git {
+                default_branch: "main".into(),
+            }),
             created_at: Utc::now(),
+        }
+    }
+
+    fn plain_repo() -> Repo {
+        Repo {
+            source_control: None,
+            ..repo()
         }
     }
 
@@ -283,6 +294,30 @@ mod tests {
         );
         assert_eq!(effective_meta_repo(None, &[a, b]), None);
         assert_eq!(effective_meta_repo(None, &[]), None);
+    }
+
+    #[test]
+    fn the_meta_repository_is_never_a_plain_folder() {
+        let (plain, git_a, git_b) = (plain_repo(), repo(), repo());
+        assert_eq!(
+            effective_meta_repo(Some(plain.id), &[plain.clone(), git_a.clone()]),
+            Some(git_a.id)
+        );
+        assert_eq!(
+            effective_meta_repo(None, std::slice::from_ref(&plain)),
+            None
+        );
+        assert_eq!(
+            effective_meta_repo(
+                Some(plain.id),
+                &[plain.clone(), git_a.clone(), git_b.clone()]
+            ),
+            None
+        );
+        assert_eq!(
+            effective_meta_repo(Some(git_b.id), &[plain, git_a, git_b.clone()]),
+            Some(git_b.id)
+        );
     }
 
     #[test]

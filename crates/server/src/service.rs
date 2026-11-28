@@ -4,13 +4,15 @@
 //! or a close), tracked in a reservation map behind a `std::sync::Mutex` that is
 //! never held across an `await`. A turn runs in its own task; its reservation is
 //! released by a drop guard, so neither a panic nor an early return can leave
-//! the agent unable to take another message.
+//! the agent unable to take another message. A turn of an agent that works in
+//! place in a plain folder claims that folder in the same map, and the same
+//! guard frees it: one such turn runs in a folder at a time.
 
 use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -19,10 +21,12 @@ use chrono::Utc;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use smithagents_core::agent::{
-    next_agent_name, next_color, Agent, AgentState, ChatMessage, Repo, Role, PLANETS,
+    next_agent_name, next_color, AddSourceControl, Agent, AgentState, ChatMessage, Repo, Role,
+    SourceControl, PLANETS,
 };
 use smithagents_core::event::EventKind;
 use smithagents_core::ids::{AgentId, IntentId, RepoId};
+use smithagents_core::intent::{IntentFilter, IntentState};
 use smithagents_core::palette::AgentColor;
 
 use crate::events::EventBus;
@@ -48,6 +52,24 @@ pub enum ServiceError {
     AgentClosed,
     #[error("a turn is already in progress for this agent")]
     TurnInProgress,
+    #[error("this repository has no source control")]
+    NeedsSourceControl,
+    /// A turn of another agent that works in the same plain folder is in
+    /// flight: one agent works in a folder at a time.
+    #[error("Another agent is working in this folder.")]
+    FolderBusy,
+    /// Source control cannot be switched while an agent of the repository
+    /// is open.
+    #[error("this repository has an agent that is not closed")]
+    RepoInUse,
+    /// A plain folder would contain, or lie inside, another repository's
+    /// folder or the daemon's home.
+    #[error("the folder overlaps another repository of this Workspace, or the daemon's home")]
+    RepoOverlaps,
+    /// Source control cannot be turned off while an intent Feedback made for
+    /// the repository is not Resolved: it starts from a branch.
+    #[error("this repository has feedback intents that are not resolved")]
+    FeedbackIntentsOpen,
     #[error("git: {0}")]
     Git(#[from] GitError),
     #[error("store: {0}")]
@@ -63,6 +85,15 @@ impl ServiceError {
             Self::AgentNotFound => (S::NOT_FOUND, "agent_not_found"),
             Self::AgentClosed => (S::CONFLICT, "agent_closed"),
             Self::TurnInProgress => (S::CONFLICT, "turn_in_progress"),
+            Self::NeedsSourceControl => (S::CONFLICT, "needs_source_control"),
+            Self::FolderBusy => (S::CONFLICT, "folder_busy"),
+            Self::RepoInUse => (S::CONFLICT, "repo_in_use"),
+            Self::RepoOverlaps => (S::CONFLICT, "repo_overlaps"),
+            Self::FeedbackIntentsOpen => (S::CONFLICT, "repo_has_feedback_intents"),
+            Self::Git(GitError::NotInstalled) => (S::BAD_REQUEST, "git_not_installed"),
+            Self::Git(GitError::IdentityMissing) => (S::BAD_REQUEST, "git_identity_missing"),
+            Self::Git(GitError::FolderNotEmpty(_)) => (S::CONFLICT, "folder_not_empty"),
+            Self::Git(GitError::NotRepoRoot) => (S::BAD_REQUEST, "not_repo_root"),
             Self::Git(GitError::PathNotFound(_)) => (S::BAD_REQUEST, "path_not_found"),
             Self::Git(GitError::NotAGitRepo) => (S::BAD_REQUEST, "not_a_git_repo"),
             Self::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
@@ -83,12 +114,16 @@ impl ServiceError {
 /// and is logged.
 async fn discard_unsaved(repo_root: &Path, agent: &Agent, base: &str) {
     let id = agent.id;
+    // An agent that works in place made nothing: its folder is the repository's.
+    let Some(branch) = agent.branch.as_deref() else {
+        return;
+    };
     if let Err(e) = git::remove_worktree(repo_root, &agent.worktree_path).await {
         // The branch is still checked out there, so it stays too.
         tracing::warn!(agent_id = %id, "could not remove worktree of unsaved agent: {e}");
         return;
     }
-    match git::delete_branch_made_from(repo_root, &agent.branch, base).await {
+    match git::delete_branch_made_from(repo_root, branch, base).await {
         Ok(true) => {}
         Ok(false) => {
             tracing::warn!(agent_id = %id, "the branch of an unsaved agent holds a commit of its own, and was kept");
@@ -126,30 +161,71 @@ struct Inner {
     quiet_after: Duration,
     /// Serializes `create_agent` so concurrent creates never pick the same name or color.
     create_lock: tokio::sync::Mutex<()>,
-    reserved: Mutex<HashMap<AgentId, Slot>>,
+    /// Serializes adding repositories and switching their source control,
+    /// so two cannot both pass the overlap check. Feedback holds it too
+    /// ([`AgentService::hold_repos`]) around its check of a repository's
+    /// source control and the insert of an intent with an origin there, or
+    /// the store of the META choice.
+    repos_lock: tokio::sync::Mutex<()>,
+    reserved: Mutex<Reserved>,
 }
 
 impl Inner {
-    fn reserved(&self) -> MutexGuard<'_, HashMap<AgentId, Slot>> {
-        // Map operations cannot leave it inconsistent, so a poisoned lock is still usable.
+    fn reserved(&self) -> MutexGuard<'_, Reserved> {
+        // Map and set operations cannot leave it inconsistent, so a poisoned lock is still usable.
         self.reserved.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-/// Exclusive claim on one agent; removed from the map when dropped.
+/// What is claimed now: agents, and the plain folders their turns work in.
+#[derive(Default)]
+struct Reserved {
+    /// What each agent is reserved for.
+    agents: HashMap<AgentId, Slot>,
+    /// The plain repositories with a turn of one of their in-place agents in
+    /// flight: one agent works in a folder at a time.
+    folders: HashSet<RepoId>,
+}
+
+impl Reserved {
+    fn release(&mut self, id: AgentId, folder: Option<RepoId>) {
+        self.agents.remove(&id);
+        if let Some(repo) = folder {
+            self.folders.remove(&repo);
+        }
+    }
+}
+
+/// Exclusive claim on one agent, and for a turn of an agent that works in
+/// place on its folder too; both are released when it is dropped.
 struct Reservation {
     inner: Arc<Inner>,
     id: AgentId,
+    /// The plain repository whose folder this claim holds.
+    folder: Option<RepoId>,
     armed: bool,
 }
 
 impl Reservation {
+    /// Claims the folder of plain repository `repo` as well; `FolderBusy`
+    /// while another agent's turn holds it.
+    fn claim_folder(&mut self, repo: RepoId) -> Result<(), ServiceError> {
+        // A second claim would overwrite the first, which then never frees.
+        debug_assert!(self.folder.is_none(), "a reservation holds one folder");
+        if !self.inner.reserved().folders.insert(repo) {
+            return Err(ServiceError::FolderBusy);
+        }
+        self.folder = Some(repo);
+        Ok(())
+    }
+
     /// Releases the reservation and publishes `kind` under the same lock, so a
-    /// new reservation of this agent (and everything it publishes) comes after `kind`.
+    /// new reservation of this agent or its folder (and everything it
+    /// publishes) comes after `kind`.
     fn release_with(mut self, kind: EventKind) {
         self.armed = false;
         let mut reserved = self.inner.reserved();
-        reserved.remove(&self.id);
+        reserved.release(self.id, self.folder);
         self.inner.bus.publish(kind);
     }
 }
@@ -157,7 +233,7 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.armed {
-            self.inner.reserved().remove(&self.id);
+            self.inner.reserved().release(self.id, self.folder);
         }
     }
 }
@@ -230,26 +306,172 @@ impl AgentService {
                 paths,
                 quiet_after,
                 create_lock: tokio::sync::Mutex::new(()),
-                reserved: Mutex::new(HashMap::new()),
+                repos_lock: tokio::sync::Mutex::new(()),
+                reserved: Mutex::default(),
             }),
         }
     }
 
-    /// Validates `path` as a git repository and registers its root.
-    pub async fn add_repo(&self, path: &Path) -> Result<Repo, ServiceError> {
-        let info = git::validate_repo(path).await?;
+    /// Registers the folder at `path` as a repository, as `choice` says:
+    ///
+    /// - `None`: the folder as it is, at its [`canonical`] path (no
+    ///   repository root is looked for above it), with no source control.
+    ///   No git runs.
+    /// - `Git`: the git repository the folder is in, at its root, with its
+    ///   default branch.
+    /// - `NewGit`: a new git repository made at the canonical path
+    ///   ([`git::init_repo`]).
+    ///
+    /// Every check and what is made use that one canonical path. A folder
+    /// that is already a repository is `repo_exists`, however it is spelled.
+    /// A plain folder may not contain or lie inside another repository's
+    /// folder, nor the daemon's home (`RepoOverlaps`); two git repositories
+    /// may nest, as before. The git choices ask first whether git can be run
+    /// at all.
+    pub async fn add_repo(
+        &self,
+        path: &Path,
+        choice: AddSourceControl,
+    ) -> Result<Repo, ServiceError> {
+        let _serialized = self.inner.repos_lock.lock().await;
+        let path = canonical(path).await;
+        let (path, source_control) = match choice {
+            AddSourceControl::None => {
+                require_folder(&path).await?;
+                self.refuse_overlap(&path, true, None).await?;
+                (path, None)
+            }
+            AddSourceControl::Git => {
+                require_git().await?;
+                let info = git::validate_repo(&path).await?;
+                self.refuse_overlap(&info.root, false, None).await?;
+                (info.root, Some(git_of(info.default_branch)))
+            }
+            AddSourceControl::NewGit => {
+                require_git().await?;
+                // Before anything is made.
+                self.refuse_overlap(&path, false, None).await?;
+                let info = git::init_repo(&path).await?;
+                (info.root, Some(git_of(info.default_branch)))
+            }
+        };
         let repo = Repo {
             id: RepoId::new(),
-            path: info.root,
-            default_branch: info.default_branch,
+            path,
+            source_control,
             created_at: Utc::now(),
         };
         self.inner.store.insert_repo(&repo).await?;
         Ok(repo)
     }
 
+    /// Turns source control on (`on`) or off for repository `id`, and
+    /// returns the repository as it then is; asking for what it already has
+    /// changes nothing.
+    ///
+    /// Refused while an agent of the repository is not closed (`RepoInUse`).
+    /// Turning on needs the folder to be the root of a git repository
+    /// (`NotRepoRoot` for one inside it). Turning off is refused when the
+    /// folder would then overlap another repository or the daemon's home, as
+    /// a plain folder may not, and while an intent Feedback made for it is
+    /// not Resolved (`FeedbackIntentsOpen`): such an intent starts from a
+    /// branch. Turning it off for the META repository is allowed: the route
+    /// then has the feedback service clear that choice
+    /// ([`crate::feedback::FeedbackService::clear_plain_meta_repo`]). The
+    /// worktrees and branches of closed agents stay.
+    pub async fn set_source_control(&self, id: RepoId, on: bool) -> Result<Repo, ServiceError> {
+        let _serialized = self.inner.repos_lock.lock().await;
+        // No agent can be made between the check below and the change.
+        let _no_new_agent = self.inner.create_lock.lock().await;
+        let store = &self.inner.store;
+        let repo = store
+            .get_repo(id)
+            .await?
+            .ok_or(ServiceError::RepoNotFound)?;
+        let has_source_control = !repo.is_plain();
+        if has_source_control == on {
+            return Ok(repo);
+        }
+        let open = store.list_agents(false).await?;
+        if open.iter().any(|agent| agent.repo_id == id) {
+            return Err(ServiceError::RepoInUse);
+        }
+        let source_control = if on {
+            require_git().await?;
+            let info = git::validate_repo(&repo.path).await?;
+            if canonical(&info.root).await != canonical(&repo.path).await {
+                return Err(GitError::NotRepoRoot.into());
+            }
+            Some(git_of(info.default_branch))
+        } else {
+            self.refuse_overlap(&repo.path, true, Some(id)).await?;
+            let intents = store
+                .list_intents(IntentFilter {
+                    state: None,
+                    repo_id: Some(id),
+                })
+                .await?;
+            let feedback_open = intents
+                .iter()
+                .any(|intent| intent.origin.is_some() && intent.state != IntentState::Resolved);
+            if feedback_open {
+                return Err(ServiceError::FeedbackIntentsOpen);
+            }
+            None
+        };
+        store
+            .set_repo_source_control(id, source_control.as_ref())
+            .await?;
+        Ok(Repo {
+            source_control,
+            ..repo
+        })
+    }
+
+    /// Waits until no repository is being added or switched, and keeps it
+    /// so while the guard lives: what a caller finds of a repository's
+    /// source control under it stays true until the guard is dropped. The
+    /// feedback service holds it while it checks a repository and makes an
+    /// intent with an origin there, or stores the META choice.
+    pub(crate) async fn hold_repos(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.repos_lock.lock().await
+    }
+
+    /// Refuses a repository at `path` (`plain`: with no source control) that
+    /// would overlap another one, `except` aside (the repository itself, when
+    /// it is switched). The same folder is `repo_exists`, as it always was.
+    /// A folder inside or around another is `RepoOverlaps` when either of
+    /// the two is plain, and a plain folder inside or around the daemon's
+    /// home is too. Paths are compared as [`canonical`] spells them.
+    async fn refuse_overlap(
+        &self,
+        path: &Path,
+        plain: bool,
+        except: Option<RepoId>,
+    ) -> Result<(), ServiceError> {
+        let path = canonical(path).await;
+        for other in self.inner.store.list_repos().await? {
+            if Some(other.id) == except {
+                continue;
+            }
+            let at = canonical(&other.path).await;
+            if at == path {
+                return Err(StoreError::DuplicateRepoPath.into());
+            }
+            if (plain || other.is_plain()) && overlaps(&path, &at) {
+                return Err(ServiceError::RepoOverlaps);
+            }
+        }
+        if plain && overlaps(&path, &canonical(&self.inner.paths.home).await) {
+            return Err(ServiceError::RepoOverlaps);
+        }
+        Ok(())
+    }
+
     /// Creates an idle agent with the first free planet name and palette color,
-    /// in a new worktree on its own branch off the repo's default branch.
+    /// in a new worktree on its own branch off the repo's default branch. On a
+    /// repository with no source control the agent works in the folder
+    /// itself, with no branch, and no git runs.
     pub async fn create_agent(&self, repo_id: RepoId) -> Result<Agent, ServiceError> {
         self.create_agent_with(repo_id, CreateAgentOptions::default())
             .await
@@ -257,7 +479,9 @@ impl AgentService {
 
     /// Like `create_agent`, with an explicit branch (which must not exist yet),
     /// a branch to start from, an owning intent and a system prompt append
-    /// saved with the agent row.
+    /// saved with the agent row. A branch or a base on a repository with no
+    /// source control is `NeedsSourceControl`; a plain folder that is gone is
+    /// `PathNotFound`.
     pub async fn create_agent_with(
         &self,
         repo_id: RepoId,
@@ -276,15 +500,32 @@ impl AgentService {
         let name = next_agent_name(&PLANETS, &names);
         let color = next_color(&colors);
         let id = AgentId::new();
-        let branch = opts.branch.unwrap_or_else(|| agent_branch(&name, id));
-        let worktrees = self.inner.paths.repo_worktrees_dir(&repo);
-        // Fully qualified, so a tag or remote-tracking ref of the same name
-        // is never taken instead.
-        let base = match &opts.base {
-            Some(base) => format!("refs/heads/{base}"),
-            None => repo.default_branch.clone(),
+        // Where the agent works, its branch, and the branch that one was made
+        // from.
+        let (worktree_path, branch, base) = match repo.default_branch() {
+            // A plain repository: the agent works in the folder itself, and
+            // no git runs.
+            None => {
+                if opts.branch.is_some() || opts.base.is_some() {
+                    return Err(ServiceError::NeedsSourceControl);
+                }
+                require_folder(&repo.path).await?;
+                (repo.path.clone(), None, None)
+            }
+            Some(default_branch) => {
+                let branch = opts.branch.unwrap_or_else(|| agent_branch(&name, id));
+                let worktrees = self.inner.paths.repo_worktrees_dir(&repo);
+                // Fully qualified, so a tag or remote-tracking ref of the same
+                // name is never taken instead.
+                let base = match &opts.base {
+                    Some(base) => format!("refs/heads/{base}"),
+                    None => default_branch.to_owned(),
+                };
+                let worktree_path =
+                    git::create_worktree(&repo.path, &worktrees, &branch, &base).await?;
+                (worktree_path, Some(branch), Some(base))
+            }
         };
-        let worktree_path = git::create_worktree(&repo.path, &worktrees, &branch, &base).await?;
         let agent = Agent {
             id,
             name,
@@ -302,7 +543,9 @@ impl AgentService {
             .insert_agent_with_append(&agent, opts.system_prompt_append.as_deref())
             .await;
         if let Err(e) = inserted {
-            discard_unsaved(&repo.path, &agent, &base).await;
+            if let Some(base) = &base {
+                discard_unsaved(&repo.path, &agent, base).await;
+            }
             return Err(e.into());
         }
         self.inner
@@ -325,14 +568,21 @@ impl AgentService {
 
     /// Records the user's message and starts a turn, returning the message.
     /// Agents in any open state may be messaged (a `Dead` agent resumes its
-    /// session); only one turn per agent runs at a time.
+    /// session); only one turn per agent runs at a time, and only one among
+    /// the agents that work in place in one plain folder: while another's
+    /// runs, the message is refused with `FolderBusy` and not kept.
     pub async fn send_message(
         &self,
         id: AgentId,
         text: String,
     ) -> Result<ChatMessage, ServiceError> {
-        let reservation = self.reserve(id, Slot::Turn)?;
-        self.open_agent(id).await?;
+        let mut reservation = self.reserve(id, Slot::Turn)?;
+        let agent = self.open_agent(id).await?;
+        // An agent made while its repository had source control keeps its
+        // own worktree, so only one that works in place takes the folder.
+        if agent.works_in_place() {
+            reservation.claim_folder(agent.repo_id)?;
+        }
         let message = self.append(id, Role::User, &text).await?;
         // Nothing below awaits before the spawn, so a caller that stops waiting
         // cannot leave a recorded message without a turn. The task sets `Working`.
@@ -345,6 +595,7 @@ impl AgentService {
     pub fn running_agent_count(&self) -> usize {
         self.inner
             .reserved()
+            .agents
             .values()
             .filter(|slot| **slot == Slot::Turn)
             .count()
@@ -355,12 +606,19 @@ impl AgentService {
     /// recorded. That is state `Working` or `Quiet`, plus the instant before
     /// the turn's task records `Working`.
     pub fn turn_in_flight(&self, id: AgentId) -> bool {
-        self.inner.reserved().get(&id) == Some(&Slot::Turn)
+        self.inner.reserved().agents.get(&id) == Some(&Slot::Turn)
+    }
+
+    /// A turn is in flight among the in-place agents of `repo`: from the
+    /// moment `send_message` accepts its message until its final state is
+    /// recorded, as [`Self::turn_in_flight`] says of the agent.
+    pub fn folder_busy(&self, repo: RepoId) -> bool {
+        self.inner.reserved().folders.contains(&repo)
     }
 
     /// Atomically claims `id` for `slot`, failing if it is already claimed.
     fn reserve(&self, id: AgentId, slot: Slot) -> Result<Reservation, ServiceError> {
-        match self.inner.reserved().entry(id) {
+        match self.inner.reserved().agents.entry(id) {
             Entry::Occupied(held) => Err(match held.get() {
                 Slot::Turn => ServiceError::TurnInProgress,
                 Slot::Closing => ServiceError::AgentClosed,
@@ -370,6 +628,7 @@ impl AgentService {
                 Ok(Reservation {
                     inner: Arc::clone(&self.inner),
                     id,
+                    folder: None,
                     armed: true,
                 })
             }
@@ -616,6 +875,76 @@ async fn wait_for_exit(
     })
 }
 
+fn git_of(default_branch: String) -> SourceControl {
+    SourceControl::Git { default_branch }
+}
+
+/// Refuses a git choice before anything is made when git cannot be run.
+/// This is the only place git is looked for: asked each time, so git
+/// installed meanwhile is noticed, and the answer is what `GET /v1/health`
+/// reports from then on.
+async fn require_git() -> Result<(), ServiceError> {
+    if git::is_installed().await {
+        Ok(())
+    } else {
+        Err(GitError::NotInstalled.into())
+    }
+}
+
+/// `PathNotFound` unless `path` is a folder, for a repository with no source
+/// control.
+async fn require_folder(path: &Path) -> Result<(), ServiceError> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(GitError::PathNotFound(path.to_owned()).into()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Err(GitError::PathNotFound(path.to_owned()).into())
+        }
+        Err(e) => Err(GitError::Io(e).into()),
+    }
+}
+
+/// `path` made absolute with links, `.` and `..` resolved (on macOS also in
+/// the letter case the disk has). The longest leading part the system can
+/// resolve, it resolves. The rest is resolved as written, a `..` there
+/// dropping the part before it: what does not exist cannot be a link. Two
+/// spellings of one folder come out the same, also where some is missing,
+/// and what is checked is what gets made.
+async fn canonical(path: &Path) -> PathBuf {
+    let Ok(path) = std::path::absolute(path) else {
+        return path.to_owned();
+    };
+    let parts: Vec<Component<'_>> = path.components().collect();
+    let (mut at, mut rest) = (PathBuf::new(), &parts[..]);
+    for end in (1..=parts.len()).rev() {
+        let leading: PathBuf = parts[..end].iter().collect();
+        if let Ok(real) = tokio::fs::canonicalize(&leading).await {
+            (at, rest) = (real, &parts[end..]);
+            break;
+        }
+    }
+    for part in rest {
+        match part {
+            Component::ParentDir => {
+                at.pop();
+            }
+            Component::CurDir => {}
+            part => at.push(part),
+        }
+    }
+    at
+}
+
+/// Whether one of two folders is, or lies inside, the other.
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
 /// `agent/<lowercase name, spaces as dashes>-<first 8 hex digits of the id>`.
 fn agent_branch(name: &str, id: AgentId) -> String {
     let slug = name.to_lowercase().replace(' ', "-");
@@ -639,8 +968,13 @@ mod tests {
 
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream, StreamExt};
-    use smithagents_core::agent::{AgentState, Role};
+    use smithagents_core::agent::{AddSourceControl, AgentState, Role};
     use smithagents_core::event::{Event, EventKind};
+    use smithagents_core::feedback::FeedbackOrigin;
+    use smithagents_core::intent::{
+        Content, Intent, IntentKind, IntentState, IntentVersion, Phase, Seed, SeedSource,
+        VersionAuthor,
+    };
     use smithagents_core::palette::palette;
     use tempfile::TempDir;
     use tokio::sync::broadcast;
@@ -731,7 +1065,10 @@ mod tests {
             paths.clone(),
             quiet_after,
         );
-        let repo = svc.add_repo(&repo_dir).await.unwrap();
+        let repo = svc
+            .add_repo(&repo_dir, AddSourceControl::Git)
+            .await
+            .unwrap();
         Fx {
             svc,
             store,
@@ -791,7 +1128,7 @@ mod tests {
     /// Receives events until `pred` matches one; returns everything seen, in order.
     async fn recv_until(
         rx: &mut broadcast::Receiver<Event>,
-        pred: impl Fn(&EventKind) -> bool,
+        mut pred: impl FnMut(&EventKind) -> bool,
     ) -> Vec<EventKind> {
         tokio::time::timeout(TURN_TIMEOUT, async {
             let mut seen = Vec::new();
@@ -815,6 +1152,21 @@ mod tests {
                 if a.id == id && matches!(a.state, AgentState::Done | AgentState::Dead))
         })
         .await
+    }
+
+    /// Receives events until every agent of `ids` has reached `Done` or
+    /// `Dead`, in whatever order.
+    async fn until_turns_end(rx: &mut broadcast::Receiver<Event>, ids: &[AgentId]) {
+        let mut running: HashSet<AgentId> = ids.iter().copied().collect();
+        recv_until(rx, |k| {
+            if let EventKind::AgentUpdated(a) = k {
+                if matches!(a.state, AgentState::Done | AgentState::Dead) {
+                    running.remove(&a.id);
+                }
+            }
+            running.is_empty()
+        })
+        .await;
     }
 
     fn is_state(kind: &EventKind, state: AgentState) -> bool {
@@ -871,7 +1223,8 @@ mod tests {
         let mut rx = fx.live();
         let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
 
-        let suffix = agent.branch.strip_prefix("agent/mercury-").unwrap();
+        let branch = agent.branch.as_deref().unwrap();
+        let suffix = branch.strip_prefix("agent/mercury-").unwrap();
         assert_eq!(suffix, &agent.id.0.simple().to_string()[..8]);
         assert!(agent.worktree_path.is_dir());
         assert!(agent
@@ -879,7 +1232,7 @@ mod tests {
             .starts_with(fx.paths.repo_worktrees_dir(&fx.repo)));
         assert_eq!(
             git(&agent.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            agent.branch
+            branch
         );
         // The user's checkout is untouched.
         assert_eq!(
@@ -912,7 +1265,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(agent.branch, "intent/fix-it");
+        assert_eq!(agent.branch.as_deref(), Some("intent/fix-it"));
         assert_eq!(agent.intent_id, Some(intent_id));
         assert_eq!(fx.agent(agent.id).await, agent);
         assert_eq!(
@@ -985,6 +1338,403 @@ mod tests {
             .exists());
     }
 
+    #[tokio::test]
+    async fn a_plain_folder_is_added_as_it_is() {
+        let fx = fixture(vec![]).await;
+        // `notes/` is not a repository.
+        let notes_dir = fx.tmp.path().join("notes");
+        std::fs::create_dir(&notes_dir).unwrap();
+        let notes = fx
+            .svc
+            .add_repo(&notes_dir, AddSourceControl::None)
+            .await
+            .unwrap();
+        assert_eq!(notes.source_control, None);
+        assert_eq!(notes.path, std::fs::canonicalize(&notes_dir).unwrap());
+        assert_eq!(fx.store.get_repo(notes.id).await.unwrap(), Some(notes));
+
+        // A folder inside a git repository that is not one of the
+        // Workspace's keeps its own path: no root is looked for above it.
+        let other = fx.tmp.path().join("other-repo");
+        std::fs::create_dir(&other).unwrap();
+        git(&other, &["init", "-b", "main"]);
+        let docs = other.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let inside = fx
+            .svc
+            .add_repo(&docs, AddSourceControl::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (inside.path, inside.source_control),
+            (std::fs::canonicalize(&docs).unwrap(), None)
+        );
+
+        let gone = fx
+            .svc
+            .add_repo(&fx.tmp.path().join("nowhere"), AddSourceControl::None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(gone, ServiceError::Git(GitError::PathNotFound(_))),
+            "{gone:?}"
+        );
+        let file = fx.tmp.path().join("a-file");
+        std::fs::write(&file, "not a folder").unwrap();
+        let err = fx
+            .svc
+            .add_repo(&file, AddSourceControl::None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Git(GitError::PathNotFound(_))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_git_repository_needs_an_empty_folder() {
+        let fx = fixture(vec![]).await;
+        let full = fx.tmp.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("notes.txt"), "keep me").unwrap();
+        let err = fx
+            .svc
+            .add_repo(&full, AddSourceControl::NewGit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Git(GitError::FolderNotEmpty(_))),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(full.join("notes.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(!full.join(".git").exists());
+
+        // The same folder reached through `..` after a folder that does not
+        // exist: nothing is made, not even the missing folder.
+        let missing = fx.tmp.path().join("missing");
+        let err = fx
+            .svc
+            .add_repo(&missing.join("..").join("full"), AddSourceControl::NewGit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Git(GitError::FolderNotEmpty(_))),
+            "{err:?}"
+        );
+        assert!(!full.join(".git").exists());
+        assert!(!missing.exists());
+        assert_eq!(fx.store.list_repos().await.unwrap(), vec![fx.repo.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_plain_folder_may_not_overlap_another_repository() {
+        let fx = fixture(vec![]).await;
+        // x/ is a plain repository; every folder below exists.
+        let x = fx.tmp.path().join("x");
+        std::fs::create_dir_all(x.join("sub")).unwrap();
+        fx.svc.add_repo(&x, AddSourceControl::None).await.unwrap();
+        std::fs::create_dir_all(fx.paths.home.join("worktrees")).unwrap();
+        std::fs::create_dir_all(fx.repo_dir.join("docs")).unwrap();
+        let with_slash = PathBuf::from(format!("{}/", x.display()));
+
+        let missing = fx.tmp.path().join("missing");
+        #[allow(unused_mut)]
+        let mut refused = vec![
+            x.join("sub"),
+            x.parent().unwrap().to_owned(),
+            x.join("sub").join(".."),
+            missing.join("..").join("x"),
+            with_slash,
+            fx.paths.home.clone(),
+            fx.paths.home.join("worktrees"),
+            fx.repo_dir.join("docs"),
+        ];
+        #[cfg(unix)]
+        {
+            let link_to_x = fx.tmp.path().join("link-to-x");
+            std::os::unix::fs::symlink(&x, &link_to_x).unwrap();
+            refused.push(link_to_x);
+        }
+        for path in refused {
+            let err = fx
+                .svc
+                .add_repo(&path, AddSourceControl::None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ServiceError::RepoOverlaps | ServiceError::Store(StoreError::DuplicateRepoPath)
+                ),
+                "{path:?}: {err:?}"
+            );
+        }
+        // Where the disk ignores letter case, the upper-cased path of x/
+        // names the same folder, and that spelling is refused too.
+        let upper = fx.tmp.path().join("X");
+        if upper.is_dir() {
+            let err = fx
+                .svc
+                .add_repo(&upper, AddSourceControl::None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ServiceError::RepoOverlaps | ServiceError::Store(StoreError::DuplicateRepoPath)
+                ),
+                "{err:?}"
+            );
+        }
+
+        // A git repository may not lie inside the plain folder either, and a
+        // new one there is refused before anything is made.
+        let inner = x.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        git(&inner, &["init", "-b", "main"]);
+        git(&inner, &["commit", "--allow-empty", "-m", "init"]);
+        let err = fx
+            .svc
+            .add_repo(&inner, AddSourceControl::Git)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::RepoOverlaps), "{err:?}");
+        let fresh = x.join("fresh");
+        let err = fx
+            .svc
+            .add_repo(&fresh, AddSourceControl::NewGit)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::RepoOverlaps), "{err:?}");
+        assert!(!fresh.exists());
+        // Nor through `..` after a folder that does not exist: git never
+        // runs in the plain folder.
+        let err = fx
+            .svc
+            .add_repo(&missing.join("..").join("x"), AddSourceControl::NewGit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ServiceError::RepoOverlaps | ServiceError::Store(StoreError::DuplicateRepoPath)
+            ),
+            "{err:?}"
+        );
+        assert!(!x.join(".git").exists());
+        assert!(!missing.exists());
+
+        // A git repository inside another git repository is still added, as
+        // before; neither may then become a plain folder.
+        let nested = fx.repo_dir.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        git(&nested, &["init", "-b", "main"]);
+        git(&nested, &["commit", "--allow-empty", "-m", "init"]);
+        let nested = fx
+            .svc
+            .add_repo(&nested, AddSourceControl::Git)
+            .await
+            .unwrap();
+        assert_eq!(nested.default_branch(), Some("main"));
+        for id in [nested.id, fx.repo.id] {
+            let err = fx.svc.set_source_control(id, false).await.unwrap_err();
+            assert!(matches!(err, ServiceError::RepoOverlaps), "{err:?}");
+            let kept = fx.store.get_repo(id).await.unwrap().unwrap();
+            assert_eq!(kept.default_branch(), Some("main"));
+        }
+    }
+
+    #[tokio::test]
+    async fn source_control_is_switched_only_with_no_open_agent() {
+        let fx = fixture(vec![]).await;
+        let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        assert!(matches!(
+            fx.svc.set_source_control(fx.repo.id, false).await,
+            Err(ServiceError::RepoInUse)
+        ));
+        fx.svc.close_agent(agent.id).await.unwrap();
+        let off = fx.svc.set_source_control(fx.repo.id, false).await.unwrap();
+        assert_eq!(off.source_control, None);
+        assert_eq!(fx.store.get_repo(fx.repo.id).await.unwrap(), Some(off));
+
+        // An open agent holds the plain repository too.
+        let in_place = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        assert!(in_place.works_in_place());
+        assert!(matches!(
+            fx.svc.set_source_control(fx.repo.id, true).await,
+            Err(ServiceError::RepoInUse)
+        ));
+        fx.svc.close_agent(in_place.id).await.unwrap();
+        let on = fx.svc.set_source_control(fx.repo.id, true).await.unwrap();
+        assert_eq!(on.default_branch(), Some("main"));
+        assert_eq!(fx.store.get_repo(fx.repo.id).await.unwrap(), Some(on));
+
+        // The closed agent's worktree folder and branch are still there.
+        assert!(agent.worktree_path.is_dir());
+        assert!(branches(&fx).contains(agent.branch.as_ref().unwrap()));
+
+        let err = fx
+            .svc
+            .set_source_control(RepoId::new(), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::RepoNotFound), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_inside_a_git_repository_cannot_be_turned_into_one() {
+        let fx = fixture(vec![]).await;
+        // docs/ inside the fixture's repository, added as plain, is refused
+        // by the overlap rule; so: a plain repository at other-repo/docs,
+        // other-repo not added.
+        let other = fx.tmp.path().join("other-repo");
+        std::fs::create_dir(&other).unwrap();
+        git(&other, &["init", "-b", "main"]);
+        git(&other, &["commit", "--allow-empty", "-m", "init"]);
+        let docs = other.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let plain = fx
+            .svc
+            .add_repo(&docs, AddSourceControl::None)
+            .await
+            .unwrap();
+        let err = fx.svc.set_source_control(plain.id, true).await.unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Git(GitError::NotRepoRoot)),
+            "{err:?}"
+        );
+        assert_eq!(fx.store.get_repo(plain.id).await.unwrap(), Some(plain));
+
+        // A folder in no git repository at all is not one either.
+        let loose = fx.tmp.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        let loose = fx
+            .svc
+            .add_repo(&loose, AddSourceControl::None)
+            .await
+            .unwrap();
+        let err = fx.svc.set_source_control(loose.id, true).await.unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Git(GitError::NotAGitRepo)),
+            "{err:?}"
+        );
+    }
+
+    /// An intent of `repo_id` in `state`, made by Feedback when `feedback`.
+    fn intent_in(repo_id: RepoId, slug: &str, state: IntentState, feedback: bool) -> Intent {
+        let now = Utc::now();
+        Intent {
+            id: IntentId::new(),
+            repo_id,
+            slug: slug.into(),
+            state,
+            phase: Phase::Review,
+            seed: Seed {
+                source: SeedSource::Text,
+                text: "seed".into(),
+                kind: None,
+            },
+            content: Content {
+                title: slug.into(),
+                kind: IntentKind::Bug,
+                current_behavior: String::new(),
+                questions: vec![],
+                preconditions: vec![],
+                criteria: vec![],
+                stories: vec![],
+                depends_on: vec![],
+            },
+            agent_id: None,
+            created_at: now,
+            updated_at: now,
+            queued_at: None,
+            sent_at: None,
+            resolved_at: None,
+            last_start_error: None,
+            base_branch: feedback.then(|| format!("feedback/{slug}")),
+            origin: feedback.then(|| FeedbackOrigin {
+                folder: format!("docs/issues/{slug}"),
+                branch: format!("feedback/{slug}"),
+                commit: "0".repeat(40),
+                idea: None,
+            }),
+        }
+    }
+
+    async fn insert_intent(store: &Store, intent: &Intent) {
+        let first = IntentVersion {
+            intent_id: intent.id,
+            version: 1,
+            author: VersionAuthor::Seed,
+            content: intent.content.clone(),
+            at: intent.created_at,
+        };
+        store.insert_intent(intent, &first).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_control_stays_on_while_a_feedback_intent_is_unresolved() {
+        let fx = fixture(vec![]).await;
+        // An intent the user wrote does not hold it; one Feedback made does.
+        let own = intent_in(fx.repo.id, "own", IntentState::Queued, false);
+        insert_intent(&fx.store, &own).await;
+        let mut fed = intent_in(fx.repo.id, "fed", IntentState::Complete, true);
+        insert_intent(&fx.store, &fed).await;
+        assert!(matches!(
+            fx.svc.set_source_control(fx.repo.id, false).await,
+            Err(ServiceError::FeedbackIntentsOpen)
+        ));
+        assert!(!fx
+            .store
+            .get_repo(fx.repo.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_plain());
+
+        fed.state = IntentState::Resolved;
+        fed.resolved_at = Some(Utc::now());
+        fx.store.save_intent(&fed).await.unwrap();
+        let off = fx.svc.set_source_control(fx.repo.id, false).await.unwrap();
+        assert_eq!(off.source_control, None);
+    }
+
+    #[test]
+    fn the_refusals_of_adding_and_switching_have_codes_of_their_own() {
+        use StatusCode as S;
+        let code = |e: ServiceError| e.status_and_code();
+        let git = |e: GitError| ServiceError::Git(e).status_and_code();
+        assert_eq!(code(ServiceError::RepoInUse), (S::CONFLICT, "repo_in_use"));
+        assert_eq!(
+            code(ServiceError::RepoOverlaps),
+            (S::CONFLICT, "repo_overlaps")
+        );
+        assert_eq!(
+            code(ServiceError::FeedbackIntentsOpen),
+            (S::CONFLICT, "repo_has_feedback_intents")
+        );
+        assert_eq!(
+            git(GitError::NotInstalled),
+            (S::BAD_REQUEST, "git_not_installed")
+        );
+        assert_eq!(
+            git(GitError::IdentityMissing),
+            (S::BAD_REQUEST, "git_identity_missing")
+        );
+        assert_eq!(
+            git(GitError::FolderNotEmpty("/src/full".into())),
+            (S::CONFLICT, "folder_not_empty")
+        );
+        assert_eq!(
+            git(GitError::NotRepoRoot),
+            (S::BAD_REQUEST, "not_repo_root")
+        );
+    }
+
     /// The local branches of the fixture's repository, sorted.
     fn branches(fx: &Fx) -> Vec<String> {
         git(
@@ -1032,7 +1782,7 @@ mod tests {
         // So the same branch is free for the next try.
         fx.store.refuse_new_agents(false).await;
         let agent = fx.svc.create_agent_with(fx.repo.id, opts()).await.unwrap();
-        assert_eq!(agent.branch, "intent/unsaved");
+        assert_eq!(agent.branch.as_deref(), Some("intent/unsaved"));
         assert_eq!(branches(&fx), ["intent/unsaved", "main"]);
     }
 
@@ -1093,7 +1843,11 @@ mod tests {
         std::fs::create_dir_all(&other_dir).unwrap();
         git(&other_dir, &["init", "-b", "main"]);
         git(&other_dir, &["commit", "--allow-empty", "-m", "init"]);
-        let other = fx.svc.add_repo(&other_dir).await.unwrap();
+        let other = fx
+            .svc
+            .add_repo(&other_dir, AddSourceControl::Git)
+            .await
+            .unwrap();
         let on = |branch: &str| CreateAgentOptions {
             branch: Some(branch.into()),
             ..CreateAgentOptions::default()
@@ -1110,8 +1864,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(first.branch, "intent/same");
-        assert_eq!(second.branch, "intent/same");
+        assert_eq!(first.branch.as_deref(), Some("intent/same"));
+        assert_eq!(second.branch.as_deref(), Some("intent/same"));
         assert_ne!(first.worktree_path, second.worktree_path);
         for (agent, repo_dir) in [(&first, &fx.repo_dir), (&second, &other_dir)] {
             assert_eq!(
@@ -1153,7 +1907,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(agent.branch, "intent/y");
+        assert_eq!(agent.branch.as_deref(), Some("intent/y"));
         assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
         // Succeeds only when the base is an ancestor of the agent's branch.
         git(
@@ -1173,7 +1927,13 @@ mod tests {
         // Without a base the agent starts from the default branch.
         let plain = fx.svc.create_agent(fx.repo.id).await.unwrap();
         assert!(!plain.worktree_path.join("docs/issues/x").exists());
-        assert_eq!(git(&fx.repo_dir, &["rev-parse", &plain.branch]), main_tip);
+        assert_eq!(
+            git(
+                &fx.repo_dir,
+                &["rev-parse", plain.branch.as_deref().unwrap()]
+            ),
+            main_tip
+        );
     }
 
     #[tokio::test]
@@ -1776,7 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn add_repo_validates_and_records_root() {
         let fx = fixture(vec![]).await;
-        assert_eq!(fx.repo.default_branch, "main");
+        assert_eq!(fx.repo.default_branch(), Some("main"));
         assert_eq!(
             std::fs::canonicalize(&fx.repo.path).unwrap(),
             std::fs::canonicalize(&fx.repo_dir).unwrap()
@@ -1785,17 +2545,272 @@ mod tests {
 
         let sub = fx.repo_dir.join("sub");
         std::fs::create_dir(&sub).unwrap();
-        let err = fx.svc.add_repo(&sub).await.unwrap_err();
+        let err = fx
+            .svc
+            .add_repo(&sub, AddSourceControl::Git)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ServiceError::Store(StoreError::DuplicateRepoPath)),
             "{err:?}"
         );
         let plain = fx.tmp.path().join("plain");
         std::fs::create_dir(&plain).unwrap();
-        let err = fx.svc.add_repo(&plain).await.unwrap_err();
+        let err = fx
+            .svc
+            .add_repo(&plain, AddSourceControl::Git)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ServiceError::Git(GitError::NotAGitRepo)),
             "{err:?}"
         );
+    }
+
+    /// A plain repository at `<tmp>/<name>`, a folder added with no source
+    /// control.
+    async fn add_plain(fx: &Fx, name: &str) -> Repo {
+        let dir = fx.tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        fx.svc.add_repo(&dir, AddSourceControl::None).await.unwrap()
+    }
+
+    /// One turn that completes, for a harness with a delay.
+    fn a_turn() -> Vec<HarnessEvent> {
+        vec![started("s1"), completed("s1", Some("ok"))]
+    }
+
+    #[tokio::test]
+    async fn an_agent_on_a_plain_repository_works_in_the_folder_itself() {
+        let fx = fixture(vec![a_turn()]).await;
+        // The folder is a git repository of its own, added as a plain
+        // folder: no worktree and no branch may be made in it.
+        let dir = fx.tmp.path().join("notes");
+        std::fs::create_dir(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        git(&dir, &["commit", "--allow-empty", "-m", "init"]);
+        let plain = fx.svc.add_repo(&dir, AddSourceControl::None).await.unwrap();
+        let untouched = |dir: &Path| {
+            let heads = git(
+                dir,
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            );
+            assert_eq!(heads, "main");
+            let listed = git(dir, &["worktree", "list", "--porcelain"]);
+            assert_eq!(listed.matches("worktree ").count(), 1, "{listed}");
+        };
+        let mut rx = fx.live();
+
+        let agent = fx.svc.create_agent(plain.id).await.unwrap();
+        assert_eq!(agent.worktree_path, plain.path);
+        assert_eq!(agent.branch, None);
+        assert!(agent.works_in_place());
+        assert_eq!(agent.state, AgentState::Idle);
+        assert_eq!(fx.agent(agent.id).await, agent);
+        assert_eq!(
+            rx.recv().await.unwrap().kind,
+            EventKind::AgentCreated(agent.clone())
+        );
+        assert!(!fx.paths.repo_worktrees_dir(&plain).exists());
+        untouched(&dir);
+
+        // One turn: the harness runs in the folder itself.
+        fx.svc.send_message(agent.id, "go".into()).await.unwrap();
+        until_turn_ends(&mut rx, agent.id).await;
+        assert_eq!(fx.agent(agent.id).await.state, AgentState::Done);
+        let reqs = fx.harness.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].cwd, plain.path);
+
+        // Options that name a branch or a base need source control.
+        for opts in [
+            CreateAgentOptions {
+                branch: Some("intent/x".into()),
+                ..Default::default()
+            },
+            CreateAgentOptions {
+                base: Some("main".into()),
+                ..Default::default()
+            },
+        ] {
+            let err = fx.svc.create_agent_with(plain.id, opts).await.unwrap_err();
+            assert!(matches!(err, ServiceError::NeedsSourceControl), "{err:?}");
+        }
+        // An agent that cannot be saved takes nothing away: the folder is
+        // the user's own.
+        fx.store.refuse_new_agents(true).await;
+        let err = fx.svc.create_agent(plain.id).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Store(_)), "{err:?}");
+        fx.store.refuse_new_agents(false).await;
+        assert!(dir.join(".git").is_dir());
+        assert_eq!(
+            fx.store.list_agents(true).await.unwrap(),
+            vec![fx.agent(agent.id).await]
+        );
+        assert!(!fx.paths.repo_worktrees_dir(&plain).exists());
+        untouched(&dir);
+
+        // A folder that is gone has no directory to work in.
+        let gone = add_plain(&fx, "gone").await;
+        std::fs::remove_dir(&gone.path).unwrap();
+        let err = fx.svc.create_agent(gone.id).await.unwrap_err();
+        assert!(
+            matches!(&err, ServiceError::Git(GitError::PathNotFound(p)) if *p == gone.path),
+            "{err:?}"
+        );
+        assert_eq!(fx.store.list_agents(true).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_agent_works_in_a_plain_folder_at_a_time() {
+        let harness = FakeHarness::scripted(vec![a_turn(), a_turn(), a_turn()])
+            .with_delay(Duration::from_millis(500));
+        let fx = fixture_with(harness, NEVER_QUIET).await;
+        let plain = add_plain(&fx, "notes").await;
+        let a = fx.svc.create_agent(plain.id).await.unwrap();
+        let b = fx.svc.create_agent(plain.id).await.unwrap();
+        let c = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let mut rx = fx.live();
+
+        assert!(!fx.svc.folder_busy(plain.id));
+        fx.svc.send_message(a.id, "go".into()).await.unwrap();
+        assert!(fx.svc.folder_busy(plain.id));
+        // The agent's own turn is answered first.
+        let err = fx.svc.send_message(a.id, "again".into()).await.unwrap_err();
+        assert!(matches!(err, ServiceError::TurnInProgress), "{err:?}");
+
+        let err = fx.svc.send_message(b.id, "go".into()).await.unwrap_err();
+        assert!(matches!(err, ServiceError::FolderBusy), "{err:?}");
+        assert_eq!(err.status_and_code(), (StatusCode::CONFLICT, "folder_busy"));
+        assert_eq!(err.to_string(), "Another agent is working in this folder.");
+        assert!(
+            fx.messages(b.id).await.is_empty(),
+            "the refused message is not kept"
+        );
+        assert!(!fx.svc.turn_in_flight(b.id));
+        assert_eq!(fx.agent(b.id).await.state, AgentState::Idle);
+
+        // Another repository is free.
+        fx.svc.send_message(c.id, "go".into()).await.unwrap();
+        assert!(!fx.svc.folder_busy(fx.repo.id));
+        assert_eq!(fx.svc.running_agent_count(), 2);
+        // A turn always ends before its folder is free.
+        let err = fx.svc.close_agent(a.id).await.unwrap_err();
+        assert!(matches!(err, ServiceError::TurnInProgress), "{err:?}");
+        assert!(fx.svc.folder_busy(plain.id));
+
+        until_turns_end(&mut rx, &[a.id, c.id]).await;
+        assert!(!fx.svc.folder_busy(plain.id));
+        fx.svc.send_message(b.id, "go".into()).await.unwrap();
+        assert!(fx.svc.folder_busy(plain.id));
+        until_turn_ends(&mut rx, b.id).await;
+        assert!(!fx.svc.folder_busy(plain.id));
+        assert_eq!(fx.harness.requests().len(), 3);
+        for id in [a.id, b.id, c.id] {
+            assert_eq!(fx.agent(id).await.state, AgentState::Done);
+        }
+        assert_eq!(
+            fx.messages(b.id).await,
+            [
+                (Role::User, "go".to_string()),
+                (Role::Assistant, "ok".to_string())
+            ]
+        );
+    }
+
+    /// A harness that cannot start a turn at all.
+    struct UnstartableHarness;
+
+    #[async_trait]
+    impl Harness for UnstartableHarness {
+        async fn run_turn(
+            &self,
+            _req: TurnRequest,
+        ) -> Result<BoxStream<'static, HarnessEvent>, HarnessError> {
+            Err(HarnessError::Failed("could not start".into()))
+        }
+
+        async fn run_structured(
+            &self,
+            _req: StructuredRequest,
+        ) -> Result<StructuredResult, HarnessError> {
+            Err(HarnessError::Failed("not used".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reservation_dropped_with_its_folder_frees_both() {
+        let fx = fixture(vec![a_turn()]).await;
+        let plain = add_plain(&fx, "notes").await;
+        let a = fx.svc.create_agent(plain.id).await.unwrap();
+        let b = fx.svc.create_agent(plain.id).await.unwrap();
+        // A turn's claim given up before the turn runs (an early return, or
+        // a caller that stops waiting) is released by its `Drop`.
+        let mut r = fx.svc.reserve(a.id, Slot::Turn).unwrap();
+        r.claim_folder(plain.id).unwrap();
+        assert!(fx.svc.folder_busy(plain.id) && fx.svc.turn_in_flight(a.id));
+        drop(r);
+        assert!(!fx.svc.folder_busy(plain.id), "the folder is free");
+        assert!(!fx.svc.turn_in_flight(a.id), "and so is the agent");
+        // Another agent of the folder can send at once.
+        let mut rx = fx.live();
+        fx.svc.send_message(b.id, "go".into()).await.unwrap();
+        until_turn_ends(&mut rx, b.id).await;
+        assert!(!fx.svc.folder_busy(plain.id));
+        assert_eq!(fx.agent(b.id).await.state, AgentState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_fails_frees_its_folder() {
+        let fx = fixture(vec![vec![failed("boom")], a_turn()]).await;
+        let plain = add_plain(&fx, "notes").await;
+        let a = fx.svc.create_agent(plain.id).await.unwrap().id;
+        let b = fx.svc.create_agent(plain.id).await.unwrap().id;
+        // A turn that reports a failure, one whose harness cannot start, and
+        // one that panics.
+        let failing: [Arc<dyn Harness>; 3] = [
+            Arc::new(fx.harness.clone()),
+            Arc::new(UnstartableHarness),
+            Arc::new(PanickingHarness),
+        ];
+        for harness in failing {
+            let svc = AgentService::new(
+                fx.store.clone(),
+                fx.bus.clone(),
+                harness,
+                fx.paths.clone(),
+                NEVER_QUIET,
+            );
+            let mut rx = fx.live();
+            svc.send_message(a, "go".into()).await.unwrap();
+            assert!(svc.folder_busy(plain.id));
+            until_turn_ends(&mut rx, a).await;
+            assert_eq!(fx.agent(a).await.state, AgentState::Dead);
+            assert!(!svc.folder_busy(plain.id));
+            svc.send_message(b, "go".into()).await.unwrap();
+            until_turn_ends(&mut rx, b).await;
+            assert!(!svc.folder_busy(plain.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn two_agents_on_a_git_repository_still_work_at_once() {
+        let harness =
+            FakeHarness::scripted(vec![a_turn(), a_turn()]).with_delay(Duration::from_millis(200));
+        let fx = fixture_with(harness, NEVER_QUIET).await;
+        let a = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let b = fx.svc.create_agent(fx.repo.id).await.unwrap();
+        let mut rx = fx.live();
+
+        fx.svc.send_message(a.id, "go".into()).await.unwrap();
+        fx.svc.send_message(b.id, "go".into()).await.unwrap();
+        assert!(fx.svc.turn_in_flight(a.id) && fx.svc.turn_in_flight(b.id));
+        assert_eq!(fx.svc.running_agent_count(), 2);
+        assert!(!fx.svc.folder_busy(fx.repo.id));
+        until_turns_end(&mut rx, &[a.id, b.id]).await;
+        for id in [a.id, b.id] {
+            assert_eq!(fx.agent(id).await.state, AgentState::Done);
+        }
+        assert!(!fx.svc.folder_busy(fx.repo.id));
     }
 }

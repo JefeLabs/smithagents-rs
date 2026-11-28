@@ -10,26 +10,28 @@ use common::feedback_submit::{outcome_with_intent, outcome_with_issue};
 use common::intents::{intent, FakeIntents};
 use smithagents_app::feedback::draft::{Attachment, AttachmentId, AttachmentKind, Draft};
 use smithagents_app::feedback::submit_vm::{
-    asks_to_acknowledge, attachments_phrase, can_confirm, confirm_label, demo_help, issue_reason,
-    maybe_public_warning, not_recorded_text, public_warning, result_text, send_failure,
-    starting_repo, submit_error_text, summary, upload_problem, SendFailure, IDEA_START, KINDS,
+    asks_to_acknowledge, attachments_phrase, can_confirm, confirm_label, demo_help, failure_text,
+    feedback_repos, first_send_failure, issue_reason, maybe_public_warning, not_recorded_text,
+    public_warning, repo_line_text, result_text, send_failure, starting_repo, submit_error_text,
+    summary, upload_problem, SendFailure, IDEA_START, KINDS,
 };
 use smithagents_app::feedback::text::{
     DEMO_HELP, DEMO_MISSING_REASON, DRAFT_FULL_TEXT, GH_MISSING_REASON, GH_SIGNED_OUT_REASON,
     IDEA_DEMO_LABEL, IDEA_DIAGRAMS_LABEL, IDEA_EXPLAINER_LABEL, IDEA_LABEL, IDEA_NEEDS_PART,
     INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING, LINK_STOPPED_TEXT, MAYBE_PUBLIC_WARNING,
-    NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PUBLIC_WARNING, REPO_GONE_TEXT, START_OVER_RISK_TEXT,
-    START_OVER_TOOLTIP,
+    NEEDS_SOURCE_CONTROL_TEXT, NOTHING_CREATED_TEXT, NO_REMOTE_REASON, PUBLIC_WARNING,
+    REPO_GONE_TEXT, START_OVER_RISK_TEXT, START_OVER_TOOLTIP,
 };
 use smithagents_app::link::LinkError;
 use smithagents_app::view_models::{
-    DAEMON_UNREACHABLE_TEXT, FILE_UNREADABLE_TEXT, NOT_CONNECTED_TEXT,
+    DAEMON_UNREACHABLE_TEXT, FILE_UNREADABLE_TEXT, NEED_REPO_TEXT, NOT_CONNECTED_TEXT,
 };
 use smithagents_client::{ClientError, FeedbackFile};
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::{
     AttachmentKind as WireKind, FeedbackAttachment, FeedbackBox, FeedbackFailure, FeedbackKind,
-    FeedbackStep, FeedbackTarget, IdeaOptions, SendAs, SubmissionId, ToolReadiness,
+    FeedbackOutcome, FeedbackStep, FeedbackTarget, IdeaOptions, SendAs, SubmissionId,
+    ToolReadiness,
 };
 use smithagents_core::ids::RepoId;
 use smithagents_core::intent::{IntentState, Phase};
@@ -93,7 +95,9 @@ fn repo(path: &str, created: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at,
     }
 }
@@ -360,6 +364,86 @@ fn the_starting_repository() {
     assert_eq!(starting_repo(&repos, Some(gone), None), None, "else none");
     assert_eq!(starting_repo(&repos, None, Some(gone)), None);
     assert_eq!(starting_repo(&[], None, None), None);
+}
+
+#[test]
+fn feedback_goes_only_to_a_repository_with_source_control() {
+    let alpha = repo("/work/alpha", "20");
+    let folder = Repo {
+        source_control: None,
+        ..repo("/work/folder", "21")
+    };
+    let both = [folder.clone(), alpha.clone()];
+
+    // No repository with source control: the sentence, in place of the menu.
+    assert_eq!(
+        repo_line_text(std::slice::from_ref(&folder)),
+        Some("Feedback needs a repository with source control.")
+    );
+    assert_eq!(
+        NEEDS_SOURCE_CONTROL_TEXT,
+        "Feedback needs a repository with source control."
+    );
+    // No repository at all: the way to add one, as before.
+    assert_eq!(repo_line_text(&[]), Some(NEED_REPO_TEXT));
+    assert_eq!(repo_line_text(&both), None);
+    assert_eq!(
+        feedback_repos(&both).map(|r| r.id).collect::<Vec<_>>(),
+        [alpha.id],
+        "the menu offers only the repository with source control"
+    );
+    // A plain folder used last is not where the screen starts.
+    assert_eq!(
+        starting_repo(&both, Some(folder.id), Some(alpha.id)),
+        Some(alpha.id)
+    );
+    assert_eq!(starting_repo(&both, Some(folder.id), None), None);
+
+    // The daemon's refusal reads as the same sentence, and so does a
+    // recorded submission's step that failed for it.
+    let refused = api(409, "needs_source_control", "x");
+    assert_eq!(
+        submit_error_text(&refused),
+        "Feedback needs a repository with source control."
+    );
+    let failed = FeedbackOutcome {
+        intent: None,
+        failed: Some(FeedbackFailure {
+            step: FeedbackStep::CreateIntent,
+            code: "needs_source_control".into(),
+            message: "x".into(),
+        }),
+        ..outcome_with_issue(
+            SubmissionId::new(),
+            alpha.id,
+            "https://github.com/acme/app/issues/1",
+        )
+    };
+    assert!(
+        failure_text(&failed)
+            .unwrap()
+            .ends_with("but: Feedback needs a repository with source control."),
+        "{:?}",
+        failure_text(&failed)
+    );
+    // A first Create made nothing under its id; a retry or a re-upload of a
+    // recorded submission may have its commit, so it is not a refusal that
+    // made nothing.
+    assert_eq!(first_send_failure(&refused), SendFailure::Refused);
+    assert_eq!(send_failure(&refused), SendFailure::MayExist);
+    // Otherwise a first Create reads as any send.
+    for error in [
+        api(409, "default_branch_missing", "x"),
+        api(500, "needs_source_control", "x"),
+        api(409, "a_code_from_a_newer_daemon", "x"),
+        LinkError::NotConnected,
+    ] {
+        assert_eq!(
+            first_send_failure(&error),
+            send_failure(&error),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]

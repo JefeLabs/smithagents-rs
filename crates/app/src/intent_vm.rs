@@ -15,7 +15,7 @@ use crate::link::LinkError;
 use crate::model::{Connection, ShellModel};
 use crate::view_models::{
     capitalized, one_line, state_dot, state_kind, state_label, DotStyle, DAEMON_UNREACHABLE_TEXT,
-    FILE_UNREADABLE_TEXT, NOT_CONNECTED_TEXT,
+    FILE_UNREADABLE_TEXT, FOLDER_BUSY_TEXT, NOT_CONNECTED_TEXT,
 };
 
 // ---- Kinds -------------------------------------------------------------------
@@ -573,7 +573,10 @@ pub fn dependency_vm(model: &ShellModel, item: &Item) -> DependencyVm {
     }
 }
 
-/// Why a queued intent has not started yet.
+/// Why a queued intent has not started yet: the dependencies not resolved;
+/// else, on a plain folder (one intent works in it at a time), the intent
+/// that holds the folder ([`folder_holder`]), or that another agent is
+/// working in it; else that it waits for a free agent slot.
 pub fn queued_reason(model: &ShellModel, intent: &Intent) -> String {
     let waiting: Vec<&str> = intent
         .content
@@ -587,11 +590,56 @@ pub fn queued_reason(model: &ShellModel, intent: &Intent) -> String {
             None => Some("another intent"),
         })
         .collect();
-    if waiting.is_empty() {
-        "Waiting for a free agent slot.".to_owned()
-    } else {
-        format!("Waiting for {} to be resolved.", waiting.join(", "))
+    if !waiting.is_empty() {
+        return format!("Waiting for {} to be resolved.", waiting.join(", "));
     }
+    if works_in_folder(model, intent) {
+        if let Some(holder) = folder_holder(model, intent) {
+            return format!(
+                "Waiting for \"{}\" to be resolved or its agent closed. One intent works in \
+                 this folder at a time.",
+                holder.content.title
+            );
+        }
+        let busy = model.agents().into_iter().any(|agent| {
+            agent.repo_id == intent.repo_id
+                && agent.works_in_place()
+                && matches!(agent.state, AgentState::Working | AgentState::Quiet)
+        });
+        if busy {
+            return "Waiting: another agent is working in this folder.".to_owned();
+        }
+    }
+    "Waiting for a free agent slot.".to_owned()
+}
+
+/// The intent that holds the folder of `intent`'s repository: another of its
+/// intents that is Sent while the model still has its agent (it holds the
+/// folder until it is Resolved or its agent is closed); of several, the one
+/// sent first.
+fn folder_holder<'a>(model: &'a ShellModel, intent: &Intent) -> Option<&'a Intent> {
+    model
+        .intents()
+        .into_iter()
+        .filter(|other| {
+            other.id != intent.id
+                && other.repo_id == intent.repo_id
+                && other.state == IntentState::Sent
+                && other
+                    .agent_id
+                    .is_some_and(|agent| model.agent(agent).is_some())
+        })
+        .min_by_key(|other| (other.sent_at.unwrap_or(other.updated_at), other.id.0))
+}
+
+/// Whether `intent`'s repository is a plain folder, as the model has it: its
+/// agent works in the folder itself, on no branch, so resolving it means the
+/// work is finished there rather than landed on a default branch.
+pub fn works_in_folder(model: &ShellModel, intent: &Intent) -> bool {
+    model
+        .repos()
+        .iter()
+        .any(|repo| repo.id == intent.repo_id && repo.is_plain())
 }
 
 /// The daemon's own start of a start error, which the sentence already says.
@@ -734,6 +782,7 @@ fn intent_code_text(code: &str) -> Option<&'static str> {
         "dependency_cross_repo" => "A dependency must be in the same repository.",
         "intent_not_found" => "That intent no longer exists.",
         "repo_not_found" => "That repository no longer exists.",
+        "folder_busy" => FOLDER_BUSY_TEXT,
         _ => return None,
     })
 }

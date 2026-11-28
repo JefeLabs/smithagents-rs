@@ -10,7 +10,7 @@ use smithagents_app::view_models::{
 };
 use smithagents_center_host::HostError;
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::agent::{Agent, AgentState, Repo, SourceControl};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
 
@@ -26,7 +26,7 @@ fn agent(name: &str) -> Agent {
         },
         repo_id: RepoId::new(),
         worktree_path: "/tmp/wt".into(),
-        branch: format!("agent/{name}"),
+        branch: Some(format!("agent/{name}")),
         harness_session_id: None,
         state: AgentState::Idle,
         created_at: at,
@@ -420,7 +420,9 @@ fn repo(path: &str, minutes: i64) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: start + Duration::minutes(minutes),
     }
 }
@@ -741,7 +743,7 @@ mod settings_pane {
         NOT_CONNECTED_TEXT, REPO_ADD_FAILED_TEXT, SYSTEM_THEME_LABEL,
     };
     use smithagents_client::ClientError;
-    use smithagents_core::agent::Repo;
+    use smithagents_core::agent::{Repo, SourceControl};
     use smithagents_core::ids::RepoId;
     use smithagents_theme::state::ThemeChoice;
     use smithagents_theme::tokens::{TextScale, ThemeSet};
@@ -911,7 +913,9 @@ mod settings_pane {
         Repo {
             id: RepoId::new(),
             path: path.into(),
-            default_branch: branch.into(),
+            source_control: Some(SourceControl::Git {
+                default_branch: branch.into(),
+            }),
             created_at: at,
         }
     }
@@ -928,16 +932,36 @@ mod settings_pane {
         let rows = repo_rows(&repos, None);
         let shown: Vec<(&str, &str, &str)> = rows
             .iter()
-            .map(|r| (r.name.as_str(), r.path.as_str(), r.default_branch.as_str()))
+            .map(|r| (r.name.as_str(), r.path.as_str(), r.source_control.as_str()))
             .collect();
         assert_eq!(
             shown,
             [
-                ("alpha", "/other/alpha", "main"),
-                ("alpha", "/src/alpha", "main"),
-                ("My Project", "/work/My Project/", "develop"),
-                ("Zeta", "/src/Zeta", "main"),
-                ("ünïcode répo", "/src/ünïcode répo", "trunk"),
+                (
+                    "alpha",
+                    "/other/alpha",
+                    "Source control: Git, default branch main"
+                ),
+                (
+                    "alpha",
+                    "/src/alpha",
+                    "Source control: Git, default branch main"
+                ),
+                (
+                    "My Project",
+                    "/work/My Project/",
+                    "Source control: Git, default branch develop"
+                ),
+                (
+                    "Zeta",
+                    "/src/Zeta",
+                    "Source control: Git, default branch main"
+                ),
+                (
+                    "ünïcode répo",
+                    "/src/ünïcode répo",
+                    "Source control: Git, default branch trunk"
+                ),
             ]
         );
         assert_eq!(rows[4].id, repos[1].id);
@@ -948,11 +972,69 @@ mod settings_pane {
                 id: root.id,
                 name: "/".into(),
                 path: "/".into(),
-                default_branch: "main".into(),
+                source_control: "Source control: Git, default branch main".into(),
+                has_source_control: true,
                 is_meta: true,
                 can_set_meta: false,
             }]
         );
+    }
+
+    fn plain(path: &str) -> Repo {
+        Repo {
+            source_control: None,
+            ..repo(path, "main")
+        }
+    }
+
+    #[test]
+    fn a_repository_row_says_its_source_control() {
+        let (folder, git_main, git_trunk) = (
+            plain("/src/a-folder"),
+            repo("/src/b-main", "main"),
+            repo("/src/c-trunk", "trunk"),
+        );
+        let repos = vec![folder.clone(), git_main.clone(), git_trunk.clone()];
+        let settings = smithagents_core::feedback::FeedbackSettings {
+            meta_repo_id: Some(git_main.id),
+        };
+        let rows = repo_rows(&repos, Some(&settings));
+        let row = |repo: &Repo| rows.iter().find(|r| r.id == repo.id).unwrap().clone();
+        assert_eq!(row(&folder).source_control, "Source control: None");
+        assert_eq!(
+            row(&git_main).source_control,
+            "Source control: Git, default branch main"
+        );
+        assert_eq!(
+            row(&git_trunk).source_control,
+            "Source control: Git, default branch trunk"
+        );
+        let folder_row = row(&folder);
+        assert!(!folder_row.can_set_meta && !folder_row.is_meta && !folder_row.has_source_control);
+        assert!(row(&git_main).is_meta && row(&git_main).has_source_control);
+        assert!(row(&git_trunk).can_set_meta && row(&git_trunk).has_source_control);
+
+        // With one repository under source control there is nothing to
+        // choose: it is the meta repository, and the folder never is.
+        let repos = vec![folder.clone(), git_main.clone()];
+        for settings in [None, Some(Default::default()), Some(settings.clone())] {
+            let rows = repo_rows(&repos, settings.as_ref());
+            let flags: Vec<_> = rows
+                .iter()
+                .map(|r| (r.id, r.is_meta, r.can_set_meta))
+                .collect();
+            assert_eq!(
+                flags,
+                [(folder.id, false, false), (git_main.id, true, false)],
+                "{settings:?}"
+            );
+        }
+        // A stored id that names the folder counts as nothing stored.
+        let on_folder = smithagents_core::feedback::FeedbackSettings {
+            meta_repo_id: Some(folder.id),
+        };
+        let rows = repo_rows(std::slice::from_ref(&folder), Some(&on_folder));
+        assert!(!rows[0].is_meta && !rows[0].can_set_meta);
     }
 
     #[test]
@@ -1046,6 +1128,54 @@ mod settings_pane {
             repo_error_text(&api(400, "not_a_git_repo", " ")),
             "That directory is not a git repository."
         );
+    }
+
+    #[test]
+    fn each_new_refusal_has_its_sentence() {
+        // The codes of a plain folder and of turning source control on or
+        // off, at the status the daemon answers each with
+        // (`ServiceError::status_and_code`).
+        for (status, code, want) in [
+            (
+                409,
+                "folder_busy",
+                "Another agent is working in this folder.",
+            ),
+            (409, "repo_in_use", "Close this repository's agents first."),
+            (
+                409,
+                "repo_overlaps",
+                "That folder overlaps another repository of this Workspace, or SmithAgents' own folder.",
+            ),
+            (
+                409,
+                "repo_has_feedback_intents",
+                "Resolve this repository's feedback intents first.",
+            ),
+            (
+                409,
+                "needs_source_control",
+                "That needs a repository with source control.",
+            ),
+            (400, "git_not_installed", "git is not installed."),
+            (
+                400,
+                "git_identity_missing",
+                "git has no name and email to commit with. Set them, then try again.",
+            ),
+            (
+                409,
+                "folder_not_empty",
+                "A new repository needs a folder that is empty or does not exist yet.",
+            ),
+            (
+                400,
+                "not_repo_root",
+                "That folder is inside a git repository. Add the repository's own folder.",
+            ),
+        ] {
+            assert_eq!(repo_error_text(&api(status, code, "x")), want, "{code}");
+        }
     }
 
     #[test]

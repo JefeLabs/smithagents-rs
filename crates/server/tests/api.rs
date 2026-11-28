@@ -133,7 +133,7 @@ impl Fx {
             .call(
                 Method::POST,
                 "/v1/repos",
-                Some(json!({ "path": self.repo_dir() })),
+                Some(json!({ "path": self.repo_dir(), "source_control": "git" })),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -289,7 +289,11 @@ async fn add_repo_rejects_non_git_dir() {
     let dir = fx.tmp.path().join("plain");
     std::fs::create_dir(&dir).unwrap();
     let (status, body) = fx
-        .call(Method::POST, "/v1/repos", Some(json!({ "path": dir })))
+        .call(
+            Method::POST,
+            "/v1/repos",
+            Some(json!({ "path": dir, "source_control": "git" })),
+        )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_error(&body, "not_a_git_repo");
@@ -299,15 +303,19 @@ async fn add_repo_rejects_non_git_dir() {
 async fn add_repo_rejects_missing_path() {
     let fx = default_fx().await;
     let dir = fx.tmp.path().join("does-not-exist");
-    let (status, body) = fx
-        .call(Method::POST, "/v1/repos", Some(json!({ "path": dir })))
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_error(&body, "path_not_found");
-    assert!(
-        body["message"].as_str().unwrap().contains("does-not-exist"),
-        "{body}"
-    );
+    // A plain folder, and a git repository.
+    for body in [
+        json!({ "path": dir }),
+        json!({ "path": dir, "source_control": "git" }),
+    ] {
+        let (status, body) = fx.call(Method::POST, "/v1/repos", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_error(&body, "path_not_found");
+        assert!(
+            body["message"].as_str().unwrap().contains("does-not-exist"),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -317,7 +325,11 @@ async fn add_repo_rejects_bare_repo() {
     std::fs::create_dir(&dir).unwrap();
     common::git(&dir, &["init", "--bare", "-b", "main"]);
     let (status, body) = fx
-        .call(Method::POST, "/v1/repos", Some(json!({ "path": dir })))
+        .call(
+            Method::POST,
+            "/v1/repos",
+            Some(json!({ "path": dir, "source_control": "git" })),
+        )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_error(&body, "bare_repo");
@@ -331,7 +343,7 @@ async fn add_repo_twice_is_409_repo_exists_and_lists() {
         .call(
             Method::POST,
             "/v1/repos",
-            Some(json!({ "path": fx.repo_dir() })),
+            Some(json!({ "path": fx.repo_dir(), "source_control": "git" })),
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
@@ -340,6 +352,105 @@ async fn add_repo_twice_is_409_repo_exists_and_lists() {
     assert_eq!(status, StatusCode::OK);
     let repos: Vec<Repo> = serde_json::from_value(body).unwrap();
     assert_eq!(repos, vec![repo]);
+}
+
+#[tokio::test]
+async fn a_repository_is_added_plain_unless_the_request_says_git() {
+    let fx = default_fx().await;
+    // A git repository, added with no choice: as a plain folder.
+    let first_dir = fx.repo_dir();
+    let (status, first) = fx
+        .call(
+            Method::POST,
+            "/v1/repos",
+            Some(json!({ "path": first_dir })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["source_control"], Value::Null, "{first}");
+    assert_eq!(
+        first["path"],
+        json!(std::fs::canonicalize(&first_dir).unwrap())
+    );
+
+    let second_dir = fx.tmp.path().join("second");
+    common::init_repo(&second_dir);
+    let (status, second) = fx
+        .call(
+            Method::POST,
+            "/v1/repos",
+            Some(json!({ "path": second_dir, "source_control": "git" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["source_control"]["git"]["default_branch"], "main",
+        "{second}"
+    );
+
+    let third_dir = fx.tmp.path().join("third");
+    std::fs::create_dir(&third_dir).unwrap();
+    let (status, body) = fx
+        .call(
+            Method::POST,
+            "/v1/repos",
+            Some(json!({ "path": third_dir, "source_control": "svn" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_error(&body, "bad_request");
+
+    // Switched on, then off again.
+    let route = format!("/v1/repos/{}", first["id"].as_str().unwrap());
+    let (status, on) = fx
+        .call(
+            Method::PATCH,
+            &route,
+            Some(json!({ "source_control": "git" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{on}");
+    assert_eq!(
+        on["source_control"]["git"]["default_branch"], "main",
+        "{on}"
+    );
+    assert_eq!(on["id"], first["id"]);
+    let (status, off) = fx
+        .call(
+            Method::PATCH,
+            &route,
+            Some(json!({ "source_control": "none" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{off}");
+    assert_eq!(off["source_control"], Value::Null, "{off}");
+    let (_, listed) = fx.call(Method::GET, "/v1/repos", None).await;
+    assert_eq!(listed[0], off, "{listed}");
+
+    // Only none and git switch; the id must be one.
+    for (route, body) in [
+        (route.as_str(), json!({ "source_control": "new_git" })),
+        (route.as_str(), json!({})),
+        ("/v1/repos/not-an-id", json!({ "source_control": "git" })),
+    ] {
+        let (status, answer) = fx.call(Method::PATCH, route, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {answer}");
+        assert_error(&answer, "bad_request");
+    }
+    let unknown = format!("/v1/repos/{}", smithagents_core::ids::RepoId::new());
+    let (status, answer) = fx
+        .call(
+            Method::PATCH,
+            &unknown,
+            Some(json!({ "source_control": "git" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_error(&answer, "repo_not_found");
+
+    let (status, health) = fx.call(Method::GET, "/v1/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["git"], true, "{health}");
 }
 
 #[tokio::test]

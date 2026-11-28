@@ -40,13 +40,13 @@ use smithagents_app::view_models::{
 };
 use smithagents_app::views::agents::{
     agent_marker_id, agent_row_id, repo_choice_id, ACCENT_BAR_ID, AGENTS_EMPTY_ID, AGENT_LIST_ID,
-    CANCEL_CLOSE_ID, CLOSE_AGENT_LABEL, CLOSE_TITLE_ID, CONFIRM_CLOSE_ID, LEFT_PANE_CONTENT_ID,
-    NEW_AGENT_ID, NOTICE_ID, NO_AGENTS_TEXT, STATUS_DOT_ID, SWATCH_ID,
+    CANCEL_CLOSE_ID, CLOSE_AGENT_LABEL, CLOSE_DESCRIPTION_ID, CLOSE_TITLE_ID, CONFIRM_CLOSE_ID,
+    LEFT_PANE_CONTENT_ID, NEW_AGENT_ID, NOTICE_ID, NO_AGENTS_TEXT, STATUS_DOT_ID, SWATCH_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_app::views::tabs::TOGGLE_AGENTS_ID;
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, Repo, SourceControl};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
@@ -98,8 +98,21 @@ impl AgentCommands for FakeCommands {
         async move { result }.boxed_local()
     }
     /// The agents pane never adds a repository.
-    fn add_repo(&self, path: &std::path::Path) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+    fn add_repo(
+        &self,
+        path: &std::path::Path,
+        _: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         panic!("the agents pane added a repository: {}", path.display())
+    }
+
+    /// Nor does it switch one's source control.
+    fn set_source_control(
+        &self,
+        id: RepoId,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        panic!("the agents pane switched the source control of {id}")
     }
 }
 
@@ -122,7 +135,9 @@ fn repo(path: &str, minutes: i64) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at + chrono::Duration::minutes(minutes),
     }
 }
@@ -904,6 +919,48 @@ fn the_close_confirmation_names_the_agent_and_enter_cancels(cx: &mut TestAppCont
         state.read_with(cx, |state, _| state.model().agents().len()),
         1
     );
+}
+
+#[gpui_kit::test]
+fn closing_an_in_place_agent_does_not_speak_of_a_worktree(cx: &mut TestAppContext) {
+    let mercury = agent_with("Mercury", 0, 200.0, AgentState::Idle);
+    let venus = Agent {
+        branch: None,
+        worktree_path: "/src/plain folder".into(),
+        ..agent_with("Venus", 1, 60.0, AgentState::Idle)
+    };
+    assert!(venus.works_in_place() && !mercury.works_in_place());
+    let fake = Rc::new(FakeCommands::default());
+    let (window, _) = open_with_commands(
+        cx,
+        connected(vec![mercury.clone(), venus.clone()], vec![]),
+        &fake,
+        None,
+    );
+    let description = |cx: &mut TestAppContext| {
+        let mut text = None;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            text = window.find(CLOSE_DESCRIPTION_ID).value().map(str::to_owned);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        text
+    };
+
+    ask_to_close(cx, window, agent_row_id(venus.id));
+    assert_eq!(
+        description(cx).as_deref(),
+        Some("Its chat tab closes and it leaves the list. The folder is not touched.")
+    );
+    ask_to_close(cx, window, agent_row_id(mercury.id));
+    assert_eq!(
+        description(cx).as_deref(),
+        Some("Its chat tab closes and it leaves the list. Its worktree stays on disk."),
+        "as before"
+    );
+    assert!(fake.closes.borrow().is_empty());
 }
 
 #[gpui_kit::test]

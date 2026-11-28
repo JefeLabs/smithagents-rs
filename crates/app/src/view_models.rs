@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use smithagents_center_host::PixelRect;
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::agent::{AddSourceControl, Agent, AgentState, Repo};
 use smithagents_core::feedback::{effective_meta_repo, FeedbackSettings};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_theme::state::ThemeChoice;
@@ -520,10 +520,10 @@ pub fn command_error_text(error: &LinkError) -> String {
 pub enum SettingsSection {
     /// App scope: theme, text size, font.
     Appearance,
-    /// Space scope: what the daemon does for every agent, today the limit on
-    /// agents working at once.
+    /// Workspace scope: what the daemon does for every agent, today the limit
+    /// on agents working at once.
     AgentDefaults,
-    /// Space scope: the daemon's source repositories.
+    /// Workspace scope: the daemon's source repositories.
     Repositories,
 }
 
@@ -693,6 +693,16 @@ pub fn font_options(set: &ThemeSet, current: &str) -> Vec<FontOptionVm> {
         .collect()
 }
 
+/// The choices of the "Add repository" form, in the order it offers them;
+/// the first is selected until another is chosen. The git choices are always
+/// offered: the daemon runs no git before it is asked, so only its answer
+/// (`git_not_installed`) says that git cannot run.
+pub const ADD_CHOICES: [(AddSourceControl, &str); 3] = [
+    (AddSourceControl::None, "A folder, no source control"),
+    (AddSourceControl::Git, "An existing git repository"),
+    (AddSourceControl::NewGit, "A new git repository"),
+];
+
 /// One row of the Source repositories list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRowVm {
@@ -701,32 +711,45 @@ pub struct RepoRowVm {
     pub name: String,
     /// The full path, for display.
     pub path: String,
-    pub default_branch: String,
+    /// The line under the path: "Source control: None", or "Source control:
+    /// Git, default branch <name>".
+    pub source_control: String,
+    /// `false` for a plain folder.
+    pub has_source_control: bool,
     /// Intents and feedback go to this repository
     /// ([`effective_meta_repo`]).
     pub is_meta: bool,
-    /// The row offers "Use for intents and feedback": not the meta
-    /// repository, there is a choice to make, and the settings are loaded.
+    /// The row offers "Use for intents and feedback": it has source control,
+    /// it is not the meta repository, there is a choice to make (two
+    /// repositories or more with source control), and the settings are
+    /// loaded.
     pub can_set_meta: bool,
 }
 
 /// The daemon's repositories by name (ignoring case), then path. Names and
 /// paths are shown as they are, spaces and any script included. `settings`
 /// is `None` until the daemon's feedback settings are loaded: then nothing
-/// is stored, and no row can be chosen.
+/// is stored, and no row can be chosen. A plain folder is never the meta
+/// repository and never offers to become it.
 pub fn repo_rows(repos: &[Repo], settings: Option<&FeedbackSettings>) -> Vec<RepoRowVm> {
     let meta = effective_meta_repo(settings.and_then(|s| s.meta_repo_id), repos);
+    let eligible = repos.iter().filter(|repo| !repo.is_plain()).count();
     let mut rows: Vec<RepoRowVm> = repos
         .iter()
         .map(|repo| {
             let is_meta = meta == Some(repo.id);
+            let has_source_control = !repo.is_plain();
             RepoRowVm {
                 id: repo.id,
                 name: repo_title(&repo.path),
                 path: repo.path.display().to_string(),
-                default_branch: repo.default_branch.clone(),
+                source_control: match repo.default_branch() {
+                    Some(branch) => format!("Source control: Git, default branch {branch}"),
+                    None => "Source control: None".to_owned(),
+                },
+                has_source_control,
                 is_meta,
-                can_set_meta: settings.is_some() && !is_meta && repos.len() >= 2,
+                can_set_meta: settings.is_some() && has_source_control && !is_meta && eligible >= 2,
             }
         })
         .collect();
@@ -749,7 +772,8 @@ pub const DAEMON_UNREACHABLE_TEXT: &str = "Could not reach the daemon";
 /// (nothing was sent).
 pub const FILE_UNREADABLE_TEXT: &str = "A file to upload could not be opened";
 
-/// A failed add as one line under the path field.
+/// A failed add, or a failed switch of a repository's source control, as
+/// one line under the path field or in the repository's row.
 ///
 /// A daemon answer with a known code reads as our own sentence (the daemon's
 /// messages carry its internal `git: ` / `store: ` prefixes, see
@@ -772,17 +796,28 @@ pub fn repo_error_text(error: &LinkError) -> String {
     }
 }
 
-/// Our sentence for a daemon error code an add can answer with. The codes
-/// and the messages they replace are the daemon's
-/// (`crates/server/src/api.rs`, `service.rs`, `git.rs`, `store.rs`):
+/// Our sentence for a daemon error code an add, a switch of source control
+/// or a choice of the meta repository can answer with. The codes and the
+/// messages they replace are the daemon's (`crates/server/src/api.rs`,
+/// `service.rs`, `git.rs`, `store.rs`); the daemon's own sentence is never
+/// shown for these:
 ///
-/// | code | daemon message |
+/// | code | daemon message, or what it answers |
 /// |---|---|
 /// | `path_not_found` | `git: no directory at <path>` |
 /// | `not_a_git_repo` | `git: not a git repository` |
 /// | `bare_repo` | `git: bare repositories are not supported` |
 /// | `no_default_branch` | `git: could not determine the default branch` |
 /// | `repo_exists` | `store: a repo with this path already exists` |
+/// | `folder_busy` | another agent of the plain folder is in a turn |
+/// | `repo_in_use` | the repository has an agent that is not closed |
+/// | `repo_overlaps` | a plain folder would contain or lie in another repository's, or the daemon's home |
+/// | `repo_has_feedback_intents` | a Feedback intent of it is not Resolved |
+/// | `needs_source_control` | the repository is a plain folder |
+/// | `git_not_installed` | git cannot run |
+/// | `git_identity_missing` | a new repository's first commit has no author |
+/// | `folder_not_empty` | a new repository's folder holds something |
+/// | `not_repo_root` | the folder is a subfolder of a git repository |
 fn repo_code_text(code: &str) -> Option<&'static str> {
     Some(match code {
         "path_not_found" => "No directory at that path.",
@@ -790,9 +825,30 @@ fn repo_code_text(code: &str) -> Option<&'static str> {
         "bare_repo" => "Bare repositories are not supported.",
         "no_default_branch" => "Could not determine the repository's default branch.",
         "repo_exists" => "That repository is already added.",
+        "folder_busy" => FOLDER_BUSY_TEXT,
+        "repo_in_use" => "Close this repository's agents first.",
+        "repo_overlaps" => {
+            "That folder overlaps another repository of this Workspace, or SmithAgents' own folder."
+        }
+        "repo_has_feedback_intents" => "Resolve this repository's feedback intents first.",
+        "needs_source_control" => "That needs a repository with source control.",
+        "git_not_installed" => "git is not installed.",
+        "git_identity_missing" => {
+            "git has no name and email to commit with. Set them, then try again."
+        }
+        "folder_not_empty" => {
+            "A new repository needs a folder that is empty or does not exist yet."
+        }
+        "not_repo_root" => {
+            "That folder is inside a git repository. Add the repository's own folder."
+        }
         _ => return None,
     })
 }
+
+/// What a message refused with `folder_busy` says: one agent works in a plain
+/// folder at a time.
+pub const FOLDER_BUSY_TEXT: &str = "Another agent is working in this folder.";
 
 /// What an add without its own sentence says when the daemon's message is
 /// blank (or only a prefix).
@@ -840,7 +896,8 @@ pub const ABSOLUTE_PATH_TEXT: &str = "Enter an absolute path";
 pub const CLONE_UNSUPPORTED_TEXT: &str =
     "Cloning from a URL is not supported yet. Enter a local path.";
 /// What the Source repositories section says when there is none.
-pub const NO_REPOS_TEXT: &str = "No repositories yet. Add a local git repository to create agents.";
+pub const NO_REPOS_TEXT: &str =
+    "No repositories yet. Add a folder or a git repository to create agents.";
 
 /// [`validate_repo_path_input_in`] with the user's home directory.
 pub fn validate_repo_path_input(raw: &str) -> Result<PathBuf, &'static str> {
