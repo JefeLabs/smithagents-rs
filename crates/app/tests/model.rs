@@ -454,6 +454,29 @@ fn repo_added_upserts_by_id() {
 }
 
 #[test]
+fn repo_updated_replaces_the_repository_of_that_id() {
+    let mut m = ShellModel::new();
+    let (a, b) = (repo(), repo());
+    m.apply(Action::RepoAdded(a.clone()));
+    m.apply(Action::RepoAdded(b.clone()));
+    let before = m.revision();
+    let plain = Repo {
+        source_control: None,
+        ..a.clone()
+    };
+    m.apply(Action::RepoUpdated(plain.clone()));
+    assert_eq!(m.repos(), [plain.clone(), b.clone()], "in its place");
+    assert_eq!(m.revision(), before + 1);
+    // The same copy again changes nothing.
+    m.apply(Action::RepoUpdated(plain.clone()));
+    assert_eq!(m.revision(), before + 1);
+    // A repository the model does not have is not added.
+    m.apply(Action::RepoUpdated(repo()));
+    assert_eq!(m.repos(), [plain, b]);
+    assert_eq!(m.revision(), before + 1);
+}
+
+#[test]
 fn snapshot_after_daemon_restart_resets_seq_and_accepts_new_events() {
     let mut m = ShellModel::new();
     m.apply(snapshot(vec![], 50));

@@ -15,7 +15,7 @@ use crate::link::LinkError;
 use crate::model::{Connection, ShellModel};
 use crate::view_models::{
     capitalized, one_line, state_dot, state_kind, state_label, DotStyle, DAEMON_UNREACHABLE_TEXT,
-    FILE_UNREADABLE_TEXT, NOT_CONNECTED_TEXT,
+    FILE_UNREADABLE_TEXT, FOLDER_BUSY_TEXT, NOT_CONNECTED_TEXT,
 };
 
 // ---- Kinds -------------------------------------------------------------------
@@ -594,6 +594,16 @@ pub fn queued_reason(model: &ShellModel, intent: &Intent) -> String {
     }
 }
 
+/// Whether `intent`'s repository is a plain folder, as the model has it: its
+/// agent works in the folder itself, on no branch, so resolving it means the
+/// work is finished there rather than landed on a default branch.
+pub fn works_in_folder(model: &ShellModel, intent: &Intent) -> bool {
+    model
+        .repos()
+        .iter()
+        .any(|repo| repo.id == intent.repo_id && repo.is_plain())
+}
+
 /// The daemon's own start of a start error, which the sentence already says.
 const DAEMON_START_PREFIX: &str = "could not start the agent:";
 /// How many characters of a start error the detail shows.
@@ -734,6 +744,7 @@ fn intent_code_text(code: &str) -> Option<&'static str> {
         "dependency_cross_repo" => "A dependency must be in the same repository.",
         "intent_not_found" => "That intent no longer exists.",
         "repo_not_found" => "That repository no longer exists.",
+        "folder_busy" => FOLDER_BUSY_TEXT,
         _ => return None,
     })
 }

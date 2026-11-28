@@ -24,13 +24,14 @@ use super::text::{
     IDEA_NEEDS_PART, IMAGE_TOO_LARGE_REASON, INTENT_MAYBE_PUBLIC_WARNING, INTENT_PUBLIC_WARNING,
     ISSUE_UNCONFIRMED_TEXT, LINK_STOPPED_TEXT, MAIN_IDEA_MAX_CHARS, MAIN_IDEA_TOO_LONG_TEXT,
     MAX_ATTACHMENTS, MAX_BOXES, MAX_COMMENT_CHARS, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES,
-    MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING, NOTHING_CREATED_TEXT, NO_REMOTE_REASON,
-    PLUGIN_OFF_REASON, PUBLIC_WARNING, REPO_GONE_TEXT, TOO_MANY_BOXES_REASON,
+    MAX_VIDEO_BYTES, MAYBE_PUBLIC_WARNING, NEEDS_SOURCE_CONTROL_TEXT, NOTHING_CREATED_TEXT,
+    NO_REMOTE_REASON, PLUGIN_OFF_REASON, PUBLIC_WARNING, REPO_GONE_TEXT, TOO_MANY_BOXES_REASON,
     UPLOAD_TOO_LARGE_TEXT, VIDEO_TOO_LARGE_REASON,
 };
 use crate::link::LinkError;
 use crate::view_models::{
-    capitalized, one_line, DAEMON_UNREACHABLE_TEXT, FILE_UNREADABLE_TEXT, NOT_CONNECTED_TEXT,
+    capitalized, one_line, DAEMON_UNREACHABLE_TEXT, FILE_UNREADABLE_TEXT, NEED_REPO_TEXT,
+    NOT_CONNECTED_TEXT,
 };
 
 /// The feedback kinds, in the order the Submit screen offers them.
@@ -70,7 +71,8 @@ pub const KINDS: [FeedbackKind; 3] = [
 /// `branch_blocked`). They count only as a 4xx answer: the daemon sends
 /// `git_failed` and `io_error` as 500, and any 5xx locks. (For a recorded
 /// submission, `unpushed_commits` before a push and `origin_unreadable` are
-/// failed steps instead.)
+/// failed steps instead.) [`NEEDS_SOURCE_CONTROL`] is not among them: see
+/// [`first_send_failure`].
 pub const NOTHING_MADE_CODES: [&str; 15] = [
     "invalid",
     "unsupported_file",
@@ -97,6 +99,12 @@ pub const PUBLIC_NOT_ACKNOWLEDGED: &str = "public_not_acknowledged";
 /// The daemon's code when a tool the submission needs is not ready: only
 /// `agent-browser`, for an idea package's demo video.
 pub const TOOL_MISSING: &str = "tool_missing";
+
+/// The daemon's code when the submission's repository is a plain folder
+/// (`FeedbackService::submit`'s `refuse_plain`, before anything runs). For a
+/// new submission nothing is made; a recorded one (a retry, or a re-upload
+/// after an answer that never came) has its commit, or may have it.
+pub const NEEDS_SOURCE_CONTROL: &str = "needs_source_control";
 
 /// What a failed send (or retry) leaves under the submission's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +147,21 @@ pub fn send_failure(error: &LinkError) -> SendFailure {
             code if *status < 500 && NOTHING_MADE_CODES.contains(&code) => SendFailure::Refused,
             _ => SendFailure::MayExist,
         },
+    }
+}
+
+/// [`send_failure`] for a first Create under the submission's id, when no
+/// request under it can have been recorded: a [`NEEDS_SOURCE_CONTROL`]
+/// refusal made nothing either, so the draft stays editable. A retry or a
+/// re-upload reads by [`send_failure`], which keeps that refusal locked.
+pub fn first_send_failure(error: &LinkError) -> SendFailure {
+    match error {
+        LinkError::Client(ClientError::Api { status, code, .. })
+            if *status < 500 && code == NEEDS_SOURCE_CONTROL =>
+        {
+            SendFailure::Refused
+        }
+        _ => send_failure(error),
     }
 }
 
@@ -312,14 +335,35 @@ pub fn confirm_label(send_as: SendAs) -> &'static str {
     }
 }
 
-/// The repository the screen starts on: the last used while it exists, else
-/// the meta repository while it exists, else none (the user chooses).
+/// The repositories a submission can go to, in `repos`' order: those with
+/// source control, since Feedback works by committing files.
+pub fn feedback_repos(repos: &[Repo]) -> impl Iterator<Item = &Repo> {
+    repos.iter().filter(|repo| !repo.is_plain())
+}
+
+/// What the Repository line says in place of its menu, as the way to
+/// Settings → Source repositories: [`NEED_REPO_TEXT`] with no repository,
+/// [`NEEDS_SOURCE_CONTROL_TEXT`] when none has source control; `None` while
+/// one has (the menu offers [`feedback_repos`]).
+pub fn repo_line_text(repos: &[Repo]) -> Option<&'static str> {
+    if repos.is_empty() {
+        Some(NEED_REPO_TEXT)
+    } else if feedback_repos(repos).next().is_none() {
+        Some(NEEDS_SOURCE_CONTROL_TEXT)
+    } else {
+        None
+    }
+}
+
+/// The repository the screen starts on: the last used while it exists with
+/// source control, else the meta repository while it exists with source
+/// control, else none (the user chooses).
 pub fn starting_repo(
     repos: &[Repo],
     last_used: Option<RepoId>,
     meta: Option<RepoId>,
 ) -> Option<RepoId> {
-    let exists = |id: &RepoId| repos.iter().any(|repo| repo.id == *id);
+    let exists = |id: &RepoId| feedback_repos(repos).any(|repo| repo.id == *id);
     last_used.filter(exists).or_else(|| meta.filter(exists))
 }
 
@@ -348,6 +392,7 @@ fn feedback_code_text(code: &str) -> Option<&'static str> {
         "issue_unconfirmed" => ISSUE_UNCONFIRMED_TEXT,
         "repo_not_found" => REPO_GONE_TEXT,
         TOOL_MISSING => DEMO_MISSING_REASON,
+        NEEDS_SOURCE_CONTROL => NEEDS_SOURCE_CONTROL_TEXT,
         _ => return None,
     })
 }

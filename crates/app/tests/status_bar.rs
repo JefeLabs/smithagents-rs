@@ -467,6 +467,14 @@ impl AgentCommands for FakeCommands {
     ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         async { Err(LinkError::NotConnected) }.boxed_local()
     }
+
+    fn set_source_control(
+        &self,
+        _: RepoId,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        async { Err(LinkError::NotConnected) }.boxed_local()
+    }
 }
 
 #[gpui_kit::test]

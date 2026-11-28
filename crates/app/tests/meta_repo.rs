@@ -50,11 +50,16 @@ fn repo(path: &str) -> Repo {
 /// loaded as `stored` (`None`: not loaded; `Some(index)`: that repository is
 /// stored; `Some(None)`: the loaded setting is empty).
 fn open(cx: &mut TestAppContext, count: usize, stored: Option<Option<usize>>) -> Opened {
-    let fake = Rc::new(FakeFeedback::default());
-    let home = tempfile::tempdir().unwrap();
     let repos: Vec<Repo> = (0..count)
         .map(|i| repo(&format!("/work/repo-{i}")))
         .collect();
+    open_with(cx, repos, stored)
+}
+
+/// [`open`] with these repositories.
+fn open_with(cx: &mut TestAppContext, repos: Vec<Repo>, stored: Option<Option<usize>>) -> Opened {
+    let fake = Rc::new(FakeFeedback::default());
+    let home = tempfile::tempdir().unwrap();
     let mut model = model_with(vec![], vec![], repos.clone());
     if let Some(stored) = stored {
         model.apply(Action::FeedbackSettingsLoaded(FeedbackSettings {
@@ -220,4 +225,51 @@ fn nothing_can_be_chosen_before_the_settings_load(cx: &mut TestAppContext) {
         assert!(!exists(cx, opened.window, repo_use_meta_id(repo.id)));
         assert!(!exists(cx, opened.window, repo_meta_tag_id(repo.id)));
     }
+}
+
+fn plain(path: &str) -> Repo {
+    Repo {
+        source_control: None,
+        ..repo(path)
+    }
+}
+
+#[gpui_kit::test]
+fn a_plain_folder_is_never_the_meta_repository(cx: &mut TestAppContext) {
+    // Alone, and even when the stored setting names it.
+    for stored in [Some(None), Some(Some(0))] {
+        let opened = open_with(cx, vec![plain("/work/folder")], stored);
+        let id = opened.repos[0].id;
+        assert!(
+            !exists(cx, opened.window, repo_meta_tag_id(id)),
+            "{stored:?}"
+        );
+        assert!(
+            !exists(cx, opened.window, repo_use_meta_id(id)),
+            "{stored:?}"
+        );
+    }
+
+    // Beside two git repositories it offers no button; they still do.
+    let opened = open_with(
+        cx,
+        vec![plain("/work/folder"), repo("/work/a"), repo("/work/b")],
+        Some(Some(1)),
+    );
+    let ids: Vec<RepoId> = opened.repos.iter().map(|repo| repo.id).collect();
+    let window = opened.window;
+    assert!(!exists(cx, window, repo_use_meta_id(ids[0])));
+    assert!(!exists(cx, window, repo_meta_tag_id(ids[0])));
+    assert!(exists(cx, window, repo_meta_tag_id(ids[1])));
+    assert!(exists(cx, window, repo_use_meta_id(ids[2])));
+
+    // Beside one: that one is the meta repository, with nothing to choose.
+    let opened = open_with(cx, vec![plain("/work/folder"), repo("/work/a")], Some(None));
+    let ids: Vec<RepoId> = opened.repos.iter().map(|repo| repo.id).collect();
+    let window = opened.window;
+    assert!(exists(cx, window, repo_meta_tag_id(ids[1])));
+    for id in &ids {
+        assert!(!exists(cx, window, repo_use_meta_id(*id)));
+    }
+    assert!(!exists(cx, window, repo_meta_tag_id(ids[0])));
 }

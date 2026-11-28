@@ -291,6 +291,33 @@ impl DaemonLink {
         })
     }
 
+    /// Turns repository `id`'s source control on (git) or off, and tells the
+    /// UI with `Action::RepoUpdated`, sent from the link's runtime like
+    /// [`DaemonLink::add_repo`]'s. Then it reads the feedback settings again
+    /// and sends them as `Action::FeedbackSettingsLoaded`: turning it off for
+    /// the meta repository clears that choice, and neither the answer nor an
+    /// event says so. The switch stands when that read fails.
+    pub fn set_source_control(
+        &self,
+        id: RepoId,
+        on: bool,
+    ) -> impl Future<Output = Result<Repo, LinkError>> + Send + 'static {
+        self.cmd.clone().run(move |c, tx| async move {
+            let repo = c.set_source_control(id, on).await?;
+            let _ = tx.send(Action::RepoUpdated(repo.clone())).await;
+            match c.feedback_settings().await {
+                Ok(settings) => {
+                    let _ = tx.send(Action::FeedbackSettingsLoaded(settings)).await;
+                }
+                Err(e) => tracing::warn!(
+                    repo = %id,
+                    "cannot read the feedback settings after a source control switch: {e}"
+                ),
+            }
+            Ok(repo)
+        })
+    }
+
     pub fn close_agent(
         &self,
         id: AgentId,
@@ -487,7 +514,8 @@ impl DaemonLink {
 }
 
 /// The commands the shell's views send to the daemon: the agents pane's
-/// create and close, and the Settings pane's add repository. [`DaemonLink`]
+/// create and close, and the Settings pane's add repository and source
+/// control switch. [`DaemonLink`]
 /// is the production implementation; headless tests inject a fake through
 /// `ShellOptions::commands` so they need no daemon.
 ///
@@ -504,6 +532,15 @@ pub trait AgentCommands {
         &self,
         path: &Path,
         choice: AddSourceControl,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>>;
+    /// Turns repository `id`'s source control on (git) or off. The model
+    /// learns of the answer through `Action::RepoUpdated`, and of the
+    /// feedback settings through `Action::FeedbackSettingsLoaded`, which the
+    /// link sends itself (a fake leaves that to the test).
+    fn set_source_control(
+        &self,
+        id: RepoId,
+        on: bool,
     ) -> LocalBoxFuture<'static, Result<Repo, LinkError>>;
 }
 
@@ -522,6 +559,14 @@ impl AgentCommands for DaemonLink {
         choice: AddSourceControl,
     ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
         DaemonLink::add_repo(self, path, choice).boxed_local()
+    }
+
+    fn set_source_control(
+        &self,
+        id: RepoId,
+        on: bool,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        DaemonLink::set_source_control(self, id, on).boxed_local()
     }
 }
 

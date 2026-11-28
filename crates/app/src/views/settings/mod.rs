@@ -8,11 +8,14 @@
 //!   select the adjacent option, wrapping), and the text size as a stepper
 //!   over the token set's scale. A change applies live and is saved to
 //!   `app-settings.json`.
-//! - **Agent defaults** (Space scope, [`agent_defaults`]): "Agents working at
-//!   once", a menu of "No limit" and 1 to 16. The daemon's answer, not the
-//!   press, changes the value shown.
-//! - **Source repositories** (Space scope, [`repositories`]): the daemon's
-//!   repositories and an "Add repository" field for a local path.
+//! - **Agent defaults** (Workspace scope, [`agent_defaults`]): "Agents
+//!   working at once", a menu of "No limit" and 1 to 16. The daemon's
+//!   answer, not the press, changes the value shown.
+//! - **Source repositories** (Workspace scope, [`repositories`]): the
+//!   daemon's repositories, each with its source control and the button that
+//!   turns it on or off, and an "Add repository" form: which of the three a
+//!   folder is (a plain folder, an existing or a new git repository), and a
+//!   field for its local path.
 //!
 //! Each section is a labeled group; its header is a button that exposes
 //! whether it is expanded. The New agent button, when there is no repository,
@@ -43,13 +46,14 @@ use gpui_kit::{
     Role, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
     Task, TestSupportExt as _, Window,
 };
+use smithagents_core::agent::AddSourceControl;
 use smithagents_core::ids::RepoId;
 
 use crate::model::Connection;
 use crate::shell::SETTINGS_PANEL;
 use crate::shell_state::{ShellEvent, ShellState};
 use crate::theme_adapter::{region_paint, token_paint, Region};
-use crate::view_models::SettingsSection;
+use crate::view_models::{SettingsSection, ADD_CHOICES};
 use crate::views::pane_heading;
 use crate::views::rail::RailEntry;
 
@@ -63,9 +67,11 @@ pub use appearance::{
     THEME_LABEL, THEME_OPTIONS_ID,
 };
 pub use repositories::{
-    repo_meta_tag_id, repo_row_id, repo_use_meta_id, ADD_REPO_ID, BROWSE_REPO_ID, META_TAG,
+    repo_meta_tag_id, repo_row_id, repo_source_control_id, repo_switch_error_id, repo_switch_id,
+    repo_use_meta_id, ADD_CHOICES_ID, ADD_CHOICES_LABEL, ADD_REPO_ID, BROWSE_REPO_ID, META_TAG,
     REPOS_EMPTY_ID, REPO_LIST_ID, REPO_META_ERROR_ID, REPO_PATH_ERROR_ID, REPO_PATH_INPUT_ID,
-    REPO_PATH_LABEL,
+    REPO_PATH_LABEL, TURN_OFF_CANCEL_ID, TURN_OFF_CONFIRM_ID, TURN_OFF_DESCRIPTION_ID,
+    TURN_OFF_TITLE_ID,
 };
 
 /// Element id of the pane's heading.
@@ -90,6 +96,9 @@ pub struct SettingsPane {
     scroll: ScrollHandle,
     /// The "Add repository" path field.
     path_input: Entity<InputState>,
+    /// The source control the next add asks for (the form's three-way
+    /// choice).
+    add_choice: AddSourceControl,
     /// The line under the path field: why the last add was refused or
     /// failed. Cleared when the text changes.
     path_error: Option<String>,
@@ -113,12 +122,19 @@ pub struct SettingsPane {
     meta_command: Option<(RepoId, Task<()>)>,
     /// The line under the repository list: why the last choice failed.
     meta_error: Option<String>,
+    /// The source control switch in flight, if any, and the repository it
+    /// was sent for. Dropping it gives it up.
+    switching: Option<(RepoId, Task<()>)>,
+    /// The line in a repository's row: why its last switch failed.
+    switch_error: Option<(RepoId, String)>,
     /// The connection as last seen, to notice it dropping.
     connection: Connection,
     /// One focus handle per theme option, and per font option (their radio
     /// groups move the focus with the arrow keys).
     theme_focus: Vec<FocusHandle>,
     font_focus: Vec<FocusHandle>,
+    /// One focus handle per choice of the add form.
+    add_choice_focus: Vec<FocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -166,6 +182,7 @@ impl SettingsPane {
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             path_input,
+            add_choice: ADD_CHOICES[0].0,
             path_error: None,
             adding: None,
             sent: None,
@@ -175,8 +192,11 @@ impl SettingsPane {
             defaults_error: None,
             meta_command: None,
             meta_error: None,
+            switching: None,
+            switch_error: None,
             theme_focus: Vec::new(),
             font_focus: Vec::new(),
+            add_choice_focus: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -197,6 +217,9 @@ impl SettingsPane {
         }
         if dropped && self.meta_command.is_some() {
             self.give_up_meta_repo();
+        }
+        if dropped && self.switching.is_some() {
+            self.give_up_switch();
         }
         self.notice_late_add(window, cx);
         cx.notify();

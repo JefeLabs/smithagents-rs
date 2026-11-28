@@ -367,6 +367,76 @@ async fn add_repo_with_a_missing_path_returns_the_typed_error() {
 }
 
 #[tokio::test]
+async fn a_plain_folder_is_added_and_then_given_source_control() {
+    let home = TestHome::new();
+    // A git repository, added as a plain folder all the same.
+    let repo_dir = home.scratch().join("plain then git ünï");
+    init_repo(&repo_dir);
+    let (link, mut rx) = connected(&home).await;
+    let repo = link
+        .add_repo(&repo_dir, AddSourceControl::None)
+        .await
+        .unwrap();
+    assert_eq!(repo.source_control, None);
+    let added = until(&mut rx, "RepoAdded", |a| match a {
+        Action::RepoAdded(r) => Some(r.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(added, repo);
+
+    // Turned on: git, with its default branch, and the model is told.
+    let on = link.set_source_control(repo.id, true).await.unwrap();
+    assert_eq!((on.id, on.default_branch()), (repo.id, Some("main")));
+    let updated = until(&mut rx, "RepoUpdated", |a| match a {
+        Action::RepoUpdated(r) => Some(r.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(updated, on);
+
+    // Chosen for intents and feedback, then turned off: the daemon clears
+    // the choice without saying so, so the link reads the settings again.
+    let chosen = FeedbackSettings {
+        meta_repo_id: Some(repo.id),
+    };
+    assert_eq!(
+        link.set_feedback_settings(chosen.clone()).await.unwrap(),
+        chosen
+    );
+    let off = link.set_source_control(repo.id, false).await.unwrap();
+    assert!(off.is_plain());
+    let updated = until(&mut rx, "RepoUpdated", |a| match a {
+        Action::RepoUpdated(r) => Some(r.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(updated, off);
+    let settings = until(&mut rx, "FeedbackSettingsLoaded", |a| match a {
+        Action::FeedbackSettingsLoaded(s) => Some(s.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(settings, FeedbackSettings { meta_repo_id: None });
+
+    // A refusal reads as its sentence: a subfolder of a git repository,
+    // added as a plain folder, cannot be turned on.
+    let other = home.scratch().join("other");
+    init_repo(&other);
+    let inner = other.join("inner");
+    std::fs::create_dir(&inner).unwrap();
+    let folder = link.add_repo(&inner, AddSourceControl::None).await.unwrap();
+    let err = link
+        .set_source_control(folder.id, true)
+        .await
+        .expect_err("a subfolder is not a repository's root");
+    assert_eq!(
+        repo_error_text(&err),
+        "That folder is inside a git repository. Add the repository's own folder."
+    );
+}
+
+#[tokio::test]
 async fn close_agent_emits_an_event() {
     let home = TestHome::new();
     let repo_dir = home.scratch().join("repo");

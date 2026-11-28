@@ -45,6 +45,10 @@ pub enum Action {
         selected: Option<AgentId>,
     },
     RepoAdded(Repo),
+    /// A repository as a change answers it (its source control turned on or
+    /// off): replaces the repository of that id. One the model does not have
+    /// is not added.
+    RepoUpdated(Repo),
     /// Every intent, as the link lists them at connect: replaces the list.
     IntentsLoaded(Vec<Intent>),
     /// An intent as a command's answer has it (an event carries it too).
@@ -222,6 +226,13 @@ impl ShellModel {
                 }
                 true
             }
+            Action::RepoUpdated(repo) => match self.repos.iter_mut().find(|r| r.id == repo.id) {
+                Some(existing) if *existing != repo => {
+                    *existing = repo;
+                    true
+                }
+                _ => false,
+            },
             Action::IntentsLoaded(intents) => {
                 let changed = !self.intents_loaded || self.intents != intents;
                 self.intents = intents;

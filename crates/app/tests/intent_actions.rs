@@ -30,7 +30,7 @@ use smithagents_app::views::intents::{
     RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
 };
 use smithagents_app::views::rail::RailEntry;
-use smithagents_core::agent::Agent;
+use smithagents_core::agent::{Agent, Repo, SourceControl};
 use smithagents_core::ids::IntentId;
 use smithagents_core::intent::{Intent, IntentState, Item, ItemStatus, Phase};
 
@@ -46,12 +46,22 @@ struct Opened {
 /// with these intents and agents, shows the Intents list and opens the first
 /// intent's detail.
 fn open_detail(cx: &mut TestAppContext, intents: Vec<Intent>, agents: Vec<Agent>) -> Opened {
+    open_detail_in(cx, intents, agents, vec![])
+}
+
+/// [`open_detail`] with these repositories too.
+fn open_detail_in(
+    cx: &mut TestAppContext,
+    intents: Vec<Intent>,
+    agents: Vec<Agent>,
+    repos: Vec<Repo>,
+) -> Opened {
     let first = intents[0].id;
     let fake = Rc::new(FakeIntents::default());
     let (window, shell) = open_shell_options(
         cx,
         ShellOptions {
-            model: model_with(intents, agents, vec![]),
+            model: model_with(intents, agents, repos),
             intent_commands: Some(fake.clone()),
             clock: Some(fixed_clock("2026-11-26T10:15:00-08:00")),
             connection_info: Some(fake_connection()),
@@ -573,6 +583,45 @@ fn mark_resolved_asks_first(cx: &mut TestAppContext) {
     assert!(!dialog_open(cx, window));
     assert!(calls(&opened).is_empty());
     assert_eq!(state_label(cx, window).as_deref(), Some("Sent"));
+}
+
+#[gpui_kit::test]
+fn the_resolved_hint_says_what_resolving_means_for_the_repository(cx: &mut TestAppContext) {
+    let mercury = agent("Mercury");
+    let intent = sent(&mercury);
+    let repo = |source_control| Repo {
+        id: intent.repo_id,
+        path: "/src/app".into(),
+        source_control,
+        created_at: intent.created_at,
+    };
+    for (source_control, hint) in [
+        (
+            None,
+            "This means the work is finished in the folder, so intents that depend on it can start.",
+        ),
+        (
+            Some(SourceControl::Git {
+                default_branch: "main".into(),
+            }),
+            "This means the work has landed on the default branch, so intents that depend on it can start.",
+        ),
+    ] {
+        let opened = open_detail_in(
+            cx,
+            vec![intent.clone()],
+            vec![mercury.clone()],
+            vec![repo(source_control.clone())],
+        );
+        click(cx, opened.window, RESOLVE_ID);
+        assert!(dialog_open(cx, opened.window));
+        assert_eq!(
+            label_of(cx, opened.window, RESOLVE_DESCRIPTION_ID).as_deref(),
+            Some(hint),
+            "{source_control:?}"
+        );
+        press(cx, opened.window, "escape");
+    }
 }
 
 #[gpui_kit::test]

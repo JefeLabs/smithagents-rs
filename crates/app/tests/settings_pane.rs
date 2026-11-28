@@ -24,7 +24,7 @@ use futures::future::LocalBoxFuture;
 use futures::FutureExt as _;
 use gpui_kit::base::Root;
 use gpui_kit::component::dock::DockPlacement;
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
     point, px, AppContext as _, Background, Bounds, Entity, Keystroke, Pixels, Point, Role,
@@ -44,10 +44,12 @@ use smithagents_app::view_models::{
 use smithagents_app::views::agents::NEW_AGENT_ID;
 use smithagents_app::views::rail::{RailEntry, RAIL_ID};
 use smithagents_app::views::settings::{
-    repo_row_id, section_header_id, section_id, ADD_REPO_ID, BROWSE_REPO_ID, FONT_LABEL,
+    repo_row_id, repo_source_control_id, repo_switch_error_id, repo_switch_id, section_header_id,
+    section_id, ADD_CHOICES_ID, ADD_CHOICES_LABEL, ADD_REPO_ID, BROWSE_REPO_ID, FONT_LABEL,
     FONT_OPTIONS_ID, REPOS_EMPTY_ID, REPO_LIST_ID, REPO_PATH_ERROR_ID, REPO_PATH_INPUT_ID,
     REPO_PATH_LABEL, SETTINGS_SCROLL_ID, TEXT_SIZE_DOWN_ID, TEXT_SIZE_ID, TEXT_SIZE_LABEL,
-    TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID, THEME_LABEL, THEME_OPTIONS_ID,
+    TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID, THEME_LABEL, THEME_OPTIONS_ID, TURN_OFF_CANCEL_ID,
+    TURN_OFF_CONFIRM_ID, TURN_OFF_DESCRIPTION_ID, TURN_OFF_TITLE_ID,
 };
 use smithagents_client::ClientError;
 use smithagents_core::agent::{AddSourceControl, Agent, Repo, SourceControl};
@@ -65,11 +67,20 @@ struct FakeRepos {
     choices: RefCell<Vec<AddSourceControl>>,
     results: RefCell<VecDeque<Result<Repo, LinkError>>>,
     pending: RefCell<Vec<oneshot::Sender<Result<Repo, LinkError>>>>,
+    /// Each switch of source control: the repository, and on or off. A
+    /// switch waits until the test answers it.
+    switches: RefCell<Vec<(RepoId, bool)>>,
+    switch_pending: RefCell<Vec<oneshot::Sender<Result<Repo, LinkError>>>>,
 }
 
 impl FakeRepos {
     fn answer(&self, result: Result<Repo, LinkError>) {
         let sender = self.pending.borrow_mut().remove(0);
+        let _ = sender.send(result);
+    }
+
+    fn answer_switch(&self, result: Result<Repo, LinkError>) {
+        let sender = self.switch_pending.borrow_mut().remove(0);
         let _ = sender.send(result);
     }
 }
@@ -95,6 +106,17 @@ impl AgentCommands for FakeRepos {
         }
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().push(tx);
+        async move { rx.await.unwrap_or(Err(LinkError::Stopped)) }.boxed_local()
+    }
+
+    fn set_source_control(
+        &self,
+        id: RepoId,
+        on: bool,
+    ) -> LocalBoxFuture<'static, Result<Repo, LinkError>> {
+        self.switches.borrow_mut().push((id, on));
+        let (tx, rx) = oneshot::channel();
+        self.switch_pending.borrow_mut().push(tx);
         async move { rx.await.unwrap_or(Err(LinkError::Stopped)) }.boxed_local()
     }
 }
@@ -218,7 +240,8 @@ fn checked(
     })
 }
 
-fn click(cx: &mut TestAppContext, window: WindowHandle<Root>, id: &'static str) {
+fn click(cx: &mut TestAppContext, window: WindowHandle<Root>, id: impl Into<gpui_kit::ElementId>) {
+    let id = id.into();
     with_window(cx, window, |window, cx| window.click(id, cx));
     frame(cx, window);
 }
@@ -658,8 +681,8 @@ fn the_repositories_are_listed_by_name_with_path_and_branch(cx: &mut TestAppCont
         assert_eq!(
             labels,
             [
-                "zeta, /src/zeta, default branch main",
-                "ünïcode app, /Users/me/My Projects/ünïcode app, default branch trunk",
+                "zeta, /src/zeta, Source control: Git, default branch main",
+                "ünïcode app, /Users/me/My Projects/ünïcode app, Source control: Git, default branch trunk",
             ]
         );
         assert!(window.find(repo_row_id(zeta.id)).visible());
@@ -684,12 +707,18 @@ fn adding_a_path_sends_one_add_disables_the_controls_and_clears_on_success(
     );
     assert_eq!(
         *setup.commands.choices.borrow(),
-        [AddSourceControl::Git],
-        "a git repository, until the add flow offers the choice"
+        [AddSourceControl::None],
+        "the first choice, a folder with no source control"
     );
     assert!(add_disabled(cx, window), "disabled while the add runs");
     with_window(cx, window, |window, _| {
         assert_eq!(window.find(BROWSE_REPO_ID).disabled(), Some(true));
+        for radio in window
+            .within(ADD_CHOICES_ID)
+            .find_all_by_role(Role::RadioButton)
+        {
+            assert_eq!(radio.disabled(), Some(true), "{:?}", radio.label());
+        }
     });
     // Typing while it runs changes nothing.
     with_window(cx, window, |window, cx| window.input("xyz", cx));
@@ -894,6 +923,325 @@ fn browse_fills_the_field_with_the_chosen_folder(cx: &mut TestAppContext) {
     cx.simulate_path_prompt_response(|_| None);
     frame(cx, window);
     assert_eq!(path_value(cx, window), "/Users/me/My Projects/ünïcode app");
+}
+
+// ---- Source control ------------------------------------------------------------
+
+/// The add form's choices, in the order offered.
+const ADD_CHOICES: [&str; 3] = [
+    "A folder, no source control",
+    "An existing git repository",
+    "A new git repository",
+];
+
+/// The add form's choices as drawn: label, checked, disabled.
+fn add_choices(cx: &mut TestAppContext, window: WindowHandle<Root>) -> Vec<(String, bool, bool)> {
+    with_window(cx, window, |window, _| {
+        window
+            .within(ADD_CHOICES_ID)
+            .find_all_by_role(Role::RadioButton)
+            .iter()
+            .map(|radio| {
+                (
+                    radio.label().unwrap_or_default().to_owned(),
+                    radio.checked() == Some(true),
+                    radio.disabled() == Some(true),
+                )
+            })
+            .collect()
+    })
+}
+
+fn api(status: u16, code: &str, message: &str) -> LinkError {
+    LinkError::Client(ClientError::Api {
+        status,
+        code: code.into(),
+        message: message.into(),
+    })
+}
+
+#[gpui_kit::test]
+fn adding_a_repository_asks_which_of_the_three_it_is(cx: &mut TestAppContext) {
+    let setup = Setup::new();
+    {
+        let mut results = setup.commands.results.borrow_mut();
+        results.push_back(Ok(repo("/src/folder")));
+        results.push_back(Ok(repo("/src/existing")));
+        results.push_back(Err(api(
+            400,
+            "git_not_installed",
+            "git: git is not installed",
+        )));
+    }
+    let (window, _, _) = setup.open(cx);
+    with_window(cx, window, |window, _| {
+        let group = window.find(ADD_CHOICES_ID);
+        assert_eq!(group.role(), Some(Role::RadioGroup));
+        assert_eq!(group.label(), Some(ADD_CHOICES_LABEL));
+        let field = window.find(REPO_PATH_INPUT_ID).bounds();
+        assert!(
+            group.bounds().bottom() <= field.origin.y,
+            "the choice is above the path field"
+        );
+    });
+    assert_eq!(
+        add_choices(cx, window),
+        [
+            (ADD_CHOICES[0].to_owned(), true, false),
+            (ADD_CHOICES[1].to_owned(), false, false),
+            (ADD_CHOICES[2].to_owned(), false, false),
+        ],
+        "the three, the first selected"
+    );
+
+    for (label, path, sent) in [
+        (ADD_CHOICES[0], "/src/folder", AddSourceControl::None),
+        (ADD_CHOICES[1], "/src/existing", AddSourceControl::Git),
+        (ADD_CHOICES[2], "/src/new", AddSourceControl::NewGit),
+    ] {
+        choose(cx, window, ADD_CHOICES_ID, label);
+        assert!(checked(cx, window, ADD_CHOICES_ID, label), "{label}");
+        type_path(cx, window, path);
+        press(cx, window, "enter");
+        assert_eq!(
+            setup.commands.choices.borrow().last(),
+            Some(&sent),
+            "{label}"
+        );
+    }
+    assert_eq!(
+        *setup.commands.adds.borrow(),
+        [
+            PathBuf::from("/src/folder"),
+            PathBuf::from("/src/existing"),
+            PathBuf::from("/src/new"),
+        ]
+    );
+
+    // Where git cannot run the daemon says so; the git choices are still
+    // offered, and the one chosen stays chosen.
+    assert_eq!(
+        path_error(cx, window).as_deref(),
+        Some("git is not installed.")
+    );
+    assert_eq!(path_value(cx, window), "/src/new", "the text stays");
+    assert_eq!(
+        add_choices(cx, window),
+        [
+            (ADD_CHOICES[0].to_owned(), false, false),
+            (ADD_CHOICES[1].to_owned(), false, false),
+            (ADD_CHOICES[2].to_owned(), true, false),
+        ]
+    );
+}
+
+/// The row's source control line.
+fn source_control_line(cx: &mut TestAppContext, window: WindowHandle<Root>, id: RepoId) -> String {
+    with_window(cx, window, |window, _| {
+        window
+            .find(repo_source_control_id(id))
+            .value()
+            .unwrap_or_default()
+            .to_owned()
+    })
+}
+
+/// What an element reads as: a label's text, else its name.
+fn text_of(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Root>,
+    id: impl Into<gpui_kit::ElementId>,
+) -> Option<String> {
+    let id = id.into();
+    with_window(cx, window, |window, _| {
+        window
+            .try_find(id)
+            .and_then(|element| element.value().or(element.label()).map(str::to_owned))
+    })
+}
+
+fn disabled(
+    cx: &mut TestAppContext,
+    window: WindowHandle<Root>,
+    id: impl Into<gpui_kit::ElementId>,
+) -> bool {
+    let id = id.into();
+    with_window(cx, window, |window, _| {
+        window.find(id).disabled() == Some(true)
+    })
+}
+
+fn dialog_open(cx: &mut TestAppContext, window: WindowHandle<Root>) -> bool {
+    with_window(cx, window, |window, cx| window.has_active_dialog(cx))
+}
+
+fn with_git(repo: &Repo) -> Repo {
+    Repo {
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
+        ..repo.clone()
+    }
+}
+
+#[gpui_kit::test]
+fn a_row_turns_source_control_on_and_off(cx: &mut TestAppContext) {
+    let folder = Repo {
+        source_control: None,
+        ..repo("/src/folder")
+    };
+    let app = repo("/src/app");
+    let setup = Setup {
+        repos: vec![folder.clone(), app.clone()],
+        ..Setup::new()
+    };
+    let (window, _, state) = setup.open(cx);
+    let switches = || setup.commands.switches.borrow().clone();
+    assert_eq!(
+        source_control_line(cx, window, folder.id),
+        "Source control: None"
+    );
+    assert_eq!(
+        text_of(cx, window, repo_switch_id(folder.id)).as_deref(),
+        Some("Turn on source control")
+    );
+    assert_eq!(
+        source_control_line(cx, window, app.id),
+        "Source control: Git, default branch main"
+    );
+    assert_eq!(
+        text_of(cx, window, repo_switch_id(app.id)).as_deref(),
+        Some("Turn off source control")
+    );
+
+    // app, the only repository with source control, is the one intents and
+    // feedback use: turning it off asks first. Enter, Escape and Cancel turn
+    // nothing off.
+    click(cx, window, repo_switch_id(app.id));
+    assert!(dialog_open(cx, window));
+    assert_eq!(
+        text_of(cx, window, TURN_OFF_TITLE_ID).as_deref(),
+        Some("Turn off source control?")
+    );
+    assert_eq!(
+        text_of(cx, window, TURN_OFF_DESCRIPTION_ID).as_deref(),
+        Some(
+            "Intents and feedback use this repository. With source control off, this \
+             Workspace has no repository for them until you choose another. Turn it off?"
+        )
+    );
+    with_window(cx, window, |window, _| {
+        assert_eq!(
+            window.find(TURN_OFF_CANCEL_ID).focused(),
+            Some(true),
+            "Cancel is the default"
+        );
+    });
+    press(cx, window, "enter");
+    assert!(!dialog_open(cx, window), "Enter dismissed it, like Cancel");
+    click(cx, window, repo_switch_id(app.id));
+    press(cx, window, "escape");
+    assert!(!dialog_open(cx, window));
+    click(cx, window, repo_switch_id(app.id));
+    click(cx, window, TURN_OFF_CANCEL_ID);
+    assert!(!dialog_open(cx, window));
+    assert!(switches().is_empty(), "nothing was turned off");
+
+    // Confirmed: sent. One switch at a time; a refusal shows its sentence and
+    // the row stays as it was.
+    click(cx, window, repo_switch_id(app.id));
+    click(cx, window, TURN_OFF_CONFIRM_ID);
+    assert!(!dialog_open(cx, window));
+    assert_eq!(switches(), [(app.id, false)]);
+    assert!(disabled(cx, window, repo_switch_id(app.id)));
+    assert!(disabled(cx, window, repo_switch_id(folder.id)));
+    setup.commands.answer_switch(Err(api(
+        409,
+        "repo_in_use",
+        "this repository has an agent that is not closed",
+    )));
+    frame(cx, window);
+    with_window(cx, window, |window, _| {
+        assert_eq!(
+            window.find(repo_switch_error_id(app.id)).role(),
+            Some(Role::Status)
+        );
+    });
+    assert_eq!(
+        text_of(cx, window, repo_switch_error_id(app.id)).as_deref(),
+        Some("Close this repository's agents first.")
+    );
+    assert_eq!(
+        source_control_line(cx, window, app.id),
+        "Source control: Git, default branch main"
+    );
+    assert!(!disabled(cx, window, repo_switch_id(app.id)));
+
+    // The folder is turned on without a question; the row follows the
+    // daemon's answer, which the link hands to the model.
+    click(cx, window, repo_switch_id(folder.id));
+    assert!(!dialog_open(cx, window));
+    assert_eq!(switches(), [(app.id, false), (folder.id, true)]);
+    assert_eq!(
+        text_of(cx, window, repo_switch_error_id(app.id)),
+        None,
+        "the last sentence goes with the next switch"
+    );
+    let turned_on = with_git(&folder);
+    setup.commands.answer_switch(Ok(turned_on.clone()));
+    state.update(cx, |state, cx| {
+        state.dispatch(Action::RepoUpdated(turned_on), cx)
+    });
+    frame(cx, window);
+    assert_eq!(
+        source_control_line(cx, window, folder.id),
+        "Source control: Git, default branch main"
+    );
+    assert_eq!(
+        text_of(cx, window, repo_switch_id(folder.id)).as_deref(),
+        Some("Turn off source control")
+    );
+
+    // Two repositories with source control and none chosen: neither is the
+    // one intents and feedback use, so turning one off asks nothing.
+    click(cx, window, repo_switch_id(folder.id));
+    assert!(!dialog_open(cx, window));
+    assert_eq!(switches().last(), Some(&(folder.id, false)));
+}
+
+#[gpui_kit::test]
+fn a_switch_the_daemon_never_answers_is_given_up(cx: &mut TestAppContext) {
+    let folder = Repo {
+        source_control: None,
+        ..repo("/src/folder")
+    };
+    let setup = Setup {
+        repos: vec![folder.clone()],
+        command_timeout: Some(Duration::from_secs(5)),
+        ..Setup::new()
+    };
+    let (window, _, state) = setup.open(cx);
+    click(cx, window, repo_switch_id(folder.id));
+    cx.executor().advance_clock(Duration::from_secs(6));
+    frame(cx, window);
+    assert_eq!(
+        text_of(cx, window, repo_switch_error_id(folder.id)).as_deref(),
+        Some(DAEMON_SILENT_TEXT)
+    );
+    assert!(!disabled(cx, window, repo_switch_id(folder.id)));
+
+    // Nor when the connection drops while it waits.
+    click(cx, window, repo_switch_id(folder.id));
+    assert!(disabled(cx, window, repo_switch_id(folder.id)));
+    state.update(cx, |state, cx| {
+        state.dispatch(Action::ConnectionChanged(Connection::Reconnecting), cx)
+    });
+    frame(cx, window);
+    assert!(!disabled(cx, window, repo_switch_id(folder.id)));
+    assert_eq!(
+        text_of(cx, window, repo_switch_error_id(folder.id)).as_deref(),
+        Some(DAEMON_SILENT_TEXT)
+    );
 }
 
 // ---- Sections and the focus request ------------------------------------------

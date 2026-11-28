@@ -696,6 +696,8 @@ fn error_sentences() {
         ),
         ("intent_not_found", "That intent no longer exists."),
         ("repo_not_found", "That repository no longer exists."),
+        // A send refused while another agent works in the plain folder.
+        ("folder_busy", "Another agent is working in this folder."),
     ] {
         assert_eq!(intent_error_text(&api_error(code, "raw daemon text")), text);
     }

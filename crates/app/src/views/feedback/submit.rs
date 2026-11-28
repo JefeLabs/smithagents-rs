@@ -6,6 +6,9 @@
 //! public-repository warning; the error line; and Create, or Retry and
 //! Start over.
 //!
+//! Only a repository with source control can be chosen: Feedback commits
+//! files. With none, the repository line says so and leads to Settings.
+//!
 //! One command at a time: while a submission or a retry is under way every
 //! control waits and the pressed button shows the spinner; nothing changes
 //! before the daemon answers. Sending to GitHub a repository that is (or may
@@ -67,9 +70,10 @@ use super::card::cards;
 use super::{confirm, Confirmation, FeedbackPane, FeedbackScreen, Paint};
 use crate::feedback::state::{Pending, SentTo, SUBMIT_TIMEOUT};
 use crate::feedback::submit_vm::{
-    asks_to_acknowledge, can_confirm, confirm_label, failure_text, issue_reason,
-    maybe_public_warning, not_recorded_text, public_warning, result_text, send_failure,
-    shows_issue_url, starting_repo, submit_error_text, summary, upload_problem, SendFailure, KINDS,
+    asks_to_acknowledge, can_confirm, confirm_label, failure_text, feedback_repos,
+    first_send_failure, issue_reason, maybe_public_warning, not_recorded_text, public_warning,
+    repo_line_text, result_text, send_failure, shows_issue_url, starting_repo, submit_error_text,
+    summary, upload_problem, SendFailure, KINDS,
 };
 use crate::feedback::text::{
     BACK_LABEL, CHOOSE_REPO_TEXT, DRAFT_BUSY_TEXT, DRAFT_NOT_READY_TEXT, KIND_LABEL,
@@ -81,8 +85,7 @@ use crate::feedback::text::{
 use crate::intent_vm::kind_label;
 use crate::link::LinkError;
 use crate::view_models::{
-    repo_title, RepoChoiceVm, SettingsSection, DAEMON_SILENT_TEXT, NEED_REPO_TEXT,
-    NOT_CONNECTED_TEXT,
+    repo_title, RepoChoiceVm, SettingsSection, DAEMON_SILENT_TEXT, NOT_CONNECTED_TEXT,
 };
 use crate::views::answered;
 use crate::views::rail::RailEntry;
@@ -243,10 +246,11 @@ fn answered_by_daemon(error: &LinkError) -> bool {
 
 /// What the repository line shows.
 enum RepoLine {
-    /// No repository yet: the way to Settings.
-    Missing,
+    /// No repository yet, or none with source control: the way to
+    /// Settings, saying which ([`repo_line_text`]).
+    Missing(&'static str),
     /// The chosen repository's name (or "Choose a repository"), and the
-    /// menu of all.
+    /// menu of those with source control.
     Menu {
         label: String,
         choices: Vec<RepoChoiceVm>,
@@ -397,7 +401,8 @@ impl FeedbackPane {
     }
 
     /// The repository Create sends to: the one sent to, the one picked
-    /// while it exists, else the last used, else the meta repository.
+    /// while it exists with source control, else the last used, else the
+    /// meta repository (a plain folder is never chosen: [`starting_repo`]).
     fn chosen_repo(&self, cx: &App) -> Option<RepoId> {
         if let Some(sent) = self.sent_to(cx) {
             return Some(sent.repo_id);
@@ -408,7 +413,7 @@ impl FeedbackPane {
         if let Some(picked) = self
             .submit
             .picked_repo
-            .filter(|id| repos.iter().any(|repo| repo.id == *id))
+            .filter(|id| feedback_repos(repos).any(|repo| repo.id == *id))
         {
             return Some(picked);
         }
@@ -826,7 +831,11 @@ impl FeedbackPane {
             }
             Some(Err(e)) => {
                 tracing::warn!(?attempt, "a feedback submission failed: {e}");
-                match send_failure(&e) {
+                let failure = match attempt {
+                    Attempt::Submit => first_send_failure(&e),
+                    Attempt::Retry | Attempt::Reupload => send_failure(&e),
+                };
+                match failure {
                     SendFailure::NotSent => {
                         // Nothing left: the submission is where it was.
                         self.feedback
@@ -1072,8 +1081,9 @@ impl FeedbackPane {
             })))
     }
 
-    /// "Repository": a menu of the repositories (its button names the
-    /// chosen one), or the way to Settings when there is none.
+    /// "Repository": a menu of the repositories with source control (its
+    /// button names the chosen one), or the way to Settings when there is
+    /// none ([`repo_line_text`]).
     fn repo_row(
         &self,
         chosen: Option<RepoId>,
@@ -1083,8 +1093,8 @@ impl FeedbackPane {
     ) -> impl IntoElement {
         let line = {
             let repos = self.state.read(cx).model().repos();
-            if repos.is_empty() {
-                RepoLine::Missing
+            if let Some(text) = repo_line_text(repos) {
+                RepoLine::Missing(text)
             } else {
                 let label = chosen
                     .and_then(|id| repos.iter().find(|repo| repo.id == id))
@@ -1093,8 +1103,7 @@ impl FeedbackPane {
                         |repo| repo_title(&repo.path),
                     );
                 // No entry is checked until one is chosen.
-                let choices = repos
-                    .iter()
+                let choices = feedback_repos(repos)
                     .map(|repo| RepoChoiceVm {
                         id: repo.id,
                         title: repo_title(&repo.path),
@@ -1106,8 +1115,8 @@ impl FeedbackPane {
             }
         };
         let button: AnyElement = match line {
-            RepoLine::Missing => Button::new(SUBMIT_REPO_ID)
-                .label(NEED_REPO_TEXT)
+            RepoLine::Missing(text) => Button::new(SUBMIT_REPO_ID)
+                .label(text)
                 .outline()
                 .small()
                 .disabled(frozen)
