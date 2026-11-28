@@ -83,7 +83,8 @@ const TURN_ON_LABEL: &str = "Turn on source control";
 const TURN_OFF_LABEL: &str = "Turn off source control";
 /// What turning it off for the repository intents and feedback use asks.
 const TURN_OFF_TITLE: &str = "Turn off source control?";
-const TURN_OFF_META_QUESTION: &str = "Intents and feedback use this repository. With source control off, this Workspace has no repository for them until you choose another. Turn it off?";
+const TURN_OFF_META_QUESTION: &str =
+    "Intents and feedback use this repository. With source control off they can no longer use it. Turn it off?";
 /// Element ids of that question's title, text and buttons.
 pub const TURN_OFF_TITLE_ID: &str = "repo-turn-off-title";
 pub const TURN_OFF_DESCRIPTION_ID: &str = "repo-turn-off-description";
@@ -98,7 +99,7 @@ pub const META_TAG: &str = "Intents and feedback";
 /// The button that makes a repository the meta repository.
 const USE_META_LABEL: &str = "Use for intents and feedback";
 
-pub(super) const PATH_PLACEHOLDER: &str = "/path/to/a/git/repository";
+pub(super) const PATH_PLACEHOLDER: &str = "/path/to/a/folder";
 
 /// Element id of a repository's row.
 pub fn repo_row_id(id: RepoId) -> ElementId {

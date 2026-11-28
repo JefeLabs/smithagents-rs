@@ -4,7 +4,8 @@
 //!
 //! - Complete: "Send", which asks the daemon to queue the intent (it starts
 //!   an agent when a slot is free).
-//! - Queued: why it has not started yet ([`queued_reason`]).
+//! - Queued: why it has not started yet ([`queued_reason`]: a dependency, an
+//!   intent or agent that holds its plain folder, or the slot limit).
 //! - Sent: "Open chat", which selects the intent's agent and opens its tab
 //!   (disabled, with the tooltip "The agent was closed", once the model no
 //!   longer has the agent), and "Mark resolved…", which asks first (in the
@@ -21,7 +22,9 @@
 //! request will carry the idea's files) and opens the intent the daemon
 //! answers with while the idea's detail is still on screen. Both run through
 //! the feedback commands, disabled without them, and both are sent with the
-//! user's acknowledgement once confirmed.
+//! user's acknowledgement once confirmed. Neither button is offered once the
+//! intent's repository is a plain folder (Feedback needs source control);
+//! an existing pull request's address still is.
 //!
 //! The start error ("The agent could not start: …") is drawn in every state
 //! while the daemon keeps it. A Send the daemon refuses with that same error
@@ -170,7 +173,8 @@ impl IntentsPane {
 
     /// An idea intent's parts of the bar: "Open pull request…" or its
     /// address, then "Create implementation intent". Empty for any other
-    /// intent.
+    /// intent. On a plain folder ([`works_in_folder`]) both buttons could
+    /// only be refused, so only an address that exists is shown.
     fn idea_parts(&self, intent: &Intent, cx: &Context<Self>) -> Vec<AnyElement> {
         let Some(idea) = intent
             .origin
@@ -182,8 +186,10 @@ impl IntentsPane {
         };
         let id = intent.id;
         let disabled = self.busy.is_some() || self.state.read(cx).feedback_commands().is_none();
+        let in_folder = works_in_folder(self.state.read(cx).model(), intent);
         let mut parts = Vec::new();
         match idea.pr_url.as_deref() {
+            None if in_folder => {}
             None => parts.push(
                 Button::new(OPEN_PR_ID)
                     .label(OPEN_PR_LABEL)
@@ -203,6 +209,9 @@ impl IntentsPane {
             // Not an address the app shows; there is a pull request all the
             // same, so no second one is offered.
             Some(_) => {}
+        }
+        if in_folder {
+            return parts;
         }
         parts.push(
             Button::new(IMPLEMENT_ID)

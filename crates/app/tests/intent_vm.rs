@@ -629,6 +629,118 @@ fn queued_reasons() {
     );
 }
 
+const SLOT_TEXT: &str = "Waiting for a free agent slot.";
+const HOLDER_TEXT: &str = "Waiting for \"Fix the zoom\" to be resolved or its agent closed. \
+     One intent works in this folder at a time.";
+const WORKING_TEXT: &str = "Waiting: another agent is working in this folder.";
+
+/// `me`'s repository: a plain folder, or a git repository.
+fn repo_of(me: &Intent, plain: bool) -> Repo {
+    Repo {
+        id: me.repo_id,
+        path: "/src/notes".into(),
+        source_control: (!plain).then(|| SourceControl::Git {
+            default_branch: "main".into(),
+        }),
+        created_at: me.created_at,
+    }
+}
+
+/// An agent of `me`'s repository in `state`, working in place or not.
+fn agent_of(
+    me: &Intent,
+    name: &str,
+    state: AgentState,
+    in_place: bool,
+) -> smithagents_core::agent::Agent {
+    smithagents_core::agent::Agent {
+        repo_id: me.repo_id,
+        state,
+        branch: (!in_place).then(|| format!("agent/{name}")),
+        ..agent(name)
+    }
+}
+
+/// An intent of `me`'s repository titled `title`, sent `minutes` after the
+/// fixture time by `agent`.
+fn sent_by(title: &str, minutes: i64, agent: &smithagents_core::agent::Agent) -> Intent {
+    let mut sent = intent(
+        &title.to_lowercase().replace(' ', "-"),
+        IntentState::Sent,
+        Phase::Review,
+    );
+    sent.content.title = title.to_owned();
+    sent.agent_id = Some(agent.id);
+    sent.sent_at = sent.sent_at.map(|at| at + Duration::minutes(minutes));
+    sent.updated_at += Duration::minutes(minutes);
+    sent
+}
+
+#[test]
+fn a_queued_intent_on_a_plain_folder_says_what_holds_the_folder() {
+    let me = intent("me", IntentState::Queued, Phase::Review);
+    let first_agent = agent_of(&me, "Mercury", AgentState::Done, true);
+    let later_agent = agent_of(&me, "Venus", AgentState::Done, true);
+    let first = sent_by("Fix the zoom", 1, &first_agent);
+    let later = sent_by("Later work", 5, &later_agent);
+    let reason = |intents: Vec<Intent>, agents, plain| {
+        let model = model_with(intents, agents, vec![repo_of(&me, plain)]);
+        queued_reason(&model, &me)
+    };
+
+    // A sent intent whose agent is open holds the folder; of two, the one
+    // sent first is named, by its title.
+    let both = vec![later.clone(), first.clone(), me.clone()];
+    let agents = vec![first_agent.clone(), later_agent.clone()];
+    assert_eq!(reason(both.clone(), agents.clone(), true), HOLDER_TEXT);
+
+    // Its agent closed: an agent that works in place and is in a turn.
+    for state in [AgentState::Working, AgentState::Quiet] {
+        let chatting = agent_of(&me, "Mars", state, true);
+        assert_eq!(
+            reason(vec![first.clone(), me.clone()], vec![chatting], true),
+            WORKING_TEXT,
+            "{state:?}"
+        );
+    }
+
+    // Nothing holds it: an idle agent in place, a busy agent with its own
+    // worktree, or a busy agent of another repository.
+    let idle = agent_of(&me, "Mars", AgentState::Idle, true);
+    let worktree = agent_of(&me, "Jupiter", AgentState::Working, false);
+    let elsewhere = smithagents_core::agent::Agent {
+        repo_id: RepoId::new(),
+        ..agent_of(&me, "Saturn", AgentState::Working, true)
+    };
+    assert_eq!(
+        reason(
+            vec![first.clone(), me.clone()],
+            vec![idle, worktree, elsewhere],
+            true
+        ),
+        SLOT_TEXT
+    );
+    assert_eq!(reason(vec![me.clone()], vec![], true), SLOT_TEXT);
+
+    // A git repository keeps the slot sentence in every case.
+    let mut busy = agents.clone();
+    busy.push(agent_of(&me, "Mars", AgentState::Working, true));
+    assert_eq!(reason(both, busy, false), SLOT_TEXT);
+
+    // A dependency still waiting is said first.
+    let mut waits = me.clone();
+    waits.content.depends_on = vec![depends(&first)];
+    let model = model_with(
+        vec![first.clone(), waits.clone()],
+        vec![first_agent],
+        vec![repo_of(&me, true)],
+    );
+    assert_eq!(
+        queued_reason(&model, &waits),
+        "Waiting for fix-the-zoom to be resolved."
+    );
+}
+
 #[test]
 fn dependencies_resolve_through_the_model() {
     let a = intent("a-one", IntentState::Queued, Phase::Review);

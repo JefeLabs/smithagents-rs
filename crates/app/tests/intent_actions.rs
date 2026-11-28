@@ -11,6 +11,7 @@ mod common;
 
 use std::rc::Rc;
 
+use common::feedback_submit::idea_intent;
 use common::intents::{fixed_clock, intent, item, model_with, FakeIntents, IntentCall};
 use common::ui::{agent, fake_connection, open_shell_options};
 use gpui_kit::base::Root;
@@ -25,9 +26,10 @@ use smithagents_app::shell::{Shell, ShellOptions, INTENTS_PANEL};
 use smithagents_app::shell_state::ShellState;
 use smithagents_app::views::intents::{
     intent_card_id, item_confirm_id, Busy, IntentsPane, Screen, DETAIL_BACK_ID, DETAIL_STATE_ID,
-    DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, INTENT_ERROR_ID, OPEN_CHAT_ID, QUEUED_REASON_ID,
-    RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID, RESOLVE_DESCRIPTION, RESOLVE_DESCRIPTION_ID, RESOLVE_ID,
-    RESOLVE_TITLE_ID, SEND_ID, START_ERROR_ID,
+    DETAIL_TITLE_ID, DETAIL_TITLE_INPUT_ID, IMPLEMENT_ID, INTENT_ERROR_ID, OPEN_CHAT_ID,
+    OPEN_PR_ID, PR_URL_ID, QUEUED_REASON_ID, RESOLVE_CANCEL_ID, RESOLVE_CONFIRM_ID,
+    RESOLVE_DESCRIPTION, RESOLVE_DESCRIPTION_ID, RESOLVE_ID, RESOLVE_TITLE_ID, SEND_ID,
+    START_ERROR_ID,
 };
 use smithagents_app::views::rail::RailEntry;
 use smithagents_core::agent::{Agent, Repo, SourceControl};
@@ -622,6 +624,38 @@ fn the_resolved_hint_says_what_resolving_means_for_the_repository(cx: &mut TestA
         );
         press(cx, opened.window, "escape");
     }
+}
+
+#[gpui_kit::test]
+fn an_idea_on_a_plain_folder_offers_no_idea_actions(cx: &mut TestAppContext) {
+    let idea = idea_intent(IntentState::Resolved, None);
+    let repo = |source_control| Repo {
+        id: idea.repo_id,
+        path: "/src/app".into(),
+        source_control,
+        created_at: idea.created_at,
+    };
+    let git = repo(Some(SourceControl::Git {
+        default_branch: "main".into(),
+    }));
+    let folder = repo(None);
+
+    // With source control, both are offered.
+    let opened = open_detail_in(cx, vec![idea.clone()], vec![], vec![git]);
+    assert!(is_drawn(cx, opened.window, OPEN_PR_ID));
+    assert!(is_drawn(cx, opened.window, IMPLEMENT_ID));
+
+    // Once the folder has none, neither is: both could only be refused.
+    let opened = open_detail_in(cx, vec![idea.clone()], vec![], vec![folder.clone()]);
+    assert!(!is_drawn(cx, opened.window, OPEN_PR_ID));
+    assert!(!is_drawn(cx, opened.window, IMPLEMENT_ID));
+
+    // A pull request that exists is still shown.
+    let url = "https://github.com/acme/app/pull/7";
+    let with_pr = idea_intent(IntentState::Resolved, Some(url));
+    let opened = open_detail_in(cx, vec![with_pr], vec![], vec![folder]);
+    assert_eq!(label_of(cx, opened.window, PR_URL_ID).as_deref(), Some(url));
+    assert!(!is_drawn(cx, opened.window, IMPLEMENT_ID));
 }
 
 #[gpui_kit::test]

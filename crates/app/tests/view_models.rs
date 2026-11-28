@@ -1145,7 +1145,7 @@ mod settings_pane {
             (
                 409,
                 "repo_overlaps",
-                "That folder overlaps another repository of this Workspace.",
+                "That folder overlaps another repository of this Workspace, or SmithAgents' own folder.",
             ),
             (
                 409,

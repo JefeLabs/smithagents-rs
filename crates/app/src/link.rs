@@ -515,9 +515,9 @@ impl DaemonLink {
 
 /// The commands the shell's views send to the daemon: the agents pane's
 /// create and close, and the Settings pane's add repository and source
-/// control switch. [`DaemonLink`]
-/// is the production implementation; headless tests inject a fake through
-/// `ShellOptions::commands` so they need no daemon.
+/// control switch. [`DaemonLink`] is the production implementation; headless
+/// tests inject a fake through `ShellOptions::commands` so they need no
+/// daemon.
 ///
 /// The futures are `'static` (a UI executor holds them without borrowing the
 /// implementation) and need not be `Send`: the shell awaits them on GPUI's

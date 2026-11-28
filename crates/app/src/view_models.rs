@@ -811,7 +811,7 @@ pub fn repo_error_text(error: &LinkError) -> String {
 /// | `repo_exists` | `store: a repo with this path already exists` |
 /// | `folder_busy` | another agent of the plain folder is in a turn |
 /// | `repo_in_use` | the repository has an agent that is not closed |
-/// | `repo_overlaps` | a plain folder would contain or lie in another repository's |
+/// | `repo_overlaps` | a plain folder would contain or lie in another repository's, or the daemon's home |
 /// | `repo_has_feedback_intents` | a Feedback intent of it is not Resolved |
 /// | `needs_source_control` | the repository is a plain folder |
 /// | `git_not_installed` | git cannot run |
@@ -827,7 +827,9 @@ fn repo_code_text(code: &str) -> Option<&'static str> {
         "repo_exists" => "That repository is already added.",
         "folder_busy" => FOLDER_BUSY_TEXT,
         "repo_in_use" => "Close this repository's agents first.",
-        "repo_overlaps" => "That folder overlaps another repository of this Workspace.",
+        "repo_overlaps" => {
+            "That folder overlaps another repository of this Workspace, or SmithAgents' own folder."
+        }
         "repo_has_feedback_intents" => "Resolve this repository's feedback intents first.",
         "needs_source_control" => "That needs a repository with source control.",
         "git_not_installed" => "git is not installed.",
@@ -894,7 +896,8 @@ pub const ABSOLUTE_PATH_TEXT: &str = "Enter an absolute path";
 pub const CLONE_UNSUPPORTED_TEXT: &str =
     "Cloning from a URL is not supported yet. Enter a local path.";
 /// What the Source repositories section says when there is none.
-pub const NO_REPOS_TEXT: &str = "No repositories yet. Add a local git repository to create agents.";
+pub const NO_REPOS_TEXT: &str =
+    "No repositories yet. Add a folder or a git repository to create agents.";
 
 /// [`validate_repo_path_input_in`] with the user's home directory.
 pub fn validate_repo_path_input(raw: &str) -> Result<PathBuf, &'static str> {

@@ -500,7 +500,12 @@ fn choosing_a_font_changes_the_theme_state_and_the_saved_settings(cx: &mut TestA
 #[gpui_kit::test]
 fn reopening_with_the_same_home_restores_every_choice(cx: &mut TestAppContext) {
     let home = tempfile::tempdir().unwrap();
-    let setup = Setup::new().home(home.path());
+    // Tall enough that, at the larger monospace text, the pane still has
+    // empty card below its sections where `painted` looks.
+    let setup = Setup {
+        size: (1200., 1000.),
+        ..Setup::new().home(home.path())
+    };
     let (window, _, state) = setup.open(cx);
     choose(cx, window, THEME_OPTIONS_ID, "Smith Light");
     choose(cx, window, FONT_OPTIONS_ID, "Monospace");
@@ -651,7 +656,16 @@ fn no_repository_shows_the_hint(cx: &mut TestAppContext) {
         let hint = window.find(REPOS_EMPTY_ID);
         assert!(hint.visible());
         assert_eq!(hint.value(), Some(NO_REPOS_TEXT));
+        assert_eq!(
+            NO_REPOS_TEXT,
+            "No repositories yet. Add a folder or a git repository to create agents."
+        );
         assert!(window.try_find(REPO_LIST_ID).is_none());
+        // The path field's placeholder speaks of a folder, the first choice.
+        assert_eq!(
+            window.find(REPO_PATH_INPUT_ID).placeholder(),
+            Some("/path/to/a/folder")
+        );
     });
 }
 
@@ -1126,8 +1140,8 @@ fn a_row_turns_source_control_on_and_off(cx: &mut TestAppContext) {
     assert_eq!(
         text_of(cx, window, TURN_OFF_DESCRIPTION_ID).as_deref(),
         Some(
-            "Intents and feedback use this repository. With source control off, this \
-             Workspace has no repository for them until you choose another. Turn it off?"
+            "Intents and feedback use this repository. With source control off they can \
+             no longer use it. Turn it off?"
         )
     );
     with_window(cx, window, |window, _| {
