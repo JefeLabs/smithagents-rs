@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::Value;
-use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::agent::{Agent, AgentState, Repo, SourceControl};
 use smithagents_core::daemon::{read_lockfile, DaemonInfo};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::palette;
@@ -525,7 +525,9 @@ async fn agents_left_running_by_a_previous_daemon_start_dead() {
     let repo = Repo {
         id: RepoId::new(),
         path: tmp.path().join("repo"),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: Utc::now(),
     };
     let agent = Agent {
@@ -534,7 +536,7 @@ async fn agents_left_running_by_a_previous_daemon_start_dead() {
         color: palette()[0],
         repo_id: repo.id,
         worktree_path: tmp.path().join("wt"),
-        branch: "agent/mercury-00000000".into(),
+        branch: Some("agent/mercury-00000000".into()),
         harness_session_id: Some("s1".into()),
         state: AgentState::Working,
         created_at: Utc::now(),

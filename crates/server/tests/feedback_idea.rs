@@ -1200,7 +1200,10 @@ async fn a_pull_request_pushes_the_agents_branch_as_the_idea_branch() {
     let (repo, bare) = fx.github_repo("r1").await;
     let (idea, agent, head) = fx.sent_idea(&repo).await;
     // A tag named like the agent's branch, elsewhere: the branch is read.
-    common::git(&repo.path, &["tag", &agent.branch, "main"]);
+    common::git(
+        &repo.path,
+        &["tag", agent.branch.as_deref().unwrap(), "main"],
+    );
     // A title with a web address in it (a title is never a link).
     let mut titled = fx.state.intents.get(idea.id).await.unwrap();
     titled.content.title = "Fix the zoom of https://a.b/@x".into();
@@ -1925,7 +1928,7 @@ async fn an_implementation_intent_depends_on_the_idea_and_starts_from_its_branch
     let created: Intent = serde_json::from_value(body).unwrap();
     assert_ne!(created.id, idea_id);
     assert_eq!(created.repo_id, repo.id);
-    assert_eq!(created.base_branch.as_deref(), Some(agent.branch.as_str()));
+    assert_eq!(created.base_branch, agent.branch);
     assert_eq!(created.content.kind, idea.content.kind);
     let origin = created.origin.clone().expect("an origin");
     assert_eq!(
@@ -1934,7 +1937,7 @@ async fn an_implementation_intent_depends_on_the_idea_and_starts_from_its_branch
             origin.branch.as_str(),
             origin.commit.as_str()
         ),
-        (FOLDER, agent.branch.as_str(), head.as_str())
+        (FOLDER, agent.branch.as_deref().unwrap(), head.as_str())
     );
     assert_eq!(origin.idea, None);
     let depends: Vec<_> = created
@@ -2582,7 +2585,11 @@ async fn lasting_conditions_have_codes_of_their_own() {
     let (idea, agent, _) = fx.sent_idea(&repo).await;
     common::git(
         &repo.path,
-        &["update-ref", "-d", &format!("refs/heads/{}", agent.branch)],
+        &[
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{}", agent.branch.as_deref().unwrap()),
+        ],
     );
     for route in ["pull-request", "implementation"] {
         let (status, body) = fx

@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo, Role};
+use smithagents_core::agent::{Agent, AgentState, ChatMessage, Repo, Role, SourceControl};
 use smithagents_core::feedback::{FeedbackRequest, SubmissionId};
 use smithagents_core::ids::{AgentId, IntentId, MessageId, RepoId};
 use smithagents_core::intent::{Intent, IntentFilter, IntentVersion};
@@ -97,9 +97,30 @@ fn repo_from_row(r: &SqliteRow) -> Result<Repo, StoreError> {
     Ok(Repo {
         id: parse_id(r.try_get("id")?)?,
         path: r.try_get::<String, _>("path")?.into(),
-        default_branch: r.try_get("default_branch")?,
+        source_control: r
+            .try_get::<Option<String>, _>("source_control")?
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(corrupt)?,
         created_at: parse_ts(r.try_get("created_at")?)?,
     })
+}
+
+/// `repos.source_control`: the JSON of `SourceControl`, `NULL` for a plain folder.
+fn source_control_json(to: Option<&SourceControl>) -> Result<Option<String>, StoreError> {
+    to.map(|s| serde_json::to_string(s).map_err(corrupt))
+        .transpose()
+}
+
+/// `agents.branch` is `NOT NULL`: an agent that works in place is stored
+/// with the empty string, which is never a branch name.
+fn branch_column(branch: Option<&str>) -> &str {
+    branch.unwrap_or("")
+}
+
+fn branch_from_column(stored: String) -> Option<String> {
+    Some(stored).filter(|b| !b.is_empty())
 }
 
 fn agent_from_row(r: &SqliteRow) -> Result<Agent, StoreError> {
@@ -109,7 +130,7 @@ fn agent_from_row(r: &SqliteRow) -> Result<Agent, StoreError> {
         color: serde_json::from_str(r.try_get("color_json")?).map_err(corrupt)?,
         repo_id: parse_id(r.try_get("repo_id")?)?,
         worktree_path: r.try_get::<String, _>("worktree_path")?.into(),
-        branch: r.try_get("branch")?,
+        branch: branch_from_column(r.try_get("branch")?),
         harness_session_id: r.try_get("harness_session_id")?,
         state: enum_from_str(r.try_get("state")?)?,
         created_at: parse_ts(r.try_get("created_at")?)?,
@@ -353,11 +374,11 @@ impl Store {
 
     pub async fn insert_repo(&self, repo: &Repo) -> Result<(), StoreError> {
         let res = sqlx::query(
-            "INSERT INTO repos (id, path, default_branch, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO repos (id, path, source_control, created_at) VALUES (?, ?, ?, ?)",
         )
         .bind(repo.id.to_string())
         .bind(repo.path.to_string_lossy().into_owned())
-        .bind(&repo.default_branch)
+        .bind(source_control_json(repo.source_control.as_ref())?)
         .bind(ts(repo.created_at))
         .execute(&self.pool)
         .await;
@@ -370,6 +391,21 @@ impl Store {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Records the source control of repository `id`; `None` makes it a plain
+    /// folder.
+    pub async fn set_repo_source_control(
+        &self,
+        id: RepoId,
+        to: Option<&SourceControl>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE repos SET source_control = ? WHERE id = ?")
+            .bind(source_control_json(to)?)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn get_repo(&self, id: RepoId) -> Result<Option<Repo>, StoreError> {
@@ -415,7 +451,7 @@ impl Store {
         .bind(serde_json::to_string(&agent.color).map_err(corrupt)?)
         .bind(agent.repo_id.to_string())
         .bind(agent.worktree_path.to_string_lossy().into_owned())
-        .bind(&agent.branch)
+        .bind(branch_column(agent.branch.as_deref()))
         .bind(agent.harness_session_id.as_deref())
         .bind(enum_to_str(&agent.state)?)
         .bind(ts(agent.created_at))
@@ -1231,11 +1267,17 @@ mod tests {
     use super::*;
     use smithagents_core::palette::palette;
 
+    fn git(default_branch: &str) -> SourceControl {
+        SourceControl::Git {
+            default_branch: default_branch.into(),
+        }
+    }
+
     fn repo(path: &str) -> Repo {
         Repo {
             id: RepoId::new(),
             path: path.into(),
-            default_branch: "main".into(),
+            source_control: Some(git("main")),
             created_at: Utc::now(),
         }
     }
@@ -1247,7 +1289,7 @@ mod tests {
             color: palette()[0],
             repo_id,
             worktree_path: format!("/tmp/wt/{name}").into(),
-            branch: format!("agent/{name}"),
+            branch: Some(format!("agent/{name}")),
             harness_session_id: Some("sess".into()),
             state: AgentState::Working,
             created_at: Utc::now(),
@@ -1794,6 +1836,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_plain_repository_and_its_agent_round_trip() {
+        let store = Store::open_in_memory().await.unwrap();
+        let r = Repo {
+            source_control: None,
+            ..repo("/repos/plain")
+        };
+        let id = r.id;
+        store.insert_repo(&r).await.unwrap();
+        let a = Agent {
+            worktree_path: r.path.clone(),
+            branch: None,
+            ..agent(id, "Earth")
+        };
+        let agent_id = a.id;
+        store.insert_agent(&a).await.unwrap();
+
+        assert_eq!(
+            store.get_repo(id).await.unwrap().unwrap().source_control,
+            None
+        );
+        assert_eq!(
+            store.get_agent(agent_id).await.unwrap().unwrap().branch,
+            None
+        );
+        assert_eq!(store.get_agent(agent_id).await.unwrap(), Some(a));
+
+        store
+            .set_repo_source_control(id, Some(&git("main")))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_repo(id).await.unwrap().unwrap().default_branch(),
+            Some("main")
+        );
+        store.set_repo_source_control(id, None).await.unwrap();
+        assert!(store.get_repo(id).await.unwrap().unwrap().is_plain());
+    }
+
+    #[tokio::test]
     async fn database_from_0001_migrates_without_touching_rows() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("old.db");
@@ -1834,7 +1915,7 @@ mod tests {
             .bind(serde_json::to_string(&a.color).unwrap())
             .bind(r.id.to_string())
             .bind(a.worktree_path.to_string_lossy().into_owned())
-            .bind(&a.branch)
+            .bind(a.branch.as_deref())
             .bind(a.harness_session_id.as_deref())
             .bind(enum_to_str(&a.state).unwrap())
             .bind(ts(a.created_at))

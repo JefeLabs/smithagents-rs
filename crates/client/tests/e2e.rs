@@ -273,11 +273,8 @@ async fn chat_flow_end_to_end() {
         assert_eq!(agent.name, "Mercury");
         assert_eq!(agent.color, palette()[0]);
         assert_eq!(agent.state, AgentState::Idle);
-        assert!(
-            agent.branch.starts_with("agent/mercury-"),
-            "{}",
-            agent.branch
-        );
+        let branch = agent.branch.as_deref().unwrap();
+        assert!(branch.starts_with("agent/mercury-"), "{branch}");
         assert!(
             agent.worktree_path.is_dir(),
             "no worktree at {}",
@@ -285,7 +282,7 @@ async fn chat_flow_end_to_end() {
         );
         assert_eq!(
             git(&agent.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            agent.branch
+            branch
         );
         // The user's checkout stays where it was.
         assert_eq!(
@@ -638,7 +635,7 @@ async fn real_claude_smoke() {
         let end = turn_end(&mut events, agent.id).await;
         let messages = chat(&client, agent.id).await;
 
-        println!("agent: {} on {}", agent.name, agent.branch);
+        println!("agent: {} on {:?}", agent.name, agent.branch);
         println!("worktree: {}", agent.worktree_path.display());
         println!("state: {:?}", end.state);
         for (role, text) in &messages {
@@ -651,14 +648,11 @@ async fn real_claude_smoke() {
             ),
             "{messages:?}"
         );
-        assert!(
-            agent.branch.starts_with("agent/mercury-"),
-            "{}",
-            agent.branch
-        );
+        let branch = agent.branch.as_deref().unwrap();
+        assert!(branch.starts_with("agent/mercury-"), "{branch}");
         assert_eq!(
             git(&agent.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            agent.branch
+            branch
         );
     })
     .await;

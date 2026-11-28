@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::FeedbackFailure;
 use smithagents_core::feedback::{FeedbackStep, SubmissionId};
 use smithagents_core::ids::RepoId;
@@ -228,7 +228,9 @@ impl Fixture {
         let repo = Repo {
             id: RepoId::new(),
             path: std::fs::canonicalize(&root).unwrap(),
-            default_branch: "main".into(),
+            source_control: Some(SourceControl::Git {
+                default_branch: "main".into(),
+            }),
             created_at: Utc::now(),
         };
         let paths = Paths {
@@ -562,7 +564,9 @@ async fn an_unborn_repository_is_refused_with_the_same_sentence() {
     let repo = Repo {
         id: RepoId::new(),
         path: root,
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: Utc::now(),
     };
     let err = place(&repo, "Fix the zoom", date(), false)

@@ -420,7 +420,7 @@ async fn send_starts_an_agent_with_the_brief() {
     assert_eq!(f.get(x.id).await, sent);
     let agent = f.agent(sent.agent_id.unwrap()).await;
     assert_eq!(agent.name, "Mercury");
-    assert_eq!(agent.branch, "intent/fix-login");
+    assert_eq!(agent.branch.as_deref(), Some("intent/fix-login"));
     assert_eq!(agent.intent_id, Some(x.id));
     assert!(agent.worktree_path.is_dir());
     let brief = compose(&x, &[]);
@@ -941,7 +941,7 @@ async fn branch_collision_retries_once_with_a_suffix() {
 
     let sent = f.svc.send(x.id).await.unwrap();
     let agent = f.agent(sent.agent_id.unwrap()).await;
-    assert_eq!(agent.branch, format!("intent/taken-{}", hex6(x.id)));
+    assert_eq!(agent.branch, Some(format!("intent/taken-{}", hex6(x.id))));
     assert_eq!(sent.last_start_error, None);
 
     // Both names taken: one retry only, then a typed error and no agent.
@@ -1047,7 +1047,7 @@ async fn failed_save_after_the_start_closes_the_agent() {
     assert_eq!(sent.state, IntentState::Sent);
     assert_eq!(sent.last_start_error, None);
     let agent = f.agent(sent.agent_id.unwrap()).await;
-    assert_eq!(agent.branch, format!("intent/x-{}", hex6(x.id)));
+    assert_eq!(agent.branch, Some(format!("intent/x-{}", hex6(x.id))));
 }
 
 // ------------------------------------------------------------------ resolve

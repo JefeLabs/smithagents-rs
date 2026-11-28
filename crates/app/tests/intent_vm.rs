@@ -10,7 +10,7 @@ use smithagents_app::intent_vm::*;
 use smithagents_app::link::LinkError;
 use smithagents_app::model::{Action, Connection, ShellModel};
 use smithagents_app::view_models::{DotStyle, DAEMON_UNREACHABLE_TEXT, NOT_CONNECTED_TEXT};
-use smithagents_core::agent::{AgentState, Repo};
+use smithagents_core::agent::{AgentState, Repo, SourceControl};
 use smithagents_core::ids::{IntentId, RepoId};
 use smithagents_core::intent::{Answer, Intent, IntentKind, IntentState, Item, ItemStatus, Phase};
 
@@ -651,7 +651,9 @@ fn repo(at: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: "/tmp/r".into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: utc(at),
     }
 }

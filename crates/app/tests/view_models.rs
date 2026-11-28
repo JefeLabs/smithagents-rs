@@ -10,7 +10,7 @@ use smithagents_app::view_models::{
 };
 use smithagents_center_host::HostError;
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::agent::{Agent, AgentState, Repo, SourceControl};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
 
@@ -26,7 +26,7 @@ fn agent(name: &str) -> Agent {
         },
         repo_id: RepoId::new(),
         worktree_path: "/tmp/wt".into(),
-        branch: format!("agent/{name}"),
+        branch: Some(format!("agent/{name}")),
         harness_session_id: None,
         state: AgentState::Idle,
         created_at: at,
@@ -420,7 +420,9 @@ fn repo(path: &str, minutes: i64) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: start + Duration::minutes(minutes),
     }
 }
@@ -741,7 +743,7 @@ mod settings_pane {
         NOT_CONNECTED_TEXT, REPO_ADD_FAILED_TEXT, SYSTEM_THEME_LABEL,
     };
     use smithagents_client::ClientError;
-    use smithagents_core::agent::Repo;
+    use smithagents_core::agent::{Repo, SourceControl};
     use smithagents_core::ids::RepoId;
     use smithagents_theme::state::ThemeChoice;
     use smithagents_theme::tokens::{TextScale, ThemeSet};
@@ -911,7 +913,9 @@ mod settings_pane {
         Repo {
             id: RepoId::new(),
             path: path.into(),
-            default_branch: branch.into(),
+            source_control: Some(SourceControl::Git {
+                default_branch: branch.into(),
+            }),
             created_at: at,
         }
     }
@@ -928,7 +932,13 @@ mod settings_pane {
         let rows = repo_rows(&repos, None);
         let shown: Vec<(&str, &str, &str)> = rows
             .iter()
-            .map(|r| (r.name.as_str(), r.path.as_str(), r.default_branch.as_str()))
+            .map(|r| {
+                (
+                    r.name.as_str(),
+                    r.path.as_str(),
+                    r.default_branch.as_deref().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(
             shown,
@@ -948,7 +958,7 @@ mod settings_pane {
                 id: root.id,
                 name: "/".into(),
                 path: "/".into(),
-                default_branch: "main".into(),
+                default_branch: Some("main".into()),
                 is_meta: true,
                 can_set_meta: false,
             }]

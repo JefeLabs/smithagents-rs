@@ -701,7 +701,8 @@ pub struct RepoRowVm {
     pub name: String,
     /// The full path, for display.
     pub path: String,
-    pub default_branch: String,
+    /// `None` for a plain folder.
+    pub default_branch: Option<String>,
     /// Intents and feedback go to this repository
     /// ([`effective_meta_repo`]).
     pub is_meta: bool,
@@ -724,7 +725,7 @@ pub fn repo_rows(repos: &[Repo], settings: Option<&FeedbackSettings>) -> Vec<Rep
                 id: repo.id,
                 name: repo_title(&repo.path),
                 path: repo.path.display().to_string(),
-                default_branch: repo.default_branch.clone(),
+                default_branch: repo.default_branch().map(str::to_owned),
                 is_meta,
                 can_set_meta: settings.is_some() && !is_meta && repos.len() >= 2,
             }

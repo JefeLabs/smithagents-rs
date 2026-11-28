@@ -50,7 +50,7 @@ use smithagents_app::views::settings::{
     TEXT_SIZE_UP_ID, TEXT_SIZE_VALUE_ID, THEME_LABEL, THEME_OPTIONS_ID,
 };
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, Repo};
+use smithagents_core::agent::{Agent, Repo, SourceControl};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_theme::native::NativeTheme;
 use smithagents_theme::state::{AppearanceSettings, ThemeChoice};
@@ -97,7 +97,9 @@ fn repo(path: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at,
     }
 }
@@ -627,7 +629,9 @@ fn no_repository_shows_the_hint(cx: &mut TestAppContext) {
 fn the_repositories_are_listed_by_name_with_path_and_branch(cx: &mut TestAppContext) {
     let zeta = repo("/src/zeta");
     let spaced = Repo {
-        default_branch: "trunk".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "trunk".into(),
+        }),
         ..repo("/Users/me/My Projects/ünïcode app")
     };
     let setup = Setup {

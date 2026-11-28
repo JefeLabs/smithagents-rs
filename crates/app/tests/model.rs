@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use smithagents_app::model::{Action, Connection, Effect, ShellModel};
-use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::agent::{Agent, AgentState, Repo, SourceControl};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
@@ -20,7 +20,7 @@ fn agent(name: &str, min: u32) -> Agent {
         },
         repo_id: RepoId::new(),
         worktree_path: "/tmp/wt".into(),
-        branch: format!("agent/{name}"),
+        branch: Some(format!("agent/{name}")),
         harness_session_id: None,
         state: AgentState::Idle,
         created_at: t(min),
@@ -33,7 +33,9 @@ fn repo() -> Repo {
     Repo {
         id: RepoId::new(),
         path: "/tmp/r".into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: t(0),
     }
 }
@@ -441,10 +443,12 @@ fn repo_added_upserts_by_id() {
     m.apply(Action::RepoAdded(r.clone()));
     assert_eq!(m.repos().len(), 1);
     let mut changed = r.clone();
-    changed.default_branch = "trunk".into();
+    changed.source_control = Some(SourceControl::Git {
+        default_branch: "trunk".into(),
+    });
     m.apply(Action::RepoAdded(changed));
     assert_eq!(m.repos().len(), 1);
-    assert_eq!(m.repos()[0].default_branch, "trunk");
+    assert_eq!(m.repos()[0].default_branch(), Some("trunk"));
     m.apply(Action::RepoAdded(repo()));
     assert_eq!(m.repos().len(), 2);
 }

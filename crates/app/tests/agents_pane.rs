@@ -46,7 +46,7 @@ use smithagents_app::views::agents::{
 use smithagents_app::views::rail::RailEntry;
 use smithagents_app::views::tabs::TOGGLE_AGENTS_ID;
 use smithagents_client::ClientError;
-use smithagents_core::agent::{Agent, AgentState, Repo};
+use smithagents_core::agent::{Agent, AgentState, Repo, SourceControl};
 use smithagents_core::event::{Event, EventKind};
 use smithagents_core::ids::{AgentId, RepoId};
 use smithagents_core::palette::AgentColor;
@@ -122,7 +122,9 @@ fn repo(path: &str, minutes: i64) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at + chrono::Duration::minutes(minutes),
     }
 }

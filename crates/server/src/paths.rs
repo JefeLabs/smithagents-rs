@@ -174,6 +174,7 @@ mod tests {
 
     #[test]
     fn a_repositorys_worktree_folder_carries_its_id() {
+        use smithagents_core::agent::SourceControl;
         use smithagents_core::ids::RepoId;
 
         let paths = Paths {
@@ -182,7 +183,9 @@ mod tests {
         let repo = |path: &str| Repo {
             id: RepoId::new(),
             path: PathBuf::from(path),
-            default_branch: "main".into(),
+            source_control: Some(SourceControl::Git {
+                default_branch: "main".into(),
+            }),
             created_at: chrono::Utc::now(),
         };
         let (work, oss) = (repo("/work/app"), repo("/oss/app"));

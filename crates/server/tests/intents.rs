@@ -2521,14 +2521,14 @@ async fn send_starts_the_agent_from_the_base_branch() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(agent.branch, format!("intent/{}", x.slug));
-    assert_eq!(agent.branch, "intent/fix-the-zoom");
+    assert_eq!(agent.branch, Some(format!("intent/{}", x.slug)));
+    assert_eq!(agent.branch.as_deref(), Some("intent/fix-the-zoom"));
     assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
     let ancestor = [
         "merge-base",
         "--is-ancestor",
         "refs/heads/feedback/x",
-        &agent.branch,
+        agent.branch.as_deref().unwrap(),
     ];
     assert!(git_stdout(&dir, &ancestor).is_some());
     // The feedback branch and the user's checkout are left as they were.
@@ -2598,10 +2598,10 @@ async fn an_intent_without_a_base_branch_starts_from_the_default_branch() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(agent.branch, "intent/fix-the-zoom");
+    assert_eq!(agent.branch.as_deref(), Some("intent/fix-the-zoom"));
     assert!(!agent.worktree_path.join("docs").exists());
     assert_eq!(
-        git_out(&dir, &["rev-parse", &agent.branch]),
+        git_out(&dir, &["rev-parse", agent.branch.as_deref().unwrap()]),
         git_out(&dir, &["rev-parse", "refs/heads/main"])
     );
     assert!(!f.first_message(&agent).await.contains("## Evidence"));
@@ -3005,7 +3005,7 @@ async fn an_agent_branch_tracks_nothing_whatever_the_repository_says() {
         .unwrap()
         .unwrap();
     for key in ["remote", "merge"] {
-        let name = format!("branch.{}.{key}", agent.branch);
+        let name = format!("branch.{}.{key}", agent.branch.as_deref().unwrap());
         assert_eq!(
             git_stdout(&dir, &["config", "--get", &name]),
             None,

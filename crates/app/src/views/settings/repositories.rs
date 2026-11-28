@@ -433,10 +433,10 @@ fn repo_row(
         .id(repo_row_id(row.id))
         .role(Role::ListItem)
         .test_support()
-        .aria_label(format!(
-            "{}, {}, default branch {}",
-            row.name, row.path, row.default_branch
-        ))
+        .aria_label(match &row.default_branch {
+            Some(branch) => format!("{}, {}, default branch {branch}", row.name, row.path),
+            None => format!("{}, {}", row.name, row.path),
+        })
         .w_full()
         .min_w_0()
         .child(
@@ -452,12 +452,14 @@ fn repo_row(
                 .text_color(paint.muted_foreground)
                 .truncate(),
         )
-        .child(
-            Label::new(format!("Default branch: {}", row.default_branch))
-                .text_xs()
-                .text_color(paint.muted_foreground)
-                .truncate(),
-        )
+        .when_some(row.default_branch, |this, branch| {
+            this.child(
+                Label::new(format!("Default branch: {branch}"))
+                    .text_xs()
+                    .text_color(paint.muted_foreground)
+                    .truncate(),
+            )
+        })
         .when(row.is_meta, |this| {
             this.child(
                 div().child(

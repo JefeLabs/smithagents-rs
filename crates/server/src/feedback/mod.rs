@@ -38,7 +38,7 @@ use crate::intents::{CreateExtras, IntentError, IntentService};
 use crate::paths::{ensure_private_real_dir, Paths};
 use crate::plugins::{clean_message, PluginManager};
 use crate::polish::MAX_SEED_BYTES;
-use crate::service::AgentService;
+use crate::service::{AgentService, ServiceError};
 use crate::store::{Store, StoreError, Submission};
 
 /// Settings key of [`FeedbackSettings`].
@@ -201,6 +201,12 @@ impl FeedbackError {
     /// system's error as its source: `.map_err(FeedbackError::io(WHAT))`.
     pub(crate) fn io(what: &'static str) -> impl Fn(std::io::Error) -> Self {
         move |source| Self::Io { what, source }
+    }
+
+    /// The repository is a plain folder, with no branch to commit on: the
+    /// agent service's refusal, with its code and status.
+    pub(crate) fn needs_source_control() -> Self {
+        Self::Intent(IntentError::Service(ServiceError::NeedsSourceControl))
     }
 
     pub fn code(&self) -> &str {

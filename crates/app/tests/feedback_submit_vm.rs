@@ -26,7 +26,7 @@ use smithagents_app::view_models::{
     DAEMON_UNREACHABLE_TEXT, FILE_UNREADABLE_TEXT, NOT_CONNECTED_TEXT,
 };
 use smithagents_client::{ClientError, FeedbackFile};
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::{
     AttachmentKind as WireKind, FeedbackAttachment, FeedbackBox, FeedbackFailure, FeedbackKind,
     FeedbackStep, FeedbackTarget, IdeaOptions, SendAs, SubmissionId, ToolReadiness,
@@ -93,7 +93,9 @@ fn repo(path: &str, created: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at,
     }
 }

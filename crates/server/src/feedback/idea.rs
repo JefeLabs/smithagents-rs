@@ -156,6 +156,14 @@ fn idea_of(intent: &Intent) -> Result<(&FeedbackOrigin, &IdeaPackage), FeedbackE
     Ok((origin, idea))
 }
 
+/// The idea agent's branch; an agent that works in place has none.
+fn agent_branch(agent: &Agent) -> Result<&str, FeedbackError> {
+    agent
+        .branch
+        .as_deref()
+        .ok_or_else(FeedbackError::needs_source_control)
+}
+
 /// Whether `folder` is `docs/issues/<name>` with a plain `name`, as Submit
 /// makes it.
 fn is_issue_folder(folder: &str) -> bool {
@@ -289,7 +297,10 @@ impl FeedbackService {
             .inspect_err(|e| {
                 tracing::warn!(intent_id = %id, step = "acknowledge", code = e.code(), "the idea branch was not pushed");
             })?;
-        for branch in [&repo.default_branch, &origin.branch] {
+        let default_branch = repo
+            .default_branch()
+            .ok_or_else(FeedbackError::needs_source_control)?;
+        for branch in [default_branch, origin.branch.as_str()] {
             let valid = !branch.starts_with('-')
                 && git::bounded(git::is_valid_branch_name(&repo.path, branch))
                     .await
@@ -357,7 +368,7 @@ impl FeedbackService {
                 id,
                 &gh,
                 &github,
-                (&repo.default_branch, &origin.branch),
+                (default_branch, &origin.branch),
                 &head,
                 &title,
                 &text.body,
@@ -427,7 +438,7 @@ impl FeedbackService {
             return Ok(Some((commit.clone(), true)));
         }
         let kept = git::is_commit_id(commit)
-            && git::is_on_branch(&repo.path, commit, &agent.branch)
+            && git::is_on_branch(&repo.path, commit, agent_branch(agent)?)
                 .await
                 .map_err(read_failed)?;
         Ok(kept.then(|| (commit.clone(), false)))
@@ -545,16 +556,17 @@ impl FeedbackService {
                 })?;
         }
         let head = self.settled_head(&repo, &agent).await?;
+        let branch = agent_branch(&agent)?;
         let req = CreateIntentRequest {
             repo_id: Some(intent.repo_id),
             kind: Some(intent.content.kind),
             seed: SeedInput::Text(implementation_seed(&intent, &origin.folder)),
         };
         let extras = CreateExtras {
-            base_branch: Some(agent.branch.clone()),
+            base_branch: Some(branch.to_owned()),
             origin: Some(FeedbackOrigin {
                 folder: origin.folder.clone(),
-                branch: agent.branch.clone(),
+                branch: branch.to_owned(),
                 commit: head,
                 idea: None,
             }),
@@ -658,10 +670,11 @@ impl FeedbackService {
     /// flight; `NotReady` when one is, or when one started while the branch
     /// was read, since it may then hold a commit made in the middle of it.
     async fn settled_head(&self, repo: &Repo, agent: &Agent) -> Result<String, FeedbackError> {
+        let branch = agent_branch(agent)?;
         if self.parts.agents.turn_in_flight(agent.id) {
             return Err(FeedbackError::NotReady(STILL_WORKING.to_owned()));
         }
-        let head = git::rev_parse(&repo.path, &format!("refs/heads/{}", agent.branch))
+        let head = git::rev_parse(&repo.path, &format!("refs/heads/{branch}"))
             .await
             .map_err(read_failed)?
             .ok_or(FeedbackError::IdeaBlocked(IdeaBlocked::BranchGone))?;

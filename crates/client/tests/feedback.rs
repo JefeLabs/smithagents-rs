@@ -698,7 +698,7 @@ async fn feedback_becomes_an_intent_whose_agent_has_the_files() {
             "merge-base",
             "--is-ancestor",
             &outcome.commit,
-            &agent.branch,
+            agent.branch.as_deref().unwrap(),
         ],
     );
     assert_eq!(
@@ -835,7 +835,10 @@ async fn an_idea_goes_from_feedback_to_a_draft_pull_request() {
     let agent = agent_done(&mut events, intent.id).await;
     let head = git(
         &fx.repo_dir,
-        &["rev-parse", &format!("refs/heads/{}", agent.branch)],
+        &[
+            "rev-parse",
+            &format!("refs/heads/{}", agent.branch.as_deref().unwrap()),
+        ],
     );
 
     // Without the acknowledgement nothing is pushed or opened.
@@ -889,7 +892,7 @@ async fn an_idea_goes_from_feedback_to_a_draft_pull_request() {
     assert_ne!(implementation.id, intent.id);
     assert_eq!(
         implementation.base_branch.as_deref(),
-        Some(agent.branch.as_str())
+        agent.branch.as_deref()
     );
     assert!(
         implementation

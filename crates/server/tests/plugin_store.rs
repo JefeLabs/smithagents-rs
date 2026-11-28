@@ -813,7 +813,9 @@ async fn migrating_from_a_database_at_0002_keeps_existing_rows() {
             .insert_repo(&smithagents_core::agent::Repo {
                 id: "2b7e9c41-5d3a-4f68-8a1c-7e4b0d9f2c35".parse().unwrap(),
                 path: "/tmp/r".into(),
-                default_branch: "main".into(),
+                source_control: Some(smithagents_core::agent::SourceControl::Git {
+                    default_branch: "main".into(),
+                }),
                 created_at: time(AT),
             })
             .await

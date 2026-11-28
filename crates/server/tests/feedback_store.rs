@@ -1,16 +1,17 @@
 //! Migration 0004 and the feedback columns and table in the store.
 
 use chrono::{DateTime, Utc};
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::{
     AttachmentKind, FeedbackAttachment, FeedbackKind, FeedbackOrigin, FeedbackRequest, IdeaPackage,
     SendAs, SubmissionId,
 };
-use smithagents_core::ids::{IntentId, ItemId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, ItemId, RepoId};
 use smithagents_core::intent::{
     Content, Intent, IntentFilter, IntentKind, IntentState, IntentVersion, Item, ItemStatus, Phase,
     Seed, SeedSource, VersionAuthor,
 };
+use smithagents_core::palette::palette;
 use smithagents_server::store::{Store, StoreError, Submission};
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::SqlitePool;
@@ -23,7 +24,9 @@ fn repo(path: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: Utc::now(),
     }
 }
@@ -160,6 +163,75 @@ async fn a_database_from_0003_migrates_and_keeps_its_intents() {
     assert_eq!(got.base_branch, None);
     assert_eq!(got.origin, None);
     assert!(!got.content.criteria[0].fixed);
+}
+
+#[tokio::test]
+async fn a_database_from_0004_migrates_its_repositories_to_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("old.db");
+    let repo_id = RepoId::new();
+    let (open_id, closed_id) = (AgentId::new(), AgentId::new());
+    {
+        let opts = SqliteConnectOptions::new()
+            .filename(&db)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePool::connect_with(opts).await.unwrap();
+        let mut m = sqlx::migrate!("./migrations");
+        m.migrations = m
+            .migrations
+            .iter()
+            .filter(|x| x.version <= 4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        m.run(&pool).await.unwrap();
+        // A quote in the name, so the migration must not build JSON by hand.
+        sqlx::query("INSERT INTO repos (id, path, default_branch, created_at) VALUES (?, ?, ?, ?)")
+            .bind(repo_id.to_string())
+            .bind("/repos/old")
+            .bind("it's-trunk")
+            .bind("2026-11-26T10:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, name, branch, closed_at) in [
+            (open_id, "Earth", "agent/earth-1", None),
+            (closed_id, "Mars", "intent/x", Some("2026-11-26T11:00:00Z")),
+        ] {
+            sqlx::query(
+                "INSERT INTO agents (id, name, color_json, repo_id, worktree_path, branch, \
+                 harness_session_id, state, created_at, closed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, NULL, 'idle', ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(name)
+            .bind(serde_json::to_string(&palette()[0]).unwrap())
+            .bind(repo_id.to_string())
+            .bind(format!("/worktrees/{name}"))
+            .bind(branch)
+            .bind("2026-11-26T10:00:00Z")
+            .bind(closed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+    }
+    let store = Store::open(&db).await.unwrap();
+    let repos = store.list_repos().await.unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(
+        repos[0].source_control,
+        Some(SourceControl::Git {
+            default_branch: "it's-trunk".into()
+        })
+    );
+    let open = store.get_agent(open_id).await.unwrap().unwrap();
+    let closed = store.get_agent(closed_id).await.unwrap().unwrap();
+    assert_eq!(open.branch.as_deref(), Some("agent/earth-1"));
+    assert_eq!(closed.branch.as_deref(), Some("intent/x"));
+    assert!(closed.closed_at.is_some());
 }
 
 #[tokio::test]

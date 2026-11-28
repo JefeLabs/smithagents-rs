@@ -87,9 +87,8 @@ pub async fn place(
     date: NaiveDate,
     idea: bool,
 ) -> Result<Placement, FeedbackError> {
-    require_default_branch(repo).await?;
+    let default = format!("refs/heads/{}", require_default_branch(repo).await?);
     let root = repo.path.as_path();
-    let default = format!("refs/heads/{}", repo.default_branch);
     let slug = issue_slug(title);
     for n in 1..=MAX_SUFFIX {
         let slug = with_suffix(&slug, n);
@@ -202,10 +201,11 @@ async fn commit_in_worktree(
     let root = repo.path.as_path();
     let dir = worktree.dir.as_path();
     remove_leftovers(root, dir).await?;
-    let base = git::rev_parse(root, &format!("refs/heads/{}", repo.default_branch))
+    let default_branch = default_branch(repo)?;
+    let base = git::rev_parse(root, &format!("refs/heads/{default_branch}"))
         .await
         .map_err(git_failed(WORKTREE_STEP))?
-        .ok_or_else(|| FeedbackError::DefaultBranchMissing(repo.default_branch.clone()))?;
+        .ok_or_else(|| FeedbackError::DefaultBranchMissing(default_branch.to_owned()))?;
     check_parents(root, &base, placement).await?;
     if name_taken(root, &base, placement).await? {
         return Err(FeedbackError::NameTaken);
@@ -442,8 +442,8 @@ const PUBLISHED_STEP: &str = "check what origin already has";
 /// publish the user's unpushed work with it. `DefaultBranchMissing` first,
 /// as for a commit.
 pub async fn require_published_default_branch(repo: &Repo) -> Result<(), FeedbackError> {
-    require_default_branch(repo).await?;
-    require_published(repo, &format!("refs/heads/{}", repo.default_branch)).await
+    let default_branch = require_default_branch(repo).await?;
+    require_published(repo, &format!("refs/heads/{default_branch}")).await
 }
 
 /// [`require_published_default_branch`] for an idea submission, whose push
@@ -537,18 +537,24 @@ fn push_failure(error: PushError) -> FeedbackFailure {
     }
 }
 
-/// `DefaultBranchMissing` unless the repository's default branch exists as a
-/// local branch (an unborn repository has none).
-async fn require_default_branch(repo: &Repo) -> Result<(), FeedbackError> {
-    let name = &repo.default_branch;
+/// The repository's default branch; a plain folder has none.
+fn default_branch(repo: &Repo) -> Result<&str, FeedbackError> {
+    repo.default_branch()
+        .ok_or_else(FeedbackError::needs_source_control)
+}
+
+/// The repository's default branch; `DefaultBranchMissing` unless it exists
+/// as a local branch (an unborn repository has none).
+async fn require_default_branch(repo: &Repo) -> Result<&str, FeedbackError> {
+    let name = default_branch(repo)?;
     let exists = !name.starts_with('-')
         && git::bounded(git::branch_exists(&repo.path, name))
             .await
             .map_err(git_failed(WORKTREE_STEP))?;
     if exists {
-        Ok(())
+        Ok(name)
     } else {
-        Err(FeedbackError::DefaultBranchMissing(name.clone()))
+        Err(FeedbackError::DefaultBranchMissing(name.to_owned()))
     }
 }
 

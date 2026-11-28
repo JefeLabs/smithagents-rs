@@ -54,7 +54,7 @@ use smithagents_app::views::feedback::{
 use smithagents_app::views::intents::{IntentsPane, Screen};
 use smithagents_app::views::rail::RailEntry;
 use smithagents_client::ClientError;
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::{
     AttachmentKind, FeedbackFailure, FeedbackKind, FeedbackSettings, FeedbackStep, FeedbackTargets,
     IdeaOptions, SendAs, ToolReadiness,
@@ -81,7 +81,9 @@ fn repo(path: &str, created: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at,
     }
 }

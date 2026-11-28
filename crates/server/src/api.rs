@@ -1587,6 +1587,12 @@ mod tests {
                 &ServiceError::TurnInProgress.to_string(),
             ),
             (
+                FeedbackError::needs_source_control(),
+                S::CONFLICT,
+                "needs_source_control",
+                "this repository has no source control",
+            ),
+            (
                 FeedbackError::NotAnIdea,
                 S::CONFLICT,
                 "not_an_idea",
@@ -1690,7 +1696,7 @@ mod tests {
             },
             repo_id: RepoId::new(),
             worktree_path: "/tmp/wt".into(),
-            branch: "agent/x".into(),
+            branch: Some("agent/x".into()),
             harness_session_id: None,
             state,
             created_at: chrono::Utc::now(),

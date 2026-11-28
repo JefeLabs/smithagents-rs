@@ -19,7 +19,7 @@ use chrono::Utc;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use smithagents_core::agent::{
-    next_agent_name, next_color, Agent, AgentState, ChatMessage, Repo, Role, PLANETS,
+    next_agent_name, next_color, Agent, AgentState, ChatMessage, Repo, Role, SourceControl, PLANETS,
 };
 use smithagents_core::event::EventKind;
 use smithagents_core::ids::{AgentId, IntentId, RepoId};
@@ -48,6 +48,8 @@ pub enum ServiceError {
     AgentClosed,
     #[error("a turn is already in progress for this agent")]
     TurnInProgress,
+    #[error("this repository has no source control")]
+    NeedsSourceControl,
     #[error("git: {0}")]
     Git(#[from] GitError),
     #[error("store: {0}")]
@@ -63,6 +65,7 @@ impl ServiceError {
             Self::AgentNotFound => (S::NOT_FOUND, "agent_not_found"),
             Self::AgentClosed => (S::CONFLICT, "agent_closed"),
             Self::TurnInProgress => (S::CONFLICT, "turn_in_progress"),
+            Self::NeedsSourceControl => (S::CONFLICT, "needs_source_control"),
             Self::Git(GitError::PathNotFound(_)) => (S::BAD_REQUEST, "path_not_found"),
             Self::Git(GitError::NotAGitRepo) => (S::BAD_REQUEST, "not_a_git_repo"),
             Self::Git(GitError::BareRepo) => (S::BAD_REQUEST, "bare_repo"),
@@ -83,12 +86,16 @@ impl ServiceError {
 /// and is logged.
 async fn discard_unsaved(repo_root: &Path, agent: &Agent, base: &str) {
     let id = agent.id;
+    // An agent that works in place made nothing: its folder is the repository's.
+    let Some(branch) = agent.branch.as_deref() else {
+        return;
+    };
     if let Err(e) = git::remove_worktree(repo_root, &agent.worktree_path).await {
         // The branch is still checked out there, so it stays too.
         tracing::warn!(agent_id = %id, "could not remove worktree of unsaved agent: {e}");
         return;
     }
-    match git::delete_branch_made_from(repo_root, &agent.branch, base).await {
+    match git::delete_branch_made_from(repo_root, branch, base).await {
         Ok(true) => {}
         Ok(false) => {
             tracing::warn!(agent_id = %id, "the branch of an unsaved agent holds a commit of its own, and was kept");
@@ -241,7 +248,9 @@ impl AgentService {
         let repo = Repo {
             id: RepoId::new(),
             path: info.root,
-            default_branch: info.default_branch,
+            source_control: Some(SourceControl::Git {
+                default_branch: info.default_branch,
+            }),
             created_at: Utc::now(),
         };
         self.inner.store.insert_repo(&repo).await?;
@@ -270,6 +279,10 @@ impl AgentService {
             .get_repo(repo_id)
             .await?
             .ok_or(ServiceError::RepoNotFound)?;
+        // A worktree needs source control.
+        let Some(default_branch) = repo.default_branch() else {
+            return Err(ServiceError::NeedsSourceControl);
+        };
         let open = store.list_agents(false).await?;
         let names: HashSet<String> = open.iter().map(|a| a.name.clone()).collect();
         let colors: Vec<AgentColor> = open.iter().map(|a| a.color).collect();
@@ -282,7 +295,7 @@ impl AgentService {
         // is never taken instead.
         let base = match &opts.base {
             Some(base) => format!("refs/heads/{base}"),
-            None => repo.default_branch.clone(),
+            None => default_branch.to_owned(),
         };
         let worktree_path = git::create_worktree(&repo.path, &worktrees, &branch, &base).await?;
         let agent = Agent {
@@ -291,7 +304,7 @@ impl AgentService {
             color,
             repo_id,
             worktree_path,
-            branch,
+            branch: Some(branch),
             harness_session_id: None,
             state: AgentState::Idle,
             created_at: Utc::now(),
@@ -871,7 +884,8 @@ mod tests {
         let mut rx = fx.live();
         let agent = fx.svc.create_agent(fx.repo.id).await.unwrap();
 
-        let suffix = agent.branch.strip_prefix("agent/mercury-").unwrap();
+        let branch = agent.branch.as_deref().unwrap();
+        let suffix = branch.strip_prefix("agent/mercury-").unwrap();
         assert_eq!(suffix, &agent.id.0.simple().to_string()[..8]);
         assert!(agent.worktree_path.is_dir());
         assert!(agent
@@ -879,7 +893,7 @@ mod tests {
             .starts_with(fx.paths.repo_worktrees_dir(&fx.repo)));
         assert_eq!(
             git(&agent.worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            agent.branch
+            branch
         );
         // The user's checkout is untouched.
         assert_eq!(
@@ -912,7 +926,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(agent.branch, "intent/fix-it");
+        assert_eq!(agent.branch.as_deref(), Some("intent/fix-it"));
         assert_eq!(agent.intent_id, Some(intent_id));
         assert_eq!(fx.agent(agent.id).await, agent);
         assert_eq!(
@@ -1032,7 +1046,7 @@ mod tests {
         // So the same branch is free for the next try.
         fx.store.refuse_new_agents(false).await;
         let agent = fx.svc.create_agent_with(fx.repo.id, opts()).await.unwrap();
-        assert_eq!(agent.branch, "intent/unsaved");
+        assert_eq!(agent.branch.as_deref(), Some("intent/unsaved"));
         assert_eq!(branches(&fx), ["intent/unsaved", "main"]);
     }
 
@@ -1110,8 +1124,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(first.branch, "intent/same");
-        assert_eq!(second.branch, "intent/same");
+        assert_eq!(first.branch.as_deref(), Some("intent/same"));
+        assert_eq!(second.branch.as_deref(), Some("intent/same"));
         assert_ne!(first.worktree_path, second.worktree_path);
         for (agent, repo_dir) in [(&first, &fx.repo_dir), (&second, &other_dir)] {
             assert_eq!(
@@ -1153,7 +1167,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(agent.branch, "intent/y");
+        assert_eq!(agent.branch.as_deref(), Some("intent/y"));
         assert!(agent.worktree_path.join("docs/issues/x/issue.md").is_file());
         // Succeeds only when the base is an ancestor of the agent's branch.
         git(
@@ -1173,7 +1187,13 @@ mod tests {
         // Without a base the agent starts from the default branch.
         let plain = fx.svc.create_agent(fx.repo.id).await.unwrap();
         assert!(!plain.worktree_path.join("docs/issues/x").exists());
-        assert_eq!(git(&fx.repo_dir, &["rev-parse", &plain.branch]), main_tip);
+        assert_eq!(
+            git(
+                &fx.repo_dir,
+                &["rev-parse", plain.branch.as_deref().unwrap()]
+            ),
+            main_tip
+        );
     }
 
     #[tokio::test]
@@ -1776,7 +1796,7 @@ mod tests {
     #[tokio::test]
     async fn add_repo_validates_and_records_root() {
         let fx = fixture(vec![]).await;
-        assert_eq!(fx.repo.default_branch, "main");
+        assert_eq!(fx.repo.default_branch(), Some("main"));
         assert_eq!(
             std::fs::canonicalize(&fx.repo.path).unwrap(),
             std::fs::canonicalize(&fx.repo_dir).unwrap()

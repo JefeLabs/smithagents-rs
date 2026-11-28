@@ -22,7 +22,7 @@ use smithagents_app::shell_state::ShellState;
 use smithagents_app::views::settings::{
     repo_meta_tag_id, repo_use_meta_id, META_TAG, REPO_META_ERROR_ID,
 };
-use smithagents_core::agent::Repo;
+use smithagents_core::agent::{Repo, SourceControl};
 use smithagents_core::feedback::FeedbackSettings;
 use smithagents_core::ids::RepoId;
 
@@ -39,7 +39,9 @@ fn repo(path: &str) -> Repo {
     Repo {
         id: RepoId::new(),
         path: path.into(),
-        default_branch: "main".into(),
+        source_control: Some(SourceControl::Git {
+            default_branch: "main".into(),
+        }),
         created_at: at,
     }
 }
