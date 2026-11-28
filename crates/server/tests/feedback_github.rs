@@ -1019,6 +1019,57 @@ async fn a_recorded_submission_whose_repository_git_cannot_read_says_so_in_its_s
     assert_eq!(again["issue_url"], ISSUE_URL);
 }
 
+#[tokio::test]
+async fn a_repository_that_loses_source_control_after_the_commit_is_not_pushed() {
+    // Source control is turned off once the commit is recorded, before the
+    // push.
+    let fx = fixture().await;
+    let (repo, bare) = fx.github_repo("r1").await;
+    let state = fx.state.clone();
+    let repo_id = repo.id;
+    fx.state
+        .feedback
+        .after_the_commit_for_test(Arc::new(move || {
+            let state = state.clone();
+            Box::pin(async move {
+                let req = Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/v1/repos/{repo_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::from(json!({"source_control": "none"}).to_string()))
+                    .unwrap();
+                let resp = router(state).oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            })
+        }));
+    let req = issue_request(&repo);
+    let sentence = "Feedback needs a repository with source control.";
+
+    let (status, out) = fx.submit_shot(&req).await;
+
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["failed"],
+        json!({"step": "push", "code": "needs_source_control", "message": sentence})
+    );
+    assert_eq!(out["pushed"], false);
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "", "nothing pushed");
+    assert!(fx.calls_starting("issue create").is_empty());
+    // A retry is refused before anything runs.
+    let (status, again) = fx.retry(&req["submission_id"]).await;
+    assert_eq!(
+        (status, again["error"].as_str(), again["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("needs_source_control"),
+            Some(sentence)
+        ),
+        "{again}"
+    );
+    assert_eq!(git_out(&bare, &["for-each-ref"]), "", "nothing pushed");
+}
+
 /// A `pre-receive` hook in `bare` that refuses every push; its path.
 fn refuse_pushes(bare: &Path) -> PathBuf {
     let hook = bare.join("hooks/pre-receive");

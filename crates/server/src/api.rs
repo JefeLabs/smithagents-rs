@@ -665,10 +665,19 @@ async fn set_source_control(
     let id: RepoId = path_id(&id, "repo")?;
     let SetSourceControlBody { source_control } = json_body(&body)?;
     let on = matches!(source_control, SwitchTo::Git);
-    let svc = s.service;
-    detached(async move { svc.set_source_control(id, on).await })
-        .await
-        .map(Json)
+    let (svc, feedback) = (s.service, s.feedback);
+    detached(async move {
+        let repo = svc.set_source_control(id, on).await?;
+        // A plain folder is never the META repository: the choice is
+        // cleared before the answer. Also when it was off already, so a
+        // request repeated after a failure here clears it.
+        if !on {
+            feedback.clear_plain_meta_repo().await?;
+        }
+        Ok::<_, ApiError>(repo)
+    })
+    .await
+    .map(Json)
 }
 
 async fn list_repos(State(s): State<AppState>) -> Result<Json<Vec<Repo>>, ApiError> {
@@ -1509,6 +1518,7 @@ mod tests {
             FeedbackError::IdeaBlocked(_) => "IdeaBlocked",
             FeedbackError::PublicNotAcknowledged(_) => "PublicNotAcknowledged",
             FeedbackError::OriginUnreadable => "OriginUnreadable",
+            FeedbackError::NeedsSourceControl => "NeedsSourceControl",
         }
     }
 
@@ -1635,12 +1645,6 @@ mod tests {
                 &ServiceError::TurnInProgress.to_string(),
             ),
             (
-                FeedbackError::needs_source_control(),
-                S::CONFLICT,
-                "needs_source_control",
-                "this repository has no source control",
-            ),
-            (
                 FeedbackError::NotAnIdea,
                 S::CONFLICT,
                 "not_an_idea",
@@ -1693,10 +1697,16 @@ mod tests {
                 "origin_unreadable",
                 "git could not read this repository's settings. Check that its folder is still a git repository.",
             ),
+            (
+                FeedbackError::NeedsSourceControl,
+                S::CONFLICT,
+                "needs_source_control",
+                "Feedback needs a repository with source control.",
+            ),
         ];
         let covered: std::collections::BTreeSet<&str> =
             cases.iter().map(|(e, ..)| feedback_variant(e)).collect();
-        assert_eq!(covered.len(), 26, "{covered:?}");
+        assert_eq!(covered.len(), 27, "{covered:?}");
 
         for (e, status, code, message) in cases {
             assert_eq!((e.status(), e.code()), (status, code), "{message}");

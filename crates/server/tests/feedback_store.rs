@@ -1,4 +1,5 @@
-//! Migration 0004 and the feedback columns and table in the store.
+//! Migrations 0004 and 0005 (a repository's source control), and the
+//! feedback columns and table in the store.
 
 use chrono::{DateTime, Utc};
 use smithagents_core::agent::{Repo, SourceControl};

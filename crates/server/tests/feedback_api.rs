@@ -239,6 +239,39 @@ impl Fx {
         serde_json::from_value(body).unwrap()
     }
 
+    /// The folder `name` (made when it does not exist), added to the daemon
+    /// with no source control.
+    async fn add_plain(&self, name: &str) -> Repo {
+        let dir = self.tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (status, body) = self
+            .call(Method::POST, "/v1/repos", Some(json!({ "path": dir })))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let repo: Repo = serde_json::from_value(body).unwrap();
+        assert!(repo.is_plain(), "{repo:?}");
+        repo
+    }
+
+    /// `PATCH /v1/repos/{id}`: turns source control on (`git`) or off
+    /// (`none`).
+    async fn switch(&self, repo: &Repo, to: &str) {
+        let (status, body) = self
+            .call(
+                Method::PATCH,
+                &format!("/v1/repos/{}", repo.id),
+                Some(json!({ "source_control": to })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{to}: {body}");
+    }
+
+    async fn meta_repo_id(&self) -> Value {
+        let (status, body) = self.call(Method::GET, "/v1/feedback/targets", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["meta_repo_id"].clone()
+    }
+
     fn feedback_tmp_is_empty(&self) -> bool {
         match std::fs::read_dir(self.paths.feedback_tmp_dir()) {
             Ok(mut entries) => entries.next().is_none(),
@@ -1918,4 +1951,235 @@ async fn an_intent_made_but_not_recorded_is_taken_up_not_made_again() {
     assert_eq!(fx.intents().await.len(), 1);
     let row = fx.state.store.get_submission(sid).await.unwrap().unwrap();
     assert_eq!(json!(row.intent_id), made, "recorded now");
+}
+
+// ------------------------------------------ repositories without source control
+
+/// The refusal of anything Feedback is asked to do with a plain folder.
+const NEEDS_SOURCE_CONTROL: &str = "Feedback needs a repository with source control.";
+
+/// Every path under `root`, relative to it, sorted.
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            found.push(path.strip_prefix(root).unwrap().to_path_buf());
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                todo.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[tokio::test]
+async fn plain_repositories_are_not_feedback_targets() {
+    let fx = fixture().await;
+    // A git repository with a GitHub remote, added as a plain folder: nothing
+    // is read of it, and gh is not asked about it.
+    let dir = fx.tmp.path().join("plain");
+    common::init_repo(&dir);
+    common::git(&dir, &["remote", "add", "origin", GITHUB_URL]);
+    fx.add_plain("plain").await;
+    let git = fx.add_repo("git").await;
+
+    let (status, body) = fx.call(Method::GET, "/v1/feedback/targets", None).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["repos"],
+        json!([{"repo_id": git.id, "has_github_remote": false, "is_public": null}])
+    );
+    // The only repository with source control is the meta repository.
+    assert_eq!(body["meta_repo_id"], json!(git.id));
+    assert_eq!(fx.fake.calls(), ["auth status --hostname=github.com"]);
+
+    // With only the plain repository there is no target and no meta
+    // repository.
+    let fx = fixture().await;
+    fx.add_plain("plain").await;
+    let (status, body) = fx.call(Method::GET, "/v1/feedback/targets", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["repos"], json!([]));
+    assert_eq!(body["meta_repo_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_submission_to_a_plain_repository_is_refused_before_anything_is_written() {
+    let fx = fixture().await;
+    let plain = fx.add_plain("plain").await;
+    std::fs::write(plain.path.join("notes.txt"), "the user's own file\n").unwrap();
+    let before = files_under(&plain.path);
+    let shot = png(300);
+
+    for send_as in ["intent", "idea", "github_issue"] {
+        let mut req = request_json(plain.id, send_as);
+        if send_as == "idea" {
+            req["send_as"] = json!("intent");
+            req["idea"] = json!({"explainer": true, "diagrams": false, "demo_video": false});
+        }
+        req["public_acknowledged"] = json!(true);
+        req["attachments"] = json!([image("a.png")]);
+
+        let (status, body) = fx.submit(&req, &[("file-1", &shot)]).await;
+
+        assert_eq!(
+            (status, body["error"].as_str(), body["message"].as_str()),
+            (
+                StatusCode::CONFLICT,
+                Some("needs_source_control"),
+                Some(NEEDS_SOURCE_CONTROL)
+            ),
+            "{send_as}: {body}"
+        );
+        let id: SubmissionId = serde_json::from_value(req["submission_id"].clone()).unwrap();
+        assert_eq!(
+            fx.state.store.get_submission(id).await.unwrap(),
+            None,
+            "{send_as}: nothing recorded"
+        );
+    }
+    // Nothing was written into the folder, nothing is left behind, and gh
+    // never ran.
+    assert_eq!(files_under(&plain.path), before);
+    assert_eq!(
+        std::fs::read_to_string(plain.path.join("notes.txt")).unwrap(),
+        "the user's own file\n"
+    );
+    assert!(fx.feedback_tmp_is_empty());
+    assert!(fx.intents().await.is_empty());
+    assert!(fx.fake.calls().is_empty(), "{:?}", fx.fake.calls());
+}
+
+#[tokio::test]
+async fn the_meta_repository_cannot_be_a_plain_folder() {
+    let fx = fixture().await;
+    let a = fx.add_repo("a").await;
+    let b = fx.add_repo("b").await;
+    let p = fx.add_plain("p").await;
+    let chose_a = json!({ "meta_repo_id": a.id });
+    let (status, body) = fx
+        .call(Method::PUT, "/v1/settings/feedback", Some(chose_a.clone()))
+        .await;
+    assert_eq!((status, &body), (StatusCode::OK, &chose_a));
+
+    // The plain folder is refused, and the stored choice stays.
+    let (status, body) = fx
+        .call(
+            Method::PUT,
+            "/v1/settings/feedback",
+            Some(json!({ "meta_repo_id": p.id })),
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].as_str(), body["message"].as_str()),
+        (
+            StatusCode::CONFLICT,
+            Some("needs_source_control"),
+            Some(NEEDS_SOURCE_CONTROL)
+        ),
+        "{body}"
+    );
+    let (_, body) = fx.call(Method::GET, "/v1/settings/feedback", None).await;
+    assert_eq!(body, chose_a);
+    assert_eq!(fx.meta_repo_id().await, json!(a.id));
+
+    // A loses its source control: it is no longer the meta repository (B,
+    // the only repository with source control left, is), and the stored
+    // choice is gone, not only ignored.
+    fx.switch(&a, "none").await;
+    assert_eq!(fx.meta_repo_id().await, json!(b.id));
+    let (_, body) = fx.call(Method::GET, "/v1/settings/feedback", None).await;
+    assert_eq!(body, json!({ "meta_repo_id": null }));
+    let stored: Option<smithagents_core::feedback::FeedbackSettings> =
+        fx.state.store.get_setting("feedback").await.unwrap();
+    assert_eq!(stored.and_then(|s| s.meta_repo_id), None);
+
+    // A has it again: two repositories with source control, none chosen.
+    fx.switch(&a, "git").await;
+    assert_eq!(fx.meta_repo_id().await, Value::Null);
+
+    // With B turned off too, A is the only one, so it is the meta repository.
+    fx.switch(&b, "none").await;
+    assert_eq!(fx.meta_repo_id().await, json!(a.id));
+}
+
+#[tokio::test]
+async fn a_recorded_submission_whose_repository_lost_source_control_is_refused() {
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    let req = request_json(repo.id, "intent");
+    fx.state
+        .feedback
+        .fail_next_intent_for_test(IntentError::Invalid("boom".into()));
+    let (status, out) = fx.submit(&req, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["failed"]["step"], "create_intent", "{out}");
+    // No intent was made, so nothing keeps source control on.
+    fx.switch(&repo, "none").await;
+    let sid = req["submission_id"].as_str().unwrap();
+
+    let (status, retried) = fx
+        .call(Method::POST, &format!("/v1/feedback/{sid}/retry"), None)
+        .await;
+    let (again, resent) = fx.submit(&req, &[]).await;
+
+    for (status, body) in [(status, retried), (again, resent)] {
+        assert_eq!(
+            (status, body["error"].as_str(), body["message"].as_str()),
+            (
+                StatusCode::CONFLICT,
+                Some("needs_source_control"),
+                Some(NEEDS_SOURCE_CONTROL)
+            ),
+            "{body}"
+        );
+    }
+    assert!(fx.intents().await.is_empty());
+    assert!(fx.fake.calls().is_empty(), "{:?}", fx.fake.calls());
+}
+
+#[tokio::test]
+async fn a_repository_that_loses_source_control_while_feedback_commits_gets_no_intent() {
+    // Source control is turned off after the commit, right before the intent
+    // would be made.
+    let fx = fixture().await;
+    let repo = fx.add_repo("r1").await;
+    let state = fx.state.clone();
+    let repo_id = repo.id;
+    fx.state
+        .feedback
+        .after_the_commit_for_test(Arc::new(move || {
+            let state = state.clone();
+            Box::pin(async move {
+                let req = Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/v1/repos/{repo_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::from(json!({"source_control": "none"}).to_string()))
+                    .unwrap();
+                let resp = router(state).oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            })
+        }));
+    let req = request_json(repo.id, "intent");
+
+    let (status, out) = fx.submit(&req, &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["intent"], Value::Null);
+    assert_eq!(
+        out["failed"],
+        json!({"step": "create_intent", "code": "needs_source_control", "message": NEEDS_SOURCE_CONTROL})
+    );
+    // What was committed stays on its branch; no intent names it.
+    let commit = git_out(&repo.path, &["rev-parse", &format!("refs/heads/{BRANCH}")]);
+    assert_eq!(out["commit"], commit);
+    assert!(fx.intents().await.is_empty());
+    let repo = fx.state.store.get_repo(repo.id).await.unwrap().unwrap();
+    assert!(repo.is_plain());
 }

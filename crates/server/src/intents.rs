@@ -166,7 +166,6 @@ impl From<ServiceError> for IntentError {
         match e {
             ServiceError::RepoNotFound => IntentError::RepoNotFound,
             ServiceError::AgentNotFound => IntentError::AgentNotFound,
-            ServiceError::NeedsSourceControl => IntentError::NeedsSourceControl,
             ServiceError::Store(s) => IntentError::Store(s),
             other => IntentError::Service(other),
         }

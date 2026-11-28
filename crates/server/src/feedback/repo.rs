@@ -138,9 +138,10 @@ pub async fn place_and_commit(
 /// `Feedback-Id: <id>` (so [`find_committed`] finds it again), removes the
 /// worktree, and returns the commit's id.
 ///
-/// `NameTaken` when the branch or the folder appeared since `place` chose
-/// them (see [`place_and_commit`]). On every failure the worktree is removed
-/// and no branch is created; `Staged` files stay where they were.
+/// A plain folder is `NeedsSourceControl`, before any git runs. `NameTaken`
+/// when the branch or the folder appeared since `place` chose them (see
+/// [`place_and_commit`]). On every failure the worktree is removed and no
+/// branch is created; `Staged` files stay where they were.
 ///
 /// When the future is dropped, the git command running is killed with its
 /// process group and `Drop` removes the worktree's directory, its
@@ -167,6 +168,8 @@ pub async fn commit_folder(
     scratch: &Path,
 ) -> Result<String, FeedbackError> {
     let root = repo.path.as_path();
+    // No git runs for a plain folder.
+    default_branch(repo)?;
     check_names(placement, files)?;
     check_branch(root, &placement.branch).await?;
     require_default_branch(repo).await?;
@@ -200,8 +203,9 @@ async fn commit_in_worktree(
 ) -> Result<String, FeedbackError> {
     let root = repo.path.as_path();
     let dir = worktree.dir.as_path();
-    remove_leftovers(root, dir).await?;
+    // Before any git runs.
     let default_branch = default_branch(repo)?;
+    remove_leftovers(root, dir).await?;
     let base = git::rev_parse(root, &format!("refs/heads/{default_branch}"))
         .await
         .map_err(git_failed(WORKTREE_STEP))?
@@ -537,10 +541,11 @@ fn push_failure(error: PushError) -> FeedbackFailure {
     }
 }
 
-/// The repository's default branch; a plain folder has none.
+/// The repository's default branch; a plain folder has none
+/// (`NeedsSourceControl`). Asked before any git runs.
 fn default_branch(repo: &Repo) -> Result<&str, FeedbackError> {
     repo.default_branch()
-        .ok_or_else(FeedbackError::needs_source_control)
+        .ok_or(FeedbackError::NeedsSourceControl)
 }
 
 /// The repository's default branch; `DefaultBranchMissing` unless it exists

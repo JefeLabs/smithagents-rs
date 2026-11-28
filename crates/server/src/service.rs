@@ -370,9 +370,10 @@ impl AgentService {
     /// folder would then overlap another repository or the daemon's home, as
     /// a plain folder may not, and while an intent Feedback made for it is
     /// not Resolved (`FeedbackIntentsOpen`): such an intent starts from a
-    /// branch. Turning it off for the META repository is allowed, and nothing
-    /// else changes: a stored META choice that names a plain repository
-    /// counts as none. The worktrees and branches of closed agents stay.
+    /// branch. Turning it off for the META repository is allowed: the route
+    /// then has the feedback service clear that choice
+    /// ([`crate::feedback::FeedbackService::clear_plain_meta_repo`]). The
+    /// worktrees and branches of closed agents stay.
     pub async fn set_source_control(&self, id: RepoId, on: bool) -> Result<Repo, ServiceError> {
         let _serialized = self.inner.repos_lock.lock().await;
         // No agent can be made between the check below and the change.
@@ -420,6 +421,15 @@ impl AgentService {
             source_control,
             ..repo
         })
+    }
+
+    /// Waits until no repository is being added or switched, and keeps it
+    /// so while the guard lives: what a caller finds of a repository's
+    /// source control under it stays true until the guard is dropped. The
+    /// feedback service holds it while it checks a repository and makes an
+    /// intent with an origin there, or stores the META choice.
+    pub async fn hold_repos(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.repos_lock.lock().await
     }
 
     /// Refuses a repository at `path` (`plain`: with no source control) that

@@ -770,6 +770,38 @@ async fn the_users_checkout_is_untouched() {
 }
 
 #[tokio::test]
+async fn a_plain_folder_is_refused_before_git_runs() {
+    // A repository with no source control, at a folder git cannot run in: a
+    // git that ran first would answer something else.
+    let fx = Fixture::new();
+    let plain = Repo {
+        path: fx.tmp.path().join("no-such-folder"),
+        source_control: None,
+        ..fx.repo.clone()
+    };
+    let placement = Placement {
+        slug: "fix-the-zoom".into(),
+        folder: FOLDER.into(),
+        branch: BRANCH.into(),
+    };
+    let scratch = fx.scratch("s");
+    let files = fx.files(&scratch);
+
+    let placed = place(&plain, "Fix the zoom", date(), false).await;
+    let committed = commit_folder(&plain, &placement, &files, "Fix the zoom", id(), &scratch).await;
+
+    for err in [placed.map(drop), committed.map(drop)] {
+        assert!(
+            matches!(err, Err(FeedbackError::NeedsSourceControl)),
+            "{err:?}"
+        );
+    }
+    // The upload is where it was, and no worktree was made.
+    assert!(scratch.join("upload").join("file-1").is_file());
+    assert!(!scratch.join("wt").exists());
+}
+
+#[tokio::test]
 async fn a_name_starting_with_a_dash_is_refused_before_git_runs() {
     let fx = Fixture::new();
     let good = Placement {

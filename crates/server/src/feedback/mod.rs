@@ -38,7 +38,7 @@ use crate::intents::{CreateExtras, IntentError, IntentService};
 use crate::paths::{ensure_private_real_dir, Paths};
 use crate::plugins::{clean_message, PluginManager};
 use crate::polish::MAX_SEED_BYTES;
-use crate::service::{AgentService, ServiceError};
+use crate::service::AgentService;
 use crate::store::{Store, StoreError, Submission};
 
 /// Settings key of [`FeedbackSettings`].
@@ -188,6 +188,13 @@ pub enum FeedbackError {
     /// a recorded submission gets it as a failed step instead.
     #[error("git could not read this repository's settings. Check that its folder is still a git repository.")]
     OriginUnreadable,
+    /// The repository is a plain folder: Feedback works by committing
+    /// files, so it is never a target or the META repository. A refusal
+    /// before anything runs, is read of the folder or is written; a
+    /// recorded submission gets it as a failed step instead when the
+    /// repository loses its source control after the commit.
+    #[error("Feedback needs a repository with source control.")]
+    NeedsSourceControl,
 }
 
 /// Why a GitHub issue or pull request was refused for a public repository.
@@ -201,12 +208,6 @@ impl FeedbackError {
     /// system's error as its source: `.map_err(FeedbackError::io(WHAT))`.
     pub(crate) fn io(what: &'static str) -> impl Fn(std::io::Error) -> Self {
         move |source| Self::Io { what, source }
-    }
-
-    /// The repository is a plain folder, with no branch to commit on: the
-    /// agent service's refusal, with its code and status.
-    pub(crate) fn needs_source_control() -> Self {
-        Self::Intent(IntentError::Service(ServiceError::NeedsSourceControl))
     }
 
     pub fn code(&self) -> &str {
@@ -237,6 +238,7 @@ impl FeedbackError {
             Self::IdeaBlocked(blocked) => blocked.code(),
             Self::PublicNotAcknowledged(_) => "public_not_acknowledged",
             Self::OriginUnreadable => "origin_unreadable",
+            Self::NeedsSourceControl => "needs_source_control",
         }
     }
 
@@ -258,7 +260,8 @@ impl FeedbackError {
             | Self::Unpublished(_)
             | Self::IdeaBlocked(_)
             | Self::PublicNotAcknowledged(_)
-            | Self::OriginUnreadable => StatusCode::CONFLICT,
+            | Self::OriginUnreadable
+            | Self::NeedsSourceControl => StatusCode::CONFLICT,
             Self::Invalid(_) | Self::UnsupportedFile(_) => StatusCode::BAD_REQUEST,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Store(_) | Self::Git { .. } | Self::Io { .. } => {
@@ -394,6 +397,8 @@ struct Faults {
     idea_saves_failed: u32,
     /// Runs after an idea action read its agent's branch.
     after_head: Option<HeadHook>,
+    /// Runs once, when a submission's steps after its commit begin.
+    after_commit: Option<HeadHook>,
 }
 
 /// A test hook an idea action awaits right after reading its agent's branch.
@@ -539,6 +544,22 @@ impl FeedbackService {
         }
     }
 
+    /// Test hook: the next submission awaits `hook` once its commit is
+    /// recorded, before the steps after it (the intent, or the push and the
+    /// issue); once.
+    #[cfg(feature = "test-util")]
+    pub fn after_the_commit_for_test(&self, hook: HeadHook) {
+        self.faults().after_commit = Some(hook);
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn after_the_commit(&self) {
+        let hook = self.faults().after_commit.take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     #[cfg(feature = "test-util")]
     fn faults(&self) -> MutexGuard<'_, Faults> {
         locked(&self.parts.faults)
@@ -582,46 +603,87 @@ impl FeedbackService {
         self.parts.paths.feedback_tmp_dir()
     }
 
-    /// The stored setting; an id whose repository is gone reads as `None`.
+    /// The stored setting; an id whose repository is gone, or has no source
+    /// control, reads as `None`.
     pub async fn settings(&self) -> Result<FeedbackSettings, FeedbackError> {
         let stored: Option<FeedbackSettings> = self.store.get_setting(FEEDBACK_KEY).await?;
         let mut settings = stored.unwrap_or_default();
         if let Some(id) = settings.meta_repo_id {
-            if self.store.get_repo(id).await?.is_none() {
+            let usable = self
+                .store
+                .get_repo(id)
+                .await?
+                .is_some_and(|repo| !repo.is_plain());
+            if !usable {
                 settings.meta_repo_id = None;
             }
         }
         Ok(settings)
     }
 
-    /// Stores the setting. A repository id that does not exist is refused and
-    /// the stored value stays. Returns what was stored.
+    /// Stores the setting. A repository id that does not exist
+    /// (`RepoNotFound`), or names a plain folder (`NeedsSourceControl`), is
+    /// refused and the stored value stays. Returns what was stored. Checked
+    /// and stored while no repository can be switched
+    /// ([`AgentService::hold_repos`]), so the choice never names a
+    /// repository that lost its source control meanwhile.
     pub async fn set_settings(
         &self,
         settings: FeedbackSettings,
     ) -> Result<FeedbackSettings, FeedbackError> {
+        let _repos = self.parts.agents.hold_repos().await;
         if let Some(id) = settings.meta_repo_id {
-            self.require_repo(id).await?;
+            let repo = self
+                .store
+                .get_repo(id)
+                .await?
+                .ok_or(FeedbackError::RepoNotFound)?;
+            require_source_control(&repo)?;
         }
         self.store.set_setting(FEEDBACK_KEY, &settings).await?;
         Ok(settings)
     }
 
-    async fn require_repo(&self, id: RepoId) -> Result<(), FeedbackError> {
+    /// Clears the stored META choice when the repository it names has no
+    /// source control: `PATCH /v1/repos/{id}` calls it once it turned a
+    /// repository's source control off, in the same request. Under
+    /// [`AgentService::hold_repos`], so a choice made after the repository
+    /// had its source control turned on again is kept.
+    pub async fn clear_plain_meta_repo(&self) -> Result<(), FeedbackError> {
+        let _repos = self.parts.agents.hold_repos().await;
+        let stored: Option<FeedbackSettings> = self.store.get_setting(FEEDBACK_KEY).await?;
+        let Some(mut settings) = stored else {
+            return Ok(());
+        };
+        let Some(id) = settings.meta_repo_id else {
+            return Ok(());
+        };
+        if self.store.get_repo(id).await?.is_some_and(|r| r.is_plain()) {
+            settings.meta_repo_id = None;
+            self.store.set_setting(FEEDBACK_KEY, &settings).await?;
+        }
+        Ok(())
+    }
+
+    /// `NeedsSourceControl` when repository `id` is a plain folder. A
+    /// repository that is gone passes: the caller answers that its own way.
+    async fn refuse_plain(&self, id: RepoId) -> Result<(), FeedbackError> {
         match self.store.get_repo(id).await? {
-            Some(_) => Ok(()),
-            None => Err(FeedbackError::RepoNotFound),
+            Some(repo) => require_source_control(&repo),
+            None => Ok(()),
         }
     }
 
-    /// One target per repository (in the store's order), the meta
-    /// repository, and whether `gh` (signed in) and `agent-browser` are
-    /// ready. The configured `origin` is only read, and no URL is returned.
-    /// While `gh` is ready, it is asked whether each repository with a
-    /// GitHub remote is public, all at once; an answer is used again for 10
-    /// minutes.
+    /// One target per repository with source control (in the store's
+    /// order), the meta repository, and whether `gh` (signed in) and
+    /// `agent-browser` are ready. A plain folder is no target, and nothing
+    /// is read of it. The configured `origin` is only read, and no URL is
+    /// returned. While `gh` is ready, it is asked whether each repository
+    /// with a GitHub remote is public, all at once; an answer is used again
+    /// for 10 minutes.
     pub async fn targets(&self) -> Result<FeedbackTargets, FeedbackError> {
-        let repos = self.store.list_repos().await?;
+        let mut repos = self.store.list_repos().await?;
+        repos.retain(|repo| !repo.is_plain());
         let gh = self.gh();
         let ready = gh_readiness(&gh).await;
         let targets =
@@ -737,7 +799,9 @@ impl FeedbackService {
     /// used): only a step that has not succeeded runs again. So is one whose
     /// commit is on a branch without its record (the daemon stopped in
     /// between): that commit is recorded, not made again. A record that
-    /// cannot be stored takes its new branch back. Before anything is
+    /// cannot be stored takes its new branch back. A submission (new or
+    /// recorded) whose repository is a plain folder is refused first
+    /// (`NeedsSourceControl`), before git or `gh` runs. Before anything is
     /// written or taken up, a new submission is checked for what it
     /// publishes ([`Self::check_publication`]): an issue is refused when
     /// `origin` is not on github.com or `gh` is not ready. A failure of a
@@ -747,9 +811,14 @@ impl FeedbackService {
         let _running = Running::start(&self.parts.running);
         let id = staged.request.submission_id;
         let _own = self.parts.ids.lock(id).await;
+        let recorded = self.store.get_submission(id).await?;
+        let repo_id = recorded
+            .as_ref()
+            .map_or(staged.request.repo_id, |s| s.repo_id);
+        self.refuse_plain(repo_id).await?;
         // Before the turn, since `gh` can take seconds. A recorded
-        // submission is continued, never refused.
-        let recorded = self.store.get_submission(id).await?.is_some();
+        // submission is otherwise continued, never refused.
+        let recorded = recorded.is_some();
         let precheck = if recorded {
             None
         } else {
@@ -765,7 +834,9 @@ impl FeedbackService {
 
     /// Runs the steps of the recorded submission `id` that have not
     /// succeeded: the intent, or the push and then the issue. A complete
-    /// submission is answered as it is; nothing is committed again.
+    /// submission is answered as it is; nothing is committed again. One
+    /// whose repository has become a plain folder is refused
+    /// (`NeedsSourceControl`) before anything runs.
     pub async fn retry(&self, id: SubmissionId) -> Result<FeedbackOutcome, FeedbackError> {
         let _running = Running::start(&self.parts.running);
         let _own = self.parts.ids.lock(id).await;
@@ -774,6 +845,7 @@ impl FeedbackService {
             .get_submission(id)
             .await?
             .ok_or(FeedbackError::SubmissionNotFound)?;
+        self.refuse_plain(recorded.repo_id).await?;
         tracing::info!(submission_id = %id, "retrying a feedback submission");
         self.finish(recorded, false).await
     }
@@ -799,6 +871,8 @@ impl FeedbackService {
             .get_repo(request.repo_id)
             .await?
             .ok_or(FeedbackError::RepoNotFound)?;
+        // It may have lost its source control since `submit` asked.
+        require_source_control(&repo)?;
         let precheck = match precheck {
             Some(precheck) => precheck,
             None => self.precheck(request).await?,
@@ -1053,6 +1127,8 @@ impl FeedbackService {
         mut s: Submission,
         gh_checked: bool,
     ) -> Result<FeedbackOutcome, FeedbackError> {
+        #[cfg(feature = "test-util")]
+        self.after_the_commit().await;
         let mut failed = None;
         let intent = match (s.request.send_as, s.intent_id) {
             (SendAs::Intent, Some(intent_id)) => Some(
@@ -1075,7 +1151,7 @@ impl FeedbackService {
                     Some(intent)
                 }
                 Err(e) => {
-                    let code = e.status_and_code().1;
+                    let code = e.code();
                     tracing::warn!(submission_id = %s.id, step = "create_intent", code, "the feedback intent was not created");
                     failed = Some(FeedbackFailure {
                         step: FeedbackStep::CreateIntent,
@@ -1107,7 +1183,7 @@ impl FeedbackService {
     /// saved (the daemon stopped, or both saves failed), found by its origin
     /// (this submission's folder, branch and commit, which only it has),
     /// else a new one ([`Self::create_intent`]).
-    async fn intent_for(&self, s: &Submission) -> Result<Intent, IntentError> {
+    async fn intent_for(&self, s: &Submission) -> Result<Intent, FeedbackError> {
         let filter = smithagents_core::intent::IntentFilter {
             state: None,
             repo_id: Some(s.repo_id),
@@ -1115,8 +1191,7 @@ impl FeedbackService {
         let made = self
             .store
             .list_intents(filter)
-            .await
-            .map_err(IntentError::Store)?
+            .await?
             .into_iter()
             .find(|i| {
                 i.origin.as_ref().is_some_and(|o| {
@@ -1133,11 +1208,12 @@ impl FeedbackService {
     /// An intent of the submission's kind, seeded from its text and the
     /// folder's whereabouts, starting from its branch. For an idea package,
     /// an idea intent: its origin records the parts asked for, and its
-    /// criteria are fixed ([`idea::fixed_criteria`]).
-    async fn create_intent(&self, s: &Submission) -> Result<Intent, IntentError> {
+    /// criteria are fixed ([`idea::fixed_criteria`]). Made only while its
+    /// repository has source control ([`Self::create_feedback_intent`]).
+    async fn create_intent(&self, s: &Submission) -> Result<Intent, FeedbackError> {
         #[cfg(feature = "test-util")]
         if let Some(e) = self.faults().intent.take() {
-            return Err(e);
+            return Err(FeedbackError::Intent(e));
         }
         let request = &s.request;
         let input = IssueInput {
@@ -1171,7 +1247,30 @@ impl FeedbackService {
             fixed_criteria: request.idea.map(idea::fixed_criteria).unwrap_or_default(),
             fixed_dependency: None,
         };
-        self.parts.intents.create_with(req, extras).await
+        self.create_feedback_intent(req, extras).await
+    }
+
+    /// Creates an intent with an origin (a Feedback intent: it starts from a
+    /// branch) in the request's repository, unless that repository is a
+    /// plain folder (`NeedsSourceControl`). The check and the insert are
+    /// made under [`AgentService::hold_repos`], the lock source control is
+    /// switched under: either the intent exists before the repository is
+    /// switched, which then refuses (`repo_has_feedback_intents`), or the
+    /// switch came first and no intent is made.
+    async fn create_feedback_intent(
+        &self,
+        req: CreateIntentRequest,
+        extras: CreateExtras,
+    ) -> Result<Intent, FeedbackError> {
+        let _repos = self.parts.agents.hold_repos().await;
+        if let Some(repo_id) = req.repo_id {
+            self.refuse_plain(repo_id).await?;
+        }
+        self.parts
+            .intents
+            .create_with(req, extras)
+            .await
+            .map_err(FeedbackError::Intent)
     }
 
     /// For an issue: `git push origin <branch>:<branch>`, then the issue,
@@ -1210,6 +1309,10 @@ impl FeedbackService {
         } else {
             FeedbackStep::Push
         };
+        // It lost its source control after the commit: no git runs.
+        if let Err(e) = require_source_control(&repo) {
+            return Ok(Some(step_failure(step, &e)));
+        }
         let github = match self.github_of(&repo).await {
             Ok(Some(github)) => github,
             Ok(None) => return Ok(Some(step_failure(step, &FeedbackError::NoGithubRemote))),
@@ -1366,6 +1469,16 @@ fn recent<K: Eq + std::hash::Hash>(
     let mut map = locked(map);
     map.retain(|_, at| now - *at < wait);
     map.contains_key(&id)
+}
+
+/// `NeedsSourceControl` for a plain folder: Feedback commits files, so it
+/// never uses one.
+fn require_source_control(repo: &Repo) -> Result<(), FeedbackError> {
+    if repo.is_plain() {
+        Err(FeedbackError::NeedsSourceControl)
+    } else {
+        Ok(())
+    }
 }
 
 /// A refusal at `step` after the commit, as a failure.
