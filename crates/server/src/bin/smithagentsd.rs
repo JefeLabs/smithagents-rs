@@ -140,7 +140,9 @@ fn main() -> ExitCode {
         }
     };
     init_logging();
-    // Before anything runs git.
+    // Before anything runs git. Nothing does at start: where git is not
+    // installed, running it can open the system's dialog offering to
+    // install it, and a Workspace of plain folders needs none.
     git::set_program(opts.git_bin.clone());
 
     let paths = match resolve_paths(opts.home.clone()) {
@@ -193,11 +195,6 @@ async fn run(paths: &Paths, opts: Options) -> Result<(), Box<dyn Error>> {
     // Registered before the lockfile exists, so a signal cannot leave it behind.
     let signal = shutdown_signal()?;
     paths.ensure_dirs()?;
-    // Kept for `GET /v1/health`. Without git the daemon still runs:
-    // repositories with no source control need none.
-    if !git::is_installed().await {
-        tracing::warn!("git could not be started: only repositories without source control can be added and used");
-    }
     let store = Store::open(&paths.db_path()).await?;
     // Turns recorded as running belonged to a previous process and died with it.
     let stale = store.mark_stale_running_agents_dead().await?;

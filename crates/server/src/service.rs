@@ -10,7 +10,7 @@ use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -269,41 +269,44 @@ impl AgentService {
 
     /// Registers the folder at `path` as a repository, as `choice` says:
     ///
-    /// - `None`: the folder as it is, made absolute with its links resolved
-    ///   (no repository root is looked for above it), with no source
-    ///   control. No git runs.
+    /// - `None`: the folder as it is, at its [`canonical`] path (no
+    ///   repository root is looked for above it), with no source control.
+    ///   No git runs.
     /// - `Git`: the git repository the folder is in, at its root, with its
     ///   default branch.
-    /// - `NewGit`: a new git repository made at `path` ([`git::init_repo`]).
+    /// - `NewGit`: a new git repository made at the canonical path
+    ///   ([`git::init_repo`]).
     ///
-    /// A folder that is already a repository is `repo_exists`, however it is
-    /// spelled. A plain folder may not contain or lie inside another
-    /// repository's folder, nor the daemon's home (`RepoOverlaps`); two git
-    /// repositories may nest, as before. The git choices ask first whether
-    /// git can be run at all.
+    /// Every check and what is made use that one canonical path. A folder
+    /// that is already a repository is `repo_exists`, however it is spelled.
+    /// A plain folder may not contain or lie inside another repository's
+    /// folder, nor the daemon's home (`RepoOverlaps`); two git repositories
+    /// may nest, as before. The git choices ask first whether git can be run
+    /// at all.
     pub async fn add_repo(
         &self,
         path: &Path,
         choice: AddSourceControl,
     ) -> Result<Repo, ServiceError> {
         let _serialized = self.inner.repos_lock.lock().await;
+        let path = canonical(path).await;
         let (path, source_control) = match choice {
             AddSourceControl::None => {
-                let path = plain_folder(path).await?;
+                require_folder(&path).await?;
                 self.refuse_overlap(&path, true, None).await?;
                 (path, None)
             }
             AddSourceControl::Git => {
                 require_git().await?;
-                let info = git::validate_repo(path).await?;
+                let info = git::validate_repo(&path).await?;
                 self.refuse_overlap(&info.root, false, None).await?;
                 (info.root, Some(git_of(info.default_branch)))
             }
             AddSourceControl::NewGit => {
                 require_git().await?;
                 // Before anything is made.
-                self.refuse_overlap(path, false, None).await?;
-                let info = git::init_repo(path).await?;
+                self.refuse_overlap(&path, false, None).await?;
+                let info = git::init_repo(&path).await?;
                 (info.root, Some(git_of(info.default_branch)))
             }
         };
@@ -787,8 +790,9 @@ fn git_of(default_branch: String) -> SourceControl {
 }
 
 /// Refuses a git choice before anything is made when git cannot be run.
-/// Asking again each time notices git installed since the daemon started,
-/// and is what `GET /v1/health` reports from then on.
+/// This is the only place git is looked for: asked each time, so git
+/// installed meanwhile is noticed, and the answer is what `GET /v1/health`
+/// reports from then on.
 async fn require_git() -> Result<(), ServiceError> {
     if git::is_installed().await {
         Ok(())
@@ -797,46 +801,53 @@ async fn require_git() -> Result<(), ServiceError> {
     }
 }
 
-/// The folder at `path`, made absolute with its links resolved, for a
-/// repository with no source control: `PathNotFound` unless it is a folder.
-async fn plain_folder(path: &Path) -> Result<PathBuf, ServiceError> {
-    let not_found = || GitError::PathNotFound(path.to_owned()).into();
-    match tokio::fs::canonicalize(path).await {
-        Ok(real) if tokio::fs::metadata(&real).await.is_ok_and(|m| m.is_dir()) => Ok(real),
-        Ok(_) => Err(not_found()),
+/// `PathNotFound` unless `path` is a folder, for a repository with no source
+/// control.
+async fn require_folder(path: &Path) -> Result<(), ServiceError> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(GitError::PathNotFound(path.to_owned()).into()),
         Err(e)
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            Err(not_found())
+            Err(GitError::PathNotFound(path.to_owned()).into())
         }
         Err(e) => Err(GitError::Io(e).into()),
     }
 }
 
 /// `path` made absolute with links, `.` and `..` resolved (on macOS also in
-/// the letter case the disk has), as far as it exists; a part that is
-/// missing is kept as written. Two spellings of one folder come out the same.
+/// the letter case the disk has). The longest leading part the system can
+/// resolve, it resolves. The rest is resolved as written, a `..` there
+/// dropping the part before it: what does not exist cannot be a link. Two
+/// spellings of one folder come out the same, also where some is missing,
+/// and what is checked is what gets made.
 async fn canonical(path: &Path) -> PathBuf {
     let Ok(path) = std::path::absolute(path) else {
         return path.to_owned();
     };
-    let mut missing = Vec::new();
-    let mut existing = path.as_path();
-    loop {
-        if let Ok(real) = tokio::fs::canonicalize(existing).await {
-            return missing.iter().rev().fold(real, |at, part| at.join(part));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name.to_owned());
-                existing = parent;
-            }
-            _ => return path,
+    let parts: Vec<Component<'_>> = path.components().collect();
+    let (mut at, mut rest) = (PathBuf::new(), &parts[..]);
+    for end in (1..=parts.len()).rev() {
+        let leading: PathBuf = parts[..end].iter().collect();
+        if let Ok(real) = tokio::fs::canonicalize(&leading).await {
+            (at, rest) = (real, &parts[end..]);
+            break;
         }
     }
+    for part in rest {
+        match part {
+            Component::ParentDir => {
+                at.pop();
+            }
+            Component::CurDir => {}
+            part => at.push(part),
+        }
+    }
+    at
 }
 
 /// Whether one of two folders is, or lies inside, the other.
@@ -1296,6 +1307,21 @@ mod tests {
             "keep me"
         );
         assert!(!full.join(".git").exists());
+
+        // The same folder reached through `..` after a folder that does not
+        // exist: nothing is made, not even the missing folder.
+        let missing = fx.tmp.path().join("missing");
+        let err = fx
+            .svc
+            .add_repo(&missing.join("..").join("full"), AddSourceControl::NewGit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::Git(GitError::FolderNotEmpty(_))),
+            "{err:?}"
+        );
+        assert!(!full.join(".git").exists());
+        assert!(!missing.exists());
         assert_eq!(fx.store.list_repos().await.unwrap(), vec![fx.repo.clone()]);
     }
 
@@ -1311,10 +1337,12 @@ mod tests {
         let with_slash = PathBuf::from(format!("{}/", x.display()));
 
         #[allow(unused_mut)]
+        let missing = fx.tmp.path().join("missing");
         let mut refused = vec![
             x.join("sub"),
             x.parent().unwrap().to_owned(),
             x.join("sub").join(".."),
+            missing.join("..").join("x"),
             with_slash,
             fx.paths.home.clone(),
             fx.paths.home.join("worktrees"),
@@ -1378,6 +1406,22 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ServiceError::RepoOverlaps), "{err:?}");
         assert!(!fresh.exists());
+        // Nor through `..` after a folder that does not exist: git never
+        // runs in the plain folder.
+        let err = fx
+            .svc
+            .add_repo(&missing.join("..").join("x"), AddSourceControl::NewGit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ServiceError::RepoOverlaps | ServiceError::Store(StoreError::DuplicateRepoPath)
+            ),
+            "{err:?}"
+        );
+        assert!(!x.join(".git").exists());
+        assert!(!missing.exists());
 
         // A git repository inside another git repository is still added, as
         // before; neither may then become a plain folder.

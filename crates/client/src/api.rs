@@ -61,10 +61,11 @@ pub struct Health {
     pub latest_seq: u64,
     pub running_agents: usize,
     pub ws_clients: usize,
-    /// Whether the daemon could run git when it last checked: when it
-    /// started, and whenever git was asked for since.
+    /// Whether the daemon could run git the last time something asked for
+    /// git (adding or switching a repository); `None` until then, since the
+    /// daemon runs no git before it is asked to.
     #[serde(default)]
-    pub git: bool,
+    pub git: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]

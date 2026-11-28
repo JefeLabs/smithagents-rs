@@ -607,8 +607,8 @@ fn agent_id(raw: &str) -> Result<AgentId, ApiError> {
 
 /// `latest_seq` and `instance_id` let a client tell whether its last seen
 /// event seq still means anything: seqs restart with every daemon. `git`
-/// says whether git could be run when last checked, which costs nothing
-/// here: clients poll this while a daemon starts.
+/// says whether git could be run the last time something asked for it, or
+/// is `null` before that: nothing here runs git.
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "version": smithagents_core::VERSION,
@@ -618,7 +618,7 @@ async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
         "latest_seq": s.bus.latest_seq(),
         "running_agents": s.service.running_agent_count(),
         "ws_clients": s.ws_clients.load(Ordering::SeqCst),
-        "git": git::installed_when_last_checked().await,
+        "git": git::installed_as_last_found(),
     }))
 }
 

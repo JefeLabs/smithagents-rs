@@ -249,8 +249,10 @@ and rebase:
   that turns it on or off.
 - The section keeps its title. [my call; the owner calls a plain folder a
   repository of the Workspace too]
-- The daemon reports whether it can run git. When it cannot, the two git
-  choices are disabled with "git is not installed".
+- The daemon does not run git until something asks for it: on a Mac
+  without the developer tools, running git opens the system's install
+  dialog. So the git choices are always offered, and choosing one where git
+  cannot run answers "git is not installed."
 - Closing an agent on a plain repository says: "Its chat tab closes and it
   leaves the list. The folder is not touched."
 - Nothing shows a branch, a worktree or a pull request for a plain repository
@@ -358,4 +360,5 @@ A chat message is the same either way: refused only while a turn runs.
 6. Polish runs are not counted as work in the folder.
 7. The wording given to the agent, and the sentences quoted for the app.
 8. The Settings section keeps the title "Source repositories".
-9. A machine without git disables the git choices instead of hiding them.
+9. The git choices are always offered; where git cannot run, choosing one
+   says so, and the daemon runs no git before then.

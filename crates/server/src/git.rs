@@ -137,7 +137,7 @@ fn remember_installed(found: bool) {
 }
 
 /// Whether git can be run: `<program> --version` starts and succeeds. The
-/// answer is kept for [`installed_when_last_checked`].
+/// answer is kept for [`installed_as_last_found`].
 pub async fn is_installed() -> bool {
     // `--version` needs no repository: any folder that exists will do.
     let ran = run(
@@ -153,14 +153,15 @@ pub async fn is_installed() -> bool {
 }
 
 /// What git was found to be the last time [`is_installed`] ran, or when it
-/// could not be started since; [`is_installed`] runs now if it never has.
-/// Cheap, for `GET /v1/health`: the daemon checks when it starts, and again
-/// whenever git is asked for.
-pub async fn installed_when_last_checked() -> bool {
+/// could not be started since; `None` before either. Runs no git, for
+/// `GET /v1/health`: the daemon looks for git only when something asks for
+/// it, since where git is not installed, running it can open the system's
+/// dialog offering to install it.
+pub fn installed_as_last_found() -> Option<bool> {
     match INSTALLED.load(Ordering::Relaxed) {
-        FOUND => true,
-        MISSING => false,
-        _ => is_installed().await,
+        FOUND => Some(true),
+        MISSING => Some(false),
+        _ => None,
     }
 }
 
@@ -317,8 +318,21 @@ const FIRST_COMMIT_MESSAGE: &str = "Initial commit";
 /// names is refused (`user.useConfigOnly`): with none configured the answer
 /// is [`GitError::IdentityMissing`]. When anything fails, what was made is
 /// removed again: the folder, when it was missing, else what git put in it.
+///
+/// A path with a `..` part is refused before anything is made: after a
+/// missing folder, `..` names one folder to these checks and another to git
+/// once the missing one exists. The service passes a canonical path.
 pub async fn init_repo(path: &Path) -> Result<RepoInfo, GitError> {
     let path = std::path::absolute(path)?;
+    if path
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(GitError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a new repository's path must not hold `..`",
+        )));
+    }
     // The first folder this makes: the topmost one of `path` that is missing.
     let made = match tokio::fs::symlink_metadata(&path).await {
         Ok(_) if is_empty_folder(&path).await => None,
@@ -2677,6 +2691,26 @@ mod tests {
             matches!(&err, GitError::PathNotFound(p) if *p == file),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_new_repository_is_not_made_at_a_path_with_dot_dot() {
+        // `missing/..` names `tmp` to git once `missing` is made, so the
+        // checks and git would see different folders: nothing runs.
+        let tmp = TempDir::new().unwrap();
+        let full = tmp.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("notes.txt"), "keep me").unwrap();
+        let missing = tmp.path().join("missing");
+        let err = super::init_repo(&missing.join("..").join("full"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, GitError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "{err:?}"
+        );
+        assert!(!missing.exists());
+        assert!(!full.join(".git").exists());
     }
 
     #[tokio::test]

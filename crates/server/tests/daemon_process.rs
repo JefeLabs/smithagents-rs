@@ -601,7 +601,8 @@ async fn a_daemon_without_git_starts_and_says_so() {
     let mut daemon = Daemon::spawn(tmp.path(), "daemon", &home, &["--git-bin", no_git], None);
     let info = daemon.wait_for_lockfile(&home).await;
     let client = smithagents_client::Client::new(&info);
-    assert!(!client.health().await.unwrap().git);
+    // Nothing has asked for git yet, so it was not run.
+    assert_eq!(client.health().await.unwrap().git, None);
 
     let folder = tmp.path().join("folder");
     std::fs::create_dir(&folder).unwrap();
@@ -615,6 +616,7 @@ async fn a_daemon_without_git_starts_and_says_so() {
     std::fs::create_dir(&folder2).unwrap();
     let answer = client.add_repo(&folder2, AddSourceControl::Git).await;
     assert_eq!(refusal(answer), (400, "git_not_installed".into()));
+    assert_eq!(client.health().await.unwrap().git, Some(false));
     let folder3 = tmp.path().join("folder3");
     let answer = client.add_repo(&folder3, AddSourceControl::NewGit).await;
     assert_eq!(refusal(answer), (400, "git_not_installed".into()));
@@ -623,8 +625,101 @@ async fn a_daemon_without_git_starts_and_says_so() {
     assert_eq!(refusal(answer), (400, "git_not_installed".into()));
 
     assert_eq!(client.list_repos().await.unwrap(), vec![plain]);
-    assert!(!client.health().await.unwrap().git);
+    assert_eq!(client.health().await.unwrap().git, Some(false));
     assert!(daemon.exited().is_none(), "log:\n{}", daemon.log_text());
+}
+
+/// A `git` for `--git-bin` at `<bin>/git` that appends each call's
+/// arguments to `calls`, then runs the real git.
+fn recording_git(bin: &Path, calls: &Path) -> PathBuf {
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    assert!(real.starts_with('/'), "no git found: {real:?}");
+    std::fs::create_dir_all(bin).unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{real}' \"$@\"\n",
+        calls.display()
+    );
+    let path = bin.join("git");
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// A git repository on `main` with one empty commit, made with the test's
+/// own git, not the daemon's.
+fn make_git_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    git_out(dir, &["init", "-q", "-b", "main"]);
+    git_out(
+        dir,
+        &[
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_daemon_runs_no_git_until_git_is_asked_for() {
+    // Where git is not installed, running it can open the system's dialog
+    // offering to install it: a Workspace of plain folders must never.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let calls = tmp.path().join("git-calls");
+    let git = recording_git(&tmp.path().join("bin"), &calls);
+    let mut daemon = Daemon::spawn(
+        tmp.path(),
+        "daemon",
+        &home,
+        &["--git-bin", git.to_str().unwrap()],
+        None,
+    );
+    let info = daemon.wait_for_lockfile(&home).await;
+    let client = smithagents_client::Client::new(&info);
+    assert_eq!(client.health().await.unwrap().git, None);
+
+    // A git repository added as a plain folder runs no git either.
+    let folder = tmp.path().join("folder");
+    make_git_repo(&folder);
+    let plain = client
+        .add_repo(&folder, AddSourceControl::None)
+        .await
+        .unwrap();
+    assert_eq!(client.list_repos().await.unwrap(), vec![plain]);
+    assert_eq!(client.health().await.unwrap().git, None);
+    assert!(
+        !calls.exists(),
+        "git ran: {:?}; log:\n{}",
+        std::fs::read_to_string(&calls),
+        daemon.log_text()
+    );
+
+    // Asked for, git runs, and health says it can.
+    let repo_dir = tmp.path().join("repo");
+    make_git_repo(&repo_dir);
+    let repo = client
+        .add_repo(&repo_dir, AddSourceControl::Git)
+        .await
+        .unwrap();
+    assert_eq!(repo.default_branch(), Some("main"));
+    assert_eq!(client.health().await.unwrap().git, Some(true));
+    let ran = std::fs::read_to_string(&calls).unwrap();
+    assert!(ran.lines().any(|call| call == "--version"), "{ran}");
 }
 
 /// A daemon whose HOME is the test's own, `<tmp>/user-home`, holding
@@ -673,7 +768,6 @@ async fn a_new_git_repository_starts_with_one_commit_on_main() {
     let mut daemon = spawn_in_own_git_home(tmp.path(), &home, gitconfig);
     let info = daemon.wait_for_lockfile(&home).await;
     let client = smithagents_client::Client::new(&info);
-    assert!(client.health().await.unwrap().git);
 
     let fresh = tmp.path().join("fresh");
     let repo = client
@@ -681,6 +775,7 @@ async fn a_new_git_repository_starts_with_one_commit_on_main() {
         .await
         .unwrap_or_else(|e| panic!("{e}; log:\n{}", daemon.log_text()));
     assert_eq!(repo.default_branch(), Some("main"));
+    assert_eq!(client.health().await.unwrap().git, Some(true));
     assert_eq!(repo.path, std::fs::canonicalize(&fresh).unwrap());
     assert_eq!(git_out(&fresh, &["rev-list", "--count", "main"]), "1");
     assert_eq!(
