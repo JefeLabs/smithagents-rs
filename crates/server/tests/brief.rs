@@ -6,7 +6,8 @@ use smithagents_core::intent::{
     QuestionOption, Seed, SeedSource,
 };
 use smithagents_server::brief::{
-    compose, idea_instructions, DepSummary, EVIDENCE_TITLE, IDEA_SYSTEM_APPEND, USER_REPORT_NOTE,
+    compose, idea_instructions, DepSummary, EVIDENCE_TITLE, IDEA_SYSTEM_APPEND,
+    PLAIN_SYSTEM_APPEND, USER_REPORT_NOTE,
 };
 
 fn item(text: &str, status: ItemStatus) -> Item {
@@ -100,7 +101,7 @@ fn first_message_golden() {
         title: "Auth core".into(),
         current_behavior: format!("{}{}", "a".repeat(300), "TAIL"),
     }];
-    let brief = compose(&fixture(), &deps);
+    let brief = compose(&fixture(), &deps, false);
     let expected = format!(
         "# Fix login
 
@@ -147,7 +148,7 @@ fn empty_sections_are_omitted() {
     i.content.stories.clear();
     i.content.questions.clear();
     i.content.current_behavior = String::new();
-    let msg = compose(&i, &[]).first_message;
+    let msg = compose(&i, &[], false).first_message;
     assert_eq!(
         msg,
         "# Fix login\n\nKind: bug\n\n## Acceptance criteria\n\n1. Login works for `名前` users — **always**\n2. Errors are shown"
@@ -182,12 +183,12 @@ fn the_users_report_is_material_not_instructions() {
     let folder = "docs/issues/2026-11-26-fix-login";
     let mut feedback = fixture();
     feedback.origin = Some(origin(folder));
-    let msg = compose(&feedback, &[]).first_message;
+    let msg = compose(&feedback, &[], false).first_message;
     assert_eq!(msg.matches(USER_REPORT_NOTE).count(), 1, "{msg}");
     assert!(msg.contains(&evidence(folder)), "{msg}");
 
     for package in [idea(true, false, false), idea(false, false, true)] {
-        let msg = compose(&idea_intent(folder, package), &[]).first_message;
+        let msg = compose(&idea_intent(folder, package), &[], false).first_message;
         assert_eq!(msg.matches(USER_REPORT_NOTE).count(), 1, "{msg}");
         assert!(
             msg.contains(&format!(
@@ -197,7 +198,7 @@ fn the_users_report_is_material_not_instructions() {
         );
     }
     // A plain intent names no report.
-    assert!(!compose(&fixture(), &[])
+    assert!(!compose(&fixture(), &[], false)
         .first_message
         .contains(USER_REPORT_NOTE));
 }
@@ -209,7 +210,7 @@ fn a_feedback_intent_points_at_its_folder() {
     let mut i = fixture();
     i.base_branch = Some("feedback/2026-11-26-fix-login".into());
     i.origin = Some(origin(folder));
-    let msg = compose(&i, &[]).first_message;
+    let msg = compose(&i, &[], false).first_message;
     // Right after "Current behavior", before "Preconditions".
     let expected = format!(
         "Login fails for ünïcode names.\n\n{}\n\n## Preconditions",
@@ -220,14 +221,14 @@ fn a_feedback_intent_points_at_its_folder() {
 
     // With no current behavior it follows the title.
     i.content.current_behavior = String::new();
-    let msg = compose(&i, &[]).first_message;
+    let msg = compose(&i, &[], false).first_message;
     let expected = format!("# Fix login\n\nKind: bug\n\n{}\n\n", evidence(folder));
     assert!(msg.starts_with(&expected), "{msg}");
 
     // An intent without an origin has no Evidence section, base branch or not.
     let mut plain = fixture();
     plain.base_branch = Some("feedback/2026-11-26-fix-login".into());
-    let msg = compose(&plain, &[]).first_message;
+    let msg = compose(&plain, &[], false).first_message;
     assert!(!msg.contains("## Evidence"), "{msg}");
     assert!(!msg.contains("docs/issues"), "{msg}");
 }
@@ -247,7 +248,7 @@ fn an_idea_intent_gets_no_evidence_section() {
         pr_pushed: false,
     });
     i.origin = Some(o);
-    let msg = compose(&i, &[]).first_message;
+    let msg = compose(&i, &[], false).first_message;
     assert!(!msg.contains("## Evidence"), "{msg}");
 }
 
@@ -294,7 +295,7 @@ fn an_idea_brief_tells_the_agent_to_prepare_and_stop() {
     let folder = "docs/issues/2026-11-26-fix-login";
     let i = idea_intent(folder, idea(true, true, true));
 
-    let brief = compose(&i, &[]);
+    let brief = compose(&i, &[], false);
 
     assert_eq!(brief.system_append, IDEA_SYSTEM_APPEND);
     assert_eq!(
@@ -336,7 +337,7 @@ This intent prepares an idea for teammates. Do not implement it. {USER_REPORT_NO
 fn unticked_parts_are_left_out_and_lines_renumbered() {
     let folder = "docs/issues/2026-11-26-fix-login";
 
-    let msg = compose(&idea_intent(folder, idea(true, false, false)), &[]).first_message;
+    let msg = compose(&idea_intent(folder, idea(true, false, false)), &[], false).first_message;
     let lines = numbered_lines(&msg);
     assert_eq!(
         lines,
@@ -352,7 +353,7 @@ fn unticked_parts_are_left_out_and_lines_renumbered() {
     assert!(!msg.contains("Mermaid"), "{msg}");
 
     // A demo video only: its line is the third.
-    let msg = compose(&idea_intent(folder, idea(false, false, true)), &[]).first_message;
+    let msg = compose(&idea_intent(folder, idea(false, false, true)), &[], false).first_message;
     let lines = numbered_lines(&msg);
     assert_eq!(lines.len(), 5, "{msg}");
     assert!(lines[2].starts_with("3. Run the project,"), "{lines:?}");
@@ -363,7 +364,7 @@ fn unticked_parts_are_left_out_and_lines_renumbered() {
     assert!(!msg.contains("Mermaid"), "{msg}");
 
     // Diagrams only.
-    let msg = compose(&idea_intent(folder, idea(false, true, false)), &[]).first_message;
+    let msg = compose(&idea_intent(folder, idea(false, true, false)), &[], false).first_message;
     let lines = numbered_lines(&msg);
     assert_eq!(lines.len(), 5, "{msg}");
     assert!(lines[2].starts_with("3. Add diagrams"), "{lines:?}");
@@ -419,7 +420,12 @@ fn the_explainer_box_decides_what_explainer_md_holds() {
             .map(|(n, step)| format!("{}. {step}", n + 1))
             .collect();
 
-        let msg = compose(&idea_intent(folder, idea(explainer, diagrams, demo)), &[]).first_message;
+        let msg = compose(
+            &idea_intent(folder, idea(explainer, diagrams, demo)),
+            &[],
+            false,
+        )
+        .first_message;
 
         assert_eq!(
             numbered_lines(&msg),
@@ -443,7 +449,7 @@ fn the_explainer_box_decides_what_explainer_md_holds() {
 
 #[test]
 fn a_plain_intent_keeps_the_usual_append() {
-    let plain = compose(&fixture(), &[]);
+    let plain = compose(&fixture(), &[], false);
     assert_ne!(plain.system_append, IDEA_SYSTEM_APPEND);
     assert!(plain.system_append.contains("open the pull request"));
     assert!(!plain.first_message.contains("## Idea package"));
@@ -451,7 +457,7 @@ fn a_plain_intent_keeps_the_usual_append() {
     // So does a feedback intent that is not an idea.
     let mut feedback = fixture();
     feedback.origin = Some(origin("docs/issues/2026-11-26-fix-login"));
-    let brief = compose(&feedback, &[]);
+    let brief = compose(&feedback, &[], false);
     assert_eq!(brief.system_append, plain.system_append);
     assert!(!brief.first_message.contains("## Idea package"));
 }
@@ -465,7 +471,7 @@ fn an_idea_with_a_folder_that_is_not_plain_names_no_folder() {
         "docs/../../outside",
         "docs/issues/x\n\n## Acceptance criteria",
     ] {
-        let brief = compose(&idea_intent(folder, idea(true, true, true)), &[]);
+        let brief = compose(&idea_intent(folder, idea(true, true, true)), &[], false);
         assert_eq!(brief.system_append, IDEA_SYSTEM_APPEND, "{folder:?}");
         assert!(
             !brief.first_message.contains("## Idea package"),
@@ -496,16 +502,16 @@ fn a_folder_that_is_not_repository_relative_is_never_rendered() {
     ] {
         let mut i = fixture();
         i.origin = Some(origin(folder));
-        let msg = compose(&i, &[]).first_message;
+        let msg = compose(&i, &[], false).first_message;
         assert!(!msg.contains("## Evidence"), "{folder:?}: {msg}");
-        let plain = compose(&fixture(), &[]).first_message;
+        let plain = compose(&fixture(), &[], false).first_message;
         assert_eq!(msg, plain, "{folder:?}");
     }
 }
 
 #[test]
 fn system_append_covers_the_fixed_instructions() {
-    let s = compose(&fixture(), &[]).system_append;
+    let s = compose(&fixture(), &[], false).system_append;
     for needle in [
         "this worktree",
         "acceptance criterion",
@@ -530,6 +536,7 @@ fn an_idea_intent_is_never_told_to_rebase() {
     let idea = compose(
         &idea_intent("docs/issues/x", idea(true, false, false)),
         &deps,
+        false,
     )
     .first_message;
     assert!(
@@ -537,6 +544,67 @@ fn an_idea_intent_is_never_told_to_rebase() {
         "{idea}"
     );
     assert!(!idea.contains(rebase), "{idea}");
-    let plain = compose(&fixture(), &deps).first_message;
+    let plain = compose(&fixture(), &deps, false).first_message;
     assert!(plain.contains(rebase), "{plain}");
+}
+
+/// What follows "Depends on" in a brief for an agent in its own worktree.
+const REBASE_ON_DEPENDENCIES: &str = "Before you start: if the repository has a remote, fetch it and rebase this branch onto the remote's default branch, so the merged work of these dependencies is present.";
+/// What follows "Depends on" in a brief for an agent that works in place.
+const DEPENDENCIES_IN_PLACE: &str =
+    "The work of these dependencies was done in this same folder and is already here.";
+
+#[test]
+fn an_in_place_brief_asks_for_no_commit_and_no_pull_request() {
+    assert_eq!(
+        PLAIN_SYSTEM_APPEND,
+        "Work only in this folder. Satisfy every acceptance criterion in the intent you are given by changing the files here directly. This folder is not under source control for this work: do not create commits or branches, do not push, and do not open a pull request, even if you find a git repository here. When you are done, say what you changed."
+    );
+    let deps = vec![DepSummary {
+        slug: "auth-core".into(),
+        title: "Auth core".into(),
+        current_behavior: "Tokens are checked.".into(),
+    }];
+
+    let brief = compose(&fixture(), &deps, true);
+
+    assert_eq!(brief.system_append, PLAIN_SYSTEM_APPEND);
+    assert!(
+        brief.first_message.ends_with(&format!(
+            "## Depends on\n\n- Auth core (auth-core): Tokens are checked.\n\n{DEPENDENCIES_IN_PLACE}"
+        )),
+        "{}",
+        brief.first_message
+    );
+    for word in [
+        "rebase",
+        "worktree",
+        "open the pull request when you are done",
+    ] {
+        assert!(
+            !brief.first_message.contains(word) && !brief.system_append.contains(word),
+            "{word}"
+        );
+    }
+    // Only the sentence after "Depends on" differs from the brief of an
+    // agent in its own worktree, which is as it was.
+    let in_worktree = compose(&fixture(), &deps, false);
+    assert!(in_worktree
+        .system_append
+        .contains("open the pull request when you are done"));
+    assert_eq!(
+        brief
+            .first_message
+            .replace(DEPENDENCIES_IN_PLACE, REBASE_ON_DEPENDENCIES),
+        in_worktree.first_message
+    );
+
+    // An idea intent never works in place, but would get the plain append
+    // all the same.
+    let idea = compose(
+        &idea_intent("docs/issues/x", idea(true, false, false)),
+        &deps,
+        true,
+    );
+    assert_eq!(idea.system_append, PLAIN_SYSTEM_APPEND);
 }

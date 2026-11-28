@@ -12,12 +12,13 @@ use serde_json::{json, Value};
 use smithagents_core::agent::{AddSourceControl, Agent, Repo, Role};
 use smithagents_core::event::EventKind;
 use smithagents_core::feedback::FeedbackOrigin;
-use smithagents_core::ids::{IntentId, ItemId, QuestionId, RepoId};
+use smithagents_core::ids::{AgentId, IntentId, ItemId, QuestionId, RepoId};
 use smithagents_core::intent::{
     Answer, AnswerInput, CreateIntentRequest, Intent, IntentFilter, IntentKind, IntentState, Item,
     ItemStatus, Patch, Phase, Question, QuestionOption, ReviewAction, SeedInput, SeedSource,
     VersionAuthor,
 };
+use smithagents_server::brief::{compose, PLAIN_SYSTEM_APPEND};
 use smithagents_server::events::{EventBus, Subscription};
 use smithagents_server::harness::fake::FakeHarness;
 use smithagents_server::harness::{
@@ -3021,4 +3022,114 @@ async fn an_agent_branch_tracks_nothing_whatever_the_repository_says() {
             "{name}"
         );
     }
+}
+
+// --------------------------------------------------------- plain repository
+
+const NEEDS_SOURCE_CONTROL: &str = "This intent needs a repository with source control.";
+
+impl Fx {
+    /// A folder with a file in it, added with no source control.
+    async fn plain_repo(&self, name: &str) -> Repo {
+        let dir = self.tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.md"), "# Notes\n").unwrap();
+        self.agents
+            .add_repo(&dir, AddSourceControl::None)
+            .await
+            .unwrap()
+    }
+
+    /// Waits until no turn of agent `id` is in flight.
+    async fn wait_turn_over(&self, id: AgentId) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.agents.turn_in_flight(id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the turn did not end");
+    }
+}
+
+#[tokio::test]
+async fn an_intent_on_a_plain_repository_starts_in_place() {
+    let f = real_fx().await;
+    let repo = f.plain_repo("folder").await;
+
+    // An intent that names a branch to start from, or files on one, needs
+    // source control: refused before anything is made.
+    let origin = FeedbackOrigin {
+        folder: "docs/issues/x".into(),
+        branch: "feedback/x".into(),
+        commit: "0".repeat(40),
+        idea: None,
+    };
+    for (base_branch, origin) in [(Some("feedback/x"), None), (None, Some(origin))] {
+        let x = f.complete_intent(&repo, base_branch, origin).await;
+
+        let err = f.svc.send(x.id).await.unwrap_err();
+
+        assert!(matches!(err, IntentError::NeedsSourceControl), "{err:?}");
+        let (status, code) = err.status_and_code();
+        assert_eq!((status.as_u16(), code), (409, "needs_source_control"));
+        assert_eq!(err.to_string(), NEEDS_SOURCE_CONTROL);
+        let now = f.svc.get(x.id).await.unwrap();
+        assert_eq!(now.state, IntentState::Complete);
+        assert_eq!(
+            now.last_start_error,
+            Some(format!("could not start the agent: {NEEDS_SOURCE_CONTROL}"))
+        );
+        assert!(f.store.list_agents(true).await.unwrap().is_empty());
+    }
+
+    let x = f.complete_intent(&repo, None, None).await;
+
+    let sent = f.svc.send(x.id).await.unwrap();
+
+    assert_eq!(sent.state, IntentState::Sent);
+    assert_eq!(sent.last_start_error, None);
+    let agent = f
+        .store
+        .get_agent(sent.agent_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.branch, None);
+    assert_eq!(agent.worktree_path, repo.path);
+    assert_eq!(agent.intent_id, Some(x.id));
+    assert_eq!(
+        f.store
+            .agent_system_prompt_append(agent.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(PLAIN_SYSTEM_APPEND)
+    );
+    assert_eq!(
+        f.first_message(&agent).await,
+        compose(&x, &[], true).first_message
+    );
+    assert!(!repo.path.join(".git").exists());
+}
+
+#[tokio::test]
+async fn send_on_a_held_folder_queues() {
+    let f = real_fx().await;
+    let repo = f.plain_repo("folder").await;
+    let a = f.complete_intent(&repo, None, None).await;
+    let b = f.complete_intent(&repo, None, None).await;
+    let a = f.svc.send(a.id).await.unwrap();
+    assert_eq!(a.state, IntentState::Sent);
+    // The fake harness has no turn for the agent, so the turn ends at once.
+    f.wait_turn_over(a.agent_id.unwrap()).await;
+    assert!(!f.agents.folder_busy(repo.id));
+
+    let b = f.svc.send(b.id).await.unwrap();
+
+    assert_eq!(b.state, IntentState::Queued);
+    assert_eq!(b.last_start_error, None);
+    assert_eq!(b.agent_id, None);
+    assert_eq!(f.store.get_intent(b.id).await.unwrap().unwrap(), b);
+    assert_eq!(f.store.list_agents(true).await.unwrap().len(), 1);
 }
